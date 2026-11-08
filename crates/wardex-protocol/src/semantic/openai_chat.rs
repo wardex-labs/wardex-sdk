@@ -1,24 +1,30 @@
 //! OpenAI Chat Completions: request/response fill and SSE reassembly.
 
+use serde::Deserialize;
+
 use super::event_json::{carries_nothing, is_done_marker, parse_event};
-use super::parts::*;
+use super::parts::{
+    blob_part, build_input_messages, build_output_messages, build_system_instructions,
+    declared_error_type, file_part, generic_part, modality_from_mime, normalize_finish_reason,
+    parse_data_url, text_part, tool_call_part, tool_call_response_part, uri_part, InMsg, OutMsg,
+    Reassembled, FINISH_ERROR,
+};
 use super::usage::{flatten_usage, UsageBounds, UsageView};
 use super::{LlmSemantics, StringOrVec};
 use crate::sse::SseEvent;
 use crate::usage::{InputConvention, TokenUsage};
-use serde::Deserialize;
 
 // Normalization table: LlmSemantics usage field <- dotted path in the raw
-// usage Value. The extraction below reads THROUGH these constants, so the
-// table a test walks and the path the code reads are one string (U4).
+// usage Value. The extraction below reads through these constants, so the
+// table a test walks and the path the code reads are one string.
 const P_INPUT: &str = "prompt_tokens";
 const P_OUTPUT: &str = "completion_tokens";
 const P_CACHE_READ: &str = "prompt_tokens_details.cached_tokens";
 const P_REASONING: &str = "completion_tokens_details.reasoning_tokens";
-// Read by the fixture test (`every_normalized_usage_path_is_extracted_
-// from_its_fixture`), not by the runtime path — the runtime reads the
-// P_* consts the table is built from, which makes the two one string.
-#[cfg_attr(not(test), allow(dead_code))]
+// Read only by the fixture test (`every_normalized_usage_path_is_extracted_
+// from_its_fixture`); the runtime reads the P_* consts the table is built
+// from, which makes the two one string.
+#[cfg(test)]
 pub(super) const NORMALIZED_USAGE_PATHS: &[(&str, &str)] = &[
     ("input_tokens", P_INPUT),
     ("output_tokens", P_OUTPUT),
@@ -242,18 +248,18 @@ pub(super) fn fill_openai_chat(
     bounds: UsageBounds,
 ) {
     out.api_type = Some("chat_completions");
-    // The pre-split dispatcher stamped `output_type="text"` on every parse;
-    // the request half below refines it from `response_format.type`.
+    // `output_type` starts as `"text"`; the request half below refines it
+    // from `response_format.type`.
     out.output_type = Some("text".to_string());
     if let Ok(r) = serde_json::from_slice::<OpenAIChatResponse>(resp) {
-        // An error object INSIDE a response object is the provider's own
+        // An error object inside a response object is the provider's own
         // failure declaration — the in-stream `error` chunk, which the
         // reassembler keeps in the synthetic body — and it wins over whatever
         // finish the choices carried. An empty or falsy `error` declares
         // nothing (`declares_failure`, the same test the reassembler applies
         // to each chunk). A bare HTTP error envelope
         // (`{"error":{...}}`, no id, no choices) is not a response object:
-        // it keeps an EMPTY response half, as before, and its span takes the
+        // it keeps an empty response half, and its span takes the
         // error from the HTTP status.
         let is_response_object = r.id.is_some() || !r.choices.is_empty();
         let declared = r
@@ -267,7 +273,7 @@ pub(super) fn fill_openai_chat(
         let mut msgs: Vec<OutMsg> = Vec::new();
         for c in r.choices {
             // One producer for both carriers: the normalized value goes into
-            // `finish_reasons` AND onto the message (unknown raw passes
+            // `finish_reasons` and onto the message (unknown raw passes
             // through as itself — total function, never a silent drop).
             let finish_reason = if declared.is_some() {
                 Some(FINISH_ERROR.to_string())
@@ -405,8 +411,9 @@ fn declares_failure(error: &serde_json::Value) -> bool {
 }
 
 /// OpenAI chat stream chunks → synthetic non-streaming-shaped JSON.
-/// Accumulates tool_call deltas into a BTreeMap keyed by index, concatenating the arguments string,
-/// then emits them as the choices[0].message.tool_calls array → fill_openai_chat reuses it for extraction.
+/// Accumulates `tool_call` deltas into a `BTreeMap` keyed by index, concatenating the arguments
+/// string, then emits them as the `choices[0].message.tool_calls` array, so `fill_openai_chat`
+/// reuses its non-streaming extraction.
 pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     use std::collections::BTreeMap;
     let mut id: Option<String> = None;
@@ -613,7 +620,7 @@ mod tests {
         }
     }
 
-    /// An `error` chunk that ALSO carries a `choices` array is still the
+    /// An `error` chunk that also carries a `choices` array is still the
     /// provider's failure declaration. OpenRouter documents its mid-stream
     /// error that way: the error at the top level plus a choice whose finish
     /// is `"error"`. A choice with no finish at all, or an empty array, must
@@ -728,7 +735,7 @@ mod tests {
         }
     }
 
-    /// An `error` chunk as the stream's ONLY event, before anything named an
+    /// An `error` chunk as the stream's only event, before anything named an
     /// id or a model: still the provider's failure declaration. No response
     /// field names the model, so the seam keeps this call on the request's
     /// model and this declaration together; none is invented here.
@@ -745,7 +752,7 @@ mod tests {
         assert_eq!(s.response_id, None);
     }
 
-    /// The HTTP error envelope every 4xx/5xx carries is NOT a response
+    /// The HTTP error envelope every 4xx/5xx carries is not a response
     /// object: no finish, no output message, no declared error type. That
     /// span keeps taking its error from the HTTP status.
     #[test]

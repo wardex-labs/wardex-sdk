@@ -1,4 +1,4 @@
-//! Argument-name rules: a value is a secret because of the NAME it sits under.
+//! Argument-name rules: a value is a secret because of the name it sits under.
 //!
 //! The value rules in `patterns.rs` recognise a credential by its shape
 //! (`sk-…`, `AKIA…`). Most credentials have no shape — `appid=4f1c…`,
@@ -16,7 +16,7 @@
 //! * `"name": value` — JSON, including JSON escaped inside a JSON string (a
 //!   tool call's `arguments`), and `'name': value` (a Python dict's repr).
 //!
-//! The judgement is by WORDS, not substrings: a name is split at `_ - .`,
+//! The judgement is by words, not substrings: a name is split at `_ - .`,
 //! spaces, brackets, `%XX` escapes and camelCase boundaries, then lowercased.
 //! That is what keeps `keyword` and `monkey` out while `apiKey`, `X-Api-Key`
 //! and `API_KEY` all read as the same two words. The lists below are the whole
@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use wardex_codec::proto::wardex::v1::RedactionRule as Rule;
 
-/// Rule 1: a strong secret word ANYWHERE in the name. These words are never a
+/// Rule 1: a strong secret word anywhere in the name. These words are never a
 /// debugging value, so their position does not matter (`password_confirmation`
 /// carries a password).
 pub const STRONG_WORDS: &[&str] = &[
@@ -45,7 +45,7 @@ pub const STRONG_WORDS: &[&str] = &[
     "cookies",
 ];
 
-/// Rule 2: the name's LAST word, when the name has two or more words. These
+/// Rule 2: the name's last word, when the name has two or more words. These
 /// words name many harmless things when they are not the head noun
 /// (`key_id`, `token_type`, `pass_through`, `otp_length`); as the head noun
 /// they name the credential (`api_key`, `access_token`, `db_pass`,
@@ -121,13 +121,22 @@ pub enum Shape {
     Json,
 }
 
-/// One value the name rules want replaced.
-pub struct NameHit {
-    pub start: usize,
-    pub end: usize,
-    pub replacement: String,
-    pub rule: Rule,
-    pub name: String,
+/// One value the name rules want replaced. Holds offsets, the placeholder and
+/// the argument name, never the value itself, so a derived Debug prints no
+/// captured secret.
+#[derive(Debug)]
+pub(crate) struct NameHit {
+    /// Byte offset of the value's first byte in the scanned text.
+    pub(crate) start: usize,
+    /// Byte offset one past the value's last byte.
+    pub(crate) end: usize,
+    /// What the value becomes: the placeholder, quoted when it replaces a
+    /// JSON number.
+    pub(crate) replacement: String,
+    pub(crate) rule: Rule,
+    /// The argument name as the rules judged it: as written, or after
+    /// percent-decoding or JSON-unescaping for a hit inside an encoded value.
+    pub(crate) name: String,
 }
 
 /// The name rules with an application's additions and exemptions applied.
@@ -184,7 +193,7 @@ impl NameRules {
     }
 
     /// Every value in `text` that sits under a secret name.
-    pub fn scan(&self, text: &str, hits: &mut Vec<NameHit>) {
+    pub(crate) fn scan(&self, text: &str, hits: &mut Vec<NameHit>) {
         self.scan_multipart(text, hits);
         let b = text.as_bytes();
         let mut quotes = Quotes::default();
@@ -205,6 +214,10 @@ impl NameRules {
     /// `name=value`. Returns where scanning resumes when a value was
     /// replaced. `quoted` says whether the `=` sits inside a double-quoted
     /// string.
+    #[expect(
+        clippy::string_slice,
+        reason = "`eq` is the offset of an ASCII `=` and `end` that of an ASCII terminator or the text's end, so both are char boundaries"
+    )]
     fn scan_form(
         &self,
         text: &str,
@@ -270,6 +283,10 @@ impl NameRules {
     /// readings are judged and the value is a secret when either one names
     /// a secret. Which name is recorded when both do is `reads_as_escape`'s
     /// call.
+    #[expect(
+        clippy::string_slice,
+        reason = "`start` is the offset of an ASCII name byte, `eq` that of an ASCII `=`, and `after` lies past an ASCII escape, so all three are char boundaries"
+    )]
     fn judge_form_name<'t>(
         &self,
         text: &'t str,
@@ -355,6 +372,10 @@ impl NameRules {
     /// A `multipart/form-data` field: `form-data; name="password"` then a
     /// blank line, then the value up to the next boundary. A part with a
     /// `filename` is a file, not an argument.
+    #[expect(
+        clippy::string_slice,
+        reason = "every offset is the text's end or that of a match of an ASCII needle, or lies a needle's length past one, so each is a char boundary"
+    )]
     fn scan_multipart(&self, text: &str, hits: &mut Vec<NameHit>) {
         // Linear however many `form-data;` a text holds: the next line end
         // and the next blank line are each found once and reused until the
@@ -417,6 +438,10 @@ impl NameRules {
 
     /// `"name": value`. Returns where scanning resumes when a value was
     /// replaced.
+    #[expect(
+        clippy::string_slice,
+        reason = "the name starts after an ASCII quote and ends at the ASCII backslash or quote that closes it, so both bounds are char boundaries"
+    )]
     fn scan_json(&self, text: &str, colon: usize, hits: &mut Vec<NameHit>) -> Option<usize> {
         let b = text.as_bytes();
         // The name's closing quote, skipping whitespace before the colon.
@@ -440,34 +465,36 @@ impl NameRules {
             return None;
         }
         let name_end = close - level;
-        let mut p = name_end;
-        while p > 0 && b[p - 1] != quote && b[p - 1] != b'\\' {
-            p -= 1;
-            if name_end - p > MAX_NAME_LEN {
+        let mut name_start = name_end;
+        while name_start > 0 && b[name_start - 1] != quote && b[name_start - 1] != b'\\' {
+            name_start -= 1;
+            if name_end - name_start > MAX_NAME_LEN {
                 return None;
             }
         }
-        if p == 0 || b[p - 1] != quote || p == name_end {
+        if name_start == 0 || b[name_start - 1] != quote || name_start == name_end {
             return None;
         }
-        let open = p - 1;
+        let open = name_start - 1;
         if backslashes_before(b, open) != level {
             return None;
         }
-        let name = &text[p..name_end];
+        let name = &text[name_start..name_end];
         let rule = self.judge(name, Shape::Json)?;
-        let mut v = colon + 1;
-        while v < b.len() && b[v].is_ascii_whitespace() {
-            v += 1;
+        let mut value_at = colon + 1;
+        while value_at < b.len() && b[value_at].is_ascii_whitespace() {
+            value_at += 1;
         }
-        if v < b.len() && (b[v] == b'{' || b[v] == b'[') {
+        if value_at < b.len() && (b[value_at] == b'{' || b[value_at] == b'[') {
             // An object or a list under a secret name is the secret, every
             // leaf of it (`"client_secret": {"value": "..."}`); its own keys
             // stay readable.
-            return Some(mask_container(text, v, quote, level, rule, name, hits));
+            return Some(mask_container(
+                text, value_at, quote, level, rule, name, hits,
+            ));
         }
-        let (s, e, next, is_string) = scalar_at(b, v, quote, level)?;
-        push_value(text, s, e, is_string, quote, level, rule, name, hits);
+        let (start, end, next, is_string) = scalar_at(b, value_at, quote, level)?;
+        push_value(text, start, end, is_string, quote, level, rule, name, hits);
         Some(next)
     }
 }
@@ -507,7 +534,7 @@ fn scalar_at(b: &[u8], at: usize, quote: u8, level: usize) -> Option<(usize, usi
             let run = backslashes_before(b, i);
             // At escape depth `level` a closing quote carries exactly `level`
             // backslashes modulo the next depth's escaping; any other run is
-            // a quote INSIDE the string.
+            // a quote inside the string.
             if run % modulus == level && i >= start + level {
                 return Some((start, i - level, i + 1, true));
             }
@@ -586,7 +613,14 @@ fn mask_container(
     b.len()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is scan state its two callers already hold separately; a struct would exist only to carry this one call"
+)]
+#[expect(
+    clippy::string_slice,
+    reason = "`scalar_at` bounds a value by an ASCII quote, an ASCII digit run or the text's end, so both offsets are char boundaries"
+)]
 fn push_value(
     text: &str,
     start: usize,
@@ -939,7 +973,10 @@ mod tests {
             let mut hits = Vec::new();
             rules().scan(text, &mut hits);
             assert_eq!(hits.len(), 1, "{text}");
-            assert_eq!(&text[hits[0].start..hits[0].end], value, "{text}");
+            let shipped = text
+                .get(hits[0].start..hits[0].end)
+                .expect("a hit lies on char boundaries");
+            assert_eq!(shipped, value, "{text}");
             assert_eq!(hits[0].name, name, "{text}");
         }
     }

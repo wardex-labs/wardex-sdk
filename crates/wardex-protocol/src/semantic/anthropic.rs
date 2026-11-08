@@ -1,27 +1,33 @@
 //! Anthropic Messages: request/response fill and SSE reassembly.
 
+use serde::Deserialize;
+
 use super::event_json::{carries_nothing, parse_event};
-use super::parts::*;
+use super::parts::{
+    blob_part, build_input_messages, build_output_messages, build_system_instructions,
+    declared_error_type, generic_part, modality_from_mime, normalize_finish_reason, reasoning_part,
+    server_tool_call_part, server_tool_call_response_part, text_part, tool_call_part,
+    tool_call_response_part, uri_part, InMsg, OutMsg, Reassembled, FINISH_ERROR,
+};
 use super::usage::{deep_merge, flatten_usage, UsageBounds, UsageView};
 use super::LlmSemantics;
 use crate::sse::SseEvent;
 use crate::usage::{InputConvention, TokenUsage};
-use serde::Deserialize;
 
 // Normalization table: LlmSemantics usage field <- dotted path in the raw
-// usage Value. The extraction below reads THROUGH these constants, so the
-// table a test walks and the path the code reads are one string (U4).
-// `input_tokens` is the EXCLUDES-CACHE raw value — the normalized getter is
+// usage Value. The extraction below reads through these constants, so the
+// table a test walks and the path the code reads are one string.
+// `input_tokens` is the excludes-cache raw value — the normalized getter is
 // leaf(input) + leaf(cache_read) + leaf(cache_creation), by `TokenUsage::new`.
 const P_INPUT: &str = "input_tokens";
 const P_OUTPUT: &str = "output_tokens";
 const P_CACHE_READ: &str = "cache_read_input_tokens";
 const P_CACHE_CREATION: &str = "cache_creation_input_tokens";
 const P_REASONING: &str = "output_tokens_details.thinking_tokens";
-// Read by the fixture test (`every_normalized_usage_path_is_extracted_
-// from_its_fixture`), not by the runtime path — the runtime reads the
-// P_* consts the table is built from, which makes the two one string.
-#[cfg_attr(not(test), allow(dead_code))]
+// Read only by the fixture test (`every_normalized_usage_path_is_extracted_
+// from_its_fixture`); the runtime reads the P_* consts the table is built
+// from, which makes the two one string.
+#[cfg(test)]
 pub(super) const NORMALIZED_USAGE_PATHS: &[(&str, &str)] = &[
     ("input_tokens", P_INPUT),
     ("output_tokens", P_OUTPUT),
@@ -181,15 +187,16 @@ fn anthropic_content_to_parts(
 }
 
 pub(super) fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8], bounds: UsageBounds) {
-    // The pre-split dispatcher stamped `output_type="text"` on every parse.
+    // Every Anthropic parse reports `output_type="text"`; nothing in the
+    // request refines it.
     out.output_type = Some("text".to_string());
     if let Ok(r) = serde_json::from_slice::<AnthropicResponse>(resp) {
-        // An error object INSIDE a response object is the provider's own
+        // An error object inside a response object is the provider's own
         // failure declaration — the in-stream `error` event, which the
         // reassembler keeps in the synthetic body — and it wins over any
         // stop_reason. A bare HTTP error envelope (`{"type":"error",
         // "error":{...}}`, no id, no content) is not a response object: it
-        // keeps an EMPTY response half, as before, and its span takes the
+        // keeps an empty response half, and its span takes the
         // error from the HTTP status.
         let is_response_object = r.id.is_some() || r.content.is_some();
         let declared = r
@@ -213,7 +220,7 @@ pub(super) fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8], bo
         }
         out.error_type = declared;
         if let Some(u) = r.usage {
-            // Anthropic reports the cache tiers OUTSIDE `input_tokens`; the
+            // Anthropic reports the cache tiers outside `input_tokens`; the
             // semconv Anthropic provider doc requires the inclusive sum, and
             // `ExcludesCache` is that requirement made unskippable.
             let view = UsageView(&u);
@@ -324,7 +331,7 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
     let mut content = String::new();
     let mut thinking = String::new();
     let mut stop_reason: Option<String> = None;
-    // The FULL usage tree, not four picked fields: `message_start.usage` is
+    // The full usage tree, not four picked fields: `message_start.usage` is
     // the base and every `message_delta.usage` deep-merges over it (Anthropic
     // documents the delta values as cumulative), so the cache tiers,
     // `server_tool_use` and `output_tokens_details` survive reassembly.
@@ -468,7 +475,7 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
     }
     for (_, (tu_id, name, args)) in tool_uses {
         let input: serde_json::Value = serde_json::from_str(&args)
-            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
         content_arr.push(serde_json::json!({
             "type": "tool_use",
             "id": tu_id,
@@ -479,7 +486,7 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
     // server_tool_use: emitted in the same shape as tool_use → reuses fill_anthropic's server_tool_use branch
     for (_, (stu_id, name, args)) in server_tool_uses {
         let input: serde_json::Value = serde_json::from_str(&args)
-            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
         content_arr.push(serde_json::json!({
             "type": "server_tool_use",
             "id": stu_id,
@@ -566,7 +573,7 @@ mod tests {
         assert_eq!(msgs[0]["parts"][0]["content"], "Hel");
     }
 
-    /// An `error` event as the stream's ONLY event, before anything named an
+    /// An `error` event as the stream's only event, before anything named an
     /// id or a model: still the provider's failure declaration. No response
     /// field names the model, so the seam keeps this call on the request's
     /// model and this declaration together; none is invented here.
@@ -583,7 +590,7 @@ mod tests {
         assert_eq!(s.response_id, None);
     }
 
-    /// The HTTP error envelope every 4xx/5xx carries is NOT a response
+    /// The HTTP error envelope every 4xx/5xx carries is not a response
     /// object: no finish, no output message, no declared error type. That
     /// span keeps taking its error from the HTTP status.
     #[test]

@@ -1,5 +1,10 @@
 //! proto/wardex/v1/*.proto → OUT_DIR/wardex.v1.rs
 
+#![expect(
+    clippy::expect_used,
+    reason = "a build script that cannot generate code must fail the build"
+)]
+
 fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path()
         .expect("protoc-bin-vendored: no binary for this platform");

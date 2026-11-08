@@ -59,14 +59,14 @@ pub struct Limits {
     /// SSE, form-encoded, gRPC). Defaults above the Anthropic Messages API
     /// request ceiling so LLM traffic can never be truncated.
     ///
-    /// Host SDKs also reuse it for the SECOND quantity of the same order: the
+    /// Host SDKs also reuse it for the second quantity of the same order: the
     /// bytes one logical unit accumulates through its adapter-side record
     /// calls (in the Python SDK, `UnitRegistry`'s per-unit input/output
     /// buffers), and the shaping budget a describe function derives from that
     /// so it stops materializing exactly where storage would cut. Crossing it
     /// truncates the record and sets the span's `truncated` integrity flag.
     ///
-    /// So this value bounds RESIDENT memory as well as one message, and the
+    /// So this value bounds resident memory as well as one message, and the
     /// span buffer's `max_buffer_bytes` is not a backstop for it — a unit is
     /// live before its span exists. The worst case is roughly
     /// `2 * max_body_bytes` per live unit, and the ceiling on live units is
@@ -119,9 +119,9 @@ pub struct Limits {
     /// open tool calls, streamed tool metadata, sub-agents, model responses
     /// still arriving, and the OTel bridge's pending buffer.
     ///
-    /// Three of those five hold entries that OWN a span, and only those three
+    /// Three of those five hold entries that own a span, and only those three
     /// evictions reach the wire. Crossing the bound on open tools, on
-    /// sub-agents or on arriving responses force-closes the OLDEST entry and
+    /// sub-agents or on arriving responses force-closes the oldest entry and
     /// emits its span carrying `session_entry_table_full`, for the same reason
     /// as `max_units`: a ceiling that dropped state silently would be a worse
     /// failure than an unenforced one. That span ships `UNSET`, not `OK` and
@@ -129,17 +129,17 @@ pub struct Limits {
     /// `OK` would claim a success nobody watched and `ERROR` would report a
     /// full table of wardex's own as a failure of the agent.
     ///
-    /// ONE CALL, TWO OBSERVATIONS. An evicted tool call that later completes
-    /// ships a SECOND span with the same call id and the same marker: the
+    /// One call, two observations. An evicted tool call that later completes
+    /// ships a second span with the same call id and the same marker: the
     /// evicted half is `[start, evicted]` and holds the input, the completion
     /// half is `[start, end]` and holds the output, and they overlap. A
-    /// latency aggregate must exclude the spans carrying this marker AND
+    /// latency aggregate must exclude the spans carrying this marker and
     /// `UNSET`, or it counts one call twice. Only the fields that make the
     /// second half nameable are remembered across the eviction (start instant,
     /// name, owning sub-agent, span context) — never the payload bytes, which
     /// are the thing the bound exists to stop holding.
     ///
-    /// ONE RESPONSE, ONE SPAN. Unlike a tool call, a model response arrives as
+    /// One response, one span. Unlike a tool call, a model response arrives as
     /// several lines that each repeat its usage, so an evicted response's later
     /// lines add no second span: one would count the request, and its tokens,
     /// twice. Only the response's id is remembered across the eviction, and
@@ -155,7 +155,7 @@ pub struct Limits {
     /// spans (`adapters.assembler.evicted_chat_table_full` in the Python SDK).
     ///
     /// The other two evict nothing to the wire. Streamed tool metadata is
-    /// consumed in ARRIVAL order, so a full table refuses the NEWEST entry
+    /// consumed in arrival order, so a full table refuses the newest entry
     /// rather than the oldest — dropping the oldest would discard the one most
     /// likely to be read next — and there is no span to mark either way. The
     /// bridge's pending buffer emits its oldest held draft immediately and
@@ -178,14 +178,14 @@ pub struct Limits {
     /// almost immediately. Scoping it to roots is what makes N read as a
     /// concurrency ceiling: N concurrent runs.
     ///
-    /// It is not, however, the ONLY thing that evicts a root. A registry also
+    /// It is not, however, the only thing that evicts a root. A registry also
     /// holds a derived ceiling over live units of every kind — the product of
     /// this bound and `max_entries_per_unit` — and reaching that evicts roots
     /// too. A run nested deeply enough inside itself can therefore still cost
     /// another run its root. The scoping raises the price of that enormously;
     /// it does not make it unreachable.
     ///
-    /// Read by the logical-unit registry. Crossing it CLOSES the oldest root
+    /// Read by the logical-unit registry. Crossing it closes the oldest root
     /// so its span is emitted carrying `unit_evicted`: a ceiling that dropped
     /// state silently would be a worse failure than an unenforced one.
     pub max_units: usize,
@@ -196,7 +196,7 @@ pub struct Limits {
     /// same order — in the Python SDK, the table of wrapped in-process MCP
     /// servers — so lowering it shrinks more than the four tables named above.
     ///
-    /// Only two of those four tables hold entries that OWN a span, and only
+    /// Only two of those four tables hold entries that own a span, and only
     /// those two evictions reach the wire. Crossing the bound on child units or
     /// on open span drafts force-closes the oldest entry and emits its span
     /// with `unit_table_full`, for the same reason as `max_units`. Crossing
@@ -206,7 +206,7 @@ pub struct Limits {
     /// `adapters.anthropic.server_table_full` in the Python SDK).
     ///
     /// What surfaces from a silent eviction is a consequence, and the alias one
-    /// is marked because unmarked it would look like an IMPROVEMENT. An alias
+    /// is marked because unmarked it would look like an improvement. An alias
     /// edge is `unit_alias` at `0.9`; losing the alias sends the resolver back
     /// down its ladder, whose next rung is the ambient span at `1.0` — for a
     /// sub-agent, its enclosing session. So the host SDK remembers which ids
@@ -219,30 +219,29 @@ pub struct Limits {
     /// hook's tool-name lookup to the builtin key space, which can do the same.
     pub max_entries_per_unit: usize,
     /// Maximum entries in the unit registry's closed-unit link memory: the
-    /// alias-key -> span-context table kept AFTER a unit closes, so a later
+    /// alias-key -> span-context table kept after a unit closes, so a later
     /// span can carry a causal link (`triggered_by`, `resumed_from`) to work
     /// that already finished. FIFO; eviction is counted host-side
     /// (`assembly._units.link_memory_full` in the Python SDK) and gets no wire
     /// marker, because the remembered span itself already shipped — what an
-    /// eviction can cost is a link on a FUTURE span, and there is no span yet
+    /// eviction can cost is a link on a future span, and there is no span yet
     /// to say so on. Sized with `max_entries_per_unit`: one breadth-bounded
     /// run's worth of remembered steps, or as many recently finished threads.
     pub max_link_targets: usize,
     /// Bytes read before giving up on detecting JSON-RPC over a stdio stream.
     pub mcp_sniff_bytes: usize,
-    /// Bound on dynamic extra keys from an open-ended key family (design §6.5
-    /// tier 1). Enforced today at exactly one site: the semantic parser's
-    /// usage pass-through family (`wardex.usage.*`) — the first open family
-    /// the core emits. It does NOT yet bound other extra keys: lowering it
-    /// prunes usage leaves only, and leaves every other extra untouched, until
-    /// draft-level enforcement lands (follow-up). Its drop count also includes
+    /// Bound on dynamic extra keys from an open-ended key family. Enforced
+    /// today at exactly one site: the semantic parser's usage pass-through
+    /// family (`wardex.usage.*`) — the first open family the core emits. It
+    /// does not yet bound other extra keys: lowering it prunes usage leaves
+    /// only, and leaves every other extra untouched. Its drop count also includes
     /// two structural sanity bounds on the same family (path > 120 bytes,
     /// depth > 6) that no real provider usage object approaches. Sized for the
     /// families that exist (a provider usage object has ~10-20 leaves).
     pub max_extra_keys: usize,
     /// Maximum transactions held by the deferred-parse queue — bodies the byte
     /// seams have captured but whose LLM-semantic parse has not yet run on the
-    /// finalize worker. Over → the OLDEST pending transaction ships unparsed,
+    /// finalize worker. Over → the oldest pending transaction ships unparsed,
     /// carrying `parse_backlog_full`; never silent. Sized like
     /// `max_buffer_spans`.
     pub max_parse_backlog: usize,
@@ -283,7 +282,7 @@ pub struct Limits {
     /// of the published configuration surface, and callers are told it is
     /// inert wherever the knob is documented rather than left to discover it.
     pub replay_buffer_size: usize,
-    /// Maximum size of ONE OTLP/HTTP POST body the Agent SDK's loopback
+    /// Maximum size of a single OTLP/HTTP POST body the Agent SDK's loopback
     /// bridge receiver accepts, checked against both numbers a receiver has
     /// to check: the declared wire body and what a gzip body decompresses to
     /// (the decompression-bomb bound). Over either → the request is rejected
@@ -291,18 +290,17 @@ pub struct Limits {
     /// own schedule, and wardex's tree is unchanged either way.
     ///
     /// Mirrors `max_otlp_request_bytes` because it bounds the same wire
-    /// quantity from the receiving side: one OTLP/HTTP request. The spike's
-    /// real sessions produced ~KB bodies (12 spans across 2 batches), so the
-    /// default is three orders of magnitude of headroom, not a ceiling a
-    /// workload is expected to meet.
+    /// quantity from the receiving side: one OTLP/HTTP request. Real sessions
+    /// produce kilobyte-scale bodies, so the default is orders of magnitude of
+    /// headroom, not a ceiling a workload is expected to meet.
     pub max_otel_bridge_body_bytes: usize,
     /// Decoded CLI spans retained per session while they await the bridge's
-    /// finalize-time merge. Over → the NEWEST arrivals are dropped and
+    /// finalize-time merge. Over → the newest arrivals are dropped and
     /// counted; the wardex spans they would have merged into ship unmerged,
     /// honestly keeping `transport_timing_unavailable_subprocess`.
     ///
-    /// Matches `max_buffer_spans`' order of magnitude. The spike measured ~6
-    /// CLI spans per turn, so the default covers a session of roughly 300
+    /// Matches `max_buffer_spans`' order of magnitude. A turn produces a
+    /// handful of CLI spans, so the default covers a session of hundreds of
     /// turns before the cap does anything at all.
     pub max_otel_bridge_spans_per_session: usize,
 
@@ -314,14 +312,14 @@ pub struct Limits {
     /// documented as inert alongside `replay_buffer_size` until an envelope
     /// transport ships.
     pub zstd_level: i32,
-    /// Maximum size of ONE attribute value on the OTLP surface, measured as it
-    /// will appear on the wire — i.e. AFTER the base64 rewrite a binary payload
+    /// Maximum size of a single attribute value on the OTLP surface, measured as it
+    /// will appear on the wire — i.e. after the base64 rewrite a binary payload
     /// goes through, not before it. A value over the bound is truncated and the
     /// span says so with an `otlp_attribute_truncated` marker.
     ///
     /// It is not a second `max_body_bytes` and does not overlap it. That one
-    /// caps what a parser KEEPS, in raw bytes, before anything is encoded; this
-    /// one caps what one attribute may COST on a wire whose receiver has its
+    /// caps what a parser keeps, in raw bytes, before anything is encoded; this
+    /// one caps what one attribute may cost on a wire whose receiver has its
     /// own opinion about request size. The two differ by up to 4/3 for binary
     /// payloads, which is exactly the gap that made a batch inside every raw
     /// cap encode to something no collector would accept.
@@ -332,7 +330,7 @@ pub struct Limits {
     /// ordinary one. Raising this without raising that moves work onto the
     /// split path instead of onto the wire.
     pub max_otlp_attribute_bytes: usize,
-    /// Maximum size of ONE OTLP/HTTP request, measured on BOTH numbers a
+    /// Maximum size of a single OTLP/HTTP request, measured on both numbers a
     /// receiver checks: the encoded, compressed body that goes on the wire and
     /// the message it decompresses to. A batch over either is split across
     /// several POSTs rather than sent whole and rejected.
@@ -424,7 +422,7 @@ mod tests {
 
     /// The relationship the two OTLP bounds are sized against, asserted rather
     /// than described: a span carrying both payload attributes at the attribute
-    /// ceiling must still fit one request, so splitting is about BATCHES.
+    /// ceiling must still fit one request, so splitting is about batches.
     #[test]
     fn two_capped_payloads_fit_one_request() {
         let l = Limits::default();

@@ -1,21 +1,25 @@
 //! Provider usage trees, flattened whole. Not `wardex_protocol::usage` — that
-//! module owns [`crate::usage::TokenUsage`], the NORMALIZED totals; this one
+//! module owns [`crate::usage::TokenUsage`], the normalized totals; this one
 //! owns the raw pass-through mirror (`wardex.usage.*`): every scalar leaf of
 //! the provider's `usage` object, provider spelling preserved, bounded by
 //! `max_extra_keys`.
 //!
 //! The two coexist because their consumers differ. The normalized fields are
 //! the semconv contract a dashboard renders; the mirror is what a cost
-//! calculator reads without knowing the mapping — and what keeps a NEW
+//! calculator reads without knowing the mapping — and what keeps a new
 //! provider counter (a cache tier, a search charge, a thinking tier) from
 //! being silently discarded by a typed struct that predates it.
 
 /// One scalar leaf of a provider usage object, exactly as reported.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UsageLeaf {
+    /// A JSON number that fits in `i64`.
     Int(i64),
+    /// Any other JSON number: fractional, or an integer outside `i64`.
     Float(f64),
+    /// A JSON `true` or `false`.
     Bool(bool),
+    /// A JSON string, unchanged.
     Str(String),
 }
 
@@ -25,14 +29,14 @@ pub enum UsageLeaf {
 /// land in the same counter, so the "emitted + dropped == leaves" arithmetic
 /// stays whole.
 #[derive(Debug, Clone, Copy)]
-pub struct UsageBounds {
-    pub max_leaves: usize,
-    pub max_depth: usize,
-    pub max_path_bytes: usize,
+pub(crate) struct UsageBounds {
+    pub(crate) max_leaves: usize,
+    pub(crate) max_depth: usize,
+    pub(crate) max_path_bytes: usize,
 }
 
 impl UsageBounds {
-    pub fn from_limits(limits: &wardex_limits::Limits) -> Self {
+    pub(crate) fn from_limits(limits: &wardex_limits::Limits) -> Self {
         Self {
             max_leaves: limits.max_extra_keys,
             max_depth: 6,
@@ -43,20 +47,20 @@ impl UsageBounds {
 
 /// The flattening result: surviving leaves plus how many were dropped.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Flattened {
-    pub leaves: Vec<(String, UsageLeaf)>,
-    pub dropped: u32,
+pub(crate) struct Flattened {
+    pub(crate) leaves: Vec<(String, UsageLeaf)>,
+    pub(crate) dropped: u32,
 }
 
 /// Every scalar leaf of `usage`, as `(dotted path, value)`.
 ///
-/// Leaves are SORTED by path BEFORE the bounds apply, so both the output
+/// Leaves are sorted by path before the bounds apply, so both the output
 /// order and which leaves survive the cap are properties of this code rather
 /// than of `serde_json`'s map order — a workspace dependency enabling
 /// `preserve_order` flips `Map` to an IndexMap, and iteration order with it.
 /// `null` is skipped (a non-value, not a drop). Arrays flatten through index
 /// segments (`.0`).
-pub fn flatten_usage(usage: &serde_json::Value, b: UsageBounds) -> Flattened {
+pub(crate) fn flatten_usage(usage: &serde_json::Value, b: UsageBounds) -> Flattened {
     let mut all: Vec<(String, UsageLeaf)> = Vec::new();
     let mut structural_dropped: u32 = 0;
     walk(
@@ -70,7 +74,10 @@ pub fn flatten_usage(usage: &serde_json::Value, b: UsageBounds) -> Flattened {
     all.sort_by(|a, z| a.0.cmp(&z.0));
     let mut dropped = structural_dropped;
     if all.len() > b.max_leaves {
-        dropped += (all.len() - b.max_leaves) as u32;
+        // A count past `u32::MAX` saturates: "at least this many dropped" is
+        // still true, where a wrapped count would not be.
+        let over_cap = u32::try_from(all.len() - b.max_leaves).unwrap_or(u32::MAX);
+        dropped = dropped.saturating_add(over_cap);
         all.truncate(b.max_leaves);
     }
     Flattened {
@@ -124,7 +131,7 @@ fn walk(
         }
         Value::String(s) => UsageLeaf::Str(s.clone()),
     };
-    // A scalar at the ROOT has no path; a usage object is an object, so this
+    // A scalar at the root has no path; a usage object is an object, so this
     // only happens for a non-object `usage` value — nothing to mirror.
     if path.is_empty() {
         return;
@@ -139,7 +146,7 @@ fn walk(
 /// Streaming Anthropic: `message_start.usage` <- each `message_delta.usage`.
 /// Key-wise overwrite, recursing into nested objects — Anthropic documents the
 /// delta values as cumulative, so the last delta is authoritative.
-pub fn deep_merge(base: &mut serde_json::Value, delta: &serde_json::Value) {
+pub(crate) fn deep_merge(base: &mut serde_json::Value, delta: &serde_json::Value) {
     if let (serde_json::Value::Object(b), serde_json::Value::Object(d)) = (base, delta) {
         for (k, dv) in d {
             match b.get_mut(k) {
@@ -155,7 +162,7 @@ pub fn deep_merge(base: &mut serde_json::Value, delta: &serde_json::Value) {
 /// Dotted-path reads over the raw usage `Value` — the normalization helper
 /// each provider `fill()` uses with its `NORMALIZED_USAGE_PATHS` table, so a
 /// path spelled in the table and the path the extraction reads are one string.
-pub struct UsageView<'a>(pub &'a serde_json::Value);
+pub(crate) struct UsageView<'a>(pub(crate) &'a serde_json::Value);
 
 impl UsageView<'_> {
     fn at(&self, path: &str) -> Option<&serde_json::Value> {
@@ -166,12 +173,8 @@ impl UsageView<'_> {
         Some(cur)
     }
 
-    pub fn i64_at(&self, path: &str) -> Option<i64> {
+    pub(crate) fn i64_at(&self, path: &str) -> Option<i64> {
         self.at(path).and_then(serde_json::Value::as_i64)
-    }
-
-    pub fn str_at(&self, path: &str) -> Option<&str> {
-        self.at(path).and_then(serde_json::Value::as_str)
     }
 }
 
@@ -188,7 +191,7 @@ mod tests {
     }
 
     fn count_scalar_leaves(v: &serde_json::Value) -> usize {
-        // The independent walker G4 checks the flattener against: counts every
+        // An independent walker to check the flattener against: counts every
         // non-null scalar under a non-empty path, ignoring all bounds.
         fn go(v: &serde_json::Value, root: bool) -> usize {
             match v {
@@ -201,7 +204,7 @@ mod tests {
         go(v, true)
     }
 
-    /// G4 — emitted + dropped == the tree's scalar-leaf count, on realistic
+    /// Emitted + dropped == the tree's scalar-leaf count, on realistic
     /// and synthetic shapes alike.
     #[test]
     fn usage_flatten_is_total_over_leaves() {
@@ -231,7 +234,7 @@ mod tests {
         }
     }
 
-    /// T-R7 — determinism is a property of the explicit sort, not of map
+    /// Determinism is a property of the explicit sort, not of map
     /// order: the same tree with keys inserted in reverse yields the same
     /// output, byte for byte.
     #[test]
@@ -248,7 +251,7 @@ mod tests {
         assert_eq!(paths, sorted, "output is path-sorted");
     }
 
-    /// T-R7 — the cap victim selection is deterministic too (sorted first,
+    /// The cap victim selection is deterministic too (sorted first,
     /// truncated after), and the count is exact.
     #[test]
     fn usage_flatten_caps_and_counts() {
@@ -280,7 +283,7 @@ mod tests {
         );
     }
 
-    /// §3.5 — the two structural sanity bounds drop INTO the same counter, so
+    /// The two structural sanity bounds drop into the same counter, so
     /// the totality arithmetic holds whichever bound fired.
     #[test]
     fn usage_flatten_counts_structural_drops() {
@@ -321,7 +324,6 @@ mod tests {
         let u = serde_json::json!({"a": {"b": 7}, "tier": "flex"});
         let v = UsageView(&u);
         assert_eq!(v.i64_at("a.b"), Some(7));
-        assert_eq!(v.str_at("tier"), Some("flex"));
         assert_eq!(v.i64_at("a.missing"), None);
         assert_eq!(v.i64_at("tier"), None, "type mismatch is None, not a panic");
     }

@@ -1,13 +1,32 @@
 //! Incremental HTTP/2 parser — frame carving + HPACK decode + stream reassembly.
 //! The frame decoder carves out the 9-byte header + payload; Http2Connection then assigns meaning.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use fluke_hpack::decoder::DecoderError;
+use fluke_hpack::Decoder;
+
+use wardex_limits::Limits;
+
 /// A carved raw HTTP/2 frame.
-#[derive(Debug, Clone)]
-pub struct Http2Frame {
-    pub frame_type: u8,
-    pub flags: u8,
-    pub stream_id: u32,
-    pub payload: Vec<u8>,
+#[derive(Clone)]
+pub(crate) struct Http2Frame {
+    pub(crate) frame_type: u8,
+    pub(crate) flags: u8,
+    pub(crate) stream_id: u32,
+    pub(crate) payload: Vec<u8>,
+}
+
+impl std::fmt::Debug for Http2Frame {
+    /// Prints the payload's length, never its bytes: it is captured traffic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http2Frame")
+            .field("frame_type", &self.frame_type)
+            .field("flags", &self.flags)
+            .field("stream_id", &self.stream_id)
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 /// Incremental decoder that accumulates bytes for one direction and carves out completed frames.
@@ -15,7 +34,7 @@ pub struct Http2Frame {
 ///
 /// Holds at most one frame plus the read it arrived in: the 24-bit length
 /// field caps a frame at 16 MiB + 9 bytes, so that is the decoder's own bound.
-pub struct Http2FrameDecoder {
+pub(crate) struct Http2FrameDecoder {
     buf: Vec<u8>,
     /// Read cursor into `buf`: bytes before it belong to frames already
     /// carved. The prefix is dropped once per `feed`, not once per frame, so a
@@ -26,6 +45,16 @@ pub struct Http2FrameDecoder {
     moved: u64,
 }
 
+impl std::fmt::Debug for Http2FrameDecoder {
+    /// Prints sizes only: the buffer holds captured traffic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http2FrameDecoder")
+            .field("buffered_len", &(self.buf.len() - self.pos))
+            .field("bytes_moved", &self.moved)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for Http2FrameDecoder {
     fn default() -> Self {
         Self::new()
@@ -33,7 +62,7 @@ impl Default for Http2FrameDecoder {
 }
 
 impl Http2FrameDecoder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: Vec::new(),
             pos: 0,
@@ -41,7 +70,10 @@ impl Http2FrameDecoder {
         }
     }
 
-    pub fn feed(&mut self, data: &[u8]) -> Vec<Http2Frame> {
+    /// Appends `data` and carves every frame it completes, in wire order. The
+    /// bytes of an incomplete frame stay buffered for the next call.
+    #[must_use = "the returned frames are the only record of the bytes this call consumed"]
+    pub(crate) fn feed(&mut self, data: &[u8]) -> Vec<Http2Frame> {
         self.buf.extend_from_slice(data);
         self.moved += data.len() as u64;
         let mut out = Vec::new();
@@ -50,17 +82,16 @@ impl Http2FrameDecoder {
             if buf.len() < 9 {
                 break;
             }
-            let length = ((buf[0] as usize) << 16) | ((buf[1] as usize) << 8) | (buf[2] as usize);
+            let length =
+                (usize::from(buf[0]) << 16) | (usize::from(buf[1]) << 8) | usize::from(buf[2]);
             let total = 9 + length;
             if buf.len() < total {
                 break;
             }
             let frame_type = buf[3];
             let flags = buf[4];
-            let stream_id = (((buf[5] & 0x7f) as u32) << 24)
-                | ((buf[6] as u32) << 16)
-                | ((buf[7] as u32) << 8)
-                | (buf[8] as u32);
+            // The top bit is reserved and ignored on receipt (RFC 9113 section 4.1).
+            let stream_id = u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]);
             let payload = buf[9..total].to_vec();
             out.push(Http2Frame {
                 frame_type,
@@ -82,7 +113,7 @@ impl Http2FrameDecoder {
     /// under twice the input. Dropping each carved frame from the front of the
     /// buffer instead moves the rest of the read once per frame, and that is
     /// what this count exists to catch.
-    pub fn bytes_moved(&self) -> u64 {
+    pub(crate) fn bytes_moved(&self) -> u64 {
         self.moved
     }
 
@@ -107,11 +138,6 @@ impl Http2FrameDecoder {
         self.pos = 0;
     }
 }
-
-use fluke_hpack::decoder::DecoderError;
-use fluke_hpack::Decoder;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use wardex_limits::Limits;
 
 const FRAME_DATA: u8 = 0x0;
 const FRAME_HEADERS: u8 = 0x1;
@@ -148,19 +174,43 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_HPACK_TABLE_BYTES: usize = 64 * 1024;
 
 /// A completed request/response transaction for one stream.
+///
+/// Debug output prints body lengths, never bodies, paths or gRPC messages:
+/// they are captured traffic.
 pub struct Http2Transaction {
+    /// The HTTP/2 stream id the exchange ran on. Odd ids are client-initiated;
+    /// ids are unique within one connection only.
     pub stream_id: u32,
+    /// The request's `:method` pseudo-header. Empty when no client header
+    /// block carrying it was observed (see `request_evicted`).
     pub method: String,
+    /// The request's `:path` pseudo-header as sent, not decoded. Empty when no
+    /// client header block carrying it was observed.
     pub path: String,
+    /// The response's `:status`. `0` when no response header block carried a
+    /// parseable status, such as a response whose headers were lost to the
+    /// stream bound.
     pub status: u16,
+    /// The response's `content-type`, or the request's when the response
+    /// declared none. `None` when neither half declared one.
     pub content_type: Option<String>,
     /// The response's `content-encoding`, as declared: the coding its body
     /// bytes are in. The request's is not kept; nothing reads a request body
     /// as anything but bytes.
     pub content_encoding: Option<String>,
+    /// The `grpc-status` header or trailer, parsed as an integer. `None` when
+    /// absent or not a number.
     pub grpc_status: Option<i32>,
+    /// The `grpc-message` header or trailer as sent, still percent-encoded.
+    /// `None` when absent.
     pub grpc_message: Option<String>,
+    /// Request DATA payloads with padding removed, in order, up to the cap the
+    /// request's own Content-Type selects. See `request_truncated` and
+    /// `request_ended`.
     pub request_body: Vec<u8>,
+    /// Response DATA payloads with padding removed, in order, up to the cap
+    /// the response's own Content-Type selects. Content codings are left as
+    /// sent (see `content_encoding`).
     pub response_body: Vec<u8>,
     /// Either half stopped at its body cap: `request_truncated ||
     /// response_truncated`.
@@ -186,10 +236,53 @@ pub struct Http2Transaction {
     pub request_evicted: bool,
 }
 
+impl std::fmt::Debug for Http2Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            stream_id,
+            method,
+            path,
+            status,
+            content_type,
+            content_encoding,
+            grpc_status,
+            grpc_message,
+            request_body,
+            response_body,
+            truncated,
+            request_truncated,
+            response_truncated,
+            request_ended,
+            request_evicted,
+        } = self;
+        f.debug_struct("Http2Transaction")
+            .field("stream_id", stream_id)
+            .field("method", method)
+            .field("path_len", &path.len())
+            .field("status", status)
+            .field("content_type", content_type)
+            .field("content_encoding", content_encoding)
+            .field("grpc_status", grpc_status)
+            .field("grpc_message_len", &grpc_message.as_ref().map(String::len))
+            .field("request_body_len", &request_body.len())
+            .field("response_body_len", &response_body.len())
+            .field("truncated", truncated)
+            .field("request_truncated", request_truncated)
+            .field("response_truncated", response_truncated)
+            .field("request_ended", request_ended)
+            .field("request_evicted", request_evicted)
+            .finish()
+    }
+}
+
 /// Result of a single feed call: streams whose request just ended + transactions whose response also ended.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Http2FeedResult {
+    /// Client stream ids whose END_STREAM arrived in this call, in arrival
+    /// order: the request is fully sent and its response is now awaited.
     pub opened_request_streams: Vec<u32>,
+    /// Exchanges whose response ended in this call, in completion order,
+    /// which need not be stream id order.
     pub transactions: Vec<Http2Transaction>,
 }
 
@@ -308,6 +401,25 @@ pub struct Http2Connection {
     limits: Limits,
 }
 
+impl std::fmt::Debug for Http2Connection {
+    /// Prints counts and state only: the buffers, pending header blocks and
+    /// stream table hold captured traffic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http2Connection")
+            .field("client_frames", &self.client_frames)
+            .field("server_frames", &self.server_frames)
+            .field("streams", &self.streams.len())
+            .field("orphans", &self.orphans.len())
+            .field("pending_blocks", &self.pending.len())
+            .field("pending_bytes", &self.pending_bytes)
+            .field("preface_seen", &self.preface_seen)
+            .field("evicted_through", &self.evicted_through)
+            .field("reset", &self.reset.len())
+            .field("disabled", &self.disabled)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for Http2Connection {
     fn default() -> Self {
         Self::new(Limits::default())
@@ -315,6 +427,10 @@ impl Default for Http2Connection {
 }
 
 impl Http2Connection {
+    /// A parser for one connection, before the client preface. `limits`
+    /// supplies the stream table bound (`max_streams`), the bound on header
+    /// blocks awaiting CONTINUATION (`max_stream_buffer_bytes`) and the
+    /// per-content-type body caps.
     pub fn new(limits: Limits) -> Self {
         Self {
             client_frames: Http2FrameDecoder::new(),
@@ -348,6 +464,11 @@ impl Http2Connection {
         self.disabled
     }
 
+    /// Appends `data`, read in the direction `from_client` names, and handles
+    /// every frame it completes. The first frame that cannot be handled
+    /// latches the connection off (see `disabled_reason`); every later call
+    /// returns an empty result.
+    #[must_use = "the returned streams and transactions are the only record of the bytes this call consumed"]
     pub fn feed(&mut self, from_client: bool, data: &[u8]) -> Http2FeedResult {
         let mut result = Http2FeedResult::default();
         if self.disabled.is_some() {
@@ -552,9 +673,8 @@ impl Http2Connection {
         frame: Http2Frame,
         result: &mut Http2FeedResult,
     ) -> Result<(), Fail> {
-        let mut p = match self.pending.remove(&frame.stream_id) {
-            Some(p) => p,
-            None => return Err(Fail("continuation_without_headers")),
+        let Some(mut p) = self.pending.remove(&frame.stream_id) else {
+            return Err(Fail("continuation_without_headers"));
         };
         self.pending_bytes -= p.buf.len();
         p.buf.extend_from_slice(&frame.payload);
@@ -742,9 +862,8 @@ impl Http2Connection {
                     method: s.method.unwrap_or_default(),
                     path: s.path.unwrap_or_default(),
                     status: s.status.unwrap_or(0),
-                    // Preserves the transaction-level field's prior semantics
-                    // (response overwrote request when both HEADERS blocks
-                    // set it): the response's declared type wins when present,
+                    // One field for the transaction, so when both HEADERS
+                    // blocks set it the response's declared type wins,
                     // falling back to the request's. Cap selection in on_data
                     // does *not* use this merged value — see the comment there.
                     content_type: s.resp_content_type.or(s.req_content_type),
@@ -781,12 +900,18 @@ fn hpack_decoder() -> Decoder<'static> {
 ///
 /// `fluke-hpack` 0.3 unwraps inside its dynamic-table size update: a `0x3f`
 /// prefix whose integer continues past the end of the block, or continues for
-/// more octets than fit, is a panic and not a `DecoderError`. A panic here
-/// would unwind past `feed`'s latch and then through PyO3 as a
-/// `BaseException` the host's `recv()` sees. Catching it turns the frame into
-/// the same `Err` any other bad block produces, so the connection latches off
-/// and stays off. PUSH_PROMISE blocks go through here too: they feed the same
-/// response decoder, so they reach the same `unwrap`.
+/// more octets than fit, is a panic and not a `DecoderError`. Uncaught, the
+/// panic would unwind past `feed`'s latch: the FFI shield turns it into a
+/// `RuntimeError` subclass for that one call, but the connection would not
+/// latch off, and its HPACK table would no longer be in step with the
+/// encoder's. Catching
+/// it turns the frame into the same `Err` any other bad block produces, so the
+/// connection latches off and stays off. PUSH_PROMISE blocks go through here
+/// too: they feed the same response decoder, so they reach the same `unwrap`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "boundary with a dependency known to panic on hostile input: the HPACK decoder unwraps on a malformed table size update, and the caught panic becomes the connection's latch reason"
+)]
 fn hpack_decode(decoder: &mut Decoder<'static>, block: &[u8]) -> Result<Vec<HeaderField>, Fail> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block))) {
         Ok(Ok(headers)) => Ok(headers),
@@ -796,22 +921,18 @@ fn hpack_decode(decoder: &mut Decoder<'static>, block: &[u8]) -> Result<Vec<Head
 }
 
 #[cfg(test)]
+#[expect(
+    unused_must_use,
+    reason = "many tests feed one half of an exchange only to set up state, and assert on the call that completes it"
+)]
 mod tests {
     use super::*;
 
     fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
-        let len = payload.len();
-        let mut f = vec![
-            (len >> 16) as u8,
-            (len >> 8) as u8,
-            len as u8,
-            ftype,
-            flags,
-            (stream_id >> 24) as u8,
-            (stream_id >> 16) as u8,
-            (stream_id >> 8) as u8,
-            stream_id as u8,
-        ];
+        let len = u32::try_from(payload.len()).expect("test payloads are far below 4 GiB");
+        let [_, l0, l1, l2] = len.to_be_bytes();
+        let [s0, s1, s2, s3] = stream_id.to_be_bytes();
+        let mut f = vec![l0, l1, l2, ftype, flags, s0, s1, s2, s3];
         f.extend_from_slice(payload);
         f
     }
@@ -1051,7 +1172,7 @@ mod tests {
         resp.extend_from_slice(&frame(0x1, FH | FS, 1, &s1));
         let r = c.feed(false, &resp);
         assert_eq!(r.transactions.len(), 2);
-        let by_id: std::collections::HashMap<u32, u16> = r
+        let by_id: HashMap<u32, u16> = r
             .transactions
             .iter()
             .map(|t| (t.stream_id, t.status))
@@ -1200,8 +1321,8 @@ mod tests {
     #[test]
     fn data_frames_cannot_grow_the_table_past_max_streams() {
         // DATA for streams no HEADERS ever opened: a peer (or capture that
-        // attached mid-connection) can name any id, and each one used to be a
-        // fresh, unbounded table entry.
+        // attached mid-connection) can name any id, and none of them may open
+        // a fresh, unbounded table entry.
         let limits = Limits {
             max_streams: 4,
             ..Default::default()
@@ -1253,7 +1374,7 @@ mod tests {
             resp.extend_from_slice(&frame(FRAME_HEADERS, FH | FS, sid, &block));
         }
         let r = c.feed(false, &resp);
-        let by_id: std::collections::BTreeMap<u32, &Http2Transaction> =
+        let by_id: BTreeMap<u32, &Http2Transaction> =
             r.transactions.iter().map(|t| (t.stream_id, t)).collect();
         assert_eq!(by_id.keys().copied().collect::<Vec<_>>(), sids.to_vec());
         for sid in [1, 3] {
@@ -1444,7 +1565,7 @@ mod tests {
     fn a_reset_stream_ignores_the_frames_already_in_flight_for_it() {
         // RST_STREAM ends a stream for both peers; frames the other side had
         // already sent are discarded by the receiver (RFC 9113 section 5.1).
-        // They used to recreate the entry and complete as a transaction with
+        // They must not recreate the entry and complete as a transaction with
         // no method, no path and no explanation.
         let block = hpack(&[(b":method", b"POST"), (b":path", b"/s")]);
         let s = hpack(&[(b":status", b"200")]);
@@ -1547,7 +1668,7 @@ mod tests {
         assert_eq!(c.feed(true, &req).opened_request_streams, vec![1]);
         assert_eq!(c.pending_bytes, 0);
 
-        // A chain that never sets END_HEADERS used to grow without bound.
+        // A chain that never sets END_HEADERS must not grow without bound.
         let mut c = Http2Connection::new(limits);
         c.feed(true, &frame(FRAME_HEADERS, FS, 1, &[0x82; 100]));
         for i in 0..9 {
@@ -1612,9 +1733,9 @@ mod tests {
 
     #[test]
     fn a_read_of_many_small_frames_is_linear_not_quadratic() {
-        // 256 KiB of 9-byte frames in ONE read: removing each frame from the
-        // front of the buffer moved the rest of the read once per frame,
-        // about 3.8 GB of memmove for this input.
+        // 256 KiB of 9-byte frames in a single read: removing each frame from
+        // the front of the buffer would move the rest of the read once per
+        // frame, about 3.8 GB of memmove for this input.
         let raw = frame(0x6, 0, 0, b"").repeat(256 * 1024 / 9);
         let mut c = Http2Connection::new(Limits::default());
         c.feed(false, &raw);
@@ -1863,5 +1984,32 @@ mod tests {
         // Only the response was cut, and the transaction says which half:
         // the request's length is still the size of the body that was sent.
         assert!(txn.truncated && txn.response_truncated && !txn.request_truncated);
+    }
+
+    #[test]
+    fn debug_output_shows_sizes_not_captured_bytes() {
+        const SECRET: &[u8] = b"planted-secret-7f3a";
+        let mut c = Http2Connection::new(Limits::default());
+        let req_block = hpack(&[(b":method", b"POST"), (b":path", b"/q?planted-secret-7f3a")]);
+        let mut req = frame(FRAME_HEADERS, FH, 1, &req_block);
+        req.extend_from_slice(&frame(FRAME_DATA, FS, 1, SECRET));
+        assert_eq!(c.feed(true, &req).opened_request_streams, vec![1]);
+        let resp_block = hpack(&[(b":status", b"200"), (b"grpc-message", SECRET)]);
+        let mut resp = frame(FRAME_HEADERS, FH, 1, &resp_block);
+        resp.extend_from_slice(&frame(FRAME_DATA, FS, 1, SECRET));
+        // A torn frame leaves captured bytes in the server-side decoder.
+        resp.extend_from_slice(&frame(FRAME_DATA, 0, 3, SECRET)[..20]);
+        let r = c.feed(false, &resp);
+        assert_eq!(r.transactions.len(), 1);
+        assert_eq!(r.transactions[0].response_body, SECRET);
+
+        let mut d = Http2FrameDecoder::new();
+        let frames = d.feed(&frame(FRAME_DATA, 0, 1, SECRET));
+        assert!(d.feed(&frame(FRAME_DATA, 0, 1, SECRET)[..20]).is_empty());
+
+        let shown = format!("{r:?} {c:?} {d:?} {frames:?}");
+        assert!(!shown.contains("planted-secret-7f3a"), "{shown}");
+        assert!(!shown.contains("112, 108, 97"), "{shown}");
+        assert!(shown.contains("response_body_len: 19"), "{shown}");
     }
 }

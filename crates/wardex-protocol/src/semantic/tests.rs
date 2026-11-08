@@ -1,5 +1,5 @@
-//! The original `semantic.rs` test suite, moved whole in the module split
-//! (names and count unchanged). New modules test beside their own code.
+//! Cross-provider tests of `parse_llm`, driven through its public entry point.
+//! Modules with logic of their own test it beside their code.
 
 use super::parts::{normalize_finish_reason, FINISH_REASONS};
 use super::*;
@@ -99,8 +99,7 @@ fn anthropic_messages_extracts_tokens() {
     assert_eq!(s.provider, "anthropic");
     assert_eq!(s.operation, "chat");
     assert_eq!(s.response_model.as_deref(), Some("claude-opus-4-8"));
-    // Inclusive total: raw 12 + cache_read 4. That this asserted 12 —
-    // and passed — was the defect's evidence (R2).
+    // Inclusive total: raw 12 + cache_read 4, never the raw 12 alone.
     assert_eq!(s.usage.input_tokens(), Some(16));
     assert_eq!(s.usage.output_tokens(), Some(3));
     assert_eq!(s.usage.cache_read_input_tokens(), Some(4));
@@ -225,7 +224,7 @@ fn anthropic_cache_creation_input_tokens_extracted() {
     )
     .unwrap();
     assert_eq!(s.usage.cache_creation_input_tokens(), Some(7));
-    // Inclusive total: raw 5 + cache_creation 7 (R2).
+    // Inclusive total: raw 5 + cache_creation 7.
     assert_eq!(s.usage.input_tokens(), Some(12));
     assert_eq!(s.usage.output_tokens(), Some(2));
 }
@@ -271,7 +270,7 @@ fn openai_sse_stream_reassembles_text_and_finish_no_usage() {
     assert_eq!(s.response_id.as_deref(), Some("chatcmpl-s"));
     assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
     assert_eq!(s.usage.output_tokens(), None); // no usage
-    let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
+    let body = String::from_utf8(s.decoded_response.unwrap()).unwrap();
     assert!(body.contains("\"content\":\"Hi!\"")); // text reassembled into the synthetic JSON
 }
 
@@ -307,16 +306,16 @@ fn anthropic_sse_stream_extracts_tokens_text_stop() {
     assert_eq!(s.usage.input_tokens(), Some(9));
     assert_eq!(s.usage.output_tokens(), Some(5)); // message_delta provides the final output_tokens
     assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
-    let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
+    let body = String::from_utf8(s.decoded_response.unwrap()).unwrap();
     assert!(body.contains("\"text\":\"Hello\""));
 }
 
-/// P2 double-add guard: `reassemble_anthropic` keeps the RAW usage in its
+/// Double-add guard: `reassemble_anthropic` keeps the raw usage in its
 /// synthetic JSON and `fill_anthropic` does the one and only inclusive
 /// sum. If the reassembler ever pre-adds the cache tiers, this total
 /// doubles and the test names the reason.
 #[test]
-fn test_reassembled_stream_is_not_double_added() {
+fn reassembled_stream_is_not_double_added() {
     let sse = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1,\"cache_read_input_tokens\":8000,\"cache_creation_input_tokens\":2000}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":500}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     let s = parse_llm(
         "api.anthropic.com",
@@ -332,9 +331,9 @@ fn test_reassembled_stream_is_not_double_added() {
     assert_eq!(s.usage.cache_read_input_tokens(), Some(8000));
     assert_eq!(s.usage.cache_creation_input_tokens(), Some(2000));
     assert_eq!(s.usage.output_tokens(), Some(500));
-    // The synthetic body still carries Anthropic's RAW value — the wire
+    // The synthetic body still carries Anthropic's raw value — the wire
     // truth is preserved and the sum happens in exactly one place.
-    let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
+    let body = String::from_utf8(s.decoded_response.unwrap()).unwrap();
     assert!(body.contains("\"input_tokens\":1000"));
 }
 
@@ -345,7 +344,7 @@ fn unknown_provider_sse_returns_raw_concat_no_semantics() {
     assert!(s.reassembled_from_stream);
     assert_eq!(s.provider, ""); // unidentified
     assert_eq!(s.response_model, None);
-    let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
+    let body = String::from_utf8(s.decoded_response.unwrap()).unwrap();
     assert_eq!(body, "{\"foo\":1}\n{\"bar\":2}");
 }
 
@@ -597,11 +596,13 @@ fn openai_and_anthropic_tool_call_same_shape() {
 // --- SSE tool_call delta accumulation ---
 
 fn sse_bytes(lines: &[&str]) -> Vec<u8> {
-    lines
-        .iter()
-        .map(|l| format!("data: {}\n\n", l))
-        .collect::<String>()
-        .into_bytes()
+    let mut out = String::new();
+    for line in lines {
+        out.push_str("data: ");
+        out.push_str(line);
+        out.push_str("\n\n");
+    }
+    out.into_bytes()
 }
 
 #[test]
@@ -672,7 +673,7 @@ fn sse_text_plus_tool_call() {
 
 #[test]
 fn finish_reason_normalization_is_total_and_closed_over_known_values() {
-    // (a) Every KNOWN provider raw value maps into the closed set — the full
+    // (a) Every known provider raw value maps into the closed set — the full
     // table, per provider, so a new endpoint cannot leak a provider spelling
     // for a value this function already knows.
     let known: &[(&str, &str, &str)] = &[
@@ -696,10 +697,9 @@ fn finish_reason_normalization_is_total_and_closed_over_known_values() {
         assert_eq!(&got, want, "({provider}, {raw})");
         assert!(FINISH_REASONS.contains(&got.as_str()));
     }
-    // (b) Total: an UNKNOWN raw value passes through in the provider's own
+    // (b) Total: an unknown raw value passes through in the provider's own
     // spelling — a new finish reason surfaces under its own name instead of
-    // silently vanishing (the old mapper returned None and the field was
-    // omitted).
+    // silently vanishing.
     assert_eq!(normalize_finish_reason("openai", "banana"), "banana");
     assert_eq!(
         normalize_finish_reason("anthropic", "pause_turn"),
@@ -868,7 +868,7 @@ fn openai_input_messages_roles_and_tool_result() {
     assert_eq!(arr[1]["parts"][0]["id"], "call_1");
     assert_eq!(arr[1]["parts"][0]["name"], "get_weather");
     assert_eq!(arr[1]["parts"][0]["arguments"]["city"], "Seoul");
-    // tool role → ToolCallResponsePart (A-3)
+    // tool role → ToolCallResponsePart
     assert_eq!(arr[2]["role"], "tool");
     assert_eq!(arr[2]["parts"][0]["type"], "tool_call_response");
     assert_eq!(arr[2]["parts"][0]["id"], "call_1");
@@ -1177,8 +1177,7 @@ fn anthropic_sse_orphan_partial_json_no_ghost_tool_call() {
     let parts = v[0]["parts"].as_array().unwrap();
     assert!(
         parts.is_empty(),
-        "an orphan partial_json must not create a ghost tool call: {:?}",
-        om
+        "an orphan partial_json must not create a ghost tool call: {om:?}"
     );
 }
 
@@ -1261,11 +1260,11 @@ macro_rules! fixture {
     };
 }
 
-/// T-R6 / U4 — every path in a provider's `NORMALIZED_USAGE_PATHS` table is
+/// Every path in a provider's `NORMALIZED_USAGE_PATHS` table is
 /// really extracted from that provider's fixture, and the normalized getter
 /// agrees with the mirror leaf at the same path. For the one ExcludesCache
 /// provider the input getter equals leaf(input) + leaf(cache_read) +
-/// leaf(cache_creation) — the S-3 rescope: `gen_ai.usage.*` is the semconv
+/// leaf(cache_creation): `gen_ai.usage.*` is the semconv
 /// norm (inclusive), `wardex.usage.*` is the provider's own text (raw).
 #[test]
 fn every_normalized_usage_path_is_extracted_from_its_fixture() {
@@ -1283,7 +1282,7 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
             path: "/v1/chat/completions",
             req: fixture!("openai_chat", "request.json"),
             resp: fixture!("openai_chat", "response.json"),
-            table: super::openai_chat::NORMALIZED_USAGE_PATHS,
+            table: openai_chat::NORMALIZED_USAGE_PATHS,
             input_excludes_cache: false,
         },
         Case {
@@ -1291,7 +1290,7 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
             path: "/v1/messages",
             req: fixture!("anthropic_messages", "request.json"),
             resp: fixture!("anthropic_messages", "response.json"),
-            table: super::anthropic::NORMALIZED_USAGE_PATHS,
+            table: anthropic::NORMALIZED_USAGE_PATHS,
             input_excludes_cache: true,
         },
         Case {
@@ -1299,7 +1298,7 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
             path: "/v1/responses",
             req: fixture!("openai_responses", "request.json"),
             resp: fixture!("openai_responses", "response.json"),
-            table: super::openai_responses::NORMALIZED_USAGE_PATHS,
+            table: openai_responses::NORMALIZED_USAGE_PATHS,
             input_excludes_cache: false,
         },
         Case {
@@ -1307,7 +1306,7 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
             path: "/v1/embeddings",
             req: fixture!("openai_embeddings", "request.json"),
             resp: fixture!("openai_embeddings", "response.json"),
-            table: super::openai_embeddings::NORMALIZED_USAGE_PATHS,
+            table: openai_embeddings::NORMALIZED_USAGE_PATHS,
             input_excludes_cache: false,
         },
     ];
@@ -1350,7 +1349,8 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
     }
 }
 
-/// T-R8 — the three Anthropic additions, each red before this commit.
+/// Anthropic thinking tokens are the reasoning output tokens. The two tests
+/// below cover the deep-merged stream usage and `output_config.effort`.
 #[test]
 fn anthropic_thinking_tokens_map_to_reasoning_output_tokens() {
     let s = parse_llm(
@@ -1412,7 +1412,7 @@ fn anthropic_output_config_effort_is_reasoning_level() {
     assert_eq!(s.reasoning_level.as_deref(), Some("medium"));
 }
 
-/// T-R9 — Chat Completions additions.
+/// Chat Completions request fields.
 #[test]
 fn openai_chat_service_tier_fingerprint_reasoning_effort_extracted() {
     let s = parse_llm(
@@ -1456,7 +1456,7 @@ fn chat_response_format_json_sets_output_type_json() {
     assert_eq!(s2.output_type.as_deref(), Some("text"));
 }
 
-/// T-R10 — embeddings request semantics, red before this commit.
+/// Embeddings request semantics.
 #[test]
 fn embeddings_request_model_formats_dimensions_and_no_output_type() {
     let s = parse_llm(
@@ -1479,7 +1479,7 @@ fn embeddings_request_model_formats_dimensions_and_no_output_type() {
     );
 }
 
-/// T-R14 — terminal detection is about the provider's grammar, not `[DONE]`
+/// Terminal detection is about the provider's grammar, not `[DONE]`
 /// alone (compatible gateways omit it), and absence is reported, not guessed.
 #[test]
 fn chat_stream_without_done_but_with_finish_reason_is_terminated() {
@@ -1519,7 +1519,7 @@ fn anthropic_stream_without_message_stop_is_unterminated() {
     assert_eq!(plain.stream_terminated, None);
 }
 
-/// G5 shape at the Rust boundary: the cap is the limit field, observed.
+/// At the Rust boundary the cap is the limit field, observed.
 #[test]
 fn usage_leaves_are_capped_by_max_extra_keys() {
     let resp = br#"{"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}],
@@ -1537,7 +1537,7 @@ fn usage_leaves_are_capped_by_max_extra_keys() {
     .unwrap();
     assert_eq!(limited.usage_leaves.len(), 3);
     assert_eq!(limited.usage_dropped_count, 4);
-    // U2: the normalized fields are extracted separately and never capped.
+    // The normalized fields are extracted separately and never capped.
     assert_eq!(limited.usage.input_tokens(), Some(6));
     assert_eq!(limited.usage.output_tokens(), Some(7));
     let unlimited = parse_llm(
@@ -1552,10 +1552,10 @@ fn usage_leaves_are_capped_by_max_extra_keys() {
     assert_eq!(unlimited.usage_leaves.len(), 7);
 }
 
-/// T-R13 — the regression pin for the fabricated body: a Responses SSE
+/// The regression pin for the fabricated body: a Responses SSE
 /// stream on the OpenAI host must never come back as a chat-shaped JSON the
 /// Chat reassembler invented (empty content, null id/model). The dispatch
-/// goes by Api now, so the Chat reassembler cannot receive the stream.
+/// goes by Api, so the Chat reassembler cannot receive the stream.
 #[test]
 fn responses_sse_on_openai_host_never_yields_a_fabricated_chat_body() {
     let sse = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-4.1\",\"output\":[]}}\n\n";
@@ -1574,9 +1574,9 @@ fn responses_sse_on_openai_host_never_yields_a_fabricated_chat_body() {
     );
 }
 
-/// The substring false positives, fixed: token counting and batch management
-/// under /v1/messages are NOT chat calls, and their spans must not carry a
-/// false `semantic_parse_failed`.
+/// Token counting and batch management under /v1/messages are not chat calls,
+/// though a substring match on `/messages` would say so, and their spans must
+/// not carry a false `semantic_parse_failed`.
 #[test]
 fn count_tokens_and_batches_are_not_chat_calls() {
     for path in ["/v1/messages/count_tokens", "/v1/messages/batches"] {
@@ -1604,9 +1604,8 @@ fn parse_responses_fixture(req: &'static [u8], resp: &'static [u8]) -> LlmSemant
     .expect("responses fixture parses")
 }
 
-/// T-R1 — the openai-agents default path, visible: a non-streaming
-/// /v1/responses call yields chat semantics with usage (it yielded None
-/// before this parser existed).
+/// The openai-agents default path, visible: a non-streaming
+/// /v1/responses call yields chat semantics with usage.
 #[test]
 fn responses_non_streaming_is_parsed_as_chat_with_usage() {
     let s = parse_responses_fixture(
@@ -1632,15 +1631,15 @@ fn responses_non_streaming_is_parsed_as_chat_with_usage() {
     // The system prompt and the string input both landed:
     assert!(s.system_instructions.is_some());
     assert!(s.input_messages.unwrap().contains("Say hello."));
-    // The open mirror carries the leaf the CLOSED table era would have
-    // dropped: openai 3.3.1's typed usage REQUIRES cache_write_tokens.
+    // The open mirror carries a leaf a closed table of known fields would
+    // drop: openai 3.3.1's typed usage requires cache_write_tokens.
     assert!(s
         .usage_leaves
         .iter()
         .any(|(p, _)| p == "input_tokens_details.cache_write_tokens"));
 }
 
-/// T-R2 — the correlation key: `call_id`, not the item id.
+/// The correlation key: `call_id`, not the item id.
 #[test]
 fn responses_function_call_becomes_tool_call_part_with_call_id() {
     let s = parse_responses_fixture(
@@ -1755,7 +1754,7 @@ fn chat_completions_request_never_names_a_conversation() {
     assert_eq!(s.conversation_id, None);
 }
 
-/// T-R3 — reasoning items and status mapping.
+/// Reasoning items and status mapping.
 #[test]
 fn responses_reasoning_item_becomes_reasoning_part() {
     let s = parse_responses_fixture(
@@ -1788,7 +1787,7 @@ fn responses_incomplete_maps_reason_to_length() {
 
 #[test]
 fn responses_http_error_envelope_claims_nothing_about_the_response_half() {
-    // The bare error envelope every 4xx/5xx carries is NOT a Response
+    // The bare error envelope every 4xx/5xx carries is not a Response
     // object: no status, no finish reason, no output message may be derived
     // from it. Same contract `test_llm_error_spans.py` pins for the sibling
     // `/v1/messages` endpoint; the request identity still comes through.
@@ -1808,11 +1807,11 @@ fn responses_http_error_envelope_claims_nothing_about_the_response_half() {
 }
 
 /// Anthropic's documented OpenAI-SDK compatibility endpoint: an
-/// anthropic-named HOST serving the Chat Completions SHAPE. The API shape
+/// anthropic-named host serving the Chat Completions shape. The API shape
 /// picks the parser and the host picks the provider label — requiring the
-/// two to agree dropped this endpoint's non-streaming capture entirely
-/// (empty semantics, so no span under AGENT mode) while the SSE half kept
-/// capturing it. Both forms are pinned so the pair cannot drift apart.
+/// two to agree would drop this endpoint's non-streaming capture entirely
+/// (empty semantics, so no span under AGENT mode) while the SSE half
+/// captures it. Both forms are pinned so the pair cannot drift apart.
 #[test]
 fn anthropic_openai_compat_endpoint_parses_chat_with_the_host_label() {
     let req = br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#;
@@ -1871,8 +1870,8 @@ fn responses_failed_maps_to_error() {
     );
 }
 
-/// T-R4 — the terminal snapshot is the truth source: the fixture's deltas
-/// and even its output_item.done deliberately DISAGREE with the snapshot,
+/// The terminal snapshot is the truth source: the fixture's deltas
+/// and even its output_item.done deliberately disagree with the snapshot,
 /// and the snapshot's values are the ones extracted.
 #[test]
 fn responses_sse_takes_completed_snapshot_not_deltas() {
@@ -1894,7 +1893,7 @@ fn responses_sse_takes_completed_snapshot_not_deltas() {
     assert_eq!(s.response_status.as_deref(), Some("completed"));
 }
 
-/// T-R5 — no terminal event: items reconstructed (done whole, added+deltas
+/// No terminal event: items reconstructed (done whole, added+deltas
 /// merged, orphan deltas ignored), usage honestly absent, unterminated.
 #[test]
 fn responses_sse_without_terminal_falls_back_to_items_and_marks_unterminated() {
@@ -1917,7 +1916,7 @@ fn responses_sse_without_terminal_falls_back_to_items_and_marks_unterminated() {
     assert_eq!(parts.len(), 2, "the orphan delta must not become a part");
 }
 
-/// T-R5b — the in-stream `error` event is the third terminal form: its
+/// The in-stream `error` event is the third terminal form: its
 /// payload (the only bytes naming the failure) is preserved into the
 /// synthetic body, and status/finish are the provider's own declaration.
 #[test]
@@ -1937,8 +1936,7 @@ fn responses_sse_error_event_preserves_error_and_maps_status() {
         None,
         "no usage arrived; none is invented"
     );
-    let body: serde_json::Value =
-        serde_json::from_slice(&s.decoded_response.clone().unwrap()).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&s.decoded_response.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "server_error");
     assert_eq!(
         body["error"]["message"],
@@ -1946,8 +1944,8 @@ fn responses_sse_error_event_preserves_error_and_maps_status() {
     );
 }
 
-/// T-R5c — background mode: the create answers 200/queued with usage null.
-/// A tokenless, finish-less, marker-less identified span is the DESIGN here
+/// Background mode: the create answers 200/queued with usage null.
+/// A tokenless, finish-less, marker-less identified span is intended here
 /// (the usage lands only on the deferred fetch_response path), pinned so the
 /// shape is a decision rather than an accident.
 #[test]
@@ -1965,9 +1963,9 @@ fn responses_background_queued_create_is_identified_but_tokenless() {
     assert_eq!(s.usage_dropped_count, 0);
 }
 
-/// T-R12's parse-level half: a Responses body on localhost resolves through
-/// the ordered body-shape check, not to Anthropic (Responses bodies carry
-/// `usage.input_tokens` too).
+/// The parse-level half of endpoint recognition: a Responses body on
+/// localhost resolves through the ordered body-shape check, not to Anthropic
+/// (Responses bodies carry `usage.input_tokens` too).
 #[test]
 fn responses_body_on_localhost_is_not_mistaken_for_anthropic() {
     let s = parse_llm(
@@ -2051,8 +2049,8 @@ fn responses_compact_is_a_billable_llm_call() {
     }
 }
 
-/// `input_text` is a block the CALLER writes; it is accepted as text only
-/// under a non-assistant role. An `input_text` block inside an ASSISTANT
+/// `input_text` is a block the caller writes; it is accepted as text only
+/// under a non-assistant role. An `input_text` block inside an assistant
 /// item is off-schema and stays what an unknown block is: a generic part
 /// with the unmapped flag — never the model's own words.
 #[test]
@@ -2075,7 +2073,7 @@ fn input_text_is_text_only_under_a_non_assistant_role() {
     );
 }
 
-// --- provider-label inference (the heuristic the label used to hide) -------
+// --- provider-label inference ---------------------------------------------
 
 /// `parse_llm` that must answer, spelled without `unwrap`/`expect` so these
 /// tests stay out of the crate's panic-site count.
@@ -2087,7 +2085,7 @@ fn parsed(host: &str, path: &str, req: &[u8], resp: &[u8]) -> LlmSemantics {
 }
 
 /// The provider label is proven only by the provider's own host. Every other
-/// way to arrive at it — a hostname that merely CONTAINS a provider's name, a
+/// way to arrive at it — a hostname that merely contains a provider's name, a
 /// response body's shape, or the API shape of the path when the host names
 /// nothing — is a guess, and `provider_inferred` says so, so the span can
 /// carry a marker instead of presenting the guess as a fact.
@@ -2184,7 +2182,7 @@ fn provider_label_is_inferred_unless_the_host_is_the_providers_own() {
 
 /// The negative corpus (`fixtures/llm/negatives/`), read by the Python rate
 /// table too: each case names its dispatch inputs and its truth in
-/// `truth.json`, and the parser must agree on BOTH the label and whether the
+/// `truth.json`, and the parser must agree on both the label and whether the
 /// label was inferred.
 #[test]
 fn negative_fixtures_match_their_truth() {

@@ -214,25 +214,25 @@ pub(super) fn server_tool_call_response_part(
 /// finish. One constant, so the two routes cannot spell it two ways.
 pub(super) const FINISH_ERROR: &str = "error";
 
-/// The closed set every KNOWN provider finish reason maps into. An UNKNOWN
+/// The closed set every known provider finish reason maps into. An unknown
 /// raw value passes through in the provider's own spelling instead of being
 /// dropped: a new finish reason the provider invents shows up under its own
 /// name rather than silently vanishing.
 pub const FINISH_REASONS: &[&str] = &["stop", "length", "tool_call", "content_filter", "error"];
 
-/// The ONE producer of `gen_ai.response.finish_reasons` and of
+/// The single producer of `gen_ai.response.finish_reasons` and of
 /// `OutMsg.finish_reason`, total over its input. Three endpoints and the
 /// Agent SDK assembler (through the PyO3 export) all spell a stop through
-/// this function, so one fact cannot reach the wire in two spellings —
-/// `["tool_calls"]` from Chat next to `["tool_call"]` from Responses was the
-/// exact split this replaces, on the one attribute dashboards group by.
+/// this function, so one fact cannot reach the wire in two spellings (say
+/// `["tool_calls"]` from Chat next to `["tool_call"]` from Responses) on the
+/// one attribute dashboards group by.
 pub fn normalize_finish_reason(provider: &str, raw: &str) -> String {
     let v = match (provider, raw) {
-        (_, "stop") | ("anthropic", "end_turn") | ("anthropic", "stop_sequence") => "stop",
+        (_, "stop") | ("anthropic", "end_turn" | "stop_sequence") => "stop",
         (_, "length") | ("anthropic", "max_tokens") | ("openai", "max_output_tokens") => "length",
-        (_, "tool_calls") | (_, "function_call") | ("anthropic", "tool_use") => "tool_call",
+        (_, "tool_calls" | "function_call") | ("anthropic", "tool_use") => "tool_call",
         (_, "content_filter") | ("anthropic", "refusal") => "content_filter",
-        ("openai", "failed") | ("openai", "cancelled") => FINISH_ERROR,
+        ("openai", "failed" | "cancelled") => FINISH_ERROR,
         _ => return raw.to_string(), // total: unknown passes through as itself
     };
     v.to_string()

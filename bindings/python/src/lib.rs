@@ -1,23 +1,38 @@
 //! PyO3 entry point for the `_wardex_native` extension module.
 
-// In the trampoline code generated when the pyo3 #[pyfunction] macro wraps a function
-// returning `PyResult<T>`, clippy mistakes the `?`'s `From<PyErr> for PyErr` (identity)
-// conversion for a useless conversion
-// (a pre-existing pyo3 0.22 issue; a function-level #[allow] can't cover macro-generated sibling items).
-#![allow(clippy::useless_conversion)]
+// Crate-wide, because the false positive sits in the sibling items the PyO3
+// macros generate, which no attribute on the function or the impl reaches.
+// Until the PyO3 upgrade this also hides a hand-written useless conversion
+// anywhere in this crate, a loss accepted because the crate is PyO3 glue.
+// `expect`, so that the upgrade that fixes it turns this attribute into a
+// build error to delete.
+#![expect(
+    clippy::useless_conversion,
+    reason = "the pyfunction and pymethods macros of PyO3 0.22 expand to a conversion of PyErr into PyErr; remove after upgrading PyO3"
+)]
+
+// The FFI shield (`shield.rs`) and the fail-closed PII scrub catch panics with
+// `catch_unwind`; under `panic = "abort"` every one of them would instead end
+// the host process. The release profile sets `panic = "unwind"`; this makes a
+// build that changes it fail instead of shipping.
+#[cfg(not(panic = "unwind"))]
+compile_error!(
+    "wardex must be built with panic = \"unwind\"; the FFI shield relies on catch_unwind"
+);
 
 mod codec;
 mod limits;
 mod shield;
 
-use limits::PyLimits;
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::types::PyBytes;
 use pyo3::wrap_pyfunction;
-use shield::shielded;
-use wardex_core::protocol::claude_stream_json as ccs;
-use wardex_core::protocol::codex_exec_json as cej;
+
+use crate::limits::PyLimits;
+use crate::shield::shielded;
+use wardex_core::protocol::claude_stream_json as claude_stream;
+use wardex_core::protocol::codex_exec_json as codex_exec;
 use wardex_core::protocol::grpc::{
     grpc_status_name as core_grpc_status_name, parse_grpc_frames as core_parse_grpc_frames,
     GrpcFrames as CoreGrpcFrames, GrpcMessage as CoreGrpcMessage,
@@ -752,7 +767,7 @@ impl WsParser {
 /// One parsed claude stream-json event (flat; kind discriminates).
 #[pyclass]
 struct ClaudeStreamEvent {
-    inner: ccs::ClaudeStreamEvent,
+    inner: claude_stream::ClaudeStreamEvent,
 }
 
 #[pymethods]
@@ -760,13 +775,13 @@ impl ClaudeStreamEvent {
     #[getter]
     fn kind(&self) -> &'static str {
         match self.inner.kind {
-            ccs::EventKind::SessionInit => "session_init",
-            ccs::EventKind::UserPrompt => "user_prompt",
-            ccs::EventKind::AssistantTurn => "assistant_turn",
-            ccs::EventKind::ToolResult => "tool_result",
-            ccs::EventKind::StreamDelta => "stream_delta",
-            ccs::EventKind::TaskLifecycle => "task_lifecycle",
-            ccs::EventKind::SessionResult => "session_result",
+            claude_stream::EventKind::SessionInit => "session_init",
+            claude_stream::EventKind::UserPrompt => "user_prompt",
+            claude_stream::EventKind::AssistantTurn => "assistant_turn",
+            claude_stream::EventKind::ToolResult => "tool_result",
+            claude_stream::EventKind::StreamDelta => "stream_delta",
+            claude_stream::EventKind::TaskLifecycle => "task_lifecycle",
+            claude_stream::EventKind::SessionResult => "session_result",
         }
     }
     #[getter]
@@ -829,7 +844,7 @@ impl ClaudeStreamEvent {
             .map(|t| (t.id.clone(), t.name.clone(), t.input_json.clone()))
             .collect()
     }
-    /// Semconv-inclusive input total. NOT the CLI's raw number: Anthropic
+    /// Semconv-inclusive input total, not the CLI's raw number: Anthropic
     /// reports the cache tiers outside `input_tokens`, and this getter is
     /// downstream of the normalization that adds them back in.
     #[getter]
@@ -854,7 +869,7 @@ impl ClaudeStreamEvent {
             .as_ref()
             .and_then(|u| u.cache_creation_input_tokens())
     }
-    /// See `LlmSemantics.usage_totals_unpaired` — same condition, P3 path.
+    /// See `LlmSemantics.usage_totals_unpaired` — same condition, on the claude stream-json path.
     #[getter]
     fn usage_totals_unpaired(&self) -> bool {
         self.inner
@@ -891,13 +906,16 @@ impl ClaudeStreamEvent {
 /// Parse one stream-json line. Returns None for unknown/non-semantic lines.
 #[pyfunction]
 fn parse_claude_stream_line(data: &[u8], outbound: bool) -> PyResult<Option<ClaudeStreamEvent>> {
-    shielded(|| Ok(ccs::parse_stream_line(data, outbound).map(|inner| ClaudeStreamEvent { inner })))
+    shielded(|| {
+        Ok(claude_stream::parse_stream_line(data, outbound)
+            .map(|inner| ClaudeStreamEvent { inner }))
+    })
 }
 
 /// One parsed `codex exec --json` event (flat; kind discriminates).
 #[pyclass]
 struct CodexExecEvent {
-    inner: cej::CodexExecEvent,
+    inner: codex_exec::CodexExecEvent,
 }
 
 #[pymethods]
@@ -905,14 +923,14 @@ impl CodexExecEvent {
     #[getter]
     fn kind(&self) -> &'static str {
         match self.inner.kind {
-            cej::CodexEventKind::ThreadStarted => "thread_started",
-            cej::CodexEventKind::TurnStarted => "turn_started",
-            cej::CodexEventKind::TurnCompleted => "turn_completed",
-            cej::CodexEventKind::TurnFailed => "turn_failed",
-            cej::CodexEventKind::ItemStarted => "item_started",
-            cej::CodexEventKind::ItemUpdated => "item_updated",
-            cej::CodexEventKind::ItemCompleted => "item_completed",
-            cej::CodexEventKind::Error => "error",
+            codex_exec::CodexEventKind::ThreadStarted => "thread_started",
+            codex_exec::CodexEventKind::TurnStarted => "turn_started",
+            codex_exec::CodexEventKind::TurnCompleted => "turn_completed",
+            codex_exec::CodexEventKind::TurnFailed => "turn_failed",
+            codex_exec::CodexEventKind::ItemStarted => "item_started",
+            codex_exec::CodexEventKind::ItemUpdated => "item_updated",
+            codex_exec::CodexEventKind::ItemCompleted => "item_completed",
+            codex_exec::CodexEventKind::Error => "error",
         }
     }
     #[getter]
@@ -992,7 +1010,7 @@ impl CodexExecEvent {
 /// Parse one `codex exec --json` line. Returns None for unknown lines.
 #[pyfunction]
 fn parse_codex_exec_line(data: &[u8]) -> PyResult<Option<CodexExecEvent>> {
-    shielded(|| Ok(cej::parse_exec_line(data).map(|inner| CodexExecEvent { inner })))
+    shielded(|| Ok(codex_exec::parse_exec_line(data).map(|inner| CodexExecEvent { inner })))
 }
 
 #[pyfunction]
@@ -1022,13 +1040,12 @@ fn normalize_finish_reason(provider: &str, raw: &str) -> PyResult<String> {
 }
 
 /// The one whole-body parse on the capture path, and the one native call that
-/// releases the GIL (design: parse-off-loop §4.2). The per-chunk parsers
-/// (`Http1Parser.feed` and friends) deliberately do NOT. Each moves a fed byte
+/// releases the GIL. The per-chunk parsers (`Http1Parser.feed` and friends)
+/// deliberately keep it. Each moves a fed byte
 /// at most twice — into its buffer, and once more if it is left over as the
-/// start of a torn frame — so a call is linear in its chunk. Measured on a
-/// release build (2026-10-11), one 256 KiB read costs 0.2 ms as 9-byte HTTP/2
-/// frames, 0.7 ms as 2-byte WebSocket frames and 2.1 ms as 87-byte JSON-RPC
-/// lines, the last spent parsing JSON. Releasing the GIL would also unguard
+/// start of a torn frame — so a call is linear in its chunk, and even a large
+/// read cut into tiny frames costs milliseconds on a release build, most of it
+/// spent parsing JSON. Releasing the GIL would also unguard
 /// the `&mut self` borrow: the HTTP/2 parser is one object that both
 /// directions of a connection feed, and a second thread reaching it while the
 /// first had the GIL released would get a borrow error raised into the host's

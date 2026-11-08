@@ -1,4 +1,4 @@
-//! Performance guard — design §9: masking 1 MiB of mixed text stays under
+//! Performance guard: masking 1 MiB of mixed text stays under
 //! 100 ms in release mode. Run explicitly:
 //! `cargo test -p wardex-pipeline --release --test pii_perf -- --ignored`
 
@@ -48,12 +48,14 @@ fn masks_one_mebibyte_under_100ms() {
         r"\npassword=x".repeat(1024 * 1024 / 12 + 1),
     ] {
         let start = std::time::Instant::now();
-        engine.mask_text(&pathological);
+        std::hint::black_box(engine.mask_text(&pathological));
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_millis() < 100,
             "masking 1 MiB of {:?}... took {elapsed:?} (budget: 100ms)",
-            &pathological[..12]
+            pathological
+                .get(..12)
+                .expect("every corpus starts with 12 ASCII bytes")
         );
     }
     assert!(

@@ -1,8 +1,10 @@
-//! Proto-tree masking walks — design §4.
+//! Proto-tree masking walks: every text a wardex envelope or an OTLP request
+//! carries out of the process passes through one of these.
 //!
-//! Every message is destructured WITHOUT `..` so that adding a proto field
+//! Every message is destructured without `..` so that adding a proto field
 //! breaks this build until someone decides whether the new field is masked
-//! (design §4.3). Non-text fields are bound to `_`.
+//! — the compiler, not a review, is what catches a new text field. Non-text
+//! fields are bound to `_`.
 //!
 //! A text field the SDK fills by itself is bound to `_` too, under an
 //! `SDK-GENERATED` note. Masking is for what the host and its traffic put on
@@ -27,12 +29,11 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use super::{PiiEngine, Report, Rule, Shape, PII_FILTER_ERROR, PLACEHOLDER};
 use wardex_codec::otlp::otlp_pb;
 use wardex_codec::proto::wardex::v1 as pb;
 
-use super::{PiiEngine, Report, Rule, Shape, PII_FILTER_ERROR, PLACEHOLDER};
-
-/// The engine plus what it has replaced so far in ONE record. A span gets a
+/// The engine plus what it has replaced so far in one record. A span gets a
 /// fresh one, so its report says what was masked in that span and nowhere
 /// else; the envelope header and snapshots use a scratch one.
 struct Masker<'e> {
@@ -48,7 +49,7 @@ impl<'e> Masker<'e> {
         }
     }
 
-    /// The rule a structured attribute's KEY puts its value under. A key is a
+    /// The rule a structured attribute's key puts its value under. A key is a
     /// name in the JSON sense — `span.set_attribute("api_key", v)` is the
     /// same argument as `{"api_key": v}` — so the `name=value`-only names do
     /// not apply.
@@ -82,11 +83,12 @@ impl<'e> Masker<'e> {
 #[cfg(any(test, feature = "panic-injection"))]
 pub(super) const TEST_PANIC_SPAN_NAME: &str = "__wardex_test_panic__";
 
-/// Mask every outbound text surface of a wardex envelope (design §3).
-/// A span/snapshot that panics during masking is scrubbed whole (fail-closed §8);
+/// Mask every outbound text surface of a wardex envelope.
+/// A span/snapshot that panics during masking is scrubbed whole (fail-closed);
 /// other items keep processing. Returns how many were scrubbed — spans and
 /// snapshots — for the caller to count: each also carries
 /// `Limitation::PiiFilterFailed`, but only to whoever opens it.
+#[must_use = "the scrub count is the only record that a span or snapshot lost its text"]
 pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) -> usize {
     let mut scrubbed = 0;
     let pb::Envelope { header, items } = env;
@@ -105,6 +107,10 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) -> usize {
         {}
         match payload {
             Some(pb::envelope_item::Payload::Span(span)) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the fail-closed scrub boundary: a panic while masking one span scrubs that span whole instead of shipping it unmasked or failing the batch"
+                )]
                 let masked = catch_unwind(AssertUnwindSafe(|| mask_span(engine, span)));
                 if masked.is_err() {
                     scrub_span_fail_closed(span);
@@ -112,8 +118,12 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) -> usize {
                 }
             }
             Some(pb::envelope_item::Payload::StateSnapshot(snap)) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the fail-closed scrub boundary: a panic while masking one snapshot scrubs that snapshot whole instead of shipping it unmasked or failing the batch"
+                )]
                 let masked = catch_unwind(AssertUnwindSafe(|| {
-                    mask_snapshot(&mut Masker::new(engine), snap)
+                    mask_snapshot(&mut Masker::new(engine), snap);
                 }));
                 if masked.is_err() {
                     scrub_snapshot_fail_closed(snap);
@@ -243,19 +253,16 @@ const STEP_NAMESPACE_KEY: &str = "wardex.step.namespace";
 /// is a node name and nothing else. A value with no such id is masked whole,
 /// as before.
 fn mask_keeping_task_ids(m: &mut Masker<'_>, s: &mut String) -> bool {
+    // A kept id holds no `:`, so visiting every `:` finds the same ids as
+    // resuming the search past each one.
     let mut ids = Vec::new();
-    let mut from = 0;
-    while let Some(off) = s[from..].find(':') {
-        let start = from + off + 1;
+    for (colon, _) in s.match_indices(':') {
+        let start = colon + 1;
         let end = start + 36;
         if s.get(start..end).is_some_and(is_langgraph_task_id)
             && s.as_bytes().get(end).is_none_or(|&c| c == b'|')
         {
-            let kept_end = (end + 1).min(s.len());
-            ids.push(start - 1..kept_end);
-            from = kept_end;
-        } else {
-            from = start;
+            ids.push(colon..(end + 1).min(s.len()));
         }
     }
     if ids.is_empty() {
@@ -264,14 +271,22 @@ fn mask_keeping_task_ids(m: &mut Masker<'_>, s: &mut String) -> bool {
     let mut out = String::with_capacity(s.len());
     let mut hit = false;
     let mut pos = 0;
+    // Every bound is an ASCII `:` or `|` or the end of the value, so `get`
+    // never misses; if it did, masking the value whole is the safe answer.
     for id in ids {
-        let mut piece = s[pos..id.start].to_string();
+        let (Some(piece), Some(kept)) = (s.get(pos..id.start), s.get(id.clone())) else {
+            return mask_string(m, s);
+        };
+        let mut piece = piece.to_string();
         hit |= mask_string(m, &mut piece);
         out.push_str(&piece);
-        out.push_str(&s[id.clone()]);
+        out.push_str(kept);
         pos = id.end;
     }
-    let mut tail = s[pos..].to_string();
+    let Some(tail) = s.get(pos..) else {
+        return mask_string(m, s);
+    };
+    let mut tail = tail.to_string();
     hit |= mask_string(m, &mut tail);
     out.push_str(&tail);
     if hit {
@@ -348,9 +363,9 @@ fn mask_string(m: &mut Masker<'_>, s: &mut String) -> bool {
 
 /// Bytes are masked as text even when they are not valid UTF-8 throughout:
 /// the engine judges a same-length stand-in and edits the original bytes, so
-/// one Latin-1 `é` in a form body no longer switches masking off for the
-/// body, nor splits a password around it. Binary payloads still hold nothing
-/// the rules recognise (documented limitation, design §4.4).
+/// one Latin-1 `é` in a form body does not switch masking off for the
+/// body, nor split a password around it. Binary payloads still hold nothing
+/// the rules recognise; that gap is a documented limitation.
 fn mask_bytes(m: &mut Masker<'_>, b: &mut Vec<u8>) -> bool {
     match m.engine.mask_bytes_into(b, &mut m.report) {
         Some(masked) => {
@@ -390,7 +405,7 @@ fn replace_any(m: &mut Masker<'_>, v: &mut pb::AnyValue, rule: Rule, key: &str) 
             *b = PLACEHOLDER.as_bytes().to_vec();
             true
         }
-        Some(Value::IntValue(_)) | Some(Value::DoubleValue(_)) => {
+        Some(Value::IntValue(_) | Value::DoubleValue(_)) => {
             *value = Some(Value::StringValue(PLACEHOLDER.into()));
             true
         }
@@ -432,10 +447,7 @@ fn mask_any(m: &mut Masker<'_>, v: &mut pb::AnyValue) -> bool {
             let pb::KeyValueList { values } = kvl;
             mask_kvs(m, values)
         }
-        Some(Value::BoolValue(_))
-        | Some(Value::IntValue(_))
-        | Some(Value::DoubleValue(_))
-        | None => false,
+        Some(Value::BoolValue(_) | Value::IntValue(_) | Value::DoubleValue(_)) | None => false,
     }
 }
 
@@ -503,6 +515,10 @@ fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
 fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
     let m = &mut Masker::new(engine);
     #[cfg(any(test, feature = "panic-injection"))]
+    #[expect(
+        clippy::panic,
+        reason = "fault injection for the fail-closed scrub; compiled only into tests and builds with the panic-injection feature, never into a release wheel"
+    )]
     if span.name == TEST_PANIC_SPAN_NAME {
         panic!("injected test panic");
     }
@@ -581,8 +597,7 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
             // A closed enum cannot carry PII by construction, and there is no
             // regex to run over an i32. This is the same disposition
             // `CaptureIntegrity.limitations` gets now that it is a repeated
-            // closed enum rather than `repeated string` — see design §6.5.1's
-            // "what Rust must receive".
+            // closed enum rather than `repeated string`.
             reason: _,
         } = link;
         hit |= mask_kvs(m, attributes);
@@ -639,10 +654,10 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         hit |= mask_string(m, request_id);
         hit |= mask_string(m, attempt_id);
     }
-    // `CaptureIntegrity` is deliberately NOT destructured any more. Every one
-    // of its fields is a bool, an i32 or a repeated closed enum; none can carry
-    // PII, so masking it was work with no possible effect.
-    // Note the ordering that survives: `redacted` and the report are written
+    // `CaptureIntegrity` is deliberately not destructured. Every one of its
+    // fields is a bool, an i32 or a repeated closed enum; none can carry PII,
+    // so masking it would be work with no possible effect.
+    // Note the ordering: `redacted` and the report are written
     // below, and they have to stay after every other field has been scanned.
     let report = std::mem::replace(m, Masker::new(engine)).finish();
     if hit {
@@ -678,7 +693,7 @@ fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
         connection_reused: _,
     } = t;
     let mut hit = false;
-    // All numeric today; the exhaustive destructure is the §4.3 compile-time
+    // All numeric today; the exhaustive destructure is the compile-time
     // tripwire for future text fields.
     if let Some(pb::TransportTiming {
         tcp_connect_ms: _,
@@ -736,6 +751,10 @@ fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
 
 fn mask_snapshot(m: &mut Masker<'_>, snap: &mut pb::StateSnapshot) {
     #[cfg(any(test, feature = "panic-injection"))]
+    #[expect(
+        clippy::panic,
+        reason = "fault injection for the fail-closed scrub; compiled only into tests and builds with the panic-injection feature, never into a release wheel"
+    )]
     if snap.conversation_state == TEST_PANIC_SPAN_NAME.as_bytes() {
         panic!("injected test panic");
     }
@@ -783,7 +802,7 @@ fn mask_snapshot(m: &mut Masker<'_>, snap: &mut pb::StateSnapshot) {
     }
 }
 
-// --- OTLP masking (design §4.2, OTLP path) ---
+// --- OTLP masking ---
 
 /// SDK-GENERATED resource attributes: the mapping writes them from the
 /// producer the binding passes and from `SdkInfo.version`. A resource has no
@@ -807,10 +826,11 @@ const SDK_RESOURCE_KEYS: [&str; 3] = [
 /// the `connection_id: _` binding in `mask_transport`.
 const SDK_SPAN_KEYS: [&str; 1] = [wardex_codec::otlp::map::T_CONNECTION_ID];
 
-/// Mask an OTLP export request (design §4.2, OTLP path). A span that panics
+/// Mask an OTLP export request. A span that panics
 /// is scrubbed whole; a span with replacements gains `wardex.redacted=true`
 /// (OTLP spans have no capture_integrity — this is the OTLP equivalent).
 /// Returns how many spans were scrubbed, for the caller to count.
+#[must_use = "the scrub count is the only record that a span lost its text"]
 pub fn mask_otlp(
     engine: &PiiEngine,
     req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
@@ -858,7 +878,12 @@ pub fn mask_otlp(
             }
             mask_string(&mut Masker::new(engine), schema_url);
             for span in spans {
-                match catch_unwind(AssertUnwindSafe(|| mask_otlp_span(engine, span))) {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the fail-closed scrub boundary: a panic while masking one span scrubs that span whole instead of shipping it unmasked or failing the batch"
+                )]
+                let masked = catch_unwind(AssertUnwindSafe(|| mask_otlp_span(engine, span)));
+                match masked {
                     Err(_) => {
                         scrub_otlp_span_fail_closed(span);
                         scrubbed += 1;
@@ -876,6 +901,10 @@ pub fn mask_otlp(
 fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option<Report> {
     let m = &mut Masker::new(engine);
     #[cfg(any(test, feature = "panic-injection"))]
+    #[expect(
+        clippy::panic,
+        reason = "fault injection for the fail-closed scrub; compiled only into tests and builds with the panic-injection feature, never into a release wheel"
+    )]
     if span.name == TEST_PANIC_SPAN_NAME {
         panic!("injected test panic");
     }
@@ -1059,7 +1088,7 @@ fn replace_otlp_any(
             *b = PLACEHOLDER.as_bytes().to_vec();
             true
         }
-        Some(Value::IntValue(_)) | Some(Value::DoubleValue(_)) => {
+        Some(Value::IntValue(_) | Value::DoubleValue(_)) => {
             *value = Some(Value::StringValue(PLACEHOLDER.into()));
             true
         }
@@ -1101,10 +1130,7 @@ fn mask_otlp_any(m: &mut Masker<'_>, v: &mut otlp_pb::common::AnyValue) -> bool 
             let otlp_pb::common::KeyValueList { values } = kvl;
             mask_otlp_kvs(m, values)
         }
-        Some(Value::BoolValue(_))
-        | Some(Value::IntValue(_))
-        | Some(Value::DoubleValue(_))
-        | None => false,
+        Some(Value::BoolValue(_) | Value::IntValue(_) | Value::DoubleValue(_)) | None => false,
     }
 }
 
@@ -1117,7 +1143,7 @@ fn otlp_kv_bool(key: &str, v: bool) -> otlp_pb::common::KeyValue {
     }
 }
 
-// --- fail-closed scrubs (§8): identity/timing survive, no text does ---
+// --- fail-closed scrubs: identity/timing survive, no text does ---
 //
 // Each one also says so in the closed vocabulary, `PiiFilterFailed`, and only
 // that: `redacted` is set on every span masking touched, so it cannot tell a
@@ -1188,6 +1214,7 @@ fn scrub_snapshot_fail_closed(snap: &mut pb::StateSnapshot) {
 mod tests {
     use super::*;
     use crate::pii::{PiiEngine, Rule};
+    use wardex_codec::otlp::otlp_pb;
 
     fn engine() -> PiiEngine {
         PiiEngine::new(&[]).unwrap()
@@ -1243,7 +1270,7 @@ mod tests {
     #[test]
     fn masks_every_text_surface_of_a_span() {
         let mut env = env_with(pii_span());
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         let span = span_of(&env);
         assert_eq!(span.name, "call [EMAIL]");
         assert_eq!(span.input_data, b"card ****-****-****-1111".to_vec());
@@ -1262,7 +1289,7 @@ mod tests {
     #[test]
     fn project_id_is_whitelisted() {
         let mut env = env_with(pii_span());
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         assert_eq!(
             env.header.as_ref().unwrap().project_id,
             "sk-live-aaaaaaaaaaaaaaaa1234"
@@ -1287,7 +1314,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         let span = span_of(&env);
         assert_eq!(span.transport.as_ref().unwrap().connection_id, cid);
         let rules = span
@@ -1351,7 +1378,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         let span = span_of(&env);
         assert_eq!(span.conversation.as_ref().unwrap().conversation_id, cid);
         assert!(span.capture_integrity.is_none());
@@ -1363,7 +1390,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         let span = span_of(&env);
         assert_eq!(
             span.conversation.as_ref().unwrap().conversation_id,
@@ -1394,7 +1421,7 @@ mod tests {
         };
         let mut env = with(MCP_TOOLS_HASH_KEY, digest);
         let before = env.clone();
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         assert_eq!(env, before);
         // The same digits under another key, or another form under this
         // key, are judged as before.
@@ -1404,7 +1431,7 @@ mod tests {
             (MCP_TOOLS_HASH_KEY, "80966977421341424"),
         ] {
             let mut env = with(key, value);
-            mask_envelope(&engine(), &mut env);
+            assert_eq!(mask_envelope(&engine(), &mut env), 0);
             let span = span_of(&env);
             assert_eq!(
                 span.capture_integrity.as_ref().unwrap().redaction_rules,
@@ -1444,7 +1471,7 @@ mod tests {
         };
         let mut env = with(STEP_TASK_ID_KEY, id);
         let before = env.clone();
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         assert_eq!(env, before);
         // The same id under another key, or another form under this key, is
         // judged as before.
@@ -1457,7 +1484,7 @@ mod tests {
             (STEP_TASK_ID_KEY, run_on.as_str()),
         ] {
             let mut env = with(key, value);
-            mask_envelope(&engine(), &mut env);
+            assert_eq!(mask_envelope(&engine(), &mut env), 0);
             let span = span_of(&env);
             assert_eq!(
                 span.capture_integrity.as_ref().unwrap().redaction_rules,
@@ -1492,7 +1519,7 @@ mod tests {
         for ns in [format!("outer:{id}|inner:{id}"), format!("에이전트:{id}")] {
             let mut env = with(&ns);
             let before = env.clone();
-            mask_envelope(&engine(), &mut env);
+            assert_eq!(mask_envelope(&engine(), &mut env), 0);
             assert_eq!(env, before, "{ns}");
         }
         // The node names are the host's and are masked around the ids; text
@@ -1526,7 +1553,7 @@ mod tests {
             ),
         ] {
             let mut env = with(&ns);
-            mask_envelope(&engine(), &mut env);
+            assert_eq!(mask_envelope(&engine(), &mut env), 0);
             let span = span_of(&env);
             assert_eq!(pb_text(&span.extra[0].value), Some(masked.as_str()), "{ns}");
             assert_eq!(
@@ -1540,14 +1567,14 @@ mod tests {
     #[test]
     fn redacted_flag_set_only_when_replacements_happened() {
         let mut dirty = env_with(pii_span());
-        mask_envelope(&engine(), &mut dirty);
+        assert_eq!(mask_envelope(&engine(), &mut dirty), 0);
         assert!(span_of(&dirty).capture_integrity.as_ref().unwrap().redacted);
 
         let mut clean = env_with(pb::Span {
             name: "plain".into(),
             ..Default::default()
         });
-        mask_envelope(&engine(), &mut clean);
+        assert_eq!(mask_envelope(&engine(), &mut clean), 0);
         let ci = &span_of(&clean).capture_integrity;
         assert!(ci.is_none() || !ci.as_ref().unwrap().redacted);
     }
@@ -1574,7 +1601,7 @@ mod tests {
                 )),
             }],
         };
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         match &env.items[0].payload {
             Some(pb::envelope_item::Payload::StateSnapshot(s)) => {
                 assert_eq!(s.conversation_state, b"user [EMAIL] asked".to_vec());
@@ -1603,7 +1630,7 @@ mod tests {
             "the scrub is counted"
         );
         let s = span_of(&env);
-        assert_eq!(s.name, crate::pii::PII_FILTER_ERROR);
+        assert_eq!(s.name, PII_FILTER_ERROR);
         assert!(s.input_data.is_empty());
         assert!(s.status.is_none());
         let integrity = s.capture_integrity.as_ref().unwrap();
@@ -1662,10 +1689,7 @@ mod tests {
         let scrubbed = snap(0);
         assert_eq!(scrubbed.trace_id, vec![0xAB; 16]);
         assert_eq!(scrubbed.turn_index, 3);
-        assert_eq!(
-            scrubbed.conversation_state,
-            crate::pii::PII_FILTER_ERROR.as_bytes()
-        );
+        assert_eq!(scrubbed.conversation_state, PII_FILTER_ERROR.as_bytes());
         assert_eq!(
             scrubbed.attributes,
             vec![pb::KeyValue {
@@ -1684,12 +1708,10 @@ mod tests {
 
     // --- OTLP tests ---
 
-    use wardex_codec::otlp::otlp_pb;
-
     #[test]
     fn a_masked_span_reports_count_rules_and_names() {
         let mut env = env_with(pii_span());
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         let ci = span_of(&env).capture_integrity.clone().unwrap();
         assert!(ci.redacted);
         // name + status (two e-mails), the card, the `sk-` key in the URL.
@@ -1714,7 +1736,7 @@ mod tests {
             name: "HTTP GET /v1/models".into(),
             ..Default::default()
         });
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         assert!(span_of(&env).capture_integrity.is_none());
     }
 
@@ -1726,7 +1748,7 @@ mod tests {
             ..Default::default()
         };
         let mut env = env_with(std::mem::take(&mut span));
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         assert_eq!(
             span_of(&env).input_data,
             b"password=[SECRET]&name=caf\xe9".to_vec()
@@ -1753,6 +1775,7 @@ mod tests {
 
     #[test]
     fn a_host_attribute_under_a_secret_name_is_replaced_whole() {
+        use pb::any_value::Value;
         let mut span = pb::Span {
             name: "tool".into(),
             extra: vec![
@@ -1763,7 +1786,7 @@ mod tests {
                 pb::KeyValue {
                     key: "request".into(),
                     value: Some(pb::AnyValue {
-                        value: Some(pb::any_value::Value::KvlistValue(pb::KeyValueList {
+                        value: Some(Value::KvlistValue(pb::KeyValueList {
                             values: vec![text_kv("api_key", "abc"), text_kv("q", "seoul")],
                         })),
                     }),
@@ -1772,7 +1795,7 @@ mod tests {
             ..Default::default()
         };
         let mut env = env_with(std::mem::take(&mut span));
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
         let sp = span_of(&env);
         let get = |k: &str| {
             sp.extra
@@ -1781,7 +1804,6 @@ mod tests {
                 .and_then(|kv| kv.value.clone())
                 .and_then(|v| v.value)
         };
-        use pb::any_value::Value;
         assert_eq!(
             get("db.password"),
             Some(Value::StringValue("[SECRET]".into()))
@@ -1817,7 +1839,7 @@ mod tests {
     #[test]
     fn otlp_reports_merge_into_one_set_of_keys() {
         let mut req = otlp_req_with_pii();
-        mask_otlp(&engine(), &mut req);
+        assert_eq!(mask_otlp(&engine(), &mut req), 0);
         let span = &req.resource_spans[0].scope_spans[0].spans[0];
         let count = |k: &str| span.attributes.iter().filter(|kv| kv.key == k).count();
         assert_eq!(count("wardex.redacted"), 1);
@@ -1830,7 +1852,7 @@ mod tests {
         // Masking the already-masked request again replaces nothing and
         // leaves the report as it was.
         let before = req.clone();
-        mask_otlp(&engine(), &mut req);
+        assert_eq!(mask_otlp(&engine(), &mut req), 0);
         assert_eq!(req, before);
     }
 
@@ -1887,7 +1909,7 @@ mod tests {
     #[test]
     fn otlp_spans_are_masked_and_flagged() {
         let mut req = otlp_req_with_pii();
-        mask_otlp(&engine(), &mut req);
+        assert_eq!(mask_otlp(&engine(), &mut req), 0);
         let span = &req.resource_spans[0].scope_spans[0].spans[0];
         assert_eq!(span.name, "chat for [EMAIL]");
         match otlp_attr(span, "gen_ai.output.messages").unwrap() {
@@ -1919,7 +1941,7 @@ mod tests {
         span.end_time_unix_nano = 2000;
         assert_eq!(mask_otlp(&engine(), &mut req), 1, "the scrub is counted");
         let span = &req.resource_spans[0].scope_spans[0].spans[0];
-        assert_eq!(span.name, crate::pii::PII_FILTER_ERROR);
+        assert_eq!(span.name, PII_FILTER_ERROR);
         assert_eq!(span.trace_id, vec![0xAB; 16]);
         assert_eq!(span.span_id, vec![0xCD; 8]);
         assert_eq!(span.start_time_unix_nano, 1000);
@@ -1960,7 +1982,7 @@ mod tests {
             name: "plain".into(),
             ..Default::default()
         };
-        mask_otlp(&engine(), &mut req);
+        assert_eq!(mask_otlp(&engine(), &mut req), 0);
         let span = &req.resource_spans[0].scope_spans[0].spans[0];
         assert!(otlp_attr(span, "wardex.redacted").is_none());
     }
@@ -1969,7 +1991,7 @@ mod tests {
 #[cfg(test)]
 mod usage_pins {
     //! Structural pins for the usage attributes: numeric usage values are
-    //! untouchable BY TYPE (the `mask_any`/`mask_otlp_any` match arms answer
+    //! untouchable by type (the `mask_any`/`mask_otlp_any` match arms answer
     //! `false` for Int/Double/Bool before any engine runs), and model-id
     //! strings pass the pattern table unchanged. Pinned here because the
     //! `wardex.usage.*` mirror multiplies the numeric attributes per span,
@@ -2004,7 +2026,7 @@ mod usage_pins {
         }
     }
 
-    /// T-R11 — integer/double usage attributes are byte-identical after a
+    /// Integer/double usage attributes are byte-identical after a
     /// full masking walk, for both key families, structurally (no exemption
     /// list involved — there is none to get wrong).
     #[test]
@@ -2029,7 +2051,7 @@ mod usage_pins {
             }],
             ..Default::default()
         };
-        mask_envelope(&engine, &mut env);
+        assert_eq!(mask_envelope(&engine, &mut env), 0);
         span = match env.items.remove(0).payload {
             Some(pb::envelope_item::Payload::Span(s)) => s,
             other => panic!("expected span, got {other:?}"),
@@ -2037,8 +2059,8 @@ mod usage_pins {
         assert_eq!(span.extra, before.extra);
     }
 
-    /// T-R11 — model ids and plain tier strings survive the shipped pattern
-    /// table. Deliberately NOT a key-based exemption: these go through the
+    /// Model ids and plain tier strings survive the shipped pattern
+    /// table. Deliberately not a key-based exemption: these go through the
     /// engine like every other string and come out unchanged because no
     /// pattern matches them.
     #[test]
@@ -2065,7 +2087,7 @@ mod usage_pins {
                 }],
                 ..Default::default()
             };
-            mask_envelope(&engine, &mut env);
+            assert_eq!(mask_envelope(&engine, &mut env), 0);
             let span = match &env.items[0].payload {
                 Some(pb::envelope_item::Payload::Span(s)) => s,
                 other => panic!("expected span, got {other:?}"),

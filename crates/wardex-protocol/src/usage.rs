@@ -4,16 +4,15 @@
 //! provider parsers in `semantic.rs` and `claude_stream_json.rs`; consumed
 //! through getters only, so a raw (exclusive) value cannot leak back out.
 //!
-//! Why a type and not a convention: the neutral structs used to carry the
-//! provider's numbers with the inclusivity contract written in a comment,
-//! and the Anthropic parsers silently violated it — every backend that
-//! subtracts the cache tiers back out (Langfuse, Phoenix) then under-billed
+//! Why a type and not a convention: an inclusivity contract written only in
+//! a comment is one a parser can silently violate, and every backend that
+//! subtracts the cache tiers back out (Langfuse, Phoenix) then under-bills
 //! by the cache volume. `TokenUsage::new` cannot be called without naming
 //! the provider's [`InputConvention`], so the next parser faces a compile
 //! error instead of a coin flip.
 
 /// How the provider counts `input_tokens`. Choosing the constructor's
-/// convention IS the declaration — there is no default.
+/// convention is the declaration — there is no default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputConvention {
     /// `input_tokens` already includes cached tokens (OpenAI, Gemini, Cohere).
@@ -128,7 +127,7 @@ impl TokenUsage {
 mod tests {
     use super::*;
 
-    /// G4 — the two conventions converge on the same inclusive total.
+    /// The two conventions converge on the same inclusive total.
     #[test]
     fn both_conventions_yield_the_same_inclusive_total() {
         let table: &[(InputConvention, i64, i64, i64)] = &[
@@ -204,7 +203,7 @@ mod tests {
         assert!(u.totals_unpaired());
     }
 
-    /// §4.3 — overflow withholds the total instead of panicking.
+    /// Overflow withholds the total instead of panicking.
     #[test]
     fn overflow_withholds_the_total_and_says_so() {
         let u = TokenUsage::new(
@@ -239,23 +238,22 @@ mod tests {
         assert_eq!(u.reasoning_output_tokens(), Some(100));
     }
 
-    /// §4.4 — constructor cost, absolute value. Not a regression gate (the
-    /// type is new, there is no "before"); a report in whole-digit ns means
-    /// the `Option` plumbing inlined. Run with:
+    /// Constructor cost, absolute value. Not a regression gate; a report in
+    /// whole-digit ns means the `Option` plumbing inlined. Run with:
     /// `cargo test --release -p wardex-protocol -- --ignored bench_token_usage_new --nocapture`
     #[test]
     #[ignore = "microbench: run explicitly with --ignored --nocapture"]
     fn bench_token_usage_new() {
         use std::hint::black_box;
         use std::time::Instant;
-        const ITERS: u64 = 10_000_000;
+        const ITERS: u32 = 10_000_000;
         let mut medians = Vec::new();
         for _ in 0..5 {
             let start = Instant::now();
             for i in 0..ITERS {
                 let u = TokenUsage::new(
                     black_box(InputConvention::ExcludesCache),
-                    black_box(Some(i as i64)),
+                    black_box(Some(i64::from(i))),
                     black_box(Some(500)),
                     black_box(Some(8000)),
                     black_box(Some(2000)),
@@ -264,7 +262,7 @@ mod tests {
                 black_box(u.input_tokens());
             }
             let elapsed = start.elapsed();
-            medians.push(elapsed.as_nanos() as f64 / ITERS as f64);
+            medians.push(elapsed.as_secs_f64() * 1e9 / f64::from(ITERS));
         }
         medians.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(

@@ -4,7 +4,7 @@
 //! `serde_json` refuses a literal such as `1e400` ("number out of range"),
 //! and also a few at the very top of the range that a correctly rounded parse
 //! makes finite (`1.7976931348623158e308`, where its fast parse overflows).
-//! Every reassembler used to skip the event that carried one: its text, its
+//! A reassembler that skipped the event carrying one would lose its text, its
 //! finish reason, its error, all for one number nothing reads (a token's
 //! `logprob`, a stray field). Python's `json`, which the provider SDKs read
 //! the same stream with, reads the literal (as an infinity, or as that
@@ -52,6 +52,10 @@ pub(super) fn carries_nothing(data: &str) -> bool {
 /// inside a string is left alone, as is anything that is not a well-formed
 /// JSON number: the retry must not accept text the strict parse rightly
 /// refused for another reason.
+#[expect(
+    clippy::string_slice,
+    reason = "every offset is 0, the text's length, the index of an ASCII byte, or the index just past one, so each is a char boundary"
+)]
 fn quote_out_of_range_numbers(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut out = String::new();
@@ -67,7 +71,6 @@ fn quote_out_of_range_numbers(text: &str) -> Option<String> {
                 {
                     i += 1;
                 }
-                // ASCII bounds on both sides, so slicing cannot split a char.
                 let literal = &text[start..i];
                 if is_json_number(literal.as_bytes())
                     && serde_json::from_str::<f64>(literal).is_err()
@@ -142,11 +145,12 @@ fn is_json_number(t: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
 
+    use super::*;
+
     /// The number that broke the event is kept as its own spelling, and
-    /// everything around it is read as before.
+    /// everything around it is read unchanged.
     #[test]
     fn an_out_of_range_number_is_read_as_its_own_spelling() {
         for (data, expected) in [
@@ -377,8 +381,8 @@ mod reassembled {
         assert_eq!(s.stream_events_unparsed, 0);
     }
 
-    /// The Responses terminal snapshot is the whole body; one number in it
-    /// used to cost the whole body. It is kept, and the number reads as the
+    /// The Responses terminal snapshot is the whole body, so one number in it
+    /// must not cost the whole body. It is kept, and the number reads as the
     /// spelling the provider sent.
     #[test]
     fn a_responses_snapshot_with_an_out_of_range_number_is_the_body() {

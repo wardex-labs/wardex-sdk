@@ -16,7 +16,7 @@
 //! (`sdks/python/tests/test_ffi_panic.py`). Getters that hand back an owned
 //! field are the one exemption: nothing from the core runs in them.
 //!
-//! What this does NOT do: silence the panic hook. The default hook prints
+//! What this does not do: silence the panic hook. The default hook prints
 //! `thread '<unnamed>' panicked at ...` to stderr before the unwind begins,
 //! and the only way to stop it is `std::panic::set_hook`, which is
 //! process-global — wardex replacing the host's panic hook would be exactly
@@ -45,6 +45,10 @@ pyo3::create_exception!(
 /// is: a parser that panicked mid-feed is a parser its caller stops feeding
 /// (the seam guard counts the failure and the connection's tracker latches
 /// off), and nothing here is shared across threads without the GIL.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the FFI boundary: the one place a panic from the core is turned into an exception the host's guards can catch"
+)]
 pub(crate) fn shielded<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
@@ -73,7 +77,10 @@ fn describe(payload: &(dyn std::any::Any + Send)) -> String {
 /// purpose is to fail.
 #[cfg(feature = "panic-injection")]
 #[pyfunction]
-#[allow(clippy::panic)] // the whole point of the function
+#[expect(
+    clippy::panic,
+    reason = "this function exists to panic, so the conversion can be tested end to end"
+)]
 fn _panic_for_test() -> PyResult<()> {
     shielded(|| -> PyResult<()> { panic!("injected by _panic_for_test") })
 }

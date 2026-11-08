@@ -10,13 +10,29 @@ use wardex_limits::Limits;
 /// A single parsed HTTP message (request or response).
 #[derive(Debug, Clone)]
 pub struct ParsedHttp {
+    /// Parsed from a request stream; a response otherwise.
     pub is_request: bool,
+    /// The request method as sent. `None` on a response.
     pub method: Option<String>,
+    /// The request target as sent (origin form, absolute form or `*`), not
+    /// decoded. `None` on a response.
     pub path: Option<String>,
+    /// The minor version from the start line: `0` for HTTP/1.0, `1` for
+    /// HTTP/1.1.
     pub version: u8,
+    /// The response status code. `None` on a request.
     pub status: Option<u16>,
+    /// Header fields in wire order, duplicates kept, names as sent. Values
+    /// that are not UTF-8 are decoded lossily. At most `max_headers` entries:
+    /// a block with more disables the stream instead.
     pub headers: Vec<(String, String)>,
+    /// The body with chunked framing removed and content codings left as
+    /// sent. Holds at most the body cap chosen from the Content-Type, so it
+    /// can be shorter than the wire body; see `truncated`.
     pub body: Vec<u8>,
+    /// `body` is not the whole body: either the body cap stopped storing
+    /// (`limitations` then names `body_cap_exceeded`), or the stream ended
+    /// first (`incomplete` is then set too).
     pub truncated: bool,
     /// The stream ended before this message's own framing did: a declared
     /// Content-Length was not reached, a chunked body never got its last
@@ -24,12 +40,20 @@ pub struct ParsedHttp {
     /// arrived is in `body` (and `truncated` is set); how the message would
     /// have ended was not observed. Only `finish` sets it.
     pub incomplete: bool,
+    /// Length in bytes of the start line and header block, including the
+    /// blank line that ends it. Bytes after it on the wire belong to the body
+    /// or, after a protocol switch, to the next protocol.
     pub header_len: usize,
     /// Capture-limitation markers surfaced on the span.
     pub limitations: Vec<&'static str>,
 }
 
 /// Incremental parser for one direction of a connection (request or response). Accumulates bytes and carves off completed messages.
+///
+/// A peer that is not speaking HTTP, a header block over `max_headers`, a
+/// chunk size over `MAX_CHUNK_SIZE`, or unconsumed input past the stream
+/// buffer ceiling latches the stream off (see `disabled_reason`); every later
+/// byte is ignored.
 pub struct Http1Stream {
     buf: Vec<u8>,
     /// Read cursor into `buf`. Bytes before it are consumed; the prefix is
@@ -130,7 +154,34 @@ enum Framing {
     None,
 }
 
+impl std::fmt::Debug for Http1Stream {
+    /// Prints sizes and state only: the buffer and any message in flight hold
+    /// captured traffic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (state, body_len) = match &self.state {
+            State::Headers => ("headers", None),
+            State::Body { msg, .. } => ("body", Some(msg.body.len())),
+            State::UntilClose { msg, .. } => ("until_close", Some(msg.body.len())),
+            State::Chunked { msg, .. } => ("chunked", Some(msg.body.len())),
+            State::Tunnel => ("tunnel", None),
+            State::Disabled(_) => ("disabled", None),
+        };
+        f.debug_struct("Http1Stream")
+            .field("is_request", &self.is_request)
+            .field("state", &state)
+            .field("body_len_in_flight", &body_len)
+            .field("buffered_len", &self.buffered_len())
+            .field("bytes_scanned", &self.bytes_scanned)
+            .field("disabled_reason", &self.disabled_reason())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Http1Stream {
+    /// A parser for one direction, starting before any header block.
+    /// `is_request` picks request or response start-line parsing; `limits`
+    /// supplies `max_headers`, `max_stream_buffer_bytes` and the
+    /// per-content-type body caps.
     pub fn new(is_request: bool, limits: Limits) -> Self {
         Self {
             buf: Vec::new(),
@@ -191,6 +242,7 @@ impl Http1Stream {
     }
 
     /// Accumulates bytes and returns zero or more completed messages (handles keep-alive).
+    #[must_use = "the returned messages are the only record of the bytes this call consumed"]
     pub fn feed(&mut self, data: &[u8]) -> Vec<ParsedHttp> {
         if matches!(self.state, State::Disabled(_) | State::Tunnel) {
             return Vec::new();
@@ -263,11 +315,12 @@ impl Http1Stream {
     /// * anything else still in flight comes back as what arrived, `truncated`
     ///   and `incomplete`: a Content-Length not reached, a chunked body short
     ///   of its last chunk, an unframed body whose end nobody saw. A chunked
-    ///   body that DID get its last chunk and lost only the trailer section is
+    ///   body that did get its last chunk and lost only the trailer section is
     ///   whole: no body byte is missing.
     ///
     /// None for a request, for a header block that never completed (no
     /// response was observed), and when no message is in flight.
+    #[must_use = "the returned message is the only record of the body bytes in flight, which this call drops"]
     pub fn finish(&mut self, peer_closed: bool) -> Option<ParsedHttp> {
         if self.is_request {
             return None;
@@ -598,7 +651,7 @@ fn body_cap(headers: &[(String, String)], limits: &Limits) -> usize {
     cap_for_content_type(None, limits)
 }
 
-fn request_to_parsed(req: &httparse::Request) -> ParsedHttp {
+fn request_to_parsed(req: &httparse::Request<'_, '_>) -> ParsedHttp {
     ParsedHttp {
         is_request: true,
         method: req.method.map(str::to_string),
@@ -614,7 +667,7 @@ fn request_to_parsed(req: &httparse::Request) -> ParsedHttp {
     }
 }
 
-fn response_to_parsed(resp: &httparse::Response) -> ParsedHttp {
+fn response_to_parsed(resp: &httparse::Response<'_, '_>) -> ParsedHttp {
     ParsedHttp {
         is_request: false,
         method: None,
@@ -630,7 +683,7 @@ fn response_to_parsed(resp: &httparse::Response) -> ParsedHttp {
     }
 }
 
-fn collect_headers(headers: &[httparse::Header]) -> Vec<(String, String)> {
+fn collect_headers(headers: &[httparse::Header<'_>]) -> Vec<(String, String)> {
     headers
         .iter()
         .filter(|h| !h.name.is_empty())
@@ -722,16 +775,16 @@ mod tests {
     fn idle_only_between_messages() {
         let mut s = Http1Stream::new(true, Limits::default());
         assert!(s.is_idle(), "an untouched stream");
-        s.feed(b"POST /a HTTP/1.1\r\nContent-Le");
+        assert!(s.feed(b"POST /a HTTP/1.1\r\nContent-Le").is_empty());
         assert!(!s.is_idle(), "inside a header block");
-        s.feed(b"ngth: 4\r\n\r\nab");
+        assert!(s.feed(b"ngth: 4\r\n\r\nab").is_empty());
         assert!(!s.is_idle(), "inside a body, with nothing buffered");
         assert_eq!(s.feed(b"cd").len(), 1);
         assert!(s.is_idle(), "the message completed at the end of the feed");
         // A message that ends inside a feed, with the next one's first bytes after it.
         assert_eq!(s.feed(b"GET /b HTTP/1.1\r\n\r\nGE").len(), 1);
         assert!(!s.is_idle(), "the next request began in the same feed");
-        s.feed(b"\x00 not http\r\n\r\n");
+        assert!(s.feed(b"\x00 not http\r\n\r\n").is_empty());
         assert!(s.disabled_reason().is_some());
         assert!(!s.is_idle(), "a disabled stream");
     }
@@ -740,13 +793,17 @@ mod tests {
     fn method_in_flight_names_a_request_whose_body_is_arriving() {
         let mut s = Http1Stream::new(true, Limits::default());
         assert_eq!(s.method_in_flight(), None);
-        s.feed(b"PUT /a HTTP/1.1\r\nContent-Le");
+        assert!(s.feed(b"PUT /a HTTP/1.1\r\nContent-Le").is_empty());
         assert_eq!(s.method_in_flight(), None, "inside a header block");
-        s.feed(b"ngth: 4\r\n\r\nab");
+        assert!(s.feed(b"ngth: 4\r\n\r\nab").is_empty());
         assert_eq!(s.method_in_flight(), Some("PUT"));
-        s.feed(b"cdPOST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n");
+        assert_eq!(
+            s.feed(b"cdPOST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n")
+                .len(),
+            1
+        );
         assert_eq!(s.method_in_flight(), Some("POST"), "a chunked body");
-        s.feed(b"ok\r\n0\r\n\r\n");
+        assert_eq!(s.feed(b"ok\r\n0\r\n\r\n").len(), 1);
         assert_eq!(s.method_in_flight(), None, "between messages");
     }
 
@@ -782,7 +839,7 @@ mod tests {
 
     #[test]
     fn the_peers_eof_returns_an_unframed_body_whole() {
-        // Neither Content-Length nor chunked: the peer's EOF IS the framing, so
+        // Neither Content-Length nor chunked: the peer's EOF is itself the framing, so
         // the body that arrived is the whole body, across however many reads.
         let mut s = Http1Stream::new(false, Limits::default());
         assert_eq!(
@@ -1012,14 +1069,16 @@ mod tests {
         // torn CRLF. The bound is one read, so retaining even two would fail.
         let raw = chunked_response(4 * 1024 * 1024);
         let mut s = Http1Stream::new(false, Limits::default());
+        let mut completed = 0;
         for part in raw.chunks(64 * 1024) {
-            s.feed(part);
+            completed += s.feed(part).len();
             assert!(
                 s.buffered_len() < 64 * 1024,
                 "buffer grew to {}",
                 s.buffered_len()
             );
         }
+        assert_eq!(completed, 1, "the whole body completes one response");
     }
 
     #[test]
@@ -1417,7 +1476,7 @@ mod tests {
         // The whole point of capping rather than disabling: a large transfer must
         // not cost us the next request on a pooled connection. This exercises the
         // opaque-cap path specifically, not just the generous cap used by the
-        // pre-existing body_cap_truncates_but_framing_keeps_advancing test.
+        // body_cap_truncates_but_framing_keeps_advancing test.
         let limits = Limits {
             max_opaque_body_bytes: 4,
             ..Default::default()
@@ -1479,9 +1538,11 @@ mod tests {
         // A valid status line, then a header block that never reaches the
         // blank line ending it — httparse keeps returning Partial forever, so
         // only the stream-buffer ceiling (not a parse error) can end this.
-        s.feed(b"HTTP/1.1 200 OK\r\n");
+        assert!(s.feed(b"HTTP/1.1 200 OK\r\n").is_empty());
         for _ in 0..100 {
-            s.feed(b"X-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+            assert!(s
+                .feed(b"X-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n")
+                .is_empty());
         }
         assert_eq!(s.disabled_reason(), Some("stream_buffer_exceeded"));
         assert!(s.buffered_len() <= 1024);
@@ -1618,5 +1679,17 @@ mod tests {
         let mut s = Http1Stream::new(false, limits);
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 10\r\n\r\n0123456789";
         assert_eq!(s.feed(raw)[0].body, b"0123456789");
+    }
+
+    #[test]
+    fn debug_output_shows_sizes_not_captured_bytes() {
+        let mut s = Http1Stream::new(true, Limits::default());
+        let msgs =
+            s.feed(b"POST /q?planted-secret-7f3a HTTP/1.1\r\nContent-Length: 40\r\n\r\nplanted-secret-7f3a");
+        assert!(msgs.is_empty());
+        let shown = format!("{s:?}");
+        assert!(!shown.contains("planted-secret-7f3a"), "{shown}");
+        assert!(!shown.contains("112, 108, 97"), "{shown}");
+        assert!(shown.contains("body_len_in_flight: Some(19)"), "{shown}");
     }
 }

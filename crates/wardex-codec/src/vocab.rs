@@ -6,7 +6,7 @@
 //! what already travels in `Span.extra`. Something has to turn it into a number.
 //!
 //! Doing that with a hand-written `match` table is how a vocabulary drifts. The
-//! table is a SECOND declaration of a list the `.proto` already declares, and
+//! table is a second declaration of a list the `.proto` already declares, and
 //! nothing makes the compiler compare the two — a member added to one and
 //! forgotten in the other compiles, ships, and silently flattens to
 //! `UNSPECIFIED` on the wire. At the size `Limitation` has already reached
@@ -15,9 +15,9 @@
 //! prost generates `from_str_name` / `as_str_name` from the schema itself, so
 //! deriving the proto value name mechanically — `PREFIX` + `_` + the uppercased
 //! wardex value — leaves exactly one declaration of the vocabulary: the
-//! `.proto` file. That is what design §6.6 means by "proto is the single source
-//! of truth"; a second SDK in another language generates from the same file and
-//! gets the same table for free.
+//! `.proto` file. The proto is the single source of truth: a second SDK in
+//! another language generates from the same file and gets the same table for
+//! free.
 //!
 //! The naming convention this relies on is not incidental — proto3 file-level
 //! enum values share the package namespace, so the prefix is mandatory anyway.
@@ -50,10 +50,11 @@ fn wardex_value(prefix: &str, name: &str) -> String {
 ///
 /// The encode direction returns `Option` on purpose. Collapsing "I do not know
 /// this value" into `UNSPECIFIED` is the silent coercion this module exists to
-/// prevent (design I4); who fills that hole, and with what, is the caller's
-/// decision because it differs per vocabulary — `Limitation` has a dedicated
-/// `VOCABULARY_UNMAPPED` value to carry the fact, most others have nothing
-/// better than `UNSPECIFIED` and should say so at the call site.
+/// prevent, because it reports a value nobody observed; who fills that hole,
+/// and with what, is the caller's decision because it differs per
+/// vocabulary — `Limitation` has a dedicated `VOCABULARY_UNMAPPED` value to
+/// carry the fact, most others have nothing better than `UNSPECIFIED` and
+/// should say so at the call site.
 macro_rules! closed_vocabulary {
     ($enum_ty:ty, $prefix:literal, $to_proto:ident, $to_wardex:ident, $doc:literal) => {
         #[doc = $doc]
@@ -203,21 +204,18 @@ mod tests {
         }
     }
 
-    /// The whole vocabulary, round-tripped by number, with the band DERIVED
+    /// The whole vocabulary, round-tripped by number, with the band derived
     /// from the schema rather than restated here. A member added with a name
     /// that breaks the convention fails here rather than flattening to
     /// UNSPECIFIED on a user's wire.
     ///
-    /// The `1..=N` literal this used to iterate — plus the count it asserted
-    /// and the two counts in the prose around it — was a second declaration of
-    /// the vocabulary's SIZE, in the one module whose entire purpose is that
-    /// the vocabulary is declared once. Every member added had to find those
-    /// sites by hand, which is the drift this file exists to prevent wearing
-    /// the clothes of a guard against it. prost's `try_from` already knows
-    /// which numbers the schema declares, and the META value opens the band
-    /// above the vocabulary, so both ends of the range come off the enum.
+    /// A literal `1..=N` range here would be a second declaration of the
+    /// vocabulary's size, in the one module whose purpose is that the
+    /// vocabulary is declared once. prost's `try_from` already knows which
+    /// numbers the schema declares, and the META value opens the band above
+    /// the vocabulary, so both ends of the range come off the enum.
     ///
-    /// The COUNT and the contiguity of that band stay pinned, once, where the
+    /// The count and the contiguity of that band stay pinned, once, where the
     /// two sides are compared: `tests/test_wire_vocabulary.py`.
     #[test]
     fn every_limitation_round_trips() {
@@ -268,7 +266,7 @@ mod tests {
     }
 
     /// `VOCABULARY_UNMAPPED` is a META value, not vocabulary. It must be
-    /// reachable for decode (a newer SDK can send it) and must NOT sit inside
+    /// reachable for decode (a newer SDK can send it) and must not sit inside
     /// the contiguous low band a consumer iterates as "the vocabulary" — which
     /// is also what lets `every_limitation_round_trips` read that band's upper
     /// end off this value instead of restating it.

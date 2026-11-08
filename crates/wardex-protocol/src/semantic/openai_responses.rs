@@ -1,24 +1,29 @@
 //! OpenAI Responses API: request/response fill and SSE reassembly.
 //!
 //! The default path of the openai-agents SDK (`Runner.run` == one
-//! `POST /v1/responses`), invisible before this module existed: non-streaming
-//! calls yielded no semantics at all, and streams were re-shaped by the Chat
-//! reassembler into a fabricated empty chat body.
+//! `POST /v1/responses`).
 //!
-//! Streaming truth (design §3.1): a terminal event
-//! (`response.completed|incomplete|failed`) carries the COMPLETE `Response`
+//! Streaming truth: a terminal event
+//! (`response.completed|incomplete|failed`) carries the complete `Response`
 //! object, so its snapshot is the body and deltas are only a fallback. An
 //! in-stream `error` event is the third terminal form — the only bytes that
 //! name the failure — and is preserved into the synthetic body rather than
 //! dropped.
 
+use serde::Deserialize;
+
 use super::event_json::{carries_nothing, parse_event};
-use super::parts::*;
+use super::parts::{
+    blob_part, build_input_messages, build_output_messages, build_system_instructions,
+    declared_error_class, declared_error_type, file_part, generic_part, modality_from_mime,
+    normalize_finish_reason, parse_data_url, reasoning_part, server_tool_call_part,
+    server_tool_call_response_part, text_part, tool_call_part, tool_call_response_part, uri_part,
+    InMsg, OutMsg, Reassembled,
+};
 use super::usage::{flatten_usage, UsageBounds, UsageView};
 use super::LlmSemantics;
 use crate::sse::SseEvent;
 use crate::usage::{InputConvention, TokenUsage};
-use serde::Deserialize;
 
 // Normalization table: LlmSemantics usage field <- dotted path in the raw
 // usage Value (semconv openai.md maps cache_read to
@@ -28,10 +33,10 @@ const P_INPUT: &str = "input_tokens";
 const P_OUTPUT: &str = "output_tokens";
 const P_CACHE_READ: &str = "input_tokens_details.cached_tokens";
 const P_REASONING: &str = "output_tokens_details.reasoning_tokens";
-// Read by the fixture test (`every_normalized_usage_path_is_extracted_
-// from_its_fixture`), not by the runtime path — the runtime reads the
-// P_* consts the table is built from, which makes the two one string.
-#[cfg_attr(not(test), allow(dead_code))]
+// Read only by the fixture test (`every_normalized_usage_path_is_extracted_
+// from_its_fixture`); the runtime reads the P_* consts the table is built
+// from, which makes the two one string.
+#[cfg(test)]
 pub(super) const NORMALIZED_USAGE_PATHS: &[(&str, &str)] = &[
     ("input_tokens", P_INPUT),
     ("output_tokens", P_OUTPUT),
@@ -39,7 +44,7 @@ pub(super) const NORMALIZED_USAGE_PATHS: &[(&str, &str)] = &[
     ("reasoning_output_tokens", P_REASONING),
 ];
 
-/// Output item types the CLIENT executes — their presence is what turns a
+/// Output item types the client executes — their presence is what turns a
 /// `completed` status into `finish_reasons=["tool_call"]`.
 const CLIENT_TOOL_TYPES: &[&str] = &[
     "function_call",
@@ -135,7 +140,7 @@ pub(super) fn fill_openai_responses(
         // from it would be fabricated: `status="failed"`,
         // `finish_reasons=["error"]` and an empty assistant output message
         // the provider never sent. The sibling endpoints ship an HTTP error
-        // with the response half EMPTY (`test_llm_error_spans` pins it), and
+        // with the response half empty (`test_llm_error_spans.py` pins it), and
         // this endpoint does the same. Every real terminal snapshot carries
         // id/status/output, and a reassembled stream is a Response by
         // construction — an HTTP error envelope is never an event stream — so
@@ -164,7 +169,7 @@ pub(super) fn fill_openai_responses(
             out.usage_leaves = flat.leaves;
             out.usage_dropped_count = flat.dropped;
         }
-        // Output items -> ONE assistant OutMsg, item order preserved. A
+        // Output items -> a single assistant OutMsg, item order preserved. A
         // `message` item carrying another role (a compaction echoes the
         // caller's own messages) becomes its own OutMsg in `pre` instead:
         // the model never said those words.
@@ -181,7 +186,7 @@ pub(super) fn fill_openai_responses(
         // status -> finish_reasons, all through the one normalizer. An
         // `error` object is the provider's own failure declaration and wins
         // over whatever raw status the (possibly synthetic) body carried —
-        // but only on a body that IS a Response object (see above): a bare
+        // but only on a body that is a Response object (see above): a bare
         // error envelope gets no response half at all.
         if is_response_object {
             // The declared failure, classified: the seam makes the span ERROR
@@ -211,7 +216,7 @@ pub(super) fn fill_openai_responses(
                         .and_then(|d| d.get("reason"))
                         .and_then(|x| x.as_str())
                         .map(|reason| normalize_finish_reason("openai", reason)),
-                    Some("failed") | Some("cancelled") => {
+                    Some("failed" | "cancelled") => {
                         Some(normalize_finish_reason("openai", "failed"))
                     }
                     _ => None, // queued | in_progress | absent: not finished
@@ -261,7 +266,7 @@ pub(super) fn fill_openai_responses(
 }
 
 /// How the provider classified the failure a Responses body declares. A
-/// Response object's `error` is `{code, message}`. The `error` STREAM event,
+/// Response object's `error` is `{code, message}`. The `error` stream event,
 /// which the reassembler keeps whole in that place, comes flat —
 /// `{"type":"error","code":...,"message":...}`, where `type` is the event's
 /// own name and no class, so only its `code` is read — or wraps the error
@@ -276,8 +281,8 @@ fn responses_error_type(err: &serde_json::Value) -> String {
     }
 }
 
-/// One output item -> OTel parts (design §4.4 table). Unknown types become a
-/// generic part AND set the unmapped flag — never silently skipped. A
+/// One output item -> OTel parts. Unknown types become a
+/// generic part and set the unmapped flag — never silently skipped. A
 /// `message` item whose `role` is not `assistant` goes to `pre` as its own
 /// message rather than into the assistant's `parts`; `input_text` is text
 /// only under such a role (a compaction echoes the caller's blocks), so an
@@ -529,7 +534,8 @@ fn input_item_to_msgs(
         }
         (Some("item_reference"), _) => {
             // The content lives on the server; the prompt cannot be fully
-            // reconstructed from these bytes — exactly what marker 30 means.
+            // reconstructed from these bytes — exactly what the
+            // `input_messages_has_unmapped` marker means.
             out.input_messages_has_unmapped = true;
             msgs.push(InMsg {
                 role: "assistant".to_string(),
@@ -604,7 +610,7 @@ fn responses_content_to_parts(
 
 pub(super) fn reassemble_responses(events: &[SseEvent]) -> Reassembled {
     use std::collections::BTreeMap;
-    // Terminal snapshot: the LAST of completed|incomplete|failed wins.
+    // Terminal snapshot: the last of completed|incomplete|failed wins.
     let mut terminal: Option<serde_json::Value> = None;
     let mut error: Option<serde_json::Value> = None;
     // Fallback state.
@@ -721,7 +727,7 @@ pub(super) fn reassemble_responses(events: &[SseEvent]) -> Reassembled {
         }
     }
 
-    // 1. Terminal snapshot IS the body — same source as a non-streaming
+    // 1. The terminal snapshot is the body — same source as a non-streaming
     //    response, annotations, status and usage included.
     if let Some(snapshot) = terminal {
         return Reassembled {
