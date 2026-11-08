@@ -1,11 +1,11 @@
 //! One export → the requests a receiver will actually accept.
 //!
-//! [`super::map`] decides what a span MEANS and [`super::encode_traces`]
+//! [`super::map`] decides what a span means and [`super::encode_traces`]
 //! serializes it; this decides how many POSTs the result has to become. It is
 //! the third thing an export needs and the only one whose answer depends on a
 //! number the backend owns rather than on anything in the span.
 //!
-//! Why it cannot be left to the receiver: an OTLP request is rejected WHOLE. A
+//! Why it cannot be left to the receiver: an OTLP request is rejected whole. A
 //! collector over its body limit answers 413 (or its gRPC front end answers
 //! RESOURCE_EXHAUSTED) and nothing in the request is stored, so one oversized
 //! batch costs every span in it — including the small ones that were never the
@@ -13,11 +13,10 @@
 //! the only case that still loses anything is a single span that cannot be made
 //! to fit, which is counted rather than swallowed.
 
-use wardex_limits::Limits;
-
 use super::map;
 use super::otlp_pb;
 use crate::{gzip, CodecError};
+use wardex_limits::Limits;
 
 /// One export, as the request bodies that will be POSTed.
 #[derive(Debug, Default)]
@@ -40,7 +39,7 @@ pub struct Requests {
 /// Encode an export, splitting it into as many bodies as
 /// `limits.max_otlp_request_bytes` requires.
 ///
-/// BOTH sizes are measured against the cap — the body as it goes on the wire
+/// Both sizes are measured against the cap — the body as it goes on the wire
 /// and the message it decompresses to — because a receiver checks both. gRPC
 /// rejects a frame over `max_receive_message_length` and then rejects what it
 /// decompresses to for the same reason; the collector's HTTP receiver applies
@@ -51,14 +50,14 @@ pub struct Requests {
 /// several-fold, so a 40 MiB export that compresses under 4 MiB would go out
 /// whole and be rejected whole.
 ///
-/// Never an ESTIMATE, in either direction: both numbers come from actually
+/// Never an estimate, in either direction: both numbers come from actually
 /// encoding and actually compressing, so nothing here can disagree with what
 /// the receiver measures.
 ///
 /// The cost of that honesty is an encode per attempt, so the shape of the
 /// algorithm matters. Two things keep it near one pass: the whole export is
 /// tried first, so a batch that fits — nearly every batch — costs one encode
-/// and no split at all; and a node already over the cap UNCOMPRESSED is never
+/// and no split at all; and a node already over the cap uncompressed is never
 /// compressed, because gzip cannot rescue a message whose decompressed size is
 /// the thing being rejected. Compression therefore runs only on bodies that
 /// will be sent, once each, whatever depth the split reached.
@@ -152,31 +151,33 @@ fn emit(
         }
         Fit::Over(size) => size,
     };
-    let mut spans = Template::reclaim(req);
-    if spans.len() == 1 {
-        let mut span = spans.pop().expect("length was just checked");
-        // The payload is what makes a span large, and a span is worth more than
-        // its payload: dropping it keeps the node in the trace, its parent edge,
-        // its timing and its semantics, and says on the span itself what was
-        // removed.
-        let removed = map::drop_payload_attributes(&mut span);
-        match fit(&template.request(vec![span]), cap, compress)? {
-            Fit::Fits(body) => {
-                out.bodies.push(body);
-                // Counted for the same reason `dropped_spans` is: the marker
-                // reaches whoever reads the span, and nobody who does not.
-                if removed {
-                    out.payload_dropped_spans += 1;
+    // A lone span cannot be split further; it is the one case handled here.
+    let spans = match <[otlp_pb::trace::Span; 1]>::try_from(Template::reclaim(req)) {
+        Ok([mut span]) => {
+            // The payload is what makes a span large, and a span is worth more than
+            // its payload: dropping it keeps the node in the trace, its parent edge,
+            // its timing and its semantics, and says on the span itself what was
+            // removed.
+            let removed = map::drop_payload_attributes(&mut span);
+            match fit(&template.request(vec![span]), cap, compress)? {
+                Fit::Fits(body) => {
+                    out.bodies.push(body);
+                    // Counted for the same reason `dropped_spans` is: the marker
+                    // reaches whoever reads the span, and nobody who does not.
+                    if removed {
+                        out.payload_dropped_spans += 1;
+                    }
                 }
+                // A span whose metadata alone will not fit — a pathological name or
+                // an event list past the cap. Counted, so the caller can say one
+                // span was lost rather than let a batch quietly arrive short.
+                Fit::Over(_) => out.dropped_spans += 1,
             }
-            // A span whose METADATA alone will not fit — a pathological name or
-            // an event list past the cap. Counted, so the caller can say one
-            // span was lost rather than let a batch quietly arrive short.
-            Fit::Over(_) => out.dropped_spans += 1,
+            return Ok(());
         }
-        return Ok(());
-    }
-    // Fan out in ONE step from the measurement already paid for, rather than
+        Err(spans) => spans,
+    };
+    // Fan out in one step from the measurement already paid for, rather than
     // bisecting. Halving looks cheaper and is not: every level re-encodes the
     // same N bytes, so depth d costs d+1 full passes over the whole batch, and
     // the depth is reachable — a full 64 MiB buffer against the 4 MiB default
@@ -207,7 +208,7 @@ enum Fit {
 
 /// Encode, compress if asked, and answer whether a receiver would take it.
 ///
-/// The uncompressed size is checked FIRST and the compression pass is skipped
+/// The uncompressed size is checked first and the compression pass is skipped
 /// when it already fails, which is both halves of the point. A receiver
 /// enforces its ceiling on the decompressed message as well as on the body, so
 /// a batch that gzips under the cap from far above it is rejected anyway;
@@ -252,7 +253,11 @@ mod tests {
                         // Random-ish so gzip cannot collapse the batch to
                         // nothing and make the split untestable.
                         (0..payload)
-                            .map(|i| char::from(b'a' + ((i * 7 + id as usize) % 26) as u8))
+                            .map(|i| {
+                                let offset = u8::try_from((i * 7 + usize::from(id)) % 26)
+                                    .expect("a remainder below 26 fits in u8");
+                                char::from(b'a' + offset)
+                            })
                             .collect(),
                     )),
                 }),
@@ -398,7 +403,7 @@ mod tests {
         // compressed size is the dangerous half: OTLP payload attributes are
         // base64 text and gzip several-fold, so a batch far over a collector's
         // decompressed ceiling fits under it compressed, goes out as one
-        // request, and is rejected WHOLE — every span in it lost, which is the
+        // request, and is rejected whole — every span in it lost, which is the
         // outcome splitting exists to avoid.
         let spans: Vec<Span> = (1..=8).map(|i| payload_span(i, 4000)).collect();
         let out = encode_requests(request(spans), limits_with_request_cap(8_000), true).unwrap();
@@ -420,7 +425,7 @@ mod tests {
         let spans: Vec<Span> = (1..=8).map(|i| payload_span(i, 4000)).collect();
         let whole = super::super::encode_traces(&request(spans.clone())).unwrap();
         assert!(
-            crate::gzip(&whole).unwrap().len() <= 8_000,
+            gzip(&whole).unwrap().len() <= 8_000,
             "not the case under test"
         );
         let out = encode_requests(request(spans), limits_with_request_cap(8_000), true).unwrap();
@@ -510,7 +515,7 @@ mod tests {
 
     #[test]
     fn a_span_that_cannot_fit_even_bare_is_dropped_alone() {
-        // The cap is below what the span's NAME costs, so nothing survives it.
+        // The cap is below what the span's name costs, so nothing survives it.
         // Every other span in the batch still has to reach the wire — the whole
         // point of splitting is that one bad span is not a lost batch.
         let mut giant = payload_span(1, 10);

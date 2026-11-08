@@ -5,21 +5,22 @@
 //! silencing the lint for the whole crate — mirrors the `codec` module's use
 //! of the same attribute for the same reason.
 
-// In the trampoline code generated when the pyo3 #[pyfunction] macro wraps a function
-// returning `PyResult<T>`, clippy mistakes the `?`'s `From<PyErr> for PyErr` (identity)
-// conversion for a useless conversion
-// (a pre-existing pyo3 0.22 issue; a function-level #[allow] can't cover macro-generated sibling items).
-#![allow(clippy::useless_conversion)]
+// Module-wide because the flagged code is the sibling items the macro
+// generates, which an attribute on the function itself does not reach.
+#![expect(
+    clippy::useless_conversion,
+    reason = "the pyfunction and pymethods macros of PyO3 0.22 expand to a conversion of PyErr into PyErr; remove after upgrading PyO3"
+)]
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::wrap_pyfunction;
-use wardex_limits::Limits;
 
 use crate::shield::shielded;
+use wardex_limits::Limits;
 
 /// Python-visible resource limits. Unspecified fields keep the core default.
-#[pyclass(name = "Limits")]
+#[pyclass(name = "Limits", frozen)]
 #[derive(Clone, Copy)]
 pub(crate) struct PyLimits {
     pub(crate) inner: Limits,
@@ -40,7 +41,10 @@ impl PyLimits {
         zstd_level=None, max_otlp_attribute_bytes=None, max_otlp_request_bytes=None,
         max_link_targets=None
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per Python keyword: the signature is the Python API, and every limit is optional by name"
+    )]
     fn new(
         max_headers: Option<usize>,
         max_body_bytes: Option<usize>,

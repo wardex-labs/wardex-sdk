@@ -1,17 +1,18 @@
 //! OpenAI Embeddings: request/response fill.
 
+use serde::Deserialize;
+
 use super::usage::{flatten_usage, UsageBounds, UsageView};
 use super::LlmSemantics;
 use crate::usage::{InputConvention, TokenUsage};
-use serde::Deserialize;
 
 // Normalization table: LlmSemantics usage field <- dotted path in the raw
 // usage Value (see `openai_chat.rs` — same contract, one entry).
 const P_INPUT: &str = "prompt_tokens";
-// Read by the fixture test (`every_normalized_usage_path_is_extracted_
-// from_its_fixture`), not by the runtime path — the runtime reads the
-// P_* consts the table is built from, which makes the two one string.
-#[cfg_attr(not(test), allow(dead_code))]
+// Read only by the fixture test (`every_normalized_usage_path_is_extracted_
+// from_its_fixture`); the runtime reads the P_* consts the table is built
+// from, which makes the two one string.
+#[cfg(test)]
 pub(super) const NORMALIZED_USAGE_PATHS: &[(&str, &str)] = &[("input_tokens", P_INPUT)];
 
 /// `encoding_format`: a single string or an array of strings.
@@ -46,8 +47,8 @@ pub(super) fn fill_openai_embeddings(
     resp: &[u8],
     bounds: UsageBounds,
 ) {
-    // `output_type` stays None: an embeddings response is vectors, and the
-    // old unconditional `"text"` stamp was a false claim on every one.
+    // `output_type` stays None: an embeddings response is vectors, and a
+    // `"text"` stamp would be a false claim on every one.
     if let Ok(r) = serde_json::from_slice::<OpenAIEmbeddingsResponse>(resp) {
         out.response_model = r.model;
         if let Some(u) = r.usage {

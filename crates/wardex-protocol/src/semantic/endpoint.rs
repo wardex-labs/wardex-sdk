@@ -1,21 +1,23 @@
 //! Endpoint recognition: which provider API a transaction spoke, from the
-//! path's LAST segments, from the response body's shape, or from the SSE
-//! event grammar. Replaces two substring checks whose false positives were
-//! real defects: `path.contains("/messages")` classified
+//! path's last segments, from the response body's shape, or from the SSE
+//! event grammar. Segments rather than substrings, because a substring check
+//! misreads real paths: `path.contains("/messages")` would classify
 //! `/v1/messages/count_tokens` and `/v1/messages/batches` as chat calls (a
-//! false `semantic_parse_failed` on every one), and the missing `/v1/responses`
-//! row sent Responses SSE through the Chat reassembler, which fabricated an
-//! empty chat body.
+//! false `semantic_parse_failed` on every one). Every API has its own row, so
+//! Responses SSE never reaches the Chat reassembler, which would fabricate an
+//! empty chat body out of it.
 //!
 //! Two wider questions live beside the LLM table: `treatment` classifies a
-//! provider path that is NOT an LLM call (provider-owned state to keep as
+//! provider path that is not an LLM call (provider-owned state to keep as
 //! plain HTTP, or a telemetry upload to exclude), and `ws_upgrade` says
 //! whether a WebSocket upgrade on an LLM path may carry LLM calls.
+
+use Seg::{Any, Lit};
 
 /// Which provider API shape the transaction used. Not the same axis as the
 /// provider label: a gateway can serve an OpenAI-shaped API from any host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Api {
+pub(crate) enum Api {
     OpenAiChatCompletions,
     OpenAiResponses,
     OpenAiEmbeddings,
@@ -34,16 +36,16 @@ impl Api {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Endpoint {
-    pub api: Api,
+pub(crate) struct Endpoint {
+    pub(crate) api: Api,
     /// wardex operation vocabulary: `"chat"` | `"embeddings"`.
-    pub operation: &'static str,
+    pub(crate) operation: &'static str,
     /// semconv `openai.api.type`; None for non-OpenAI APIs.
-    pub api_type: Option<&'static str>,
+    pub(crate) api_type: Option<&'static str>,
     /// This API has a WebSocket transport on the same path; the seam may
     /// treat a WS upgrade here as an LLM connection — only after
     /// corroboration, see `ws_upgrade`.
-    pub ws_transport: bool,
+    pub(crate) ws_transport: bool,
 }
 
 /// One segment of a path pattern: a literal, or any single segment (a
@@ -55,9 +57,7 @@ enum Seg {
     Any,
 }
 
-use Seg::{Any, Lit};
-
-/// Does `pattern` match the LAST segments of `segments`?
+/// Does `pattern` match the last segments of `segments`?
 fn suffix_matches(segments: &[&str], pattern: &[Seg]) -> bool {
     if segments.len() < pattern.len() {
         return false;
@@ -69,7 +69,7 @@ fn suffix_matches(segments: &[&str], pattern: &[Seg]) -> bool {
     })
 }
 
-/// Matched against the path's LAST segments — query, fragment and trailing
+/// Matched against the path's last segments — query, fragment and trailing
 /// `/` stripped, then split on `/`. Gateway prefixes (`/openai/v1/...`,
 /// `/proxy/...`) pass through; sub-resources (`/v1/responses/{id}`,
 /// `/v1/messages/count_tokens`, `/v1/messages/batches`) do not match.
@@ -96,7 +96,7 @@ const ENDPOINTS: &[(&[Seg], Endpoint)] = &[
     // Same parser and label as /responses; a `CompactedResponse` carries no
     // `status`, so finish_reasons/response_status stay empty, and its echoed
     // user messages keep their role (parts.rs `OutMsg.role`) rather than
-    // becoming the model's words. Listed AFTER the /responses row so
+    // becoming the model's words. Listed after the /responses row so
     // `lookup(Api::OpenAiResponses)` keeps answering with /responses.
     (
         &[Lit("responses"), Lit("compact")],
@@ -136,9 +136,9 @@ fn segments_of(path: &str) -> Vec<&str> {
 }
 
 /// The path-based decision. Conservative by design: a non-matching path is
-/// None, never a guess (body-shape capture on arbitrary paths is the
-/// compat-gateway follow-up, not this table's job).
-pub fn from_path(path: &str) -> Option<Endpoint> {
+/// None, never a guess (body-shape capture on arbitrary paths is not this
+/// table's job).
+pub(crate) fn from_path(path: &str) -> Option<Endpoint> {
     endpoint_of(&segments_of(path))
 }
 
@@ -161,7 +161,7 @@ pub enum Treatment {
     /// non-LLM capture rule, and a refusal is counted.
     ProviderState,
     /// A telemetry upload (`/v1/traces/ingest`): the caller's own run
-    /// record on its way to a tracing backend. Telemetry ABOUT the agent,
+    /// record on its way to a tracing backend. Telemetry about the agent,
     /// not agent activity — never captured, in any mode, above any
     /// allowlist; counted.
     Excluded,
@@ -220,7 +220,7 @@ pub enum WsUpgrade {
 }
 
 /// The provider's own API hosts: the apex API host or any subdomain of the
-/// provider's domain. Deliberately NOT the substring test the provider
+/// provider's domain. Deliberately not the substring test the provider
 /// label uses (`provider_from_host`): a label is a hint on a span, but this
 /// answer makes a bare WebSocket ship under the default mode with payload
 /// samples, and `openai-mock.corp` speaking its own protocol on
@@ -256,11 +256,11 @@ pub fn ws_upgrade(host: &str, path: &str) -> Option<WsUpgrade> {
     }
 }
 
-/// The body-shape decision, for PROVIDER inference when the host says
+/// The body-shape decision, for provider inference when the host says
 /// nothing. Order is load-bearing: a Responses body carries
 /// `usage.input_tokens` too, so the Responses check must run before the
 /// Anthropic one.
-pub fn from_body_shape(body: &serde_json::Value) -> Option<Endpoint> {
+pub(crate) fn from_body_shape(body: &serde_json::Value) -> Option<Endpoint> {
     let obj = body.as_object()?;
     let is = |name: &str| obj.get("object").and_then(|o| o.as_str()) == Some(name);
     // 1. Responses: object == "response" (or a compaction's
@@ -311,7 +311,7 @@ fn is_type(obj: &serde_json::Map<String, serde_json::Value>, name: &str) -> bool
 
 /// The SSE-grammar decision: `response.*` event types are the Responses API,
 /// `message_start` is Anthropic, a `choices` payload is Chat Completions.
-pub fn from_sse_shape(events: &[crate::sse::SseEvent]) -> Option<Endpoint> {
+pub(crate) fn from_sse_shape(events: &[crate::sse::SseEvent]) -> Option<Endpoint> {
     for ev in events {
         if let Some(name) = ev.event.as_deref() {
             if name.starts_with("response.") {
@@ -346,7 +346,7 @@ fn lookup(api: Api) -> Option<Endpoint> {
 mod tests {
     use super::*;
 
-    /// T-R12 — the last-segment table: gateway prefixes pass, sub-resources
+    /// The last-segment table: gateway prefixes pass, sub-resources
     /// and sibling operations do not.
     #[test]
     fn path_table_accepts_endpoints_and_rejects_subresources() {
@@ -423,7 +423,7 @@ mod tests {
             ws_upgrade("eu.api.openai.com", "/v1/responses"),
             Some(WsUpgrade::KnownProvider)
         );
-        // A host that merely CONTAINS the provider's name is not the
+        // A host that merely contains the provider's name is not the
         // provider: a mock or a shim speaking its own protocol on the
         // Responses path must not ship under the default mode on the
         // strength of its hostname.
@@ -464,7 +464,7 @@ mod tests {
         assert_eq!(e.operation, "embeddings");
     }
 
-    /// 4.2.2 order — a Responses body carries `usage.input_tokens` too and
+    /// The check order is load-bearing — a Responses body carries `usage.input_tokens` too and
     /// must not read as Anthropic.
     #[test]
     fn responses_shaped_body_is_not_anthropic() {

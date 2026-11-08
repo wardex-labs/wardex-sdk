@@ -2,8 +2,6 @@
 //! endpoint = the path's last segments (`endpoint::ENDPOINTS`); provider = host
 //! priority + body/SSE shape fallback. fail-safe (parse failure = partial/empty result).
 
-use std::io::Read;
-
 mod anthropic;
 pub mod endpoint;
 mod event_json;
@@ -15,6 +13,12 @@ mod parts;
 mod tests;
 pub mod usage;
 
+use std::io::Read;
+
+use serde::Deserialize;
+
+use crate::sse;
+use crate::usage::TokenUsage;
 use anthropic::{fill_anthropic, reassemble_anthropic};
 pub use endpoint::{treatment, ws_upgrade, Treatment, WsUpgrade};
 use endpoint::{Api, Endpoint};
@@ -24,41 +28,81 @@ use openai_responses::{fill_openai_responses, reassemble_responses};
 pub use parts::{normalize_finish_reason, FINISH_REASONS};
 use usage::UsageBounds;
 pub use usage::UsageLeaf;
-
-use crate::sse;
-use crate::usage::TokenUsage;
-use serde::Deserialize;
 use wardex_limits::Limits;
 
-/// Neutral semantic fields absorbing per-provider differences. All Option (None = not extracted).
+/// Neutral semantic fields absorbing per-provider differences.
+///
+/// Every `Option` is `None` when the body did not carry the value (or carried
+/// it in a shape the parser does not read); nothing is defaulted or inferred
+/// unless the field's own doc says so.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct LlmSemantics {
-    pub provider: String, // "openai" | "anthropic"
+    /// The provider label, `"openai"` or `"anthropic"`. Empty when no host,
+    /// path or body shape named one (an unrecognized stream).
+    pub provider: String,
     /// `provider` is a guess: it was not read off one of that provider's own
     /// hosts (`endpoint::is_official_host`) but off a hostname that merely
     /// contains a provider's name, the response body's shape, or the API
     /// shape of the path. False when `provider` is empty (nothing labelled).
     pub provider_inferred: bool,
-    pub operation: String, // "chat" | "embeddings"
+    /// The operation, `"chat"` or `"embeddings"`, decided by the endpoint. An
+    /// unrecognized stream reports `"chat"`.
+    pub operation: String,
+    /// The request body's `model`, as the caller sent it.
     pub request_model: Option<String>,
+    /// The response body's `model`: the model the provider says served the
+    /// call, which can differ from `request_model` (an alias resolved to a
+    /// dated snapshot, for example).
     pub response_model: Option<String>,
+    /// The provider's id for the response (`chatcmpl-...`, `msg_...`,
+    /// `resp_...`).
     pub response_id: Option<String>,
     /// Always semconv-inclusive — the parser that filled it named its
     /// provider's `InputConvention`, and `TokenUsage::new` did the arithmetic.
     pub usage: TokenUsage,
+    /// The request's sampling `temperature`, as sent.
     pub temperature: Option<f64>,
+    /// The request's nucleus-sampling `top_p`, as sent.
     pub top_p: Option<f64>,
+    /// The request's `top_k` (Anthropic only), as sent.
     pub top_k: Option<f64>,
+    /// The request's `frequency_penalty` (Chat Completions only), as sent.
     pub frequency_penalty: Option<f64>,
+    /// The request's `presence_penalty` (Chat Completions only), as sent.
     pub presence_penalty: Option<f64>,
+    /// The output-token cap the request set: `max_tokens` (Anthropic, and
+    /// Chat Completions, falling back to `max_completion_tokens`) or
+    /// `max_output_tokens` (Responses).
     pub max_tokens: Option<i64>,
+    /// The request's sampling `seed` (Chat Completions only), as sent.
     pub seed: Option<i64>,
+    /// How many choices the request asked for (Chat Completions `n`).
     pub choice_count: Option<i64>,
+    /// The request's stop sequences: Chat's `stop` (a single string becomes a
+    /// one-element list) or Anthropic's `stop_sequences`.
     pub stop_sequences: Option<Vec<String>>,
+    /// The request's `stream` flag, as sent. Whether the response actually
+    /// streamed is `reassembled_from_stream`.
     pub stream: Option<bool>,
+    /// One normalized finish reason per choice that reported one (see
+    /// `normalize_finish_reason`), `"error"` where the provider declared a
+    /// failure inside the response. `None` when no choice reported any, which
+    /// is the normal state of an unfinished or cut stream.
     pub finish_reasons: Option<Vec<String>>,
+    /// For Chat Completions and Responses: `"json"` when the request asked for
+    /// structured JSON output (`response_format` or `text.format` of type
+    /// `json_schema` or `json_object`), `"text"` otherwise, including when it
+    /// asked for nothing. For Anthropic: always `"text"`; the request's output
+    /// format is not read. `None` for embeddings, and for a Responses call
+    /// whose request body could not be read.
     pub output_type: Option<String>,
+    /// The response body this result was read from: decompressed when the
+    /// wire body was gzip or zlib, the synthetic body a reassembler built for
+    /// a recognized stream, or the event data joined by newlines for an
+    /// unrecognized one.
     pub decoded_response: Option<Vec<u8>>,
+    /// The response was an SSE stream and `decoded_response` was built from
+    /// its events rather than copied from the wire.
     pub reassembled_from_stream: bool,
     /// OTel gen_ai.output.messages (all parts of the response: text·tool_call etc., Some only when present) — JSON string.
     pub output_messages: Option<String>,
@@ -87,7 +131,7 @@ pub struct LlmSemantics {
     pub reasoning_level: Option<String>,
     /// `gen_ai.request.previous_response.id` (Responses chaining).
     pub previous_response_id: Option<String>,
-    /// The conversation the REQUEST names (Responses `conversation`, either
+    /// The conversation the request names (Responses `conversation`, either
     /// the bare id or the object's `id`) — the provider-held conversation
     /// the call appends to. The seam turns it into `gen_ai.conversation.id`
     /// when the request was not issued inside one of its own. None when the
@@ -120,7 +164,7 @@ pub struct LlmSemantics {
     /// repeats the deltas, nothing repeats a lost Chat chunk), so the seam
     /// marks the span when this is not 0.
     pub stream_events_unparsed: u32,
-    /// The provider declared a failure INSIDE a response — the in-stream
+    /// The provider declared a failure inside a response — the in-stream
     /// `error` event of a Chat, Anthropic or Responses stream, whose error
     /// object the reassembler keeps in the synthetic body, or a Responses
     /// object whose status is `failed` (a `response.failed` snapshot) — and
@@ -148,7 +192,7 @@ impl StringOrVec {
     }
 }
 
-/// The provider label a hostname SUGGESTS, by substring. A hint, not proof:
+/// The provider label a hostname suggests, by substring. A hint, not proof:
 /// `myopenai-proxy.internal` and `prod.openai.azure.com` both answer
 /// `openai`. Whether a label is proven is `label_inferred`'s question.
 fn provider_from_host(host: &str) -> Option<&'static str> {
@@ -181,36 +225,51 @@ fn try_parse_sse(
     }
     let events = sse::parse(decoded);
     // The reassembler is selected by Api — path first, SSE grammar second.
-    // The old dispatch keyed on the HOST and defaulted to the Chat
-    // reassembler, which is exactly what fabricated an empty chat body out
-    // of a Responses stream on api.openai.com.
+    // Keying it on the host, with the Chat reassembler as the default, would
+    // fabricate an empty chat body out of a Responses stream on
+    // api.openai.com.
     let matched = endpoint::from_path(path).or_else(|| endpoint::from_sse_shape(&events));
-    // ... and the HOST names the provider LABEL when it can: an Anthropic
+    // ... and the host names the provider label when it can: an Anthropic
     // host serving its OpenAI-compat Chat endpoint is still Anthropic. The
     // Api's implied provider is the fallback for a host that names none —
     // a gateway serving a provider-shaped API. Same split as the
     // non-streaming dispatch below: shape picks the parser, host picks the
     // label, so the two halves of one endpoint cannot disagree.
     let provider = provider_from_host(host);
-    match matched.map(|e| e.api) {
-        Some(Api::OpenAiChatCompletions) => {
+    match matched {
+        Some(
+            endpoint @ Endpoint {
+                api: Api::OpenAiChatCompletions,
+                ..
+            },
+        ) => {
             let reassembled = reassemble_openai(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), host, provider, reassembled);
+            let mut out = sse_semantics(endpoint, host, provider, reassembled);
             fill_openai_chat(&mut out, req, &body, bounds);
             Some(out)
         }
-        Some(Api::AnthropicMessages) => {
+        Some(
+            endpoint @ Endpoint {
+                api: Api::AnthropicMessages,
+                ..
+            },
+        ) => {
             let reassembled = reassemble_anthropic(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), host, provider, reassembled);
+            let mut out = sse_semantics(endpoint, host, provider, reassembled);
             fill_anthropic(&mut out, req, &body, bounds);
             Some(out)
         }
-        Some(Api::OpenAiResponses) => {
+        Some(
+            endpoint @ Endpoint {
+                api: Api::OpenAiResponses,
+                ..
+            },
+        ) => {
             let reassembled = reassemble_responses(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), host, provider, reassembled);
+            let mut out = sse_semantics(endpoint, host, provider, reassembled);
             fill_openai_responses(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -286,6 +345,17 @@ fn decode_body(resp: &[u8], limits: Limits) -> Vec<u8> {
     resp.to_vec()
 }
 
+/// Extracts provider-neutral semantics from one HTTP exchange.
+///
+/// `host` and `path` come from the request line; `req` is the request body
+/// and `resp` the response body as it crossed the wire (possibly compressed,
+/// possibly an SSE stream). `limits` bounds decompression and the usage
+/// mirror.
+///
+/// Returns `None` when the exchange is not a recognized LLM call: a
+/// non-streaming response whose path matches no known endpoint, or whose
+/// provider neither the host nor the body shape names. A recognized call
+/// whose body cannot be parsed still returns `Some` with what could be read.
 pub fn parse_llm(
     host: &str,
     path: &str,
@@ -298,9 +368,9 @@ pub fn parse_llm(
     if let Some(s) = try_parse_sse(host, path, req, &decoded, bounds) {
         return Some(s);
     }
-    // Non-streaming: the ENDPOINT is decided by the path alone (conservative
-    // — same reach as before, minus the substring false positives). The body
-    // shape decides only the PROVIDER, when the host names none.
+    // Non-streaming: the endpoint is decided by the path alone (conservative:
+    // a path that matches no endpoint is not an LLM call). The body shape
+    // decides only the provider, when the host names none.
     let matched = endpoint::from_path(path)?;
     let provider = provider_from_host(host).or_else(|| {
         serde_json::from_slice::<serde_json::Value>(&decoded)
@@ -316,14 +386,14 @@ pub fn parse_llm(
         decoded_response: Some(decoded.clone()),
         ..Default::default()
     };
-    // The API SHAPE picks the parser; the host (or, failing that, the body
-    // shape) picked only the provider LABEL above. Requiring the two to
-    // AGREE dropped real traffic: Anthropic's documented OpenAI-compat
-    // endpoint (`api.anthropic.com/v1/chat/completions`) is an
+    // The API shape picks the parser; the host (or, failing that, the body
+    // shape) picked only the provider label above. The two need not agree,
+    // because requiring it would drop real traffic: Anthropic's documented
+    // OpenAI-compat endpoint (`api.anthropic.com/v1/chat/completions`) is an
     // anthropic-named host speaking the Chat shape, and a `(provider, api)`
-    // match left it as empty semantics — no gen_ai, no marker, and under
-    // AGENT mode no span at all — while the SSE half of the same endpoint
-    // kept capturing. A genuinely cross-shaped BODY on the path now parses
+    // match would leave it as empty semantics — no gen_ai, no marker, and
+    // under AGENT mode no span at all — while the SSE half of the same
+    // endpoint captures. A genuinely cross-shaped body on the path parses
     // with the shape's parser: overlapping fields (a top-level `model`,
     // usage) still extract, and a 200 body the parser cannot read at all
     // ships under the honest `semantic_parse_failed` — either way the call
@@ -339,10 +409,11 @@ pub fn parse_llm(
 
 #[cfg(test)]
 mod bench {
-    //! `#[ignore]` timing probes for the semantic parser (design gate: the
-    //! usage-model additions must cost <= 10% on the existing paths, and the
-    //! Responses path must land within +-20% of the Chat path). Run with:
+    //! `#[ignore]` timing probes for the semantic parser (budget: the
+    //! Responses path lands within +-20% of the Chat path). Run with:
     //! `cargo test --release -p wardex-protocol -- --ignored bench_parse_llm --nocapture`
+    use std::fmt::Write as _;
+
     use super::*;
 
     const ITERS: u32 = 10_000;
@@ -363,7 +434,7 @@ mod bench {
                 );
                 black_box(&s);
             }
-            medians.push(start.elapsed().as_nanos() as f64 / f64::from(ITERS));
+            medians.push(start.elapsed().as_secs_f64() * 1e9 / f64::from(ITERS));
         }
         medians.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!("{name}: {:.0} ns/op (median of 3 x {ITERS})", medians[1]);
@@ -386,8 +457,8 @@ mod bench {
     #[ignore = "profiling probe"]
     fn bench_profile_responses_2k_size_matched() {
         // A Responses body size-matched to the chat 2k bench body, for the
-        // apples-to-apples +-20% comparison (the design-named benches differ
-        // in body size: 2k vs 3k).
+        // apples-to-apples +-20% comparison (`openai_chat_2k` and
+        // `openai_responses_3k` differ in body size: 2k vs 3k).
         let text = "The quick brown fox jumps over the lazy dog. ".repeat(37);
         let req = serde_json::to_vec(&serde_json::json!({
             "model": "gpt-4.1", "input": "Summarize the following.",
@@ -513,9 +584,7 @@ mod bench {
     fn bench_parse_llm_openai_chat_sse_50ev() {
         let mut sse = String::new();
         for i in 0..48 {
-            sse.push_str(&format!(
-                "data: {{\"id\":\"chatcmpl-s\",\"model\":\"gpt-4o-mini\",\"choices\":[{{\"delta\":{{\"content\":\"chunk {i} of the answer \"}},\"finish_reason\":null}}]}}\n\n"
-            ));
+            write!(sse, "data: {{\"id\":\"chatcmpl-s\",\"model\":\"gpt-4o-mini\",\"choices\":[{{\"delta\":{{\"content\":\"chunk {i} of the answer \"}},\"finish_reason\":null}}]}}\n\n").unwrap();
         }
         sse.push_str("data: {\"id\":\"chatcmpl-s\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":48}}\n\n");
         sse.push_str("data: [DONE]\n\n");
@@ -538,9 +607,7 @@ mod bench {
         for i in 0..46 {
             let piece = format!("chunk {i} of the answer ");
             text.push_str(&piece);
-            sse.push_str(&format!(
-                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"{piece}\"}}\n\n"
-            ));
+            write!(sse, "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"{piece}\"}}\n\n").unwrap();
         }
         let done = serde_json::json!({
             "type": "response.output_item.done", "output_index": 0,
@@ -548,9 +615,7 @@ mod bench {
                      "status": "completed",
                      "content": [{"type": "output_text", "text": text, "annotations": []}]}
         });
-        sse.push_str(&format!(
-            "event: response.output_item.done\ndata: {done}\n\n"
-        ));
+        write!(sse, "event: response.output_item.done\ndata: {done}\n\n").unwrap();
         let completed = serde_json::json!({
             "type": "response.completed", "sequence_number": 49,
             "response": {"id": "resp_s", "object": "response", "status": "completed",
@@ -564,7 +629,7 @@ mod bench {
                                     "output_tokens_details": {"reasoning_tokens": 0},
                                     "total_tokens": 56}}
         });
-        sse.push_str(&format!("event: response.completed\ndata: {completed}\n\n"));
+        write!(sse, "event: response.completed\ndata: {completed}\n\n").unwrap();
         bench(
             "openai_responses_sse_50ev",
             "api.openai.com",

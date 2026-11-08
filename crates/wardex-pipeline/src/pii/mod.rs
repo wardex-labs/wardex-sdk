@@ -1,11 +1,11 @@
-//! PII masking engine — design doc 2026-07-07-phase3-pii-masking.
+//! PII masking engine.
 //!
 //! Detection is fully deterministic: regex proposes, checksum validators
-//! confirm (design §5.1). No ML/entropy heuristics. Two families of rules feed
-//! one replacement pass: VALUE rules recognise a value by its shape
-//! (`patterns.rs`), NAME rules recognise it by the argument it is passed as
-//! (`names.rs`). Every replacement is recorded against the rule that made it,
-//! so a span can say what was masked and why.
+//! confirm. No ML or entropy heuristics, so the same text is always masked
+//! the same way. Two families of rules feed one replacement pass: VALUE rules
+//! recognise a value by its shape (`patterns.rs`), NAME rules recognise it by
+//! the argument it is passed as (`names.rs`). Every replacement is recorded
+//! against the rule that made it, so a span can say what was masked and why.
 
 mod names;
 mod patterns;
@@ -19,14 +19,14 @@ pub use walk::{mask_envelope, mask_otlp};
 pub use wardex_codec::proto::wardex::v1::RedactionRule as Rule;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use regex::Regex;
 
 use patterns::{Replacement, BUILTINS, CATEGORIES};
 
 /// Fail-closed placeholder — what a span's text becomes when masking itself
-/// failed and we refuse to ship the original (design §8).
+/// failed and we refuse to ship the original.
 pub const PII_FILTER_ERROR: &str = "[PII_FILTER_ERROR]";
 
 /// What replaces the credentials in `scheme://user:password@host` — the value
@@ -38,12 +38,23 @@ pub const USERINFO_REDACTED: &str = "REDACTED:REDACTED";
 /// fields cannot grow a span without bound.
 pub const MAX_REPORTED_NAMES: usize = 32;
 
+/// Why an engine could not be built from a masking configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum PiiError {
-    #[error("unknown PII category: {0:?} (known: email, phone_number, credit_card, us_ssn, ip_address, us_bank_routing, iban, secret)")]
+    /// A category to disable that no built-in pattern belongs to, as the host
+    /// spelled it. Rejected rather than ignored, so a misspelled category
+    /// cannot leave the intended one switched on.
+    #[error("unknown PII category `{0}` (known: {known})", known = CATEGORIES.join(", "))]
     UnknownCategory(String),
+    /// A built-in pattern failed to compile. The patterns are constants of
+    /// this crate, so this is a defect in the SDK, never in the host's input.
     #[error("invalid builtin pattern for category {category}: {message}")]
-    InvalidPattern { category: String, message: String },
+    InvalidPattern {
+        /// The category whose pattern failed, as listed in the category table.
+        category: String,
+        /// The regex compiler's own explanation.
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -75,6 +86,8 @@ pub struct Report {
 }
 
 impl Report {
+    /// True when nothing was replaced. `rules` and `names` are then empty as
+    /// well, since each is recorded only alongside a replacement.
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
@@ -100,7 +113,8 @@ struct Hit {
     name: Option<String>,
 }
 
-/// Compiled pattern set. Build once per config via `engine_for` (design §4.3).
+/// Compiled pattern set. Build once per config via `engine_for`: compiling
+/// the regexes is the expensive part.
 #[derive(Debug)]
 pub struct PiiEngine {
     active: Vec<Compiled>,
@@ -123,16 +137,13 @@ fn category_rule(category: &str) -> Rule {
 }
 
 /// The userinfo of every `scheme://userinfo@host` in `text`: after `://`,
-/// everything up to the LAST `@` before any path, query, fragment, whitespace
+/// everything up to the last `@` before any path, query, fragment, whitespace
 /// or quoting byte — a raw password may itself contain `@`. A scanner rather
 /// than a regex so there is no compile step that could fail on the export
 /// path.
 fn userinfo_hits(text: &str, hits: &mut Vec<Hit>, spans: &mut Vec<(usize, usize)>) {
     let b = text.as_bytes();
-    let mut from = 0;
-    while let Some(off) = text[from..].find("://") {
-        let sep = from + off;
-        from = sep + 3;
+    for (sep, _) in text.match_indices("://") {
         let mut s = sep;
         while s > 0 && (b[s - 1].is_ascii_alphanumeric() || matches!(b[s - 1], b'+' | b'.' | b'-'))
         {
@@ -183,7 +194,12 @@ fn userinfo_hits(text: &str, hits: &mut Vec<Hit>, spans: &mut Vec<(usize, usize)
         if end == start {
             continue;
         }
-        let userinfo = &text[start..end];
+        // `start` follows the ASCII `://` and `end` is the offset of an ASCII
+        // `@`, so this never misses; `get` keeps a slicing bug from becoming
+        // a panic that prints the text.
+        let Some(userinfo) = text.get(start..end) else {
+            continue;
+        };
         let replacement = if userinfo.contains(':') {
             USERINFO_REDACTED
         } else {
@@ -271,6 +287,7 @@ impl PiiEngine {
     }
 
     /// Mask every validated match. `None` means "no change".
+    #[must_use = "`None` means no change; ignoring `Some` ships the unmasked text"]
     pub fn mask_text(&self, text: &str) -> Option<String> {
         self.mask_text_into(text, &mut Report::default())
     }
@@ -278,7 +295,14 @@ impl PiiEngine {
     /// `mask_text`, recording each replacement into `report`.
     /// Single pass over the original text (retry-on-reject patterns may
     /// re-probe within a rejected candidate); replaced regions are never
-    /// rescanned, so placeholders cannot re-match (design §5.2).
+    /// rescanned, so placeholders cannot re-match.
+    #[must_use = "`None` means no change; ignoring `Some` ships the unmasked text"]
+    #[expect(
+        clippy::string_slice,
+        reason = "every edit bound is a regex match bound, the offset of an ASCII \
+                  delimiter found by the userinfo or name scanner, or the end of an \
+                  earlier edit, so each is a char boundary of `text`"
+    )]
     pub fn mask_text_into(&self, text: &str, report: &mut Report) -> Option<String> {
         let edits = self.edits(text, report);
         if edits.is_empty() {
@@ -298,7 +322,8 @@ impl PiiEngine {
     /// Bytes that may not be UTF-8 as a whole. Each invalid byte is judged as
     /// a `?` — one byte for one byte, so every offset holds — and the edits
     /// land on the original bytes. A Latin-1 `é` inside a password therefore
-    /// no longer splits the value in two and ships its tail.
+    /// does not split the value in two and ship its tail.
+    #[must_use = "`None` means no change; ignoring `Some` ships the unmasked bytes"]
     pub fn mask_bytes_into(&self, bytes: &[u8], report: &mut Report) -> Option<Vec<u8>> {
         let text = std::str::from_utf8(bytes)
             .map(std::borrow::Cow::Borrowed)
@@ -354,7 +379,11 @@ impl PiiEngine {
                     // Resume just past the rejected candidate's first char so
                     // a valid match starting inside the span is still found
                     // (leading bleed, e.g. out of a preceding IP octet).
-                    at = m.start() + text[m.start()..].chars().next().map_or(1, char::len_utf8);
+                    at = m.start()
+                        + text
+                            .get(m.start()..)
+                            .and_then(|rest| rest.chars().next())
+                            .map_or(1, char::len_utf8);
                 } else {
                     // Rejection consumes the span (find_iter semantics).
                     at = m.end();
@@ -391,8 +420,9 @@ impl PiiEngine {
                 i == 0 || h.start > spans[i - 1].1
             });
         }
-        // Leftmost first; on ties the longer match wins (§5.2), and on an
-        // identical range the name rule's hit, so the report keeps the name.
+        // Leftmost first; on ties the longer match wins, so the output does
+        // not depend on pattern order; and on an identical range the name
+        // rule's hit wins, so the report keeps the name.
         hits.sort_by(|a, b| {
             a.start
                 .cmp(&b.start)
@@ -439,7 +469,9 @@ fn shrink_to_valid(p: &Compiled, text: &str, start: usize, end: usize) -> Option
         if !bytes[e - 1].is_ascii_digit() || bytes[e].is_ascii_digit() {
             continue; // candidate must end a digit run, not split one
         }
-        let cand = &text[start..e];
+        let Some(cand) = text.get(start..e) else {
+            break;
+        };
         if cand.bytes().filter(u8::is_ascii_digit).count() < 13 {
             break; // shorter probes only lose more digits
         }
@@ -462,21 +494,28 @@ fn apply(r: &Replacement, matched: &str) -> String {
                 digits.len() >= 4,
                 "CardLast4 requires the >=13-digit Luhn floor"
             );
-            format!("****-****-****-{}", &digits[digits.len() - 4..])
+            let last4 = digits
+                .get(digits.len().saturating_sub(4)..)
+                .unwrap_or_default();
+            format!("****-****-****-{last4}")
         }
         Replacement::AfterColon(label) => {
             // The pattern guarantees a colon; the name and the spacing after
             // it are the writer's and stay as written.
-            let keep = matched.find(':').map_or(0, |c| {
-                c + 1 + matched[c + 1..].len() - matched[c + 1..].trim_start().len()
-            });
-            format!("{}{label}", &matched[..keep])
+            // What follows the colon, less its leading spacing, is a suffix
+            // of `matched`; stripping it leaves the name, the colon and the
+            // spacing.
+            let head = matched
+                .split_once(':')
+                .and_then(|(_, after)| matched.strip_suffix(after.trim_start()))
+                .unwrap_or_default();
+            format!("{head}{label}")
         }
     }
 }
 
 /// Process-wide engine cache keyed by the sorted disabled list.
-/// Regex compilation is the expensive part — pay it once per config (§4.3).
+/// Regex compilation is the expensive part — pay it once per config.
 pub fn engine_for(disabled: &[String]) -> Result<Arc<PiiEngine>, PiiError> {
     engine_for_policy(disabled, &[], &[])
 }
@@ -498,13 +537,27 @@ pub fn engine_for_policy(
     };
     let key = (canon(disabled), canon(extra), canon(reveal));
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("pii engine cache poisoned");
-    if let Some(e) = guard.get(&key) {
-        return Ok(e.clone());
+    // A poisoned cache is still consistent: it only ever gains whole entries,
+    // each an immutable `Arc`, so no panic can leave one half-written. The
+    // host calls this on every export, so panicking on poison here would turn
+    // one past panic into a failure of every later export.
+    let lookup = |key: &Key| {
+        cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    };
+    if let Some(engine) = lookup(&key) {
+        return Ok(engine);
     }
+    // Compiled with the lock released: compilation takes milliseconds, and a
+    // thread asking for an engine that is already cached must not wait for
+    // it. Two threads may race to build the same engine; the first insert
+    // wins and the other copy is dropped.
     let engine = Arc::new(PiiEngine::with_names(&key.0, &key.1, &key.2)?);
-    guard.insert(key, engine.clone());
-    Ok(engine)
+    let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    Ok(Arc::clone(guard.entry(key).or_insert(engine)))
 }
 
 /// The shared `userinfo_only` engine.
@@ -518,6 +571,7 @@ pub fn userinfo_engine() -> Arc<PiiEngine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn engine() -> PiiEngine {
         PiiEngine::new(&[]).unwrap()
@@ -555,7 +609,7 @@ mod tests {
         );
     }
 
-    // --- tricky true negatives: the promise of §5.1's validators ---
+    // --- tricky true negatives: what the checksum validators reject ---
 
     #[test]
     fn does_not_mask_near_misses() {
@@ -641,7 +695,7 @@ mod tests {
             "prefix 012-2481-7730",
         ] {
             let mut r = Report::default();
-            engine().mask_text_into(text, &mut r);
+            let _masked = engine().mask_text_into(text, &mut r);
             assert!(!r.rules.contains(&Rule::PhoneNumber), "{text}: {r:?}");
         }
     }
@@ -663,7 +717,7 @@ mod tests {
         }
     }
 
-    // --- overlap / determinism / idempotency (§5.2) ---
+    // --- overlap / determinism / idempotency ---
 
     #[test]
     fn leftmost_longest_wins_and_no_rescan() {
@@ -742,7 +796,7 @@ mod tests {
     fn engine_cache_returns_same_instance() {
         let a = engine_for(&["email".to_string()]).unwrap();
         let b = engine_for(&["email".to_string()]).unwrap();
-        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&a, &b));
     }
 
     #[test]
@@ -875,9 +929,11 @@ mod tests {
     #[test]
     fn reported_names_are_capped_but_the_count_is_not() {
         let e = engine();
-        let body: String = (0..40)
-            .map(|i| format!("{{\"svc{i}_token\": \"v{i}\"}} "))
-            .collect();
+        let mut body = String::new();
+        for i in 0..40 {
+            write!(body, "{{\"svc{i}_token\": \"v{i}\"}} ")
+                .expect("writing to a String cannot fail");
+        }
         let mut r = Report::default();
         e.mask_text_into(&body, &mut r).unwrap();
         assert_eq!(r.count, 40);

@@ -5,14 +5,23 @@
 /// Metadata for a single gRPC message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrpcMessage {
+    /// The frame's flag byte was non-zero: the payload is compressed with the
+    /// encoding the `grpc-encoding` header names, which this parser does not read.
     pub compressed: bool,
+    /// Payload length in bytes as declared by the 4-byte big-endian prefix,
+    /// excluding the 5-byte prefix itself. Only frames whose whole payload is
+    /// present in the body are reported.
     pub length: u32,
 }
 
 /// Framing result for one direction's (request or response) body.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrpcFrames {
+    /// Every complete frame, in wire order. Empty for an empty body.
     pub messages: Vec<GrpcMessage>,
+    /// The body ended inside a frame: fewer than 5 prefix bytes remained, or
+    /// fewer payload bytes than the prefix declared. Bytes after the last
+    /// complete frame are not described by `messages`.
     pub truncated: bool,
 }
 
@@ -38,17 +47,16 @@ pub fn parse_grpc_frames(body: &[u8]) -> GrpcFrames {
         let compressed = body[off] != 0;
         let length =
             u32::from_be_bytes([body[off + 1], body[off + 2], body[off + 3], body[off + 4]]);
-        let end = match off
+        // A declared length that does not fit the address space cannot be
+        // present in this body, so it reads as a truncated frame.
+        let Some(end) = off
             .checked_add(5)
-            .and_then(|x| x.checked_add(length as usize))
-        {
-            Some(e) => e,
-            None => {
-                return GrpcFrames {
-                    messages,
-                    truncated: true,
-                }
-            }
+            .and_then(|x| x.checked_add(usize::try_from(length).ok()?))
+        else {
+            return GrpcFrames {
+                messages,
+                truncated: true,
+            };
         };
         if end > n {
             return GrpcFrames {
@@ -92,7 +100,11 @@ mod tests {
     /// Serializes a single gRPC message for testing.
     fn msg(compressed: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![compressed];
-        v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        v.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("test payloads are far below 4 GiB")
+                .to_be_bytes(),
+        );
         v.extend_from_slice(payload);
         v
     }

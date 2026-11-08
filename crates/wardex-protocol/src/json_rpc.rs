@@ -9,7 +9,7 @@
 //! can answer a batch with a batch.
 //!
 //! No line longer than `max_stream_buffer_bytes` is ever parsed, however it arrives, but what
-//! happens to the stream depends on how it arrives. Only a line that lands WHOLE in one read is
+//! happens to the stream depends on how it arrives. Only a line that lands whole in one read is
 //! skipped on its own and counted (`lines_over_cap`), with the stream kept: its newline is in
 //! hand, so the framing around it is intact. A line that arrives across reads latches the whole
 //! stream off (`disabled_reason() == "stream_buffer_exceeded"`) as soon as the unterminated part
@@ -17,24 +17,44 @@
 //! case: a pipe write over 16 MiB reaches the reader in pieces far smaller than that.
 
 use serde_json::Value;
+
 use wardex_limits::Limits;
 
+/// Which of the three JSON-RPC 2.0 message shapes a line held, decided by
+/// which members are present rather than by the `jsonrpc` version member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonRpcKind {
+    /// Has `method` and a string or numeric `id`: the peer expects a response
+    /// carrying the same `id`.
     Request,
+    /// Has no `method` but has `result` or `error`.
     Response,
+    /// Has `method` and no usable `id` (absent, `null`, or another type): no
+    /// response will correlate with it.
     Notification,
 }
 
 /// A single parsed JSON-RPC message.
 #[derive(Debug, Clone)]
 pub struct JsonRpcMessage {
+    /// The shape the members present imply.
     pub kind: JsonRpcKind,
-    pub id: Option<String>, // numeric/string id normalized to a string (correlation key)
-    pub method: Option<String>, // request/notification
-    pub params: Option<Vec<u8>>, // request/notification JSON, re-encoded compact
-    pub result: Option<Vec<u8>>, // response success JSON, re-encoded compact
-    pub error: Option<Vec<u8>>, // response error JSON, re-encoded compact
+    /// The correlation key: a string id as sent, a numeric id in its decimal
+    /// form. `None` when `id` is absent, `null`, or neither a string nor a
+    /// number.
+    pub id: Option<String>,
+    /// The `method` member when it is a string; set on requests and
+    /// notifications.
+    pub method: Option<String>,
+    /// The `params` member re-encoded as compact JSON. `None` when the member
+    /// is absent, which is distinct from an explicit `null`.
+    pub params: Option<Vec<u8>>,
+    /// The `result` member of a successful response, re-encoded as compact
+    /// JSON. `None` when the member is absent.
+    pub result: Option<Vec<u8>>,
+    /// The `error` member of a failed response, re-encoded as compact JSON.
+    /// `None` when the member is absent.
+    pub error: Option<Vec<u8>>,
 }
 
 /// Incremental parser for one direction (stdin or stdout) of a byte stream. Carves out messages at newline boundaries.
@@ -60,7 +80,23 @@ pub struct JsonRpcStream {
     disabled_reason: Option<&'static str>,
 }
 
+impl std::fmt::Debug for JsonRpcStream {
+    /// Prints counters and state only: the buffer holds captured traffic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonRpcStream")
+            .field("buffered_len", &self.buffered_len())
+            .field("bytes_moved", &self.moved)
+            .field("bytes_scanned", &self.scanned)
+            .field("lines_over_cap", &self.lines_over_cap)
+            .field("disabled_reason", &self.disabled_reason)
+            .finish_non_exhaustive()
+    }
+}
+
 impl JsonRpcStream {
+    /// A parser with an empty buffer. `limits.max_stream_buffer_bytes` bounds
+    /// both the longest line that is parsed and the unterminated tail that may
+    /// be held before the stream latches off.
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
@@ -104,6 +140,7 @@ impl JsonRpcStream {
     }
 
     /// Accumulates bytes and returns zero or more completed (newline-terminated) JSON-RPC messages. Non-JSON-RPC lines are skipped.
+    #[must_use = "the returned messages are the only record of the lines this call consumed"]
     pub fn feed(&mut self, data: &[u8]) -> Vec<JsonRpcMessage> {
         if self.disabled_reason.is_some() {
             return Vec::new();
@@ -321,7 +358,7 @@ mod tests {
         };
         let mut s = JsonRpcStream::new(limits);
         for _ in 0..100 {
-            s.feed(&[b'x'; 64]); // never a newline
+            assert!(s.feed(&[b'x'; 64]).is_empty()); // never a newline
         }
         assert_eq!(s.disabled_reason(), Some("stream_buffer_exceeded"));
         assert!(s.buffered_len() <= 512);
@@ -335,7 +372,7 @@ mod tests {
         };
         let mut s = JsonRpcStream::new(limits);
         for _ in 0..10 {
-            s.feed(&[b'x'; 64]);
+            assert!(s.feed(&[b'x'; 64]).is_empty());
         }
         assert_eq!(s.disabled_reason(), Some("stream_buffer_exceeded"));
         // Even a well-formed line is ignored once latched.
@@ -433,8 +470,8 @@ mod tests {
 
     #[test]
     fn a_read_of_many_short_lines_is_linear_not_quadratic() {
-        // 256 KiB of empty lines in ONE read: removing each line from the
-        // front of the buffer moved the rest of the read once per line, about
+        // 256 KiB of empty lines in a single read: removing each line from the
+        // front of the buffer would move the rest of the read once per line, about
         // 34 GB of memmove for this input.
         let raw = vec![b'\n'; 256 * 1024];
         let mut s = JsonRpcStream::new(Limits::default());
@@ -467,6 +504,18 @@ mod tests {
             line.len()
         );
         assert!(s.bytes_moved() <= 2 * line.len() as u64);
+    }
+
+    #[test]
+    fn debug_output_shows_sizes_not_buffered_bytes() {
+        let mut s = JsonRpcStream::new(Limits::default());
+        assert!(s.feed(b"{\"params\":\"planted-secret-7f3a\"").is_empty());
+        let shown = format!("{s:?}");
+        assert!(!shown.contains("planted-secret-7f3a"), "{shown}");
+        // A `Vec<u8>` prints as decimals, so the string check alone would miss
+        // a leaked buffer: `p`, `l`, `a` are 112, 108, 97.
+        assert!(!shown.contains("112, 108, 97"), "{shown}");
+        assert!(shown.contains("buffered_len"), "{shown}");
     }
 
     #[test]

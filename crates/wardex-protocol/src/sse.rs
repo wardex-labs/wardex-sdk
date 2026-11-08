@@ -5,16 +5,22 @@
 /// A single SSE event.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SseEvent {
+    /// The last `event:` line's value. `None` when the event had no such
+    /// line, which the WHATWG convention reads as type `message`.
     pub event: Option<String>,
+    /// Every `data:` line's value, joined by `\n`. Empty only when every
+    /// `data:` line of the event was empty; an event with no `data:` line at
+    /// all is not emitted.
     pub data: String,
+    /// The last `id:` line's value. `None` when the event had no such line.
     pub id: Option<String>,
 }
 
-/// Parses a completed SSE body into a list of events. Events with empty data are not emitted.
+/// Parses a completed SSE body into a list of events. An event with no
+/// `data:` line is not emitted; a body that is not UTF-8 yields no events.
 pub fn parse(body: &[u8]) -> Vec<SseEvent> {
-    let text = match std::str::from_utf8(body) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Vec::new();
     };
     let mut events = Vec::new();
     let mut cur = SseEvent::default();
@@ -34,15 +40,8 @@ pub fn parse(body: &[u8]) -> Vec<SseEvent> {
         if line.starts_with(':') {
             continue; // comment
         }
-        let (field, value) = match line.find(':') {
-            Some(idx) => {
-                let f = &line[..idx];
-                let mut v = &line[idx + 1..];
-                if let Some(stripped) = v.strip_prefix(' ') {
-                    v = stripped;
-                }
-                (f, v)
-            }
+        let (field, value) = match line.split_once(':') {
+            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
             None => (line, ""),
         };
         match field {

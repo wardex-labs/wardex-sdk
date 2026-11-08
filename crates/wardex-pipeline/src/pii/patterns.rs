@@ -1,4 +1,4 @@
-//! Declarative PII pattern registry — design §7.
+//! Declarative PII pattern registry: the VALUE rules, one row per pattern.
 //!
 //! Each row is one detection pattern; several rows may share a category
 //! (secret prefixes, IPv4/IPv6). Adding a category = adding rows here plus a
@@ -56,8 +56,8 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         replacement: Replacement::Label("[EMAIL]"),
         retry_on_reject: false,
     },
-    // NANP with mandatory separators (or +1): bare 10-digit runs are NOT matched
-    // to avoid masking ids/timestamps (design §5.1).
+    // NANP with mandatory separators (or +1): bare 10-digit runs are not matched
+    // to avoid masking ids and timestamps, which are bare digit runs too.
     PatternDef {
         category: "phone_number",
         regex: r"(?:\+1[ .-]?)?\(?[2-9][0-9]{2}\)?[ .-][0-9]{3}[ .-][0-9]{4}\b",
@@ -146,7 +146,8 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         replacement: Replacement::Label("[IBAN]"),
         retry_on_reject: false,
     },
-    // Secrets: fixed prefixes only — deterministic, no entropy guessing (§5.1).
+    // Secrets: fixed prefixes only. Deterministic, no entropy guessing, so the
+    // same text is always masked the same way.
     PatternDef {
         category: "secret",
         regex: r"\bsk-[A-Za-z0-9_-]{16,}", // covers sk- and sk-ant-
@@ -234,7 +235,7 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
     },
 ];
 
-// --- validators: regex proposes, these confirm (design §5.1) ---
+// --- validators: regex proposes, these confirm ---
 
 fn digits_of(s: &str) -> Vec<u8> {
     s.bytes()
@@ -266,9 +267,10 @@ pub(crate) fn luhn_valid(m: &str) -> bool {
 
 pub(crate) fn ssn_valid(m: &str) -> bool {
     // matched shape is fixed by the regex: ddd-dd-dddd
-    let area: u32 = m[0..3].parse().unwrap_or(0);
-    let group: u32 = m[4..6].parse().unwrap_or(0);
-    let serial: u32 = m[7..11].parse().unwrap_or(0);
+    let field = |range: std::ops::Range<usize>| -> u32 {
+        m.get(range).and_then(|f| f.parse().ok()).unwrap_or(0)
+    };
+    let (area, group, serial) = (field(0..3), field(4..6), field(7..11));
     area != 0 && area != 666 && area < 900 && group != 0 && serial != 0
 }
 
@@ -294,8 +296,11 @@ pub(crate) fn aba_valid(m: &str) -> bool {
 
 pub(crate) fn iban_valid(m: &str) -> bool {
     // ISO 13616: move the first 4 chars to the end, map A..Z to 10..35, mod 97 == 1
+    let (Some(head), Some(tail)) = (m.get(..4), m.get(4..)) else {
+        return false;
+    };
     let mut rem: u32 = 0;
-    for c in m[4..].chars().chain(m[..4].chars()) {
+    for c in tail.chars().chain(head.chars()) {
         let v = if c.is_ascii_digit() {
             c as u32 - '0' as u32
         } else if c.is_ascii_uppercase() {

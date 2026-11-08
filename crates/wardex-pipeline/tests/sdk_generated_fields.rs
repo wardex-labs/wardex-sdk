@@ -127,8 +127,13 @@ fn all_rules() -> Vec<Rule> {
 
 /// The default rules plus one name the application listed, so the
 /// application's own rule is exercised too.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed expectation fails the test that called it"
+)]
 fn engine() -> PiiEngine {
-    PiiEngine::with_names(&[], &["x_corp_widget".into()], &[]).unwrap()
+    PiiEngine::with_names(&[], &["x_corp_widget".into()], &[])
+        .expect("the built-in rules and one valid application name always build")
 }
 
 enum Text<'a> {
@@ -153,7 +158,7 @@ fn each_any(path: &'static str, v: &mut pb::AnyValue, f: &mut Visit<'_>) {
     }
 }
 
-/// Attribute VALUES. A key is a name: the name rules judge it and the
+/// Attribute values. A key is a name: the name rules judge it and the
 /// walk never rewrites it, so it is not a field either side of the census.
 fn each_kv(path: &'static str, kvs: &mut [pb::KeyValue], f: &mut Visit<'_>) {
     for pb::KeyValue { key: _, value } in kvs {
@@ -561,6 +566,10 @@ fn texts(env: &mut pb::Envelope) -> Vec<(&'static str, String)> {
     out
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed expectation fails the test that called it"
+)]
 fn the_span(env: &pb::Envelope) -> &pb::Span {
     env.items
         .iter()
@@ -568,7 +577,7 @@ fn the_span(env: &pb::Envelope) -> &pb::Span {
             Some(pb::envelope_item::Payload::Span(s)) => Some(s),
             _ => None,
         })
-        .unwrap()
+        .expect("every envelope these tests build holds a span")
 }
 
 #[test]
@@ -589,12 +598,12 @@ fn the_census_value_fires_every_rule_in_a_customer_field() {
                     }),
                 }],
                 input_data: value.clone().into_bytes(),
-                output_data: value.clone().into_bytes(),
+                output_data: value.into_bytes(),
                 ..Default::default()
             })),
         }],
     };
-    mask_envelope(&engine(), &mut env);
+    assert_eq!(mask_envelope(&engine(), &mut env), 0);
     let span = the_span(&env);
     for payload in [&span.input_data, &span.output_data] {
         let text = String::from_utf8_lossy(payload);
@@ -618,7 +627,7 @@ fn an_sdk_field_holding_it_is_shipped_as_written_and_unrecorded() {
     let value = every_rule();
     let mut env = envelope_with(&value, |path| SDK_GENERATED_ENVELOPE.contains(&path));
     let before = env.clone();
-    mask_envelope(&engine(), &mut env);
+    assert_eq!(mask_envelope(&engine(), &mut env), 0);
     // Byte-identical, which includes "no CaptureIntegrity appeared": a
     // span whose only masked-looking value is the SDK's own carries no
     // record of a masking that did not happen.
@@ -630,7 +639,7 @@ fn an_sdk_field_holding_it_is_shipped_as_written_and_unrecorded() {
 fn every_other_envelope_text_field_still_loses_it() {
     let value = every_rule();
     let mut env = envelope_with(&value, |_| true);
-    mask_envelope(&engine(), &mut env);
+    assert_eq!(mask_envelope(&engine(), &mut env), 0);
     let mut seen = BTreeSet::new();
     for (path, text) in texts(&mut env) {
         seen.insert(path);
@@ -734,7 +743,7 @@ fn the_otlp_mapping_of_the_sdk_fields_is_shipped_as_written() {
     };
     let mut req = envelope_to_traces(env, producer);
     let before = req.clone();
-    mask_otlp(&engine(), &mut req);
+    assert_eq!(mask_otlp(&engine(), &mut req), 0);
     // Byte-identical: no value rewritten and no `wardex.redacted` added.
     assert_eq!(req, before);
     // And each field did hold the value — except the one the mapping
@@ -759,7 +768,7 @@ fn every_other_otlp_text_field_still_loses_it() {
     };
     let mut req = envelope_to_traces(env, producer);
     let before = otlp_texts(&req);
-    mask_otlp(&engine(), &mut req);
+    assert_eq!(mask_otlp(&engine(), &mut req), 0);
     let after = otlp_texts(&req);
     let mut carried = 0;
     for (path, text) in &before {
@@ -799,7 +808,7 @@ fn a_host_value_under_the_connection_id_name_never_ships() {
     let host = pb::KeyValue {
         key: "wardex.transport.connection_id".into(),
         value: Some(pb::AnyValue {
-            value: Some(pb::any_value::Value::StringValue(value.clone())),
+            value: Some(pb::any_value::Value::StringValue(value)),
         }),
     };
     for transport in [
@@ -822,7 +831,7 @@ fn a_host_value_under_the_connection_id_name_never_ships() {
             }],
         };
         let mut req = envelope_to_traces(env, PYTHON);
-        mask_otlp(&engine(), &mut req);
+        assert_eq!(mask_otlp(&engine(), &mut req), 0);
         let texts = otlp_texts(&req);
         assert!(
             texts.values().all(|t| !t.contains("john.doe@acme.com")),
@@ -902,7 +911,7 @@ const MINTED_CONVERSATION_IDS: &[(&str, &str)] = &[
     ("uuid.uuid4().hex", "12345678901241238123456789012345"),
 ];
 
-/// Host conversation ids the card rule fires on that are NOT a minted form:
+/// Host conversation ids the card rule fires on that are not a minted form:
 /// close to one, and judged as host text all the same.
 const HOST_CONVERSATION_IDS: &[&str] = &[
     "48620579-8682-4828-A0E5-0454F31AF317",
@@ -921,13 +930,17 @@ const PYTHON: Producer<'static> = Producer {
 
 const CONVERSATION_ATTR: &str = "Span[0].attributes[gen_ai.conversation.id]";
 
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a failed expectation fails the test that called it"
+)]
 fn redaction_rules(span: &pb::Span) -> Vec<Rule> {
     span.capture_integrity
         .as_ref()
         .map(|ci| {
             ci.redaction_rules
                 .iter()
-                .map(|n| Rule::try_from(*n).unwrap())
+                .map(|n| Rule::try_from(*n).expect("the masker records only rules it knows"))
                 .collect()
         })
         .unwrap_or_default()
@@ -950,12 +963,12 @@ fn a_minted_conversation_id_is_shipped_as_written_and_unrecorded() {
         assert_eq!(engine.mask_text(id).is_some(), reachable, "{form}");
         let env = envelope_with(id, |path| path == "ConversationContext.conversation_id");
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         // Byte-identical: the id as written, and no CaptureIntegrity.
         assert_eq!(masked, env, "{form}");
         let mut req = envelope_to_traces(env, PYTHON);
         let before = req.clone();
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         assert_eq!(req, before, "{form}");
         assert_eq!(
             otlp_texts(&req).get(CONVERSATION_ATTR).map(String::as_str),
@@ -981,7 +994,7 @@ fn the_same_minted_id_in_a_customer_field_is_still_masked() {
         // A tool call's arguments and result, and an attribute.
         let env = envelope_with(id, customer);
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         assert_eq!(
             redaction_rules(the_span(&masked)),
             vec![Rule::CreditCard],
@@ -995,7 +1008,7 @@ fn the_same_minted_id_in_a_customer_field_is_still_masked() {
         let mut req = envelope_to_traces(env, PYTHON);
         let carried = otlp_texts(&req).values().filter(|t| t.contains(id)).count();
         assert!(carried >= 3, "{form}: only {carried} OTLP values held it");
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         let kept: Vec<_> = otlp_texts(&req)
             .into_iter()
             .filter(|(_, text)| text.contains(id))
@@ -1014,7 +1027,7 @@ fn a_host_conversation_id_of_any_other_form_is_still_masked() {
             .unwrap_or_else(|| panic!("{id} fires no rule"));
         let env = envelope_with(id, |path| path == "ConversationContext.conversation_id");
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         let span = the_span(&masked);
         assert_eq!(
             span.conversation.as_ref().unwrap().conversation_id,
@@ -1023,7 +1036,7 @@ fn a_host_conversation_id_of_any_other_form_is_still_masked() {
         );
         assert!(redaction_rules(span).contains(&Rule::CreditCard), "{id}");
         let mut req = envelope_to_traces(env, PYTHON);
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         assert_eq!(
             otlp_texts(&req).get(CONVERSATION_ATTR).map(String::as_str),
             Some(alone.as_str()),
@@ -1063,22 +1076,22 @@ fn a_hand_spelled_conversation_id_attribute_agrees_on_both_wires() {
     for (_, id) in MINTED_CONVERSATION_IDS {
         let env = with_attr(id);
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         assert_eq!(masked, env, "{id}");
         let mut req = envelope_to_traces(env, PYTHON);
         let before = req.clone();
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         assert_eq!(req, before, "{id}");
     }
     for id in HOST_CONVERSATION_IDS {
         let alone = engine.mask_text(id).unwrap();
         let env = with_attr(id);
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         assert_eq!(shipped(&masked), alone, "{id}");
         assert!(redaction_rules(the_span(&masked)).contains(&Rule::CreditCard));
         let mut req = envelope_to_traces(env, PYTHON);
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         assert_eq!(
             otlp_texts(&req).get(CONVERSATION_ATTR).map(String::as_str),
             Some(alone.as_str()),
@@ -1095,6 +1108,7 @@ fn a_hand_spelled_conversation_id_attribute_agrees_on_both_wires() {
 #[test]
 fn nothing_but_the_card_rule_can_match_inside_a_minted_id() {
     // SplitMix64: deterministic, so a failure names a reproducible id.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut state = 0x5eed_c0de_u64;
     let mut next = move || {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -1103,7 +1117,6 @@ fn nothing_but_the_card_rule_can_match_inside_a_minted_id() {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     };
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let engine = engine();
     let mut card = [0usize; 2];
     for _ in 0..20_000 {
@@ -1112,22 +1125,23 @@ fn nothing_but_the_card_rule_can_match_inside_a_minted_id() {
             .map(|_| {
                 let r = next();
                 if r % 8 == 0 {
-                    HEX[10 + (r >> 8) as usize % 6]
+                    HEX[10 + usize::try_from((r >> 8) % 6).expect("a remainder below 6 fits")]
                 } else {
-                    HEX[(r >> 8) as usize % 10]
+                    HEX[usize::try_from((r >> 8) % 10).expect("a remainder below 10 fits")]
                 }
             })
             .collect();
         digits[12] = b'4';
-        digits[16] = b"89ab"[next() as usize % 4];
+        digits[16] = b"89ab"[usize::try_from(next() % 4).expect("a remainder below 4 fits")];
         let hex = String::from_utf8(digits).unwrap();
+        let group = |range| hex.get(range).expect("the id is 32 ASCII hex digits");
         let canonical = format!(
             "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32]
+            group(0..8),
+            group(8..12),
+            group(12..16),
+            group(16..20),
+            group(20..32)
         );
         for (form, id) in [(0, &canonical), (1, &hex)] {
             let mut report = Report::default();
@@ -1221,12 +1235,12 @@ fn an_sdk_computed_attribute_is_shipped_as_written_and_unrecorded() {
         assert_eq!(report.rules, vec![Rule::CreditCard], "{producer}");
         let env = span_with(vec![text_kv(key, value)], "");
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         // Byte-identical: the value as written, and no CaptureIntegrity.
         assert_eq!(masked, env, "{producer}");
         let mut req = envelope_to_traces(env, PYTHON);
         let before = req.clone();
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         assert_eq!(req, before, "{producer}");
         assert!(!otlp_redacted(&req), "{producer}");
         assert_eq!(
@@ -1250,7 +1264,7 @@ fn the_same_value_anywhere_else_is_still_masked() {
             value,
         );
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         let span = the_span(&masked);
         assert_eq!(redaction_rules(span), vec![Rule::CreditCard], "{producer}");
         assert_eq!(span.capture_integrity.as_ref().unwrap().redaction_count, 3);
@@ -1268,7 +1282,7 @@ fn the_same_value_anywhere_else_is_still_masked() {
                 >= 3,
             "{producer}"
         );
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         let kept: Vec<_> = otlp_texts(&req)
             .into_iter()
             .filter(|(_, text)| text.contains(value))
@@ -1297,7 +1311,7 @@ fn a_value_of_any_other_form_under_an_sdk_key_is_still_masked() {
                 .unwrap_or_else(|| panic!("{other} fires no rule"));
             let env = span_with(vec![text_kv(key, &other)], "");
             let mut masked = env.clone();
-            mask_envelope(&engine, &mut masked);
+            assert_eq!(mask_envelope(&engine, &mut masked), 0);
             let span = the_span(&masked);
             assert!(
                 span.capture_integrity.as_ref().unwrap().redacted,
@@ -1307,7 +1321,7 @@ fn a_value_of_any_other_form_under_an_sdk_key_is_still_masked() {
                 assert!(!text.contains(&other), "{producer}: {other}");
             }
             let mut req = envelope_to_traces(env, PYTHON);
-            mask_otlp(&engine, &mut req);
+            assert_eq!(mask_otlp(&engine, &mut req), 0);
             assert!(otlp_redacted(&req), "{producer}: {other}");
             let shipped = otlp_texts(&req)
                 .get(&format!("Span[0].attributes[{key}]"))
@@ -1328,6 +1342,7 @@ fn a_value_of_any_other_form_under_an_sdk_key_is_still_masked() {
 /// only rule that ever fires.
 #[test]
 fn nothing_but_the_card_rule_can_match_inside_a_tool_list_digest() {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut state = 0x0d16_e57a_u64;
     let mut next = move || {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -1336,7 +1351,6 @@ fn nothing_but_the_card_rule_can_match_inside_a_tool_list_digest() {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     };
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let engine = engine();
     let mut card = 0usize;
     for _ in 0..20_000 {
@@ -1344,9 +1358,9 @@ fn nothing_but_the_card_rule_can_match_inside_a_tool_list_digest() {
             .map(|_| {
                 let r = next();
                 char::from(if r % 16 == 0 {
-                    HEX[10 + (r >> 8) as usize % 6]
+                    HEX[10 + usize::try_from((r >> 8) % 6).expect("a remainder below 6 fits")]
                 } else {
-                    HEX[(r >> 8) as usize % 10]
+                    HEX[usize::try_from((r >> 8) % 10).expect("a remainder below 10 fits")]
                 })
             })
             .collect();
@@ -1366,6 +1380,7 @@ fn nothing_but_the_card_rule_can_match_inside_a_tool_list_digest() {
 /// fires, and only on the id's own 8-4-4 or 4-12 groups.
 #[test]
 fn nothing_but_the_card_rule_can_match_inside_a_langgraph_task_id() {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut state = 0x1a96_7a5c_u64;
     let mut next = move || {
         state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -1374,7 +1389,6 @@ fn nothing_but_the_card_rule_can_match_inside_a_langgraph_task_id() {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
     };
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let engine = engine();
     let mut card = 0usize;
     for _ in 0..20_000 {
@@ -1382,19 +1396,20 @@ fn nothing_but_the_card_rule_can_match_inside_a_langgraph_task_id() {
             .map(|_| {
                 let r = next();
                 char::from(if r % 8 == 0 {
-                    HEX[10 + (r >> 8) as usize % 6]
+                    HEX[10 + usize::try_from((r >> 8) % 6).expect("a remainder below 6 fits")]
                 } else {
-                    HEX[(r >> 8) as usize % 10]
+                    HEX[usize::try_from((r >> 8) % 10).expect("a remainder below 10 fits")]
                 })
             })
             .collect();
+        let group = |range| hex.get(range).expect("the id is 32 ASCII hex digits");
         let id = format!(
             "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32]
+            group(0..8),
+            group(8..12),
+            group(12..16),
+            group(16..20),
+            group(20..32)
         );
         let mut report = Report::default();
         if engine.mask_text_into(&id, &mut report).is_some() {
@@ -1418,11 +1433,11 @@ fn a_checkpoint_namespace_keeps_its_task_ids_on_both_wires() {
         let ns = format!("outer:{id}|inner:{id}");
         let env = span_with(vec![text_kv(KEY, &ns)], "");
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         assert_eq!(masked, env, "{producer}");
         let mut req = envelope_to_traces(env, PYTHON);
         let before = req.clone();
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         assert_eq!(req, before, "{producer}");
         assert!(!otlp_redacted(&req), "{producer}");
 
@@ -1430,7 +1445,7 @@ fn a_checkpoint_namespace_keeps_its_task_ids_on_both_wires() {
         let want = format!("[EMAIL]:{id}|****-****-****-1111:{id}");
         let env = span_with(vec![text_kv(KEY, &host)], "");
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         let span = the_span(&masked);
         assert_eq!(
             redaction_rules(span),
@@ -1438,7 +1453,7 @@ fn a_checkpoint_namespace_keeps_its_task_ids_on_both_wires() {
             "{producer}"
         );
         let mut req = envelope_to_traces(env, PYTHON);
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         assert!(otlp_redacted(&req), "{producer}");
         assert_eq!(
             otlp_texts(&req).get(&attr).map(String::as_str),
@@ -1472,12 +1487,12 @@ fn a_secret_name_the_application_gives_an_exempt_key_wins_on_both_wires() {
         let engine = PiiEngine::with_names(&[], &[key.to_string()], &[]).unwrap();
         let env = span_with(vec![text_kv(key, value)], "");
         let mut masked = env.clone();
-        mask_envelope(&engine, &mut masked);
+        assert_eq!(mask_envelope(&engine, &mut masked), 0);
         let span = the_span(&masked);
         assert_eq!(span.extra[0].value, text_kv(key, "[SECRET]").value, "{key}");
         assert_eq!(redaction_rules(span), vec![Rule::SecretUserName], "{key}");
         let mut req = envelope_to_traces(env, PYTHON);
-        mask_otlp(&engine, &mut req);
+        assert_eq!(mask_otlp(&engine, &mut req), 0);
         assert_eq!(
             otlp_texts(&req)
                 .get(&format!("Span[0].attributes[{key}]"))
@@ -1501,7 +1516,7 @@ fn a_secret_name_the_application_gives_an_exempt_key_wins_on_both_wires() {
         }],
     };
     let mut masked = env.clone();
-    mask_envelope(&engine, &mut masked);
+    assert_eq!(mask_envelope(&engine, &mut masked), 0);
     let span = the_span(&masked);
     assert_eq!(
         span.conversation.as_ref().unwrap().conversation_id,
@@ -1509,7 +1524,7 @@ fn a_secret_name_the_application_gives_an_exempt_key_wins_on_both_wires() {
     );
     assert_eq!(redaction_rules(span), vec![Rule::SecretUserName]);
     let mut req = envelope_to_traces(env, PYTHON);
-    mask_otlp(&engine, &mut req);
+    assert_eq!(mask_otlp(&engine, &mut req), 0);
     assert_eq!(
         otlp_texts(&req).get(CONVERSATION_ATTR).map(String::as_str),
         Some("[SECRET]")

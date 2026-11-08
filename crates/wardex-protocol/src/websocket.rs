@@ -4,14 +4,25 @@
 
 use wardex_limits::Limits;
 
+/// A frame's 4-bit opcode (RFC 6455 section 5.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WsOpcode {
+    /// `0x0`: a later fragment of the data message the last Text or Binary
+    /// frame started.
     Continuation,
+    /// `0x1`: the first frame of a UTF-8 text message.
     Text,
+    /// `0x2`: the first frame of a binary message.
     Binary,
+    /// `0x8`: the sender is closing; the first two payload bytes, when
+    /// present, are the close code.
     Close,
+    /// `0x9`: a keepalive the peer answers with a Pong.
     Ping,
+    /// `0xA`: the answer to a Ping, or an unsolicited heartbeat.
     Pong,
+    /// An opcode RFC 6455 leaves unassigned, carrying its 4-bit value. The
+    /// frame is still parsed and counted but never starts a message.
     Reserved(u8),
 }
 
@@ -41,19 +52,51 @@ impl WsOpcode {
     }
 }
 
+/// Header facts of one complete frame. The payload itself is not kept here;
+/// data frames contribute to [`WsFeedResult::messages`] instead.
 #[derive(Debug, Clone)]
 pub struct WsFrame {
+    /// The FIN bit: this frame ends its message.
     pub fin: bool,
+    /// The frame type, including control frames and reserved opcodes, which
+    /// are reported here rather than dropped.
     pub opcode: WsOpcode,
+    /// The MASK bit. RFC 6455 requires it on every client-to-server frame and
+    /// forbids it on server-to-client frames; the parser records it without
+    /// enforcing either rule.
     pub masked: bool,
-    pub payload_len: u64,        // full wire payload length (for aggregation)
-    pub close_code: Option<u16>, // set when opcode==Close
+    /// Payload length in bytes as declared on the wire, before any sample
+    /// cap. Never above `max_ws_frame_bytes`: a larger frame disables the
+    /// parser instead of being reported.
+    pub payload_len: u64,
+    /// The close code of a Close frame. `None` for every other opcode, and for
+    /// a Close frame whose payload is shorter than two bytes or whose sample
+    /// cap is below two bytes.
+    pub close_code: Option<u16>,
 }
 
+/// Everything one [`WsParser::feed`] call completed.
 #[derive(Default)]
 pub struct WsFeedResult {
+    /// Every frame completed by this call, in wire order, control frames
+    /// included.
     pub frames: Vec<WsFrame>,
-    pub messages: Vec<Vec<u8>>, // reassembled messages (single message ≤ the configured sample cap)
+    /// Unmasked payloads of every data message completed by this call, in
+    /// order. Each holds at most `ws_sample_bytes` bytes: the start of the
+    /// message, cut at the cap. A message whose final frame has not arrived
+    /// yet appears in a later call.
+    pub messages: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for WsFeedResult {
+    /// Prints message sizes, never their bytes: messages are captured traffic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message_lens: Vec<usize> = self.messages.iter().map(Vec::len).collect();
+        f.debug_struct("WsFeedResult")
+            .field("frames", &self.frames)
+            .field("message_lens", &message_lens)
+            .finish()
+    }
 }
 
 enum ParseStep {
@@ -62,6 +105,11 @@ enum ParseStep {
     Error,
 }
 
+/// Incremental frame parser for one direction of a WebSocket connection.
+///
+/// A frame whose declared length exceeds `max_ws_frame_bytes` disables the
+/// parser for good (see [`WsParser::is_disabled`]): the framing after it can
+/// no longer be trusted, and buffering it would be unbounded.
 pub struct WsParser {
     buf: Vec<u8>,
     /// Read cursor into `buf`: bytes before it belong to frames already
@@ -77,6 +125,19 @@ pub struct WsParser {
     limits: Limits,
 }
 
+impl std::fmt::Debug for WsParser {
+    /// Prints sizes and state only: the buffers hold captured traffic.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsParser")
+            .field("buffered_len", &self.avail().len())
+            .field("bytes_moved", &self.moved)
+            .field("frag_opcode", &self.frag_opcode)
+            .field("frag_payload_len", &self.frag_payload.len())
+            .field("disabled", &self.disabled)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for WsParser {
     fn default() -> Self {
         Self::new(Limits::default())
@@ -84,6 +145,9 @@ impl Default for WsParser {
 }
 
 impl WsParser {
+    /// A parser with nothing buffered. `limits.max_ws_frame_bytes` is the
+    /// largest frame accepted and `limits.ws_sample_bytes` the most payload
+    /// kept per message.
     pub fn new(limits: Limits) -> Self {
         Self {
             buf: Vec::new(),
@@ -96,6 +160,10 @@ impl WsParser {
         }
     }
 
+    /// Appends `data` and parses every frame it completes. Bytes of an
+    /// incomplete frame stay buffered for the next call. Once disabled, every
+    /// call returns an empty result and buffers nothing.
+    #[must_use = "the returned frames and messages are the only record of the bytes this call consumed"]
     pub fn feed(&mut self, data: &[u8]) -> WsFeedResult {
         let mut result = WsFeedResult::default();
         if self.disabled {
@@ -105,7 +173,7 @@ impl WsParser {
         self.moved += data.len() as u64;
         loop {
             match self.try_parse_one(&mut result) {
-                ParseStep::Parsed => continue,
+                ParseStep::Parsed => {}
                 ParseStep::NeedMore => break,
                 ParseStep::Error => {
                     self.disabled = true;
@@ -165,7 +233,7 @@ impl WsParser {
         let fin = b0 & 0x80 != 0;
         let opcode = WsOpcode::from_u8(b0 & 0x0f);
         let masked = b1 & 0x80 != 0;
-        let len7 = (b1 & 0x7f) as u64;
+        let len7 = u64::from(b1 & 0x7f);
 
         let mut offset = 2usize;
         let payload_len: u64 = if len7 < 126 {
@@ -174,7 +242,7 @@ impl WsParser {
             if buf.len() < offset + 2 {
                 return ParseStep::NeedMore;
             }
-            let l = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as u64;
+            let l = u64::from(u16::from_be_bytes([buf[offset], buf[offset + 1]]));
             offset += 2;
             l
         } else {
@@ -187,8 +255,12 @@ impl WsParser {
             u64::from_be_bytes(arr)
         };
 
-        // Oversized frame defense — blocks unbounded buffering.
-        if payload_len > self.limits.max_ws_frame_bytes as u64 {
+        // Oversized frame defense — blocks unbounded buffering. A length the
+        // address space cannot hold is oversized by definition.
+        let Ok(plen) = usize::try_from(payload_len) else {
+            return ParseStep::Error;
+        };
+        if plen > self.limits.max_ws_frame_bytes {
             return ParseStep::Error;
         }
 
@@ -204,7 +276,6 @@ impl WsParser {
             None
         };
 
-        let plen = payload_len as usize;
         if buf.len() < offset + plen {
             return ParseStep::NeedMore;
         }
@@ -279,11 +350,11 @@ mod tests {
         v.push(if fin { 0x80 } else { 0x00 } | opcode);
         let masked_bit = if mask_key.is_some() { 0x80 } else { 0x00 };
         let n = payload.len();
-        if n < 126 {
-            v.push(masked_bit | n as u8);
-        } else if n <= 0xffff {
+        if let Ok(short @ 0..=125) = u8::try_from(n) {
+            v.push(masked_bit | short);
+        } else if let Ok(medium) = u16::try_from(n) {
             v.push(masked_bit | 126);
-            v.extend_from_slice(&(n as u16).to_be_bytes());
+            v.extend_from_slice(&medium.to_be_bytes());
         } else {
             v.push(masked_bit | 127);
             v.extend_from_slice(&(n as u64).to_be_bytes());
@@ -400,8 +471,8 @@ mod tests {
 
     #[test]
     fn a_read_of_many_small_frames_is_linear_not_quadratic() {
-        // 256 KiB of 2-byte frames in ONE read: dropping each frame from the
-        // front of the buffer moved the rest of the read 131072 times, about
+        // 256 KiB of 2-byte frames in a single read: dropping each frame from
+        // the front of the buffer would move the rest of the read 131072 times, about
         // 17 GB of memmove. Moving each byte at most once after it arrives
         // keeps the count under twice the input.
         let raw = frame(true, 0x9, None, b"").repeat(128 * 1024);
@@ -429,5 +500,22 @@ mod tests {
         }
         assert_eq!(messages, 4096);
         assert!(p.bytes_moved() <= 2 * raw.len() as u64);
+    }
+
+    #[test]
+    fn debug_output_shows_sizes_not_payload_bytes() {
+        let secret = b"planted-secret-7f3a";
+        let mut raw = frame(true, 0x1, Some([9, 8, 7, 6]), secret);
+        // A second, incomplete frame leaves captured bytes in the buffer and
+        // in the fragment being reassembled.
+        raw.extend_from_slice(&frame(false, 0x1, None, secret));
+        raw.extend_from_slice(&frame(true, 0x0, None, secret)[..6]);
+        let mut p = WsParser::new(Limits::default());
+        let r = p.feed(&raw);
+        assert_eq!(r.messages, vec![secret.to_vec()]);
+        let shown = format!("{r:?} {p:?}");
+        assert!(!shown.contains("planted-secret-7f3a"), "{shown}");
+        assert!(!shown.contains("112, 108, 97"), "{shown}");
+        assert!(shown.contains("message_lens"), "{shown}");
     }
 }

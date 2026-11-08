@@ -1,14 +1,14 @@
 //! wardex envelope → OTLP traces: the semantic mapping.
 //!
-//! This is the half of the OTLP export that decides MEANING — what a span is
+//! This is the half of the OTLP export that decides meaning — what a span is
 //! called, which keys carry the gen_ai / http / server semantics, what the
 //! resource and scope around them say — as opposed to [`super::encode_traces`],
 //! which only serializes what this module decided.
 //!
-//! It lived in the PyO3 binding until now, which made every one of those
-//! decisions Python's private opinion. A Node or Java binding would have had to
-//! re-derive span naming and each `wardex.*` key from prose, and the first
-//! disagreement between two SDKs would have surfaced as two differently shaped
+//! It lives here rather than in a language binding so that those decisions are
+//! not one language's private opinion. A Node or Java binding would otherwise
+//! have to re-derive span naming and each `wardex.*` key from prose, and the
+//! first disagreement between two SDKs would surface as two differently shaped
 //! traces in one backend rather than as a failing build. Here it is one
 //! implementation over the schema every binding already marshals into.
 //!
@@ -16,7 +16,7 @@
 //!
 //! [`pb::Envelope`] is the input on purpose. Declaring a second Rust struct
 //! tree to feed this mapping would be a third copy of a model the `.proto`
-//! already owns (design §6.6) — the same duplication `vocab` exists to remove —
+//! already owns — the same duplication `vocab` exists to remove —
 //! and a binding would then have to keep two marshaling paths in step.
 //!
 //! The cost is proto3's default semantics: a field a host language holds as
@@ -29,11 +29,11 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use wardex_limits::Limits;
 
 use super::otlp_pb;
 use crate::proto::wardex::v1 as pb;
 use crate::vocab;
+use wardex_limits::Limits;
 
 /// Who produced this export — the two facts the mapping cannot read off an
 /// envelope because they describe the SDK doing the exporting, not the spans.
@@ -42,6 +42,7 @@ use crate::vocab;
 /// user's application and a host is free to rename it, while
 /// `InstrumentationScope.name` names the library that produced the spans and
 /// must not move when it does.
+#[derive(Debug)]
 pub struct Producer<'a> {
     /// `telemetry.sdk.language` — `"python"`, `"node"`, `"java"`.
     pub language: &'a str,
@@ -96,7 +97,7 @@ fn kv_strs(key: &str, vs: Vec<String>) -> otlp_pb::common::KeyValue {
 /// By value throughout this module: the envelope is built for this mapping and
 /// dropped by it, so a borrow would buy nothing and cost a second copy of every
 /// captured payload — alive at the same time as the first, on the background
-/// export path, where `max_buffer_bytes` is sized against ONE.
+/// export path, where `max_buffer_bytes` is sized against a single copy.
 fn any_value(v: pb::AnyValue) -> otlp_pb::common::AnyValue {
     use otlp_pb::common::any_value::Value as Otlp;
     use pb::any_value::Value as Wardex;
@@ -133,7 +134,7 @@ fn key_value(kv: pb::KeyValue) -> otlp_pb::common::KeyValue {
 
 // --- enums (the numbers differ between the two schemas) ---
 
-/// wardex `SpanKind` → OTLP `SpanKind`. The names line up, the NUMBERS do not
+/// wardex `SpanKind` → OTLP `SpanKind`. The names line up, the numbers do not
 /// (wardex CLIENT is 2, OTLP CLIENT is 3), so the pass has to be explicit.
 /// Matching on the generated enum rather than on a string keeps the compiler in
 /// the loop when the schema gains a kind.
@@ -165,7 +166,7 @@ fn status_code(code: i32) -> i32 {
 /// same `f32` recovers the number the field's declared 0.0–1.0 domain is
 /// written in, which is the number a reader is being asked to trust.
 fn widen(v: f32) -> f64 {
-    v.to_string().parse().unwrap_or(v as f64)
+    v.to_string().parse().unwrap_or_else(|_| f64::from(v))
 }
 
 // --- span ---
@@ -191,13 +192,13 @@ pub fn limitation_attribute(member: pb::Limitation) -> otlp_pb::common::KeyValue
 /// OTLP has no native home for either, so they travel under `wardex.*` the same
 /// way a link's `reason` does. Leaving them out is not a smaller version of the
 /// same export — it is the one that cannot be audited. Every marker this SDK
-/// spends its design on says what it could NOT establish, and OTLP is the only
+/// spends its design on says what it could not establish, and OTLP is the only
 /// transport exported from the package root: a user on the documented path
 /// would receive spans stripped of every "this edge is a guess" and every "this
 /// body was truncated", with nothing to distinguish them from spans that had
 /// nothing to report.
 fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
-    // HOW each span was captured — seen by an adapter's hook, rebuilt from
+    // How each span was captured — seen by an adapter's hook, rebuilt from
     // wire bytes, merged from a bridge — is the same grade of fact as the
     // markers below: it says how far the span can be trusted. The envelope has
     // carried it in a typed field all along and this mapping left it out, so
@@ -221,7 +222,7 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
             attrs.push(kv_str("wardex.parent_source", &source));
         }
         attrs.push(kv_f64("wardex.parent_confidence", widen(c.confidence)));
-        // The identifier that was CONSULTED to pick a parent. Present only when
+        // The identifier that was consulted to pick a parent. Present only when
         // one was, so a non-null value is actionable rather than decorative.
         for (value, key) in [
             (&c.request_id, "wardex.correlation.request_id"),
@@ -235,7 +236,7 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
     }
     if let Some(i) = &sp.capture_integrity {
         // Numbers in, names out — a consumer reading `[3, 17]` would have to
-        // hold its own copy of the vocabulary to know what was lost (§6.6), and
+        // hold its own copy of the vocabulary to know what was lost, and
         // a number this build does not know says so in its own name rather than
         // passing for "nothing to report".
         let markers: Vec<String> = i
@@ -257,7 +258,7 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
         ] {
             attrs.push(kv_bool(key, value));
         }
-        // Emitted only when true / non-zero: unlike the four above, whose FALSE
+        // Emitted only when true / non-zero: unlike the four above, whose false
         // is the informative reading, these describe an event that either
         // happened or did not.
         if i.truncated {
@@ -289,13 +290,13 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
         if i.dropped_chunk_count > 0 {
             attrs.push(kv_int(
                 "wardex.capture.dropped_chunks",
-                i.dropped_chunk_count as i64,
+                i64::from(i.dropped_chunk_count),
             ));
         }
     }
 }
 
-/// Set `kv`, REPLACING a same-keyed attribute rather than sitting beside it.
+/// Set `kv`, replacing a same-keyed attribute rather than sitting beside it.
 ///
 /// The typed fields below are the sender's one home for their values, and a
 /// receiver of the envelope reads them there. `extra` is the host's to write,
@@ -320,7 +321,7 @@ fn set_attr(attrs: &mut Vec<otlp_pb::common::KeyValue>, kv: otlp_pb::common::Key
 /// empty session id and a turn of 0 emit nothing.
 ///
 /// The call site takes semconv's stable `code.*` names. `code.function.name`
-/// is defined as FULLY QUALIFIED, with the namespace inside it rather than
+/// is defined as fully qualified, with the namespace inside it rather than
 /// beside it, so the module is composed in; a module with no function names no
 /// function and is left out.
 fn typed_blocks(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
@@ -337,7 +338,7 @@ fn typed_blocks(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
         if c.turn_index != 0 {
             set_attr(
                 attrs,
-                kv_int("wardex.conversation.turn_index", c.turn_index as i64),
+                kv_int("wardex.conversation.turn_index", i64::from(c.turn_index)),
             );
         }
     }
@@ -346,7 +347,7 @@ fn typed_blocks(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
             set_attr(attrs, kv_str("code.file.path", &c.file));
         }
         if c.line != 0 {
-            set_attr(attrs, kv_int("code.line.number", c.line as i64));
+            set_attr(attrs, kv_int("code.line.number", i64::from(c.line)));
         }
         if !c.function.is_empty() {
             let name = if c.module.is_empty() {
@@ -381,10 +382,8 @@ pub enum OtlpHome {
 /// of `Span`, and every leaf under `Span.transport`. Each says where it lands
 /// in OTLP or why it does not.
 ///
-/// It exists because a field the mapping never read used to vanish from the
-/// OTLP export with no error and every test green: `workflow_name` never
-/// reached it, and of the sixteen transport values the SDK measures only four
-/// did. Two checks hold this table to the code. `span` and `transport` below
+/// It exists because a field the mapping never reads vanishes from the OTLP
+/// export with no error and every test green. Two checks hold this table to the code. `span` and `transport` below
 /// destructure their input exhaustively, so a field added to the schema does
 /// not compile until it is read or bound to `_`; and the tests compare this
 /// table against the field list in `span.proto` and run a span carrying a
@@ -635,10 +634,10 @@ const MCP_METHOD_NAME: &str = "mcp.method.name";
 /// `jsonrpc.request.id` — semantic conventions registry (development).
 const JSONRPC_REQUEST_ID: &str = "jsonrpc.request.id";
 /// The OTLP attribute names reserved for the transport values the SDK
-/// observed: what [`transport`] writes, and nothing else. A host attribute
-/// under one of them would ship as if the SDK had measured it, on a span with
-/// no transport at all or beside the SDK's own reading as a second copy of the
-/// key, of which a backend keeps one. So the mapping leaves every such host
+/// observed: what the mapping's transport pass writes, and nothing else. A
+/// host attribute under one of them would ship as if the SDK had measured it,
+/// on a span with no transport at all or beside the SDK's own reading as a
+/// second copy of the key, of which a backend keeps one. So the mapping leaves every such host
 /// attribute out before it writes its own and reports how many it left
 /// ([`Mapped::reserved_overwritten`]): the SDK's value replaces the host's,
 /// and where the SDK has none the name does not go out.
@@ -762,11 +761,11 @@ fn transport(t: &pb::TransportAttributes, attrs: &mut Vec<otlp_pb::common::KeyVa
             attrs,
             kv_int("http.response.status_code", i64::from(*status_code)),
         );
-        // The WHOLE URL, query included: `url.full` is semconv's one home
+        // The full URL, query included: `url.full` is semconv's one home
         // for a client span's URL, and the query is the call's arguments
-        // (`?q=seoul&page=2`) — dropping it silently threw away what an
-        // agent asked for while the same arguments sent in a POST body
-        // shipped whole. Credentials in it are the masker's to replace,
+        // (`?q=seoul&page=2`) — dropping it would silently throw away what
+        // an agent asked for while the same arguments sent in a POST body
+        // ship whole. Credentials in it are the masker's to replace,
         // by the same name rules that cover a body, before this request
         // leaves the process. An empty captured URL emits nothing.
         if !url.is_empty() {
@@ -790,9 +789,10 @@ fn transport(t: &pb::TransportAttributes, attrs: &mut Vec<otlp_pb::common::KeyVa
 /// OTLP is the surface that actually leaves the process, so filling
 /// `Span.events`/`Span.links` on the wardex envelope and not here would leave
 /// the two encoders disagreeing about the same span — and a user configured for
-/// the OTLP exporter would lose design §6.3's whole graph model with no
+/// the OTLP exporter would lose every link and event between spans with no
 /// counter, no `Limitation` marker and no failing test, indistinguishable from
-/// "this agent has no graph edges". That is the silent-loss shape I4 forbids.
+/// "this agent has no graph edges". A loss nobody can see is the one the SDK
+/// must never produce.
 fn event(ev: pb::SpanEvent) -> otlp_pb::trace::span::Event {
     otlp_pb::trace::span::Event {
         time_unix_nano: ev.time_unix_nano,
@@ -836,7 +836,7 @@ fn string_attr<'a>(extra: &'a [pb::KeyValue], key: &str) -> Option<&'a str> {
     })
 }
 
-/// Does this operation name a call TO A MODEL — the one shape whose semconv
+/// Does this operation name a call to a model — the one shape whose semconv
 /// name is composed from a model id?
 ///
 /// `gen_ai.operation.name` is not "this span is an LLM call": every span in the
@@ -871,14 +871,14 @@ fn is_model_operation(operation: &str) -> bool {
 /// The OTLP span name — `{gen_ai.operation.name} {model}` for a call to a
 /// model, otherwise the name the sender gave it.
 ///
-/// The name it replaces was the transport's: `HTTP POST /v1/chat/completions`,
-/// which is the SAME STRING for every model, every prompt and every provider
-/// behind one endpoint. Span name is the axis every backend groups by, so a
-/// latency or cost breakdown over an agent's LLM calls collapsed into a single
-/// bucket that answered no question anyone asks — while the two facts a reader
-/// actually groups by sat one level down in the attributes.
+/// The transport's name would be `HTTP POST /v1/chat/completions`, which is
+/// the same string for every model, every prompt and every provider behind
+/// one endpoint. Span name is the axis every backend groups by, so a latency
+/// or cost breakdown over an agent's LLM calls would collapse into a single
+/// bucket that answers no question anyone asks — while the two facts a reader
+/// actually groups by sit one level down in the attributes.
 ///
-/// Two things this deliberately does NOT do, because each would trade one
+/// Two things this deliberately does not do, because each would trade one
 /// collapse for a wider one:
 ///
 ///   * It does not rename a span whose operation is not a model call. Those
@@ -982,7 +982,7 @@ fn span(mut sp: pb::Span, overwritten: &mut usize) -> otlp_pb::trace::Span {
         attrs.push(kv_str("server.address", &sp.server_address));
     }
     if sp.server_port != 0 {
-        attrs.push(kv_int("server.port", sp.server_port as i64));
+        attrs.push(kv_int("server.port", i64::from(sp.server_port)));
     }
     if let Some(t) = &sp.transport {
         transport(t, &mut attrs);
@@ -1008,9 +1008,9 @@ fn span(mut sp: pb::Span, overwritten: &mut usize) -> otlp_pb::trace::Span {
     uncertainty(&sp, &mut attrs);
 
     // `error.type` is a span attribute — semconv's home for it — and the
-    // status message stays the status message. It used to be SUBSTITUTED into
-    // `Status.message`, which destroyed the one field a backend renders as
-    // "what went wrong" to relabel it with a fact that now travels beside it.
+    // status message stays the status message. Substituting it into
+    // `Status.message` would destroy the one field a backend renders as
+    // "what went wrong" to relabel it with a fact that travels beside it.
     if !sp.error_type.is_empty() {
         attrs.push(kv_str("error.type", &sp.error_type));
     }
@@ -1051,7 +1051,7 @@ fn span(mut sp: pb::Span, overwritten: &mut usize) -> otlp_pb::trace::Span {
 /// `resource_spans`, so a caller can tell "nothing to send" from "a batch of
 /// empty spans" without decoding.
 ///
-/// BY VALUE, so the envelope's payloads are moved into the request rather than
+/// By value, so the envelope's payloads are moved into the request rather than
 /// copied beside it. The caller builds this envelope for this mapping and
 /// discards it, and the export path runs on the background batch worker inside
 /// the host's process: holding the envelope and the request alive together
@@ -1067,14 +1067,36 @@ pub fn envelope_to_traces(
 
 /// An OTLP request, and what its mapping did that the request cannot say for
 /// itself.
-#[derive(Debug)]
 pub struct Mapped {
+    /// Every span item of the envelope, in envelope order, under one resource
+    /// and one instrumentation scope. Not yet masked, capped or stripped of
+    /// `bytes_value`s: the caller runs those passes on it. Empty (no
+    /// `resource_spans` at all) when the envelope held no span.
     pub request: otlp_pb::trace_service::ExportTraceServiceRequest,
     /// Host attributes under a reserved transport name that did not ship as
     /// the host set them: each was replaced by the SDK's own value or, where
     /// the SDK had none, left out ([`RESERVED_TRANSPORT_PREFIX`]). The mapping
     /// has no channel to a user, so the binding that called it says so.
     pub reserved_overwritten: usize,
+}
+
+// Hand-written because `request` carries captured payloads; a derived impl
+// would print them into any panic message or test failure that formats this.
+impl std::fmt::Debug for Mapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let spans: usize = self
+            .request
+            .resource_spans
+            .iter()
+            .flat_map(|rs| &rs.scope_spans)
+            .map(|ss| ss.spans.len())
+            .sum();
+        f.debug_struct("Mapped")
+            .field("spans", &spans)
+            .field("encoded_len", &prost::Message::encoded_len(&self.request))
+            .field("reserved_overwritten", &self.reserved_overwritten)
+            .finish()
+    }
 }
 
 /// [`envelope_to_traces`], with the count the request does not carry. The
@@ -1107,9 +1129,9 @@ fn traces_request(
     }
     let sdk = env.header.as_ref().and_then(|h| h.sdk.as_ref());
     let version = sdk.map(|s| s.version.as_str()).unwrap_or_default();
-    // Resource identity is the APPLICATION's, read off `EnvelopeHeader.
-    // resource`, never off SdkInfo: every app used to export as
-    // `service.name = "wardex.python"`, which made two services one service
+    // Resource identity is the application's, read off `EnvelopeHeader.
+    // resource`, never off SdkInfo: exporting every app as
+    // `service.name = "wardex.python"` would make two services one service
     // in any backend that groups by the resource — the axis they all group by.
     // An unnamed service gets semconv's own fallback shape, never the SDK's
     // name; `telemetry.sdk.name` is the constant `"wardex"` across languages
@@ -1141,7 +1163,7 @@ fn traces_request(
         // an absence. The SDK stamps this live at drain time, so a fork
         // parent and its children arrive distinguishable.
         if r.process_pid > 0 {
-            resource_attrs.push(kv_int("process.pid", r.process_pid as i64));
+            resource_attrs.push(kv_int("process.pid", i64::from(r.process_pid)));
         }
     }
     otlp_pb::trace_service::ExportTraceServiceRequest {
@@ -1176,7 +1198,7 @@ fn traces_request(
 
 /// Strip every `bytes_value` from an OTLP export request, in place.
 ///
-/// Run this AFTER masking, never before: the PII engine's byte-level patterns
+/// Run this after masking, never before: the PII engine's byte-level patterns
 /// match inside raw payloads, and a payload already rewritten to base64 would
 /// hide them.
 pub fn strip_bytes_values(req: &mut otlp_pb::trace_service::ExportTraceServiceRequest) {
@@ -1202,7 +1224,7 @@ pub fn strip_bytes_values(req: &mut otlp_pb::trace_service::ExportTraceServiceRe
 }
 
 fn strip_kvs(kvs: &mut Vec<otlp_pb::common::KeyValue>) {
-    // (companion key, went_base64) for every attribute whose value WAS bytes.
+    // (companion key, went_base64) for every attribute whose value was bytes.
     let mut rewritten: Vec<(String, bool)> = Vec::new();
     for kv in kvs.iter_mut() {
         if let Some(v) = kv.value.as_mut() {
@@ -1277,7 +1299,7 @@ fn strip_any(v: &mut otlp_pb::common::AnyValue) -> Option<bool> {
 
 // --- Size caps at the OTLP surface ---
 //
-// Every cap the SDK enforced before this point measures a RAW size, taken
+// Every cap the SDK enforced before this point measures a raw size, taken
 // before anything is encoded: `max_body_bytes` on what a parser keeps,
 // `max_buffer_bytes` on what the client holds. None of them is the size a
 // receiver measures. The rewrite above turns a binary payload into base64, so a
@@ -1291,7 +1313,7 @@ fn strip_any(v: &mut otlp_pb::common::AnyValue) -> Option<bool> {
 /// Truncate every attribute value over `limits.max_otlp_attribute_bytes`,
 /// marking each span whose content was cut.
 ///
-/// Runs AFTER masking and BEFORE [`strip_bytes_values`], and neither half of
+/// Runs after masking and before [`strip_bytes_values`], and neither half of
 /// that is arbitrary. Before masking, a truncation could cut a PII match in two
 /// and ship the surviving half — the engine would never see the pattern whole.
 /// After the base64 rewrite, truncating would land mid-quantum and leave a
@@ -1328,7 +1350,7 @@ pub fn cap_attribute_values(
     }
 }
 
-/// The attribute that names the knob behind a payload removed WHOLE.
+/// The attribute that names the knob behind a payload removed whole.
 ///
 /// `otlp_attribute_truncated` (39) names `max_otlp_attribute_bytes`, and a
 /// span whose payload was removed to fit `max_otlp_request_bytes` carries 39
@@ -1344,13 +1366,14 @@ pub const PAYLOAD_DROPPED_REASON_KEY: &str = "wardex.payload_dropped.reason";
 pub const PAYLOAD_DROPPED_FOR_REQUEST_CAP: &str = "max_otlp_request_bytes";
 
 /// Remove a span's captured payload and mark it — the last thing tried for a
-/// span whose encoded size ALONE exceeds the per-request cap. `true` when a
+/// span whose encoded size alone exceeds the per-request cap. `true` when a
 /// payload was there to remove.
 ///
 /// The alternative at that point is dropping the span, and a span is worth more
 /// than its payload: its identity, its parent edge, its timing and its
 /// gen_ai semantics are what a trace is made of, and a hole in the tree is
 /// read as "this call never happened" rather than as "this call was large".
+#[must_use = "`true` is the only record that the span lost its payload; the caller counts it"]
 pub fn drop_payload_attributes(sp: &mut otlp_pb::trace::Span) -> bool {
     // Both key pairs a payload can land under: the wardex.* defaults and the
     // semconv pair an `execute_tool` span uses. Whichever pair `span()` chose,
@@ -1384,9 +1407,9 @@ pub fn drop_payload_attributes(sp: &mut otlp_pb::trace::Span) -> bool {
 }
 
 fn mark_truncated(attrs: &mut Vec<otlp_pb::common::KeyValue>) {
-    // By NUMBER off the schema, never as a literal: the vocabulary is declared
+    // By number off the schema, never as a literal: the vocabulary is declared
     // in `common.proto` and a string written here would be a second
-    // declaration of it, free to drift (design §6.6).
+    // declaration of it, free to drift.
     let name = vocab::limitation_name(pb::Limitation::OtlpAttributeTruncated as i32);
     push_limitation(attrs, name);
 }
@@ -1433,7 +1456,7 @@ fn cap_kvs(kvs: &mut [otlp_pb::common::KeyValue], cap: usize) -> bool {
     cut
 }
 
-/// True when this value was cut. The bound is per VALUE, so an array is capped
+/// True when this value was cut. The bound is per value, so an array is capped
 /// element by element rather than in total: the elements are separate facts,
 /// and a bound on their sum would silently delete whole entries from a list a
 /// consumer reads positionally.
@@ -1457,7 +1480,7 @@ fn cap_any(v: &mut otlp_pb::common::AnyValue, cap: usize) -> bool {
             if b.len() <= cap / 4 * 3 {
                 return false;
             }
-            // Measured as it will LEAVE, not as it sits here: `as_text` is the
+            // Measured as it will leave, not as it sits here: `as_text` is the
             // same test `strip_bytes_values` will apply, so this is that pass's
             // own arithmetic asked one step early.
             let text = as_text(b).is_some();
@@ -1513,6 +1536,7 @@ fn floor_char_boundary(bytes: &[u8], i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otlp_pb::common::any_value::Value as V;
 
     const PRODUCER: Producer<'static> = Producer {
         language: "python",
@@ -1612,7 +1636,7 @@ mod tests {
 
     #[test]
     fn a_non_model_operation_keeps_the_subject_the_sender_composed() {
-        // EVERY span in the closed vocabulary carries `gen_ai.operation.name`,
+        // Every span in the closed vocabulary carries `gen_ai.operation.name`,
         // not only the LLM ones, and none of these can carry a request model —
         // `execute_tool` requires a tool block, `invoke_agent` an agent block.
         // Reading the key as "this is an LLM call" and dropping to the bare
@@ -1639,7 +1663,7 @@ mod tests {
 
     #[test]
     fn a_tool_span_is_not_renamed_by_a_model_that_wandered_onto_it() {
-        // The gate is the OPERATION, not the presence of a model attribute: a
+        // The gate is the operation, not the presence of a model attribute: a
         // tool span that picked up a model from a parsed payload is still a
         // tool span, and `execute_tool gpt-4.1-mini` names the wrong thing.
         let sp = pb::Span {
@@ -1662,7 +1686,7 @@ mod tests {
     #[test]
     fn the_name_is_the_only_thing_the_rename_touches() {
         // Attributes stay where a consumer expects them: the model reached the
-        // name by being READ, not by being moved.
+        // name by being read, not by being moved.
         let env = envelope(gen_ai_span(&[
             ("gen_ai.operation.name", "chat"),
             ("gen_ai.request.model", "gpt-4.1-mini"),
@@ -1758,10 +1782,9 @@ mod tests {
 
     #[test]
     fn an_unnamed_service_exports_as_unknown_service_never_as_the_sdk() {
-        // The regression this slice exists to fix: every app exported as
-        // `service.name = "wardex.python"`, so two services were one service
-        // in any backend. The fallback is semconv's own shape, and SdkInfo's
-        // name may not leak into it.
+        // Exporting every app as `service.name = "wardex.python"` would make
+        // two services one service in any backend. The fallback is semconv's
+        // own shape, and SdkInfo's name may not leak into it.
         let req = envelope_to_traces(envelope(pb::Span::default()), PRODUCER);
         assert_eq!(
             resource_attr(&req, "service.name"),
@@ -1820,11 +1843,10 @@ mod tests {
 
     #[test]
     fn error_type_is_an_attribute_and_the_status_message_survives() {
-        // The inverse of the substitution this mapping used to make: semconv's
-        // home for the exception class is the `error.type` attribute, and
-        // `Status.message` is the one field a backend renders as "what went
-        // wrong" — overwriting it destroyed the message to relabel it with a
-        // fact that now travels beside it.
+        // Semconv's home for the exception class is the `error.type`
+        // attribute, and `Status.message` is the one field a backend renders
+        // as "what went wrong" — overwriting it would destroy the message to
+        // relabel it with a fact that travels beside it.
         let env = envelope(pb::Span {
             error_type: "TimeoutError".into(),
             status: Some(pb::Status {
@@ -1944,7 +1966,7 @@ mod tests {
     #[test]
     fn a_tool_payloads_companions_follow_the_key_it_landed_under() {
         // The base64 companion and the payload drop both key off whichever
-        // pair the payload used — a companion under the OLD key would tell a
+        // pair the payload used — a companion under the other key would tell a
         // consumer to decode an attribute that is not there.
         let env = envelope(pb::Span {
             extra: vec![kv_wardex("gen_ai.operation.name", "execute_tool")],
@@ -1958,7 +1980,7 @@ mod tests {
             attr(sp, "gen_ai.tool.call.arguments.encoding"),
             Some(&str_value("base64"))
         );
-        drop_payload_attributes(sp);
+        assert!(drop_payload_attributes(sp));
         assert!(attr(sp, "gen_ai.tool.call.arguments").is_none());
         assert!(attr(sp, "gen_ai.tool.call.arguments.encoding").is_none());
         assert_eq!(markers(sp), vec!["otlp_attribute_truncated"]);
@@ -2161,13 +2183,13 @@ mod tests {
 
     #[test]
     fn a_capped_binary_payload_is_still_decodable() {
-        // Truncating the base64 STRING instead of the bytes behind it lands
+        // Truncating the base64 string instead of the bytes behind it lands
         // mid-quantum and hands the consumer something that will not decode —
         // a payload lost in a way that looks like corruption rather than like
         // a cap.
         for raw in [3000usize, 3001, 3002, 3003] {
             let env = envelope(pb::Span {
-                input_data: (0..raw).map(|i| (i % 251) as u8).collect(),
+                input_data: (0..=250u8).cycle().take(raw).collect(),
                 ..Default::default()
             });
             let sp = capped(env, limits_with_attribute_cap(1000));
@@ -2210,7 +2232,7 @@ mod tests {
                 let env = envelope(pb::Span {
                     // Not text: the base64 branch is the one the arithmetic is
                     // about, and the one with room to be wrong.
-                    input_data: (0..raw).map(|i| 0x80 | (i % 64) as u8).collect(),
+                    input_data: (0..64u8).cycle().take(raw).map(|b| 0x80 | b).collect(),
                     ..Default::default()
                 });
                 let sp = capped(env, limits_with_attribute_cap(cap));
@@ -2315,7 +2337,7 @@ mod tests {
         let mut req = envelope_to_traces(env, PRODUCER);
         strip_bytes_values(&mut req);
         let sp = &mut req.resource_spans[0].scope_spans[0].spans[0];
-        drop_payload_attributes(sp);
+        assert!(drop_payload_attributes(sp));
         assert!(attr(sp, "wardex.input_data").is_none());
         assert!(attr(sp, "wardex.input_data.encoding").is_none());
         // The semantics survive: the span keeps its place in the trace and
@@ -2375,18 +2397,15 @@ mod tests {
         );
     }
 
-    use otlp_pb::common::any_value::Value as V;
-
     fn keys(sp: &otlp_pb::trace::Span, key: &str) -> usize {
         sp.attributes.iter().filter(|kv| kv.key == key).count()
     }
 
-    /// The typed conversation field is the sender's ONLY home for these
-    /// values, so this projection is all an OTLP backend sees of them. The
-    /// escape it closes: the sender wrote the keys into `extra` and left the
-    /// typed field empty, which a receiver of the envelope — reading the typed
-    /// field — stored as an empty conversation id on every span. Found by
-    /// decoding a real encode and looking for the field, not by a failing run.
+    /// The typed conversation field is the sender's only home for these
+    /// values, so this projection is all an OTLP backend sees of them. A
+    /// sender that wrote the keys into `extra` and left the typed field empty
+    /// would make a receiver of the envelope — reading the typed field — store
+    /// an empty conversation id on every span.
     #[test]
     fn the_typed_conversation_projects_onto_the_keys_a_backend_groups_by() {
         let sp = only_span(envelope(pb::Span {
@@ -2442,10 +2461,9 @@ mod tests {
     }
 
     /// A host that spelled a typed field's key into `extra` by hand gets the
-    /// TYPED value, once: a duplicated key is the backend's coin toss, and the
+    /// typed value, once: a duplicated key is the backend's coin toss, and the
     /// host's value winning would make OTLP disagree with the envelope a
-    /// receiver reads. Found by review: `wardex.capture_sources` was pushed
-    /// bare and shipped twice.
+    /// receiver reads.
     #[test]
     fn a_typed_value_replaces_a_same_keyed_extra_and_appears_once() {
         let sp = only_span(envelope(pb::Span {
@@ -2544,7 +2562,7 @@ mod tests {
         };
         // Owned strings joined for the comparison, deliberately: a borrowed
         // string vector is the shape the limitation census reads as a marker
-        // channel, and it registers the binding's NAME repository-wide.
+        // channel, and it registers the binding's name repository-wide.
         let got = arr
             .values
             .iter()
@@ -2807,6 +2825,24 @@ mod tests {
                 value: Some(pb::any_value::Value::BoolValue(v)),
             }),
         }
+    }
+
+    #[test]
+    fn mapped_debug_prints_sizes_and_never_the_captured_payload() {
+        let planted = "planted-secret-payload-7f3a";
+        let out = map_envelope(
+            envelope(pb::Span {
+                input_data: planted.as_bytes().to_vec(),
+                ..Default::default()
+            }),
+            PRODUCER,
+        );
+        let printed = format!("{out:?}");
+        assert!(!printed.contains(planted), "{printed}");
+        // A `Vec<u8>` prints as decimals, so the string check alone would miss
+        // a leaked payload: `p`, `l`, `a` are 112, 108, 97.
+        assert!(!printed.contains("112, 108, 97"), "{printed}");
+        assert!(printed.contains("spans: 1"), "{printed}");
     }
 
     fn mapped(sp: pb::Span) -> (otlp_pb::trace::Span, usize) {

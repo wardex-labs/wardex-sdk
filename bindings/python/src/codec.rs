@@ -1,32 +1,34 @@
 //! PyO3 core marshaling — `InternalEnvelope`(Python) ↔ `pb::Envelope`(prost).
 //!
-//! Option 1 (Rust getattr traversal): walks the Python object directly to populate the proto struct.
+//! Rust getattr traversal: walks the Python object directly to populate the proto struct.
 //! Lossless round-trip including the transport tree, capture_integrity, correlation, state_snapshots
 //! and client_reports.
 //!
-//! Marshaling is all this file does. What an exported span MEANS — its OTLP
+//! Marshaling is all this file does. What an exported span means — its OTLP
 //! name, the `gen_ai.*`/`http.*`/`wardex.*` keys, the resource and scope around
 //! it — lives in `wardex_core::codec::otlp::map`, over the wire schema rather
 //! than over Python objects, because a Node or Java binding needs the same
 //! decisions and re-deriving them from prose is how two SDKs end up shaping the
 //! same trace two ways.
 
-// In the trampoline code generated when the pyo3 #[pyfunction] macro wraps a function
-// returning `PyResult<T>`, clippy mistakes the `?`'s `From<PyErr> for PyErr` (identity)
-// conversion for a useless conversion
-// (a pre-existing pyo3 0.22 issue; a function-level #[allow] can't cover macro-generated sibling items).
-#![allow(clippy::useless_conversion)]
+// Module-wide because the flagged code is the sibling items the macro
+// generates, which an attribute on the function itself does not reach.
+#![expect(
+    clippy::useless_conversion,
+    reason = "the pyfunction and pymethods macros of PyO3 0.22 expand to a conversion of PyErr into PyErr; remove after upgrading PyO3"
+)]
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
 
-use wardex_core::codec::otlp::{self, otlp_pb};
-use wardex_core::codec::proto::wardex::v1 as pb;
-use wardex_core::codec::{decode_envelope, encode_envelope};
-use wardex_core::pipeline::pii;
-
 use crate::limits::PyLimits;
 use crate::shield::shielded;
+use wardex_core::codec::otlp::{self, otlp_pb};
+use wardex_core::codec::proto::wardex::v1 as pb;
+use wardex_core::codec::vocab::{self, link_reason_name};
+use wardex_core::codec::{decode_envelope, encode_envelope};
+use wardex_core::pipeline::pii;
 
 // --- getattr helpers ---
 
@@ -36,13 +38,13 @@ fn opt<'py>(obj: &Bound<'py, PyAny>, name: &str) -> PyResult<Option<Bound<'py, P
     Ok(if v.is_none() { None } else { Some(v) })
 }
 
-/// TraceId/SpanId wrapper (.value: bytes) → Vec<u8>.
-fn id_bytes(obj: &Bound<PyAny>) -> PyResult<Vec<u8>> {
+/// TraceId/SpanId wrapper (`.value: bytes`) → `Vec<u8>`.
+fn id_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     obj.getattr("value")?.extract()
 }
 
 /// Python enum → .value string.
-fn enum_str(obj: &Bound<PyAny>) -> PyResult<String> {
+fn enum_str(obj: &Bound<'_, PyAny>) -> PyResult<String> {
     obj.getattr("value")?.extract()
 }
 
@@ -75,24 +77,23 @@ fn tolerated<T>(py: Python<'_>, r: PyResult<T>) -> PyResult<Option<T>> {
 /// A host's attribute value → proto AnyValue, never by raising.
 ///
 /// `Span.set_attribute` promises `str | int | float | bool`, and validates
-/// nothing, so this reads each value as the type it IS, and refuses to bend it
-/// into one it is not. An integer outside `int64` used to fall through to the
-/// `float` read and ship as `1.18e+21` — a different number, under the type of
-/// a measurement, with nothing on the span to say so; it now ships as its
-/// exact decimal digits, named. A value no read takes (`object()`, `bytes`, a
-/// `str` holding a lone surrogate) used to raise here, and on the export path
-/// that raise cost the WHOLE batch: the client's drain is fail-closed and
-/// silent off-debug. It is now left out, named, and the span and its batch
-/// ship.
+/// nothing, so this reads each value as the type it is, and refuses to bend it
+/// into one it is not. An integer outside `int64` ships as its exact decimal
+/// digits, named, rather than falling through to the `float` read and shipping
+/// as `1.18e+21` — a different number, under the type of a measurement. A
+/// value no read takes (`object()`, `bytes`, a `str` holding a lone surrogate)
+/// is left out, named, and the span and its batch ship: on the export path a
+/// raise would cost the whole batch, because the client's drain is
+/// fail-closed and silent off-debug.
 ///
 /// The order is the point. A `bool` is an `int`, so it goes first; the three
 /// other promised types are read as themselves; then an integer that is not
-/// an `int` (numpy's, or anything with `__index__`) is read EXACTLY, through
+/// an `int` (numpy's, or anything with `__index__`) is read exactly, through
 /// `operator.index`, before the `float` read gets a chance at it — `float()`
 /// falls back to `__index__` as well, and would round `np.uint64(2**64 - 1)`
 /// to `1.8446744073709552e+19` without a word. Whatever is left (a `Decimal`,
 /// a `Fraction`) is what `float()` makes of it.
-fn any_value(v: &Bound<PyAny>) -> PyResult<HostValue> {
+fn any_value(v: &Bound<'_, PyAny>) -> PyResult<HostValue> {
     use pb::any_value::Value;
     let py = v.py();
     let kept = |value| HostValue::Kept(pb::AnyValue { value: Some(value) });
@@ -143,7 +144,7 @@ fn any_value(v: &Bound<PyAny>) -> PyResult<HostValue> {
 /// `__str__`, which an `int` subclass may override. A value too long for
 /// Python's integer-to-string limit (`sys.get_int_max_str_digits()`, 4300 by
 /// default) cannot be written that way and is the unreadable kind.
-fn int_value(n: &Bound<PyAny>) -> PyResult<HostValue> {
+fn int_value(n: &Bound<'_, PyAny>) -> PyResult<HostValue> {
     use pb::any_value::Value;
     let py = n.py();
     if let Some(i) = tolerated(py, n.extract::<i64>())? {
@@ -171,7 +172,7 @@ fn int_value(n: &Bound<PyAny>) -> PyResult<HostValue> {
 /// `1.0`. Looked up in `sys.modules` rather than imported: if numpy is not
 /// loaded, nothing can be one of its bools, and an encoder must not be what
 /// imports it.
-fn is_numpy_bool(v: &Bound<PyAny>) -> PyResult<bool> {
+fn is_numpy_bool(v: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = v.py();
     let numpy_bool = py
         .import_bound("sys")
@@ -224,11 +225,11 @@ fn kv_bool(key: &str, v: bool) -> pb::KeyValue {
         }),
     }
 }
-/// A list of strings as ONE attribute holding an ArrayValue — the same shape
+/// A list of strings as one attribute holding an ArrayValue — the same shape
 /// `wardex.limitations` already ships in. The semconv list-valued keys
 /// (stop_sequences, finish_reasons, encoding_formats) are arrays on the wire;
-/// the CSV join this replaces destroyed the elements' boundaries the moment a
-/// value contained a comma.
+/// a CSV join would destroy the elements' boundaries the moment a value
+/// contained a comma.
 fn kv_strs(key: &str, vs: Vec<String>) -> pb::KeyValue {
     pb::KeyValue {
         key: key.into(),
@@ -245,7 +246,7 @@ fn kv_strs(key: &str, vs: Vec<String>) -> pb::KeyValue {
     }
 }
 
-/// What names an attribute whose KEY is not a `str` (`set_attribute(123, v)`)
+/// What names an attribute whose key is not a `str` (`set_attribute(123, v)`)
 /// in the `UNMARSHALLED_FIELD_KEY` note. Fixed text, because the key is the
 /// host's object: spelling it would run its `__str__`, and a key that is
 /// neither text nor anything the wire can name has no honest spelling.
@@ -256,14 +257,14 @@ const NON_STR_KEY: &str = "<non-str key>";
 /// that cannot be written.
 const UNENCODABLE_KEY: &str = "<unencodable key>";
 
-/// Python tuple[(key, scalar)] → Vec<KeyValue>, with the key of every value
+/// Python `tuple[(key, scalar)]` → `Vec<KeyValue>`, with the key of every value
 /// that did not ship as the host gave it pushed onto `unmarshalled`.
 ///
-/// A key that is not a `str`, or is one the wire cannot encode, raised here
-/// like a bad value did, and cost the batch the same way. Its attribute is
-/// left out, value unread, and named by a fixed placeholder.
+/// A key that is not a `str`, or is one the wire cannot encode, does not
+/// raise: a raise here would cost the batch. Its attribute is left out, value
+/// unread, and named by a fixed placeholder.
 fn kv_list(
-    extra: &Bound<PyAny>,
+    extra: &Bound<'_, PyAny>,
     out: &mut Vec<pb::KeyValue>,
     unmarshalled: &mut Vec<String>,
 ) -> PyResult<()> {
@@ -300,7 +301,7 @@ fn kv_list(
 /// `kv_list` for a record whose attributes are its own: an event's, a
 /// snapshot's. The keys it could not ship as given are named on that same
 /// record, under `UNMARSHALLED_FIELD_KEY`, one attribute however many.
-fn kv_list_noted(extra: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+fn kv_list_noted(extra: &Bound<'_, PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     let mut unmarshalled = Vec::new();
     kv_list(extra, out, &mut unmarshalled)?;
     set_unmarshalled_note(out, &unmarshalled);
@@ -308,7 +309,7 @@ fn kv_list_noted(extra: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<
 }
 
 /// The `UNMARSHALLED_FIELD_KEY` note onto `attrs`, when there is anything to
-/// name — REPLACING a same-keyed attribute the host set itself. Pushed beside
+/// name — replacing a same-keyed attribute the host set itself. Pushed beside
 /// it, the key would ship twice, and an OTLP decoder keeps one of a duplicated
 /// key: the backend's choice whether the note or the host's value survives.
 fn set_unmarshalled_note(attrs: &mut Vec<pb::KeyValue>, names: &[String]) {
@@ -321,10 +322,10 @@ fn set_unmarshalled_note(attrs: &mut Vec<pb::KeyValue>, names: &[String]) {
 
 // --- enum mapping (unmapped → *_UNSPECIFIED) ---
 //
-// Every one of these was a hand-written `match` from the Python enum value to
-// the proto number — a second declaration of a list the `.proto` already owns,
-// with nothing to make the compiler compare the two. `wardex_core::codec::vocab`
-// derives the mapping from the schema instead (design §6.6), so the tables here
+// A hand-written `match` from the Python enum value to the proto number would
+// be a second declaration of a list the `.proto` already owns, with nothing to
+// make the compiler compare the two. `wardex_core::codec::vocab`
+// derives the mapping from the schema instead, so the tables here
 // are only about what to do when the schema has no such value.
 //
 // That decision is per-vocabulary and stays visible at the call site rather
@@ -347,10 +348,10 @@ fn map_capture_source(s: &str) -> i32 {
     vocab::capture_source_to_proto(s).unwrap_or(pb::CaptureSource::Unspecified as i32)
 }
 
-// --- span vocabulary registry (design §6.2, §6.3, §6.6) ---
+// --- span vocabulary registry ---
 //
 // proto is the single source of truth for the span vocabulary, and these
-// functions are the mapping from the Python enum VALUE (`"execute_tool"`,
+// functions are the mapping from the Python enum value (`"execute_tool"`,
 // `"ipc"`, `"triggered_by"`) to the declared proto number. Node and Java get
 // the same table by generating from the same `.proto`, which is the whole point
 // of declaring the enums: a second SDK must not re-derive the vocabulary from
@@ -376,12 +377,10 @@ fn map_link_reason(s: &str) -> i32 {
     vocab::link_reason_to_proto(s).unwrap_or(pb::LinkReason::Unspecified as i32)
 }
 
-use wardex_core::codec::vocab::{self, link_reason_name};
-
 // --- gen_ai flattening ---
 
 /// GenAIAttributes → extra KeyValue (OTel keys). Only populated fields.
-fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+fn flatten_gen_ai(g: &Bound<'_, PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     // operation: OperationName|str (required). If enum, use .value; if str, use as-is.
     let op = g.getattr("operation")?;
     let op_s: String = if op.hasattr("value")? {
@@ -464,7 +463,7 @@ fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()>
         out.push(kv_bool("gen_ai.request.stream", v.extract()?));
     }
     // tuple[str] → ArrayValue of strings (semconv declares these as arrays;
-    // the CSV join they used to get was lossy on any element with a comma).
+    // a CSV join would be lossy on any element with a comma).
     for (attr, key) in [
         ("stop_sequences", "gen_ai.request.stop_sequences"),
         ("finish_reasons", "gen_ai.response.finish_reasons"),
@@ -487,7 +486,7 @@ fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()>
 }
 
 /// EmbeddingsAttributes → extra KeyValue. Only populated fields.
-fn flatten_embeddings(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+fn flatten_embeddings(e: &Bound<'_, PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     if let Some(v) = opt(e, "dimension_count")? {
         out.push(kv_int("gen_ai.embeddings.dimension.count", v.extract()?));
     }
@@ -496,12 +495,9 @@ fn flatten_embeddings(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult
 
 /// RetrievalAttributes → extra KeyValue (semconv `gen_ai.retrieval.*` and
 /// `gen_ai.data_source.id`). Only populated fields; an empty `documents` is
-/// the dataclass default, not a fact. The third typed block that was
-/// declared, settable through `SpanDraft.set_retrieval`, required by the
-/// `RETRIEVAL` intent — and never marshalled, the same gap the conversation
-/// and evaluation blocks had. `documents` travels as bytes on the envelope
+/// the dataclass default, not a fact. `documents` travels as bytes on the envelope
 /// surface and degrades to text on the OTLP one like every other payload.
-fn flatten_retrieval(r: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+fn flatten_retrieval(r: &Bound<'_, PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     for (attr, key) in [
         ("data_source_id", "gen_ai.data_source.id"),
         ("query_text", "gen_ai.retrieval.query.text"),
@@ -513,7 +509,7 @@ fn flatten_retrieval(r: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<
     if let Some(v) = opt(r, "documents")? {
         // A `str` that skipped the dataclass's own coercion is read as its
         // UTF-8 rather than refused: the field is documented as JSON, and a
-        // refusal here used to cost the whole span.
+        // refusal here would cost the whole span.
         let docs: Vec<u8> = match v.extract::<Vec<u8>>() {
             Ok(b) => b,
             Err(_) => v.extract::<String>()?.into_bytes(),
@@ -526,7 +522,7 @@ fn flatten_retrieval(r: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<
 }
 
 /// AgentAttributes → extra KeyValue. Only populated fields.
-fn flatten_agent(a: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+fn flatten_agent(a: &Bound<'_, PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     out.push(kv_str("gen_ai.agent.name", a.getattr("name")?.extract()?));
     for (attr, key) in [
         ("id", "gen_ai.agent.id"),
@@ -545,7 +541,7 @@ fn flatten_agent(a: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> 
 }
 
 /// ToolAttributes → extra KeyValue. Only populated fields.
-fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+fn flatten_tool(t: &Bound<'_, PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     out.push(kv_str("gen_ai.tool.name", t.getattr("name")?.extract()?));
     for (attr, key) in [
         ("call_id", "gen_ai.tool.call.id"),
@@ -576,21 +572,22 @@ fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
 /// ships; such a value is omitted — except an integer outside `int64`, which
 /// ships as its decimal digits in a string — and this note says which. Without
 /// it a `ConversationContext(conversation_id=uuid)` or a `set_attribute("k",
-/// 10**400)` raised out of the encoder and the client dropped the ENTIRE
-/// batch, every good span with it, in silence. One attribute per record,
-/// comma-joined in the order the values were read: two bad fields used to
-/// push the key twice, and an OTLP decoder keeps one of a duplicated key.
+/// 10**400)` would raise out of the encoder and the client would drop the
+/// entire batch, every good span with it, in silence. One attribute per
+/// record, comma-joined in the order the values were read: a key pushed per
+/// bad field would ship twice, and an OTLP decoder keeps one of a duplicated
+/// key.
 const UNMARSHALLED_FIELD_KEY: &str = "wardex.codec.unmarshalled";
 
 /// `float(v)`-tolerant read: an f64, or a string that parses as one.
-fn as_f64(v: &Bound<PyAny>) -> Option<f64> {
+fn as_f64(v: &Bound<'_, PyAny>) -> Option<f64> {
     if let Ok(f) = v.extract::<f64>() {
         return Some(f);
     }
     v.str().ok()?.to_str().ok()?.trim().parse::<f64>().ok()
 }
 
-/// A host-written attribute, read so that NOTHING the host put there can raise
+/// A host-written attribute, read so that nothing the host put there can raise
 /// out of the encoder: absent, `None`, or an object with no such attribute at
 /// all (a tuple where a `CallSite` was expected) all read as "not there".
 ///
@@ -603,18 +600,16 @@ fn host_attr<'py>(obj: &Bound<'py, PyAny>, name: &str) -> Option<Bound<'py, PyAn
 }
 
 /// `str(v)`, or `None` when the object's own `__str__` raises.
-fn host_text(v: &Bound<PyAny>) -> Option<String> {
+fn host_text(v: &Bound<'_, PyAny>) -> Option<String> {
     v.str().ok().map(|s| s.to_string())
 }
 
 /// ConversationContext → `Span.conversation` (field 23), its typed home.
 ///
-/// This block has been lost twice. First it was declared (`span.proto`
-/// field 23, `wardex.conversation()`'s docstring) and never marshalled at
-/// all. Then it was flattened into `extra` beside the agent and tool blocks,
-/// which reached an OTLP backend and left field 23 empty — and a receiver of
-/// the envelope reads field 23, so it stored every conversation id as "".
-/// The typed field is the one source now; the OTLP mapping derives
+/// A receiver of the envelope reads field 23, so flattening this block into
+/// `extra` beside the agent and tool blocks would reach an OTLP backend and
+/// leave the receiver storing every conversation id as "". The typed field is
+/// the one source; the OTLP mapping derives
 /// `gen_ai.conversation.id` and the two `wardex.conversation.*` keys from it
 /// and lets them replace a same-keyed `extra`, so the value rides the envelope
 /// once and the two surfaces carry the same one.
@@ -627,7 +622,7 @@ fn host_text(v: &Bound<PyAny>) -> Option<String> {
 /// that is not an integer or does not fit `int32` — is named as unmarshalled
 /// and left unset; it is never wrapped and never raised.
 fn conversation_to_proto(
-    c: &Bound<PyAny>,
+    c: &Bound<'_, PyAny>,
     unmarshalled: &mut Vec<String>,
 ) -> pb::ConversationContext {
     let mut conv = pb::ConversationContext::default();
@@ -652,17 +647,16 @@ fn conversation_to_proto(
 
 /// CallSite → `Span.call_site` (field 22), its typed home.
 ///
-/// Declared in the schema, filled by the tracing decorators and settable by a
-/// host through `Span.call_site`, read by a receiver of the envelope — and
-/// never written here, so a location the host was told it could record left
-/// the process nowhere. The setter validates nothing, so what arrives may not
+/// Declared in the schema, filled by the tracing decorators, settable by a
+/// host through `Span.call_site`, and read by a receiver of the envelope. The
+/// setter validates nothing, so what arrives may not
 /// be a `CallSite` at all: each field is read tolerantly, one the field's type
 /// cannot hold is named as unmarshalled, and the rest of the location ships.
 /// The names are the OTLP attributes the mapping derives, except the module,
 /// which has none of its own — it is composed into `code.function.name` — and
 /// is named as the field it is, so that losing it does not read as losing the
 /// function.
-fn call_site_to_proto(c: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> pb::CallSite {
+fn call_site_to_proto(c: &Bound<'_, PyAny>, unmarshalled: &mut Vec<String>) -> pb::CallSite {
     let mut site = pb::CallSite::default();
     for (attr, name, slot) in [
         ("file", "code.file.path", &mut site.file),
@@ -686,13 +680,11 @@ fn call_site_to_proto(c: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> pb::C
 }
 
 /// EvaluationAttributes → extra KeyValue (semconv `gen_ai.evaluation.*`).
-/// Only populated fields. This block had the same omission as the
-/// conversation block above — declared, set by adapters, never marshalled.
-/// It has no typed field in the schema, so `extra` is its one home.
+/// Only populated fields. It has no typed field in the schema, so `extra` is its one home.
 /// `score_value` accepts what `float()`
 /// would; anything else is omitted and named under `UNMARSHALLED_FIELD_KEY`.
 fn flatten_evaluation(
-    e: &Bound<PyAny>,
+    e: &Bound<'_, PyAny>,
     out: &mut Vec<pb::KeyValue>,
     unmarshalled: &mut Vec<String>,
 ) -> PyResult<()> {
@@ -741,7 +733,7 @@ fn map_modality(s: &str) -> i32 {
 /// on the wire:
 /// Python `None` stays unset rather than becoming `0`, `false` or `0.0`. An
 /// unset modality is `None` on the Python side and `MODALITY_UNSPECIFIED` here.
-fn transport_to_proto(t: &Bound<PyAny>) -> PyResult<pb::TransportAttributes> {
+fn transport_to_proto(t: &Bound<'_, PyAny>) -> PyResult<pb::TransportAttributes> {
     let tm = t.getattr("timing")?;
     let http = match opt(t, "http")? {
         Some(h) => Some(pb::HttpMeta {
@@ -851,10 +843,9 @@ const UNMAPPED_LIMITATION_KEY: &str = "wardex.limitation.unmapped";
 
 /// `CaptureIntegrity` → proto, returning any marker the schema has no value for.
 ///
-/// The second half of that return type is the point. `limitations` used to be
-/// `repeated string`, so anything the Python side held reached the wire
-/// verbatim; now it is a closed enum and a value with no proto counterpart has
-/// nowhere to go. Dropping it would produce exactly the failure the vocabulary
+/// The second half of that return type is the point. `limitations` is a
+/// closed enum on the wire, so a value with no proto counterpart has nowhere
+/// to go. Dropping it would produce exactly the failure the vocabulary
 /// exists to prevent — a span that reads as fully captured because the reason it
 /// was not could not be spelled.
 ///
@@ -866,9 +857,9 @@ const UNMAPPED_LIMITATION_KEY: &str = "wardex.limitation.unmapped";
 /// This should be unreachable: `test_vocabulary.py` asserts the Python enum and
 /// the proto enum agree member for member, so a gap fails CI before it ships.
 /// It exists because "unreachable" is a property of today's build, and the
-/// decode side of this same file has to survive an envelope written by a NEWER
+/// decode side of this same file has to survive an envelope written by a newer
 /// SDK — where the gap is not a bug but the normal case.
-fn integrity_to_proto(c: &Bound<PyAny>) -> PyResult<(pb::CaptureIntegrity, Vec<String>)> {
+fn integrity_to_proto(c: &Bound<'_, PyAny>) -> PyResult<(pb::CaptureIntegrity, Vec<String>)> {
     let mut codes: Vec<i32> = Vec::new();
     let mut unmapped: Vec<String> = Vec::new();
     for m in c.getattr("limitations")?.iter()? {
@@ -909,7 +900,7 @@ fn integrity_to_proto(c: &Bound<PyAny>) -> PyResult<(pb::CaptureIntegrity, Vec<S
     ))
 }
 
-fn correlation_to_proto(c: &Bound<PyAny>) -> PyResult<pb::CorrelationInfo> {
+fn correlation_to_proto(c: &Bound<'_, PyAny>) -> PyResult<pb::CorrelationInfo> {
     let mut corr = pb::CorrelationInfo {
         confidence: c.getattr("confidence")?.extract()?,
         ..Default::default()
@@ -945,7 +936,7 @@ fn correlation_to_proto(c: &Bound<PyAny>) -> PyResult<pb::CorrelationInfo> {
 
 /// Lifted out of `state_to_proto` so `vocabulary_tables()` can pin it beside
 /// the other three registry enums. An unrecognized value still becomes
-/// UNSPECIFIED here, but it can no longer arrive unnoticed: `SnapshotType` is
+/// UNSPECIFIED here, but it does not arrive unnoticed: `SnapshotType` is
 /// closed on the Python side too, and `SnapshotDraft` attaches
 /// `Limitation.SNAPSHOT_TYPE_UNKNOWN` at the point of coercion instead of
 /// letting this function flatten it in silence.
@@ -953,7 +944,7 @@ fn map_snapshot_type(v: &str) -> i32 {
     vocab::snapshot_type_to_proto(v).unwrap_or(pb::SnapshotType::Unspecified as i32)
 }
 
-fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
+fn state_to_proto(s: &Bound<'_, PyAny>) -> PyResult<pb::StateSnapshot> {
     let mut ss = pb::StateSnapshot {
         trace_id: id_bytes(&s.getattr("trace_id")?)?,
         span_id: id_bytes(&s.getattr("span_id")?)?,
@@ -1015,9 +1006,9 @@ fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
 
 /// One span is three steps — this head, `flatten_typed_blocks`, then
 /// `span_tail_to_proto` — run in that order by `envelope_to_proto`, and
-/// split so the export path can skip exactly ONE of them: the core fields
+/// split so the export path can skip exactly one of them: the core fields
 /// and the wardex-owned blocks (head and tail) are the encoder's own and a
-/// failure there is an encoder bug that must raise; the HOST-FACING typed
+/// failure there is an encoder bug that must raise; the host-facing typed
 /// blocks in the middle hold values the host wrote, and a value the
 /// marshaller cannot read there is that one span's loss and nothing else's.
 ///
@@ -1026,7 +1017,7 @@ fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
 /// split. An `extra` key or value the wire cannot hold as given is named
 /// onto `unmarshalled` rather than raised, so the head stays the encoder's
 /// own: nothing a host can set fails it.
-fn span_head_to_proto(sp: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> PyResult<pb::Span> {
+fn span_head_to_proto(sp: &Bound<'_, PyAny>, unmarshalled: &mut Vec<String>) -> PyResult<pb::Span> {
     let ctx = sp.getattr("context")?;
     let mut span = pb::Span {
         trace_id: id_bytes(&ctx.getattr("trace_id")?)?,
@@ -1075,7 +1066,7 @@ fn span_head_to_proto(sp: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> PyRe
 /// because every value read here was written by the host. A field read here
 /// but not shipped as given is named onto `unmarshalled`, after the head's.
 fn flatten_typed_blocks(
-    sp: &Bound<PyAny>,
+    sp: &Bound<'_, PyAny>,
     span: &mut pb::Span,
     unmarshalled: &mut Vec<String>,
 ) -> PyResult<()> {
@@ -1095,7 +1086,7 @@ fn flatten_typed_blocks(
         flatten_retrieval(&r, &mut span.extra)?;
     }
     // The two host-facing blocks the schema gives a typed field of their own.
-    // They are written THERE and nowhere else: a value with two homes on one
+    // They are written there and nowhere else: a value with two homes on one
     // envelope is a value whose readers can each pick a different one.
     if let Some(c) = opt(sp, "conversation")? {
         span.conversation = Some(conversation_to_proto(&c, unmarshalled));
@@ -1111,7 +1102,7 @@ fn flatten_typed_blocks(
 
 /// The wardex-owned blocks after the typed ones: transport, integrity,
 /// correlation, events and links. Encoder-owned, so a failure raises.
-fn span_tail_to_proto(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> {
+fn span_tail_to_proto(sp: &Bound<'_, PyAny>, span: &mut pb::Span) -> PyResult<()> {
     if let Some(t) = opt(sp, "transport")? {
         span.transport = Some(transport_to_proto(&t)?);
     }
@@ -1142,14 +1133,12 @@ fn span_tail_to_proto(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> {
 
 /// `InternalSpan.events` -> `Span.events` (tag 10).
 ///
-/// This encoder did not exist. `Span.events` and `Span.links` were declared in
-/// `span.proto` and never filled, so `_types.py`'s `events`/`links` tuples were
+/// Without this encoder, `_types.py`'s `events`/`links` tuples would be
 /// dropped whole at encode — and with them `InternalSpanLink.reason`, which
-/// made `LinkReason` dead vocabulary and design §6.3's entire graph model
+/// would make `LinkReason` dead vocabulary and the span graph it names
 /// (TRIGGERED_BY edges, HANDOFF_FROM siblings, RESUMED_FROM across a
-/// checkpoint) impossible to transmit at all. Declaring the enum without this
-/// would have been theatre.
-fn events_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanEvent>) -> PyResult<()> {
+/// checkpoint) impossible to transmit at all.
+fn events_to_proto(sp: &Bound<'_, PyAny>, out: &mut Vec<pb::SpanEvent>) -> PyResult<()> {
     for ev in sp.getattr("events")?.iter()? {
         let ev = ev?;
         let mut event = pb::SpanEvent {
@@ -1173,7 +1162,7 @@ fn events_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanEvent>) -> PyResult<
 /// becomes UNSPECIFIED — and that is bounded by `LinkReason` being closed and
 /// `SpanDraft.add_link` taking the enum, so no caller inside the SDK can
 /// produce a string that is not a member.
-fn links_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanLink>) -> PyResult<()> {
+fn links_to_proto(sp: &Bound<'_, PyAny>, out: &mut Vec<pb::SpanLink>) -> PyResult<()> {
     for ln in sp.getattr("links")?.iter()? {
         let ln = ln?;
         let mut link = pb::SpanLink {
@@ -1196,7 +1185,7 @@ fn links_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanLink>) -> PyResult<()
 
 // --- envelope ---
 
-fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
+fn header_to_proto(h: &Bound<'_, PyAny>) -> PyResult<pb::EnvelopeHeader> {
     let sdk = h.getattr("sdk")?;
     let mut header = pb::EnvelopeHeader {
         event_id: h.getattr("event_id")?.extract()?,
@@ -1240,16 +1229,15 @@ fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
 /// returned, to be raised.
 fn skip_reason(sp: &Bound<'_, PyAny>, e: &PyErr) -> PyResult<String> {
     let py = sp.py();
-    let host_text =
-        |text: PyResult<Bound<'_, pyo3::types::PyString>>, placeholder: &str| -> PyResult<String> {
-            match text {
-                Ok(s) => Ok(s.to_string_lossy().into_owned()),
-                Err(err) if err.is_instance_of::<pyo3::exceptions::PyException>(py) => {
-                    Ok(placeholder.into())
-                }
-                Err(err) => Err(err),
+    let host_text = |text: PyResult<Bound<'_, PyString>>, placeholder: &str| -> PyResult<String> {
+        match text {
+            Ok(s) => Ok(s.to_string_lossy().into_owned()),
+            Err(err) if err.is_instance_of::<pyo3::exceptions::PyException>(py) => {
+                Ok(placeholder.into())
             }
-        };
+            Err(err) => Err(err),
+        }
+    };
     let name = host_text(sp.getattr("name").and_then(|n| n.str()), "<unnamed>")?;
     let value = e.value_bound(py);
     let kind = host_text(value.get_type().qualname(), "<unnamed exception>")?;
@@ -1266,14 +1254,14 @@ fn skip_reason(sp: &Bound<'_, PyAny>, e: &PyErr) -> PyResult<String> {
 /// it rides in. A repeated key adds up rather than overwriting, for the same
 /// reason. A value that is not an integer at all still raises: that is a bug
 /// in what built the report, not a range.
-fn client_report_to_proto(r: &Bound<PyAny>) -> PyResult<pb::ClientReport> {
-    let count = |v: Bound<PyAny>| -> PyResult<i32> {
+fn client_report_to_proto(r: &Bound<'_, PyAny>) -> PyResult<pb::ClientReport> {
+    let count = |v: Bound<'_, PyAny>| -> PyResult<i32> {
         let n = saturating_int(&v, i64::MIN, i64::MAX)?;
         Ok(i32::try_from(n.clamp(0, i64::from(i32::MAX))).unwrap_or(i32::MAX))
     };
     let mut discarded_events = std::collections::HashMap::new();
     for pair in r.getattr("discarded_events")?.iter()? {
-        let (key, n): (String, Bound<PyAny>) = pair?.extract()?;
+        let (key, n): (String, Bound<'_, PyAny>) = pair?.extract()?;
         let n = count(n)?;
         let total: &mut i32 = discarded_events.entry(key).or_insert(0);
         *total = total.saturating_add(n);
@@ -1289,7 +1277,7 @@ fn client_report_to_proto(r: &Bound<PyAny>) -> PyResult<pb::ClientReport> {
 
 /// A Python int as `T`, saturated at `low`/`high` when it is past what `T`
 /// holds: the sign says which end. Any other extraction error is returned.
-fn saturating_int<T>(v: &Bound<PyAny>, low: T, high: T) -> PyResult<T>
+fn saturating_int<T>(v: &Bound<'_, PyAny>, low: T, high: T) -> PyResult<T>
 where
     T: for<'py> FromPyObject<'py>,
 {
@@ -1307,21 +1295,21 @@ where
 /// marshaling state snapshots and drop reports the mapping then drops would
 /// spend the walk on data that cannot reach that wire, and would let a
 /// malformed one fail an export whose spans were fine.
-/// Envelope → proto, plus the spans it could NOT marshal, when asked to go on.
+/// Envelope → proto, plus the spans it could not marshal, when asked to go on.
 ///
 /// `skip_unmarshallable` is the export path's setting. A span whose typed
 /// block holds a value of the wrong Python type fails `flatten_typed_blocks`
-/// for that one span; raising here made the client's drain drop the WHOLE
-/// batch (its `except` is fail-closed and silent off-debug), so one bad
-/// value deleted every good span around it. With the flag set the bad span
+/// for that one span; raising here would make the client's drain drop the
+/// whole batch (its `except` is fail-closed and silent off-debug), so one bad
+/// value would delete every good span around it. With the flag set the bad span
 /// is skipped and named — `"{span name}: {reason}"`, host text, for the
 /// caller to count and to show only under debug; the fidelity encoders keep
 /// raising, because a round-trip tool that hides a span is lying about what
-/// it round-tripped. ONLY the typed-block step is skippable: a failure in
+/// it round-tripped. Only the typed-block step is skippable: a failure in
 /// the core fields or the wardex-owned blocks is an encoder bug, and the
 /// flag does not turn that into a quiet per-span loss.
 fn envelope_to_proto(
-    env: &Bound<PyAny>,
+    env: &Bound<'_, PyAny>,
     non_span_items: bool,
     skip_unmarshallable: bool,
 ) -> PyResult<(pb::Envelope, Vec<String>)> {
@@ -1330,7 +1318,7 @@ fn envelope_to_proto(
     for sp in env.getattr("spans")?.iter()? {
         let sp = sp?;
         // What the head and the typed blocks could not ship as given, named
-        // under ONE key: a key pushed per field would be a duplicate
+        // under one key: a key pushed per field would be a duplicate
         // attribute, of which an OTLP decoder keeps one, and the other loss
         // would go unnamed. Owned strings, deliberately: `Vec<&'static str>`
         // is the shape of a limitation-marker channel in this codebase and
@@ -1350,8 +1338,7 @@ fn envelope_to_proto(
             unmarshalled.push(skip_reason(&sp, &e)?);
             continue;
         }
-        // After the typed blocks' attributes and before the tail's, where the
-        // note has always sat.
+        // After the typed blocks' attributes and before the tail's.
         set_unmarshalled_note(&mut span.extra, &not_as_given);
         span_tail_to_proto(&sp, &mut span)?;
         items.push(pb::EnvelopeItem {
@@ -1406,7 +1393,7 @@ fn any_to_py(py: Python<'_>, v: &pb::AnyValue) -> PyObject {
         Some(Value::BoolValue(b)) => b.into_py(py),
         Some(Value::BytesValue(b)) => PyBytes::new_bound(py, b).into_py(py),
         // The decode half of `kv_strs`: the list-valued gen_ai keys ship as
-        // ArrayValue now, and a reader handed `None` for a value the encoder
+        // ArrayValue, and a reader handed `None` for a value the encoder
         // wrote would report the key as unset (same reasoning as
         // `otlp_any_to_py` below).
         Some(Value::ArrayValue(a)) => {
@@ -1609,8 +1596,8 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
         cd.set_item("truncated", c.truncated)?;
         cd.set_item("redacted", c.redacted)?;
         // Numbers in, names out. Handing a consumer a raw `i32` would make it
-        // re-derive the vocabulary from the schema by hand — the exact drift
-        // §6.6 exists to stop — and an unrecognized number says so in its own
+        // re-derive the vocabulary from the schema by hand, which is how two
+        // copies of it drift apart; an unrecognized number says so in its own
         // name rather than passing for "unset".
         cd.set_item(
             "limitations",
@@ -1636,9 +1623,9 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
         cd.set_item("confidence", c.confidence)?;
         d.set_item("correlation", cd)?;
     }
-    // The decode half of the events/links encoder above. Both directions land in
-    // the same commit so the round-trip is testable: an encoder nobody can
-    // decode is indistinguishable from no encoder at all.
+    // The decode half of the events/links encoder above, so the round-trip is
+    // testable: an encoder nobody can decode is indistinguishable from no
+    // encoder at all.
     let events = PyList::empty_bound(py);
     for ev in &sp.events {
         let ed = PyDict::new_bound(py);
@@ -1656,8 +1643,7 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
         // The wardex value string, not the raw i32 the rest of this function
         // still hands back for enums. A number is not a vocabulary: a consumer
         // reading `2` has to hold a copy of the enum to know what it means,
-        // which is the drift §6.6 exists to prevent. (The other enums here
-        // still hand back numbers; converting them is separate work.)
+        // which is how two copies of it drift apart.
         ld.set_item("reason", link_reason_name(ln.reason))?;
         ld.set_item("attributes", kv_to_py(py, &ln.attributes)?)?;
         links.append(ld)?;
@@ -1751,10 +1737,11 @@ fn envelope_to_dict(py: Python<'_>, env: &pb::Envelope) -> PyResult<PyObject> {
 // --- OTLP decode → dict (for tests/debugging) ---
 
 fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        let _ = write!(s, "{:02x}", b);
+        s.push(char::from(DIGITS[usize::from(b >> 4)]));
+        s.push(char::from(DIGITS[usize::from(b & 0x0f)]));
     }
     s
 }
@@ -1815,9 +1802,8 @@ fn otlp_traces_to_dict(
             if let Some(sc) = &ss.scope {
                 scoped.set_item("name", &sc.name)?;
                 scoped.set_item("version", &sc.version)?;
-                // Scope attributes were omitted while the only consumers were
-                // round-trip tests; the bridge ingests foreign telemetry, so a
-                // projection that silently discards fields would discard data
+                // Scope attributes are kept because the bridge ingests foreign
+                // telemetry: a projection that silently discards fields would discard data
                 // wardex never produced and cannot re-derive.
                 scoped.set_item("attributes", otlp_attrs_to_py(py, &sc.attributes)?)?;
                 scoped.set_item("dropped_attributes_count", sc.dropped_attributes_count)?;
@@ -1849,8 +1835,7 @@ fn otlp_traces_to_dict(
                 spd.set_item("attributes", otlp_attrs_to_py(py, &sp.attributes)?)?;
                 // The decode half of `events_to_otlp`/`links_to_otlp`. An
                 // encoder nobody can decode is indistinguishable from no
-                // encoder, which is how these two fields went missing on this
-                // surface in the first place.
+                // encoder.
                 let events = PyList::empty_bound(py);
                 for ev in &sp.events {
                     let ed = PyDict::new_bound(py);
@@ -1883,6 +1868,12 @@ fn otlp_traces_to_dict(
 
 // --- pyfunctions + submodule ---
 
+/// A core error as the `ValueError` Python callers catch: the core's own
+/// message, unchanged, so the text a user sees names the failed operation.
+fn value_error(e: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(e.to_string())
+}
+
 /// The PII policy one encode call applies: the mode, the exempted
 /// categories, and the application's own secret names and exemptions.
 struct PiiPolicy<'a> {
@@ -1903,21 +1894,21 @@ impl PiiPolicy<'_> {
         match self.mode {
             "off" => Ok(pii::userinfo_engine()),
             "mask" => pii::engine_for_policy(&self.disabled, &self.extra_names, &self.reveal_names)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())),
-            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                .map_err(value_error),
+            other => Err(PyValueError::new_err(format!(
                 "unsupported pii_mode {other:?} (expected \"mask\" or \"off\")"
             ))),
         }
     }
 }
 
-/// Apply the PII policy to a marshalled wardex envelope (design §4.2), and
+/// Apply the PII policy to a marshalled wardex envelope, and
 /// say how many records masking itself failed on and scrubbed fail-closed.
 fn pii_apply_envelope(proto: &mut pb::Envelope, policy: &PiiPolicy<'_>) -> PyResult<usize> {
     Ok(pii::mask_envelope(&*policy.engine()?, proto))
 }
 
-/// Apply the PII policy to a marshalled OTLP export request (design §4.2), and
+/// Apply the PII policy to a marshalled OTLP export request, and
 /// say how many spans masking itself failed on and scrubbed fail-closed.
 fn pii_apply_otlp(
     req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
@@ -1937,13 +1928,13 @@ fn encode_envelope_py(
     pii_extra_names: Vec<String>,
     pii_reveal_names: Vec<String>,
 ) -> PyResult<Py<PyBytes>> {
-    let policy = PiiPolicy {
-        mode: pii_mode,
-        disabled: pii_disabled,
-        extra_names: pii_extra_names,
-        reveal_names: pii_reveal_names,
-    };
     shielded(|| {
+        let policy = PiiPolicy {
+            mode: pii_mode,
+            disabled: pii_disabled,
+            extra_names: pii_extra_names,
+            reveal_names: pii_reveal_names,
+        };
         // Marshalling walks Python objects — the only part that needs the GIL.
         // The fidelity encoder counts nothing: a scrubbed record still says so
         // itself, and the count is the export path's to report.
@@ -1957,9 +1948,9 @@ fn encode_envelope_py(
 ///
 /// `encode_envelope` is the fidelity encoder: a span it cannot marshal is a
 /// raise, because a round-trip tool that hides a span is lying about what it
-/// round-tripped. On the export path that raise reached the client's drain,
-/// which drops the WHOLE batch — so one host value of the wrong type cost
-/// every good span shipped beside it, silently off-debug. This encoder skips
+/// round-tripped. On the export path that raise would reach the client's
+/// drain, which drops the whole batch — so one host value of the wrong type
+/// would cost every good span shipped beside it, silently off-debug. This encoder skips
 /// that one span and names it, exactly as `encode_otlp_requests` does on the
 /// OTLP wire; the caller counts and reports, because the core has no channel
 /// to a user.
@@ -1979,13 +1970,13 @@ fn encode_envelope_export(
     pii_extra_names: Vec<String>,
     pii_reveal_names: Vec<String>,
 ) -> PyResult<(Option<Py<PyBytes>>, Vec<String>, usize)> {
-    let policy = PiiPolicy {
-        mode: pii_mode,
-        disabled: pii_disabled,
-        extra_names: pii_extra_names,
-        reveal_names: pii_reveal_names,
-    };
     shielded(|| {
+        let policy = PiiPolicy {
+            mode: pii_mode,
+            disabled: pii_disabled,
+            extra_names: pii_extra_names,
+            reveal_names: pii_reveal_names,
+        };
         let (proto, unmarshalled) = envelope_to_proto(envelope, true, true)?;
         if proto.items.is_empty() {
             return Ok((None, unmarshalled, 0));
@@ -2010,11 +2001,10 @@ fn masked_envelope_bytes(
     // configured level be validated and then silently discarded.
     let limits = limits.map(|p| p.inner).unwrap_or_default();
     // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
-    // keep running while the batch worker encodes (design §9).
+    // keep running while the batch worker encodes.
     let (bytes, scrubbed) = py.allow_threads(|| -> PyResult<(Vec<u8>, usize)> {
         let scrubbed = pii_apply_envelope(&mut proto, policy)?;
-        let bytes = encode_envelope(&proto, limits)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let bytes = encode_envelope(&proto, limits).map_err(value_error)?;
         Ok((bytes, scrubbed))
     })?;
     Ok((PyBytes::new_bound(py, &bytes).unbind(), scrubbed))
@@ -2023,8 +2013,7 @@ fn masked_envelope_bytes(
 #[pyfunction]
 fn decode_envelope_py(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
     shielded(|| {
-        let env = decode_envelope(data)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let env = decode_envelope(data).map_err(value_error)?;
         envelope_to_dict(py, &env)
     })
 }
@@ -2065,7 +2054,7 @@ fn otlp_request(
     usize,
     usize,
 )> {
-    // `proto` is CONSUMED here, so the envelope's payloads move into the
+    // `proto` is consumed here, so the envelope's payloads move into the
     // request instead of being copied beside it — one flush of a full batch
     // holds one copy of every captured body, not two.
     let otlp::map::Mapped {
@@ -2089,15 +2078,15 @@ fn encode_otlp_traces(
     pii_extra_names: Vec<String>,
     pii_reveal_names: Vec<String>,
 ) -> PyResult<Py<PyBytes>> {
-    let policy = PiiPolicy {
-        mode: pii_mode,
-        disabled: pii_disabled,
-        extra_names: pii_extra_names,
-        reveal_names: pii_reveal_names,
-    };
     shielded(|| {
-        // ONE request, uncompressed, whatever its size — the bare serialization of
-        // an envelope. `encode_otlp_requests` is what an EXPORT calls: this one
+        let policy = PiiPolicy {
+            mode: pii_mode,
+            disabled: pii_disabled,
+            extra_names: pii_extra_names,
+            reveal_names: pii_reveal_names,
+        };
+        // One request, uncompressed, whatever its size — the bare serialization of
+        // an envelope. `encode_otlp_requests` is what an export calls: this one
         // answers "what does this envelope look like on the wire", which is a
         // question with one answer, and a caller that needs a body a receiver will
         // accept needs the other function's several.
@@ -2106,7 +2095,7 @@ fn encode_otlp_traces(
         // Traces only: state snapshots have no OTLP trace form, so walking them
         // here would spend the GIL on records the mapping drops.
         //
-        // ONE marshaller feeds both export surfaces, which means this walk reads a
+        // One marshaller feeds both export surfaces, which means this walk reads a
         // few fields the trace mapping does not project. That is the price of the
         // envelope being the only model either surface is built from: a narrower
         // walk for traces would be a second marshaling path to keep in step, and
@@ -2115,13 +2104,12 @@ fn encode_otlp_traces(
         let (proto, _) = envelope_to_proto(envelope, false, false)?;
         let limits = limits.map(|p| p.inner).unwrap_or_default();
         // Mapping + masking + protobuf are pure Rust: release the GIL so app
-        // threads keep running while the batch worker encodes (design §9).
+        // threads keep running while the batch worker encodes.
         let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
             // Not an export, so nothing here is counted: the reserved-name
             // and scrub counts are the export encoder's to report.
             let (req, _, _) = otlp_request(proto, &policy, limits)?;
-            otlp::encode_traces(&req)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+            otlp::encode_traces(&req).map_err(value_error)
         })?;
         Ok(PyBytes::new_bound(py, &bytes).unbind())
     })
@@ -2133,15 +2121,15 @@ type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize, usize);
 
 /// Envelope → `(request bodies, spans dropped)` — the export path's encoder.
 ///
-/// Several bodies rather than one because an OTLP request is rejected WHOLE: a
+/// Several bodies rather than one because an OTLP request is rejected whole: a
 /// batch over the receiver's limit loses every span in it, including the small
 /// ones. `max_otlp_request_bytes` decides where the boundary is and the core
-/// measures the FINAL body against it, compression included, because that is
+/// measures the final body against it, compression included, because that is
 /// the number the receiver measures.
 ///
 /// The second element of the return value is a count of spans that could not
 /// be made to fit even alone, after their payload was dropped; the third names
-/// the spans that could not be MARSHALLED at all (a typed block holding a
+/// the spans that could not be marshalled at all (a typed block holding a
 /// value of the wrong Python type), each as `"{name}: {reason}"`; the fourth
 /// counts the host attributes under a reserved `wardex.transport.*` name the
 /// mapping did not ship as set (`otlp::map::Mapped`); the fifth counts the
@@ -2150,12 +2138,13 @@ type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize, usize);
 /// the sixth counts the spans masking itself failed on, shipped emptied and
 /// marked `pii_filter_failed`. They exist because the core has no channel to a user: a loss reported
 /// nowhere is the silent kind, and the caller is the only one who can say it
-/// out loud. The third used to be a raise, and the raise cost the whole batch.
+/// out loud.
 #[pyfunction]
 #[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, compress = true, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
-// One argument per Python keyword: the signature IS the Python API, and a
-// bundling struct would only move the same fields behind a `FromPyObject`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per Python keyword: the signature is the Python API, and a bundling struct would only move the same fields behind a FromPyObject"
+)]
 fn encode_otlp_requests(
     py: Python<'_>,
     envelope: &Bound<'_, PyAny>,
@@ -2166,20 +2155,20 @@ fn encode_otlp_requests(
     pii_extra_names: Vec<String>,
     pii_reveal_names: Vec<String>,
 ) -> PyResult<OtlpExport> {
-    let policy = PiiPolicy {
-        mode: pii_mode,
-        disabled: pii_disabled,
-        extra_names: pii_extra_names,
-        reveal_names: pii_reveal_names,
-    };
     shielded(|| {
+        let policy = PiiPolicy {
+            mode: pii_mode,
+            disabled: pii_disabled,
+            extra_names: pii_extra_names,
+            reveal_names: pii_reveal_names,
+        };
         let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
         let limits = limits.map(|p| p.inner).unwrap_or_default();
         let (requests, overwritten, scrubbed) =
             py.allow_threads(move || -> PyResult<(otlp::split::Requests, usize, usize)> {
                 let (req, overwritten, scrubbed) = otlp_request(proto, &policy, limits)?;
-                let requests = otlp::split::encode_requests(req, limits, compress)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                let requests =
+                    otlp::split::encode_requests(req, limits, compress).map_err(value_error)?;
                 Ok((requests, overwritten, scrubbed))
             })?;
         let bodies = PyList::empty_bound(py);
@@ -2200,8 +2189,7 @@ fn encode_otlp_requests(
 #[pyfunction]
 fn decode_otlp_traces(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
     shielded(|| {
-        let req = otlp::decode_traces(data)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let req = otlp::decode_traces(data).map_err(value_error)?;
         otlp_traces_to_dict(py, &req)
     })
 }
@@ -2256,7 +2244,7 @@ fn otlp_wire_fields(py: Python<'_>) -> PyResult<PyObject> {
 
 /// The declared span vocabulary, as `{enum name: {wardex value: proto number}}`.
 ///
-/// This is what makes "proto is the single source of truth" (§6.6) checkable
+/// This is what makes "proto is the single source of truth" checkable
 /// rather than aspirational. `OperationName` and `ToolExecutionType` are
 /// declared in `common.proto` and referenced by no message field in this schema
 /// version — deliberately, because both already travel as `Span.extra` keys and
@@ -2265,7 +2253,7 @@ fn otlp_wire_fields(py: Python<'_>) -> PyResult<PyObject> {
 /// `map_tool_execution_type` would be dead code, and the Python enums could
 /// drift from the proto ones with nothing to notice.
 ///
-/// The tables are keyed by the WARDEX value (`"execute_tool"`), not the proto
+/// The tables are keyed by the wardex value (`"execute_tool"`), not the proto
 /// value name, because the wardex value is what actually reaches the wire today
 /// in `extra` — so a mismatch here is a mismatch a consumer would see.
 #[pyfunction]
@@ -2316,10 +2304,10 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
         }
         out.set_item("SnapshotType", snaps)?;
 
-        // The three closed vocabularies that live on the wire, exposed the OTHER
+        // The three closed vocabularies that live on the wire, exposed the other
         // way round — number → name, walking the schema rather than a list written
         // here. A table keyed by hand would only prove that this file agrees with
-        // itself; walking the numbers lets a Python test compare the SCHEMA against
+        // itself; walking the numbers lets a Python test compare the schema against
         // `assembly._integrity.Limitation`, `assembly._parentage.ParentSource` and
         // `_enums.CaptureSource` member for member, in both directions, which is
         // what makes a missing member a CI failure instead of a silently
@@ -2342,10 +2330,9 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
         }
         out.set_item("ParentSource", sources)?;
 
-        // `CaptureSource` had no parity table until the bridge added a member to
-        // it: `Span.capture_sources` was already on the wire, so a spelling drift
-        // between `_enums.CaptureSource` and `CAPTURE_SOURCE_*` would have
-        // flattened a real observation channel to UNSPECIFIED with nothing to
+        // `CaptureSource` gets a parity table because `Span.capture_sources` is
+        // on the wire, so a spelling drift between `_enums.CaptureSource` and
+        // `CAPTURE_SOURCE_*` would flatten a real observation channel to UNSPECIFIED with nothing to
         // notice. Same schema walk as the two above.
         let capture_sources = PyDict::new_bound(py);
         for n in 1..=200 {
@@ -2356,7 +2343,7 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
         }
         out.set_item("CaptureSource", capture_sources)?;
 
-        // The meta value, kept OUT of the vocabulary table above on purpose — a
+        // The meta value, kept out of the vocabulary table above on purpose — a
         // consumer iterating "the vocabulary" must not find it there — but exposed
         // so a test can pin both its number and the fact that it is not vocabulary.
         let meta = PyDict::new_bound(py);
@@ -2369,7 +2356,7 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
 }
 
 /// Registers the `_wardex_native.codec` submodule.
-pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
+pub(crate) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new_bound(parent.py(), "codec")?;
     m.add_function(wrap_pyfunction!(encode_envelope_py, &m)?)?;
     m.add_function(wrap_pyfunction!(encode_envelope_export, &m)?)?;

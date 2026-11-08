@@ -7,7 +7,7 @@
 //! (forward compatibility), and an item of a type this parser does not name is
 //! still returned with its raw JSON, so a caller decides what it is worth.
 //!
-//! What the stream does NOT carry, so no field here pretends to: the model
+//! What the stream does not carry, so no field here pretends to: the model
 //! name, per-model-call boundaries, timestamps. `turn.completed.usage` is the
 //! whole turn's total across every model call in it.
 
@@ -15,22 +15,38 @@ use serde_json::Value;
 
 use crate::usage::{InputConvention, TokenUsage};
 
+/// The line's `type`, one variant per event type this parser names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexEventKind {
+    /// `thread.started`: carries the thread id.
     ThreadStarted,
+    /// `turn.started`: carries nothing else.
     TurnStarted,
+    /// `turn.completed`: carries the turn's total usage.
     TurnCompleted,
+    /// `turn.failed`: carries the error message.
     TurnFailed,
+    /// `item.started`: a new item; `item_json` holds its initial state.
     ItemStarted,
+    /// `item.updated`: `item_json` holds the item's state at this moment,
+    /// superseding earlier events for the same item.
     ItemUpdated,
+    /// `item.completed`: `item_json` holds the item's final state, the one
+    /// to record.
     ItemCompleted,
+    /// A top-level `error` line, outside any item: carries its message.
     Error,
 }
 
 /// Flat event struct: one shape for all kinds keeps the FFI surface trivial.
+///
+/// Every `Option` field is `None` when the line did not carry that key (or
+/// carried it with another JSON type); nothing is filled in by inference.
 #[derive(Debug, Clone)]
 pub struct CodexExecEvent {
+    /// Which line this was, and so which fields below can be set.
     pub kind: CodexEventKind,
+    /// `thread.started` only: the thread's id.
     pub thread_id: Option<String>,
     /// `turn.completed` only. Normalized (semconv-inclusive): Codex reports
     /// `input_tokens` with the cached part already inside it, the OpenAI
@@ -38,7 +54,11 @@ pub struct CodexExecEvent {
     pub usage: Option<TokenUsage>,
     /// `turn.failed`'s `error.message`, or a top-level `error`'s `message`.
     pub message: Option<String>,
+    /// Item events only: the item's `id`, such as `item_0`.
     pub item_id: Option<String>,
+    /// Item events only: the item's `type`, verbatim. Always set on an item
+    /// event, since an item without a type is not returned at all; a type this
+    /// parser does not name is kept as it was written.
     pub item_type: Option<String>,
     /// The item's text for the types that have one: `agent_message`,
     /// `reasoning` (a summary, never the raw chain of thought) and `error`.
@@ -62,11 +82,15 @@ impl CodexExecEvent {
     }
 }
 
-fn s(v: &Value, key: &str) -> Option<String> {
+/// The string at `key`, owned; `None` when the key is absent or not a string.
+/// Shared with the Claude stream-json parser, which reads lines the same way.
+pub(crate) fn str_field(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
-fn i(v: &Value, key: &str) -> Option<i64> {
+/// The integer at `key`; `None` when the key is absent or not an integer that
+/// fits in `i64`.
+pub(crate) fn i64_field(v: &Value, key: &str) -> Option<i64> {
     v.get(key).and_then(Value::as_i64)
 }
 
@@ -74,39 +98,41 @@ fn parse_usage(v: &Value) -> Option<TokenUsage> {
     let u = v.get("usage")?;
     Some(TokenUsage::new(
         InputConvention::Inclusive,
-        i(u, "input_tokens"),
-        i(u, "output_tokens"),
-        i(u, "cached_input_tokens"),
-        i(u, "cache_write_input_tokens"),
-        i(u, "reasoning_output_tokens"),
+        i64_field(u, "input_tokens"),
+        i64_field(u, "output_tokens"),
+        i64_field(u, "cached_input_tokens"),
+        i64_field(u, "cache_write_input_tokens"),
+        i64_field(u, "reasoning_output_tokens"),
     ))
 }
 
 fn item_event(kind: CodexEventKind, v: &Value) -> Option<CodexExecEvent> {
     let item = v.get("item")?;
     let mut e = CodexExecEvent::new(kind);
-    e.item_id = s(item, "id");
-    e.item_type = s(item, "type");
+    e.item_id = str_field(item, "id");
+    e.item_type = str_field(item, "type");
     e.item_type.as_ref()?;
-    if matches!(
-        e.item_type.as_deref(),
-        Some("agent_message") | Some("reasoning")
-    ) {
-        e.text = s(item, "text");
+    if matches!(e.item_type.as_deref(), Some("agent_message" | "reasoning")) {
+        e.text = str_field(item, "text");
     } else if e.item_type.as_deref() == Some("error") {
-        e.text = s(item, "message");
+        e.text = str_field(item, "message");
     }
     e.item_json = serde_json::to_vec(item).ok();
     Some(e)
 }
 
+/// Parses one line of `codex exec --json` output.
+///
+/// Returns `None` for a line that is not JSON, has no string `type`, is of a
+/// type this parser does not name, or is an item event without an item or
+/// without an item `type`.
 pub fn parse_exec_line(line: &[u8]) -> Option<CodexExecEvent> {
     let v: Value = serde_json::from_slice(line).ok()?;
     let typ = v.get("type")?.as_str()?;
     match typ {
         "thread.started" => {
             let mut e = CodexExecEvent::new(CodexEventKind::ThreadStarted);
-            e.thread_id = s(&v, "thread_id");
+            e.thread_id = str_field(&v, "thread_id");
             Some(e)
         }
         "turn.started" => Some(CodexExecEvent::new(CodexEventKind::TurnStarted)),
@@ -117,7 +143,7 @@ pub fn parse_exec_line(line: &[u8]) -> Option<CodexExecEvent> {
         }
         "turn.failed" => {
             let mut e = CodexExecEvent::new(CodexEventKind::TurnFailed);
-            e.message = v.get("error").and_then(|err| s(err, "message"));
+            e.message = v.get("error").and_then(|err| str_field(err, "message"));
             Some(e)
         }
         "item.started" => item_event(CodexEventKind::ItemStarted, &v),
@@ -125,7 +151,7 @@ pub fn parse_exec_line(line: &[u8]) -> Option<CodexExecEvent> {
         "item.completed" => item_event(CodexEventKind::ItemCompleted, &v),
         "error" => {
             let mut e = CodexExecEvent::new(CodexEventKind::Error);
-            e.message = s(&v, "message");
+            e.message = str_field(&v, "message");
             Some(e)
         }
         _ => None,
@@ -160,7 +186,7 @@ mod tests {
     }
 
     /// Codex's `input_tokens` already contains the cached part (23130 of which
-    /// 20992 cached): the OpenAI convention, so the total is NOT added to.
+    /// 20992 cached): the OpenAI convention, so nothing is added to the total.
     #[test]
     fn turn_usage_is_inclusive_as_reported() {
         let e = parse_exec_line(DONE).unwrap();

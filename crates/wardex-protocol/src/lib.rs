@@ -17,9 +17,3 @@ pub mod usage;
 pub mod websocket;
 
 pub use usage::{InputConvention, TokenUsage};
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_compiles() {}
-}
