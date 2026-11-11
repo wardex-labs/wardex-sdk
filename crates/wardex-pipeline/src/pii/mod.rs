@@ -711,11 +711,13 @@ mod tests {
         }
     }
 
-    /// A dotted quad in a version context is a version, not an address: after
-    /// a pip comparison operator, touching a `v`, after `version ` or
-    /// `version=`, after a package name and `/` or `-`, or as part of a
-    /// longer dotted number. An address in free text, in a filter on an
-    /// address field or in a URL path is still an address.
+    /// A dotted quad in a version context is a version, not an address: as
+    /// part of a longer dotted number, touching a `v`, after `version ` or
+    /// `version=`; or, where the context could as well hold an address (after
+    /// a pip comparison operator, `v=`, `ver: `, a name and `/` or `-`, or
+    /// before a pre-release suffix), when its numbers read as a version. An
+    /// address in free text, in a filter on an address field or in a URL path
+    /// is still an address.
     #[test]
     fn version_strings_are_not_ip_addresses() {
         for text in [
@@ -730,6 +732,9 @@ mod tests {
             "ua python-requests/2.31.0.1",
             "openssl-1.1.1.1",
             "name-1.2.3.4",
+            "ver: 1.2.3.4",
+            "release 2.10.1.0-rc1",
+            "build 1.2.3.4+local",
             "release 1.2.3.4.5",
             "release 1.2.3.4.1000",
             "release 1000.1.2.3.4",
@@ -757,22 +762,45 @@ mod tests {
             ("see http://10.0.0.5/x", "see http://[IP_ADDRESS]/x"),
             ("ops@10.0.0.5", "ops@[IP_ADDRESS]"),
             ("range 10.0.0.1-10.0.0.9", "range [IP_ADDRESS]-[IP_ADDRESS]"),
+            // A name and `-` or `/`, a comparison or `v=` holds an address as
+            // readily as a version: a public address there is still masked.
+            (
+                "login from client-203.0.113.9 failed",
+                "login from client-[IP_ADDRESS] failed",
+            ),
+            ("peer/203.0.113.9 timed out", "peer/[IP_ADDRESS] timed out"),
+            (
+                "blocked attacker at host-198.51.100.7",
+                "blocked attacker at host-[IP_ADDRESS]",
+            ),
+            (
+                "example.com/203.0.113.9 returned 500",
+                "example.com/[IP_ADDRESS] returned 500",
+            ),
+            ("remote==203.0.113.9", "remote==[IP_ADDRESS]"),
+            ("?v=203.0.113.9", "?v=[IP_ADDRESS]"),
+            ("peer/10.0.0.5", "peer/[IP_ADDRESS]"),
+            ("ver: 203.0.113.9", "ver: [IP_ADDRESS]"),
+            ("host 10.0.0.5-east", "host [IP_ADDRESS]-east"),
         ] {
             assert_eq!(mask(text), masked, "{text}");
         }
     }
 
     /// A card, SSN or routing number glued into a longer token is part of an
-    /// id, not a value of its own: joined by a letter, digit or `_`, or by a
-    /// `-` or `.` to another digit or hex group. The same digits standing
-    /// alone, or joined to a word by a `-` or `.`, are still masked.
+    /// id or a number, not a value of its own: joined by a letter, digit or
+    /// `_`, joined by a `-` or `.` to a hex group with a letter in it, to
+    /// another group of the same UUID, or going on a dotted number. The same
+    /// digits standing alone, joined to a word, or beside a plain digit group
+    /// outside a UUID (an expiry, a CVV, an account number, a year, cents)
+    /// are still masked.
     #[test]
     fn digits_inside_a_longer_token_are_not_cards_ssns_or_routing_numbers() {
         for text in [
             "id ord_4111111111111111x",
             "uuid 41111111-1111-1111-1234-567890123456",
             "uuid 48620579-8682-4828-a0e5-0454f31af317",
-            "ref 123-45-6789-01",
+            "id 4111111111111111-a0e5",
             "ref 021000021_b",
             "ref 2.021000021",
         ] {
@@ -804,6 +832,22 @@ mod tests {
             ("id 4111111111111111-a", "id ****-****-****-1111-a"),
             ("ref INV-123-45-6789", "ref INV-[SSN]"),
             ("ref acct-021000021", "ref acct-[BANK_ROUTING]"),
+            (
+                "card 4111111111111111-1227",
+                "card ****-****-****-1111-1227",
+            ),
+            (
+                "card 4111-1111-1111-1111-123",
+                "card ****-****-****-1111-123",
+            ),
+            (
+                "paid with 4111111111111111.00",
+                "paid with ****-****-****-1111.00",
+            ),
+            ("row 7-4111111111111111", "row 7-****-****-****-1111"),
+            ("ach 021000021-123456789", "ach [BANK_ROUTING]-123456789"),
+            ("ssn 123-45-6789-1990", "ssn [SSN]-1990"),
+            ("ref 123-45-6789-01", "ref [SSN]-01"),
         ] {
             assert_eq!(mask(text), masked, "{text}");
         }

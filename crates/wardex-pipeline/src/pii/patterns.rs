@@ -285,32 +285,61 @@ fn word_run(text: &str, at: usize, rev: bool) -> &str {
     text.get(lo..hi).unwrap_or_default()
 }
 
-/// A digit or hex group the way an id writes one: hex digits only, at least
-/// one of them decimal (`1111`, `a0e5`, `01`). A word (`card`, `SSN`,
-/// `json`) is not one, so a label joined to a value by `-` or `.` still
-/// leaves the value standing alone.
+/// A digit or hex group the way a number or an id writes one: hex digits
+/// only, at least one of them decimal (`1111`, `a0e5`, `01`). A word
+/// (`card`, `SSN`, `json`) is not one.
 fn is_id_group(run: &str) -> bool {
     !run.is_empty()
         && run.bytes().all(|c| c.is_ascii_hexdigit())
         && run.bytes().any(|c| c.is_ascii_digit())
 }
 
+/// An id group with a letter in it (`a0e5`): a piece of a hex id. A plain
+/// digit group beside a card or SSN is an expiry, a CVV, an account number,
+/// a year or cents, so it does not make the digits part of an id.
+fn is_hex_id_group(run: &str) -> bool {
+    is_id_group(run) && run.bytes().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Is the match at `start..end` inside a UUID: the token of word bytes and
+/// `-` around it is five hex groups of 8, 4, 4, 4 and 12.
+fn in_uuid(text: &str, start: usize, end: usize) -> bool {
+    let b = text.as_bytes();
+    let part = |c: &&u8| is_word(**c) || **c == b'-';
+    let lo = start
+        - b.get(..start)
+            .map_or(0, |h| h.iter().rev().take_while(part).count());
+    let hi = end
+        + b.get(end..)
+            .map_or(0, |t| t.iter().take_while(part).count());
+    text.get(lo..hi).is_some_and(|token| {
+        let groups = || token.trim_matches('-').split('-');
+        groups().all(|g| g.bytes().all(|c| c.is_ascii_hexdigit()))
+            && groups().map(str::len).eq([8, 4, 4, 4, 12])
+    })
+}
+
 /// Is the match at `start..end` glued into a longer token: a letter, digit or
-/// `_` right beside it, or a `-` or `.` and then another digit or hex group
-/// (a UUID's groups, `123-45-6789-01`, `2.021000021`). A label joined by a
-/// `-` or `.` (`card-4111…`, `4111….json`), a `.` ending a sentence and a
-/// `-` starting a negative number join nothing.
+/// `_` right beside it; a `.` and a digit group before it (the digits go on
+/// a dotted number: `2.021000021`, the last octet of `10.0.0.0 4111…`); a
+/// `-` or `.` and a hex group with a letter in it; or, inside a UUID, a `-`
+/// and any of its groups with a decimal digit. A label joined by a `-` or
+/// `.` (`card-4111…`, `4111….json`), a plain digit group outside a UUID
+/// (`4111…-1227`, `7-4111…`, `4111….00`, `021000021-123456789`), a `.`
+/// ending a sentence and a `-` starting a negative number join nothing.
 fn joined(text: &str, start: usize, end: usize) -> bool {
     let b = text.as_bytes();
     let near = |i: Option<usize>| i.and_then(|i| b.get(i).copied());
+    let group = |run: &str| is_hex_id_group(run) || (is_id_group(run) && in_uuid(text, start, end));
     let before = match near(start.checked_sub(1)) {
         Some(c) if is_word(c) => true,
-        Some(b'-' | b'.') => is_id_group(word_run(text, start - 1, true)),
+        Some(b'.') => is_id_group(word_run(text, start - 1, true)),
+        Some(b'-') => group(word_run(text, start - 1, true)),
         _ => false,
     };
     let after = match near(Some(end)) {
         Some(c) if is_word(c) => true,
-        Some(b'-' | b'.') => is_id_group(word_run(text, end + 1, false)),
+        Some(b'-' | b'.') => group(word_run(text, end + 1, false)),
         _ => false,
     };
     before || after
@@ -353,11 +382,25 @@ fn package_token(head: &str) -> Option<&str> {
     .then_some(token)
 }
 
-/// A dotted quad is an address unless its context makes it a version: part
-/// of a longer dotted number (`1.2.3.4.1000`); after a pip comparison
-/// operator (`numpy==1.26.4.1`) whose field does not name an address;
-/// touching a `v` or `v=` (`v1.2.3.4`); after `version ` or `version=`; or
-/// after a package name and `/` or `-` (`nginx/1.2.3.4`, `openssl-1.1.1.1`).
+/// Numbers that read as a version rather than an address: every part under
+/// 100, and a first part other than 10, where private networks start. A
+/// random public address passes this about one time in fifty, so it decides
+/// only where the context could hold either.
+fn reads_as_version(quad: &str) -> bool {
+    let mut parts = quad
+        .split('.')
+        .map(|p| p.parse::<u16>().unwrap_or(u16::MAX));
+    parts.next().is_some_and(|n| n < 100 && n != 10) && parts.all(|n| n < 100)
+}
+
+/// A dotted quad is an address unless its context makes it a version. Part
+/// of a longer dotted number (`1.2.3.4.1000`), touching a `v` (`v1.2.3.4`),
+/// or after `version ` or `version=`: always a version. After a pip
+/// comparison operator whose field does not name an address
+/// (`numpy==1.26.4.1`), after `v=` or `ver: `, after a name and `/` or `-`
+/// (`nginx/1.2.3.4`), or before a pre-release suffix (`2.10.1.0-rc1`): the
+/// same place holds an address as readily (`client-203.0.113.9`,
+/// `remote==203.0.113.9`), so only numbers that read as a version are kept.
 pub(crate) fn ipv4_in_context(text: &str, start: usize, end: usize) -> bool {
     let b = text.as_bytes();
     let dotted_after = b.get(end) == Some(&b'.') && b.get(end + 1).is_some_and(u8::is_ascii_digit);
@@ -372,10 +415,11 @@ pub(crate) fn ipv4_in_context(text: &str, start: usize, end: usize) -> bool {
     let Some(head) = text.get(..start) else {
         return true;
     };
-    for op in ["==", ">=", "<=", "~=", "!="] {
-        if let Some(field) = head.strip_suffix(op) {
-            return names_an_address(word_run_dotted(field));
-        }
+    let pip = ["==", ">=", "<=", "~=", "!="]
+        .iter()
+        .find_map(|op| head.strip_suffix(op));
+    if pip.is_some_and(|field| names_an_address(word_run_dotted(field))) {
+        return true;
     }
     // A lone word: nothing alphabetic right before it.
     let ends_with_word = |w: &str| {
@@ -389,14 +433,24 @@ pub(crate) fn ipv4_in_context(text: &str, start: usize, end: usize) -> bool {
                 .and_then(|i| b.get(i))
                 .is_some_and(u8::is_ascii_alphabetic)
     };
-    if ["v", "v=", "version ", "version="]
+    if ["v", "version ", "version="]
         .iter()
         .any(|w| ends_with_word(w))
     {
         return false;
     }
-    let sep = head.strip_suffix('/').or_else(|| head.strip_suffix('-'));
-    sep.and_then(package_token).is_none()
+    let label = ["v=", "ver ", "ver=", "ver: ", "version: "]
+        .iter()
+        .any(|w| ends_with_word(w));
+    let named = head
+        .strip_suffix('/')
+        .or_else(|| head.strip_suffix('-'))
+        .and_then(package_token)
+        .is_some();
+    let suffix = matches!(b.get(end), Some(b'-' | b'+'))
+        && b.get(end + 1).is_some_and(u8::is_ascii_alphabetic);
+    let either = pip.is_some() || label || named || suffix;
+    !(either && text.get(start..end).is_some_and(reads_as_version))
 }
 
 /// The field name ending `head`, dots and dashes included (`ip.addr`).
