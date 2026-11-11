@@ -248,6 +248,12 @@ reader benefit.
 
 - Protobuf Rust types are generated at build time by `crates/wardex-codec/build.rs`
   (prost-build + vendored protoc). Edit `proto/wardex/v1/*.proto`, not generated code.
+- `LIMITATIONS.md` is the output of `python -m wardex_sdk explain --all`. After
+  you add or reword a limitation marker (`MARKERS` in
+  `sdks/python/src/wardex_sdk/_assembly/_explain.py`) or a loss reason
+  (`REASONS` in `_assembly/_drop_reasons.py`), regenerate it with
+  `uv run python -m wardex_sdk explain --all > LIMITATIONS.md`. No gate checks
+  that it is current.
 
 ## Architecture (one mental model)
 

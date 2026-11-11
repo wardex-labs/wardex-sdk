@@ -73,7 +73,8 @@ wardex-sdk is built to produce that record.
   to the wardex receiver.
 - **It stays out of your way.** The core is Rust, the wheel has no runtime
   Python dependencies, parsing runs on the SDK's own worker threads, and
-  nothing the SDK does after `init()` raises into your code.
+  nothing the SDK does after `init()` raises into your code. The measured
+  cost is under [Overhead](#overhead).
 
 ## Next to the tools you are evaluating
 
@@ -89,7 +90,7 @@ how the data is collected.
 without callbacks or `LangChainTracer`: one span per graph run, one per node,
 one per tool call a `ToolNode` dispatches, with every model and HTTP call
 underneath placed by context. The OpenAI Agents SDK and the Claude Agent SDK have adapters as well,
-and all three install themselves when `init()` finds the framework. On a
+and each installs itself when your application imports its framework. On a
 framework with no adapter, model calls to recognised providers are still
 captured with their token usage and model ids, and a few decorators add the
 structure.
@@ -115,10 +116,11 @@ install. Other platforms, such as Alpine (musl), have no wheel yet.
 ## Quickstart
 
 Point the SDK at any OpenTelemetry backend that accepts OTLP/HTTP (Langfuse,
-Phoenix, an OTel Collector):
+Phoenix, an OTel Collector). wardex appends `/v1/traces` to the address
+unless its path already ends with it.
 
 ```bash
-export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces
+export WARDEX_ENDPOINT=http://127.0.0.1:6006   # a local Phoenix
 ```
 
 ```python
@@ -131,24 +133,42 @@ wardex.init()
 wardex.close()  # optional: spans also flush every 5 seconds and at exit
 ```
 
+To check the install, run `python -m wardex_sdk doctor`. It reads the same
+environment as your app, sends one test span, and ends with
+`OK: <url> accepted the test span.` (exit code 0) or `FAIL:` and the fix
+(exit code 1). In your app, the first delivered export prints one line on
+stderr: `[wardex] first export delivered: N span(s) accepted by <url>`.
+
+For Langfuse, use its OTLP base URL and its key pair as HTTP Basic auth:
+
+```bash
+export WARDEX_ENDPOINT=https://cloud.langfuse.com/api/public/otel
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20$(printf '%s' "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" | base64 | tr -d '\n')"
+```
+
 A host that already exports OTLP needs no new variable:
 `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS` are read as
-well. Capture starts at `init()` (`intercept=False` turns it off). With no
-destination configured, the SDK sends nothing and says so once on stderr.
+well. Capture starts at `init()` (`intercept=False` turns it off).
+`WARDEX_DISABLED=1` turns wardex off without a code change.
 
 Where the data goes is decided by what you configured, and nothing else:
 
 | You set | Data goes to |
 |---|---|
-| `endpoint` (`WARDEX_ENDPOINT`, or the OTel endpoint variables) | that OTLP/HTTP collector, authenticated by `headers` / `OTEL_EXPORTER_OTLP_HEADERS` |
-| `api_key` (`WARDEX_API_KEY`) | the hosted wardex receiver the key's region names |
-| `api_key` + `base_url` | a self-hosted wardex receiver at `base_url` |
+| `WARDEX_ENDPOINT`, an OTel endpoint variable, or `backend=BackendConfig(endpoint=...)` | that OTLP/HTTP collector, authenticated by `OTEL_EXPORTER_OTLP_HEADERS` or `BackendConfig(headers=...)` |
+| `WARDEX_API_KEY` or `BackendConfig(api_key=...)` | the hosted wardex receiver the key's region names |
+| the key plus `WARDEX_BASE_URL` or `BackendConfig(base_url=...)` | a self-hosted wardex receiver at that URL |
 | `transport=` | that transport, always |
-| none of these | nowhere, said once on stderr |
+| none of these | nowhere: `init()` installs nothing and says so once on stderr |
 
-When two settings name different destinations, the one that loses is announced
-with a `WardexConfigWarning`. The `api_key` rows are on the main branch and
-are not available in the current release.
+To capture without exporting, in a test suite for example, pass
+`transport=wardex_sdk.NoOpTransport()`. A setting that loses to another is
+announced: as a `WardexConfigWarning` when both are arguments to `init()`,
+as a `[wardex]` line on stderr when one came from the environment. A bad
+environment value never stops your app: wardex names the variable and the
+fix on stderr and exports nothing. The same value as an argument raises. The
+`api_key` rows are on the main branch and are not available in the current
+release.
 
 ## See a real trace
 
@@ -185,9 +205,10 @@ tree.
 | Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |
 | Any other framework, or your own loop | model calls with model, messages and token usage; decorators add the structure |
 
-Adapters are detected automatically when the framework is installed (the
-Codex adapter when `codex` is on `PATH`); `AdaptersConfig` selects and
-configures them.
+An adapter installs when your application imports its framework, before or
+after `init()`, and shows as `waiting_for_import` until then. `init()`
+imports no framework itself. The Codex adapter installs at `init()` when
+`codex` is on `PATH`. `AdaptersConfig` selects and configures them.
 
 Each adapter is tested against the framework releases in the table above. On
 any other release it still installs and records, and says so once on stderr
@@ -205,8 +226,9 @@ for adapter in wardex.diagnostics().adapters:
 
 wardex never raises into your application, so what it misses (spans a full
 buffer evicted, an adapter that did not install or runs on an untested
-release, an error inside wardex itself) is one line on stderr. In your test
-suite you can make it a failure instead:
+release, an error inside wardex itself) is one `[wardex]` line on stderr, or
+one record on the `wardex_sdk` logger when your app configures logging. In
+your test suite you can make it a failure instead:
 
 ```bash
 pytest --wardex-strict
@@ -216,7 +238,11 @@ A test during which wardex lost something fails with what was lost, how many
 and what to do. Accept one on purpose with
 `--wardex-strict-allow=queue_overflow`, or scope it as `REASON:SUBJECT`.
 Outside pytest, call `wardex.testing.assert_no_capture_gaps()` at the end of a
-run; `wardex.diagnostics().losses` reads the same counts at any time.
+run; `wardex.diagnostics().losses` reads the same counts at any time. Both
+fail when `init()` installed nothing. `python -m wardex_sdk explain NAME`
+says what a loss reason or a `wardex.limitations` marker means, and
+[LIMITATIONS.md](https://github.com/wardex-labs/wardex-sdk/blob/main/LIMITATIONS.md)
+lists them all. For a bug report, paste `wardex.diagnostics().report()`.
 
 The Codex adapter only reads what your process already exchanges with
 `codex exec` — the prompt passed to `communicate()` and the `--json` events
@@ -249,20 +275,28 @@ def research(question: str): ...
 
 
 @wardex.tool(name="search")
-def search(query: str): ...
+def search(query: str):
+    wardex.current_span().set_input({"query": query})
+    ...
 
 
+wardex.set_user("user-42")
+wardex.set_account("acme-corp")  # your own customer, as wardex.account.id
 with wardex.conversation("support-chat", id="session-123"):
     research("Which plan includes SSO?")
 ```
 
-The decorators produce `invoke_agent` and `execute_tool` spans (`@workflow`
-and `@step` produce `invoke_workflow` and `execute_step`); on a generator the
-span lasts from the first item to the last. Every span inside a
-`conversation()` block, model calls included, carries
-`gen_ai.conversation.id`. An exception that leaves a span is recorded on it,
-and your code still receives the same exception. Hand-started threads need
-`wardex.bind_context(fn)` to carry the context; `asyncio` tasks inherit it.
+The decorators produce `invoke_agent researcher` and `execute_tool search`
+spans (`@workflow` and `@step` produce `invoke_workflow` and
+`execute_step`); without `name=`, the name is the qualified function name.
+On a generator the span lasts from the first item to the last. Every span
+inside a `conversation()` block, model calls included, carries
+`gen_ai.conversation.id`, and the spans after `set_user` and `set_account`
+carry `user.id` and `wardex.account.id`. `set_input()` on a tool span
+exports as `gen_ai.tool.call.arguments`. An exception that leaves a span is
+recorded on it, and your code still receives the same exception.
+Hand-started threads need `wardex.bind_context(fn)` to carry the context;
+`asyncio` tasks inherit it.
 
 ## Data safety
 
@@ -274,12 +308,14 @@ card numbers, US SSNs, IP addresses, IBANs, bank routing numbers, credential
 formats (`sk-…`, `AKIA…`, `ghp_…`, JWTs, PEM private keys and more), and any
 value passed under a secret-looking name such as `api_key` or `password`,
 whether it sits in a URL, a JSON body, a form field or a span attribute.
-Argument names stay readable, and each masked span records how many values
-were replaced and by which rule. If masking itself fails on a span, the span
-is never sent unmasked: it leaves with only its ids, kind and timing, named
+Version strings such as `numpy==1.26.4.1` are kept, and so are private
+addresses in `server.address` and the host of `url.full`. Argument names
+stay readable, and each masked span records how many values were replaced
+and by which rule. If masking itself fails on a span, the span is never sent
+unmasked: it leaves with only its ids, kind and timing, named
 `[PII_FILTER_ERROR]` and marked `pii_filter_failed`, and is counted under
-`transport.otlp.pii_scrubbed` (`transport.wardex.pii_scrubbed` for the wardex
-receiver) with one log line. That is a wardex bug; please report it.
+`internal_sdk_error` in `wardex.diagnostics().losses` with one log line.
+That is a wardex bug; please report it.
 
 ```python
 from wardex_sdk import PIIConfig
@@ -308,6 +344,63 @@ What masking does not catch:
 - anything read before the encoder runs: `before_send_envelope`,
   `ConsoleTransport` and a transport that serializes envelopes itself all see
   data before masking.
+
+## Reference
+
+### Environment variables
+
+An argument to `init()` wins over its environment variable.
+
+| Variable | What it sets |
+|---|---|
+| `WARDEX_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector; `/v1/traces` is appended unless the path ends with it |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | the collector's trace URL, used as written; it wins over `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | the collector's request headers, `key=value,key2=value2`, percent-encoded |
+| `WARDEX_API_KEY`, `WARDEX_BASE_URL` | the wardex project key, and a self-hosted receiver for it |
+| `WARDEX_SERVICE_NAME`, `WARDEX_RELEASE`, `WARDEX_ENVIRONMENT` | `service_name`, `release`, `environment`; else read from `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` |
+| `WARDEX_DEBUG`, `WARDEX_PII` | `1` turns `debug` on; `off` turns masking off |
+| `WARDEX_DISABLED`, `OTEL_SDK_DISABLED` | `WARDEX_DISABLED=1` or `OTEL_SDK_DISABLED=true`: `init()` installs nothing |
+
+`OTEL_EXPORTER_OTLP_PROTOCOL=grpc` next to an OTel endpoint makes wardex
+export nothing and say why: it speaks OTLP over HTTP only.
+
+### Deployment notes
+
+- A serverless runtime can freeze the process before the 5-second flush, so
+  call `wardex.flush()` before the handler returns.
+- `os.fork()` is handled: the child exports its own spans.
+- On uvloop, plaintext `http://` calls are not captured and `https://` calls
+  are. wardex says so once. Use TLS, or run uvicorn with `--loop asyncio`.
+- gevent is not supported, and wardex says so once.
+- Another OpenTelemetry LLM instrumentation (OpenInference, OpenLLMetry,
+  Logfire) records each model call again in a separate trace, and wardex
+  warns once. For one trace, make the calls inside an active OpenTelemetry
+  span and inside `with wardex.continue_from_otel():`.
+
+### Model providers
+
+Model calls are read from the bytes for OpenAI Chat Completions, Responses
+and Embeddings and for Anthropic Messages, on any host, and for a streamed
+reply on any path. `gen_ai.provider.name` comes from the host (`openai`,
+`anthropic`, `azure.ai.openai`, `groq`, `deepseek`, `mistral_ai`, `x_ai`,
+`perplexity`, `cohere`, `gcp.gemini`, `gcp.vertex_ai`, `aws.bedrock`); any
+other host gets none and the `provider_inferred` marker. Gemini and Vertex
+AI `generateContent`, Bedrock Runtime, Ollama's `/api/chat` and
+`/api/generate`, and Cohere and Mistral calls on other paths are not parsed
+yet. Outside a span they are counted under `mode_refused` and said once per
+API; record them inside `wardex.span(...)` or with
+`capture_mode=CaptureMode.ALL`.
+
+### Overhead
+
+Measured on one arm64 macOS machine at a load average of about 2, not a
+guarantee. An HTTP request wardex does not keep (outside any span, not a
+model call) adds about 35 to 40 µs of CPU on the calling thread for a small
+or a 1.2 MB plaintext reply, and about 95 µs for 1.2 MB over TLS; the body
+is not stored or copied. `init()` takes about 35 ms with three agent
+frameworks installed and none imported. A `wardex.span()` block or a
+decorated call costs about 23 µs. To measure on your machine, run
+`uv run python sdks/python/tests/bench_host_overhead.py` in a clone.
 
 ## Status
 
