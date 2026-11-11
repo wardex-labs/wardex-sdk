@@ -404,6 +404,25 @@ def test_ordinary_refusals_are_not_counted_as_model_calls(server, capsys):
     assert "not recorded" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "path", ["/internal/search", "/v1beta/models/gemini-2.0-flash:generateContent"]
+)
+def test_debug_says_why_each_refused_call_was_not_recorded(server, capsys, monkeypatch, path):
+    monkeypatch.setenv("WARDEX_DEBUG", "1")
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
+    _post(server.port, path, b'{"contents":[]}')
+    lines = [x for x in capsys.readouterr().err.splitlines() if "debug: not recorded:" in x]
+    assert len(lines) == 1, lines
+    assert f"127.0.0.1{path}" in lines[0]
+    assert "capture_mode=AGENT" in lines[0] and "wardex span" in lines[0]
+
+
+def test_without_debug_a_refused_call_prints_no_debug_line(server, capsys):
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
+    _post(server.port, "/internal/search", b"{}")
+    assert "debug:" not in capsys.readouterr().err
+
+
 # --- intercept_hosts names a TLS host too ---------------------------------------------------
 
 

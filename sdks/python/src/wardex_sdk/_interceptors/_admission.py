@@ -8,8 +8,8 @@ why). This module holds what a request head alone can answer, and the account a 
   is no, the HTTP/1 parser stores a body only while the exchange can still be a model call.
 * `named_in`: is this peer one the user named in `intercept_hosts`?
 * `could_be_model_call`: could a parse find a model call in an exchange, whatever the policy?
-* `report_unread_model_api`: a refused call to a model API wardex does not parse yet is counted
-  and said, never silent.
+* `count_refusal`: a refused call to a model API wardex does not parse yet is counted and said,
+  never silent; under debug every refusal is said with why.
 * `_accepted_prefix`: the part of a send buffer the kernel took, without copying the rest.
 """
 
@@ -23,7 +23,8 @@ from .._assembly import (
     DropReason,
     Prefilter,
     capture_mode_of,
-    diag_warning,
+    counters,
+    debug_refused_call,
     in_degraded_run,
     lose,
     parent_is_closed_unit,
@@ -208,12 +209,25 @@ def unread_model_api(host: str, path: str) -> str | None:
     return None
 
 
-def report_unread_model_api(host: str, path: str, debug: bool) -> None:
-    """The capture mode refused this exchange. If its head names a model API wardex does not parse
-    yet, it was a model call refused only for not being recognised: record it as `mode_refused`
-    and say so once per API, with what to do. Any other refusal is ordinary traffic outside agent
-    work and stays uncounted."""
-    api = unread_model_api(host, path)
+def count_refusal(treatment: str | None, host: str, path: str, debug: bool) -> None:
+    """The capture mode refused this exchange. A Conversations-API path (provider state, no model)
+    is counted. A head that names a model API wardex does not parse yet was a model call refused
+    only for not being recognised: recorded as `mode_refused` and said once per API, with what to
+    do. Any other refusal is ordinary traffic outside agent work and stays uncounted. Under debug,
+    every refusal is said by host and path with why, rate-limited (`debug_refused_call`)."""
+    api = None if treatment == "provider_state" else unread_model_api(host, path)
+    if debug:
+        what = api and f"a call to {api}, which wardex does not parse yet"
+        if treatment == "provider_state":
+            what = "provider state, not a model call"
+        debug_refused_call(
+            host,
+            path,
+            f"{what or 'not a model call wardex reads'}, issued outside any open wardex span: "
+            "capture_mode=AGENT keeps such traffic only inside a span",
+        )
+    if treatment == "provider_state":
+        counters.bump("interceptors.seam.provider_state_dropped")
     if api is None:
         return
     lose(
@@ -229,5 +243,3 @@ def report_unread_model_api(host: str, path: str, debug: bool) -> None:
         ),
         key=f"interceptors.admission.unread_model_api.{api}",
     )
-    if debug:
-        diag_warning(f"refused a call to {api} at {host}")

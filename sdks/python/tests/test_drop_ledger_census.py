@@ -775,7 +775,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.peer_unresolved'"): Marker(
         "PEER_UNRESOLVED", at="_interceptors/_seam.py"
     ),
-    ("_interceptors/_seam.py", "bump", "'interceptors.seam.provider_state_dropped'"): _MODE,
+    ("_interceptors/_admission.py", "bump", "'interceptors.seam.provider_state_dropped'"): _MODE,
     ("_interceptors/_seam.py", "record", "DropReason.BACKPRESSURE"): L("BACKPRESSURE"),
     ("_interceptors/_seam.py", "record", "DropReason.BODY_CAP"): L("BODY_CAP"),
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.stream_unterminated'"): _SEAM,

@@ -61,7 +61,7 @@ from .._types import (
     TransportTiming,
 )
 from ._admission import _accepted_prefix as _accepted_prefix
-from ._admission import could_be_model_call, keeps_bodies, named_in, report_unread_model_api
+from ._admission import could_be_model_call, count_refusal, keeps_bodies, named_in
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
@@ -605,7 +605,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         mode = capture_mode_of(client)
         if not (_should_capture(pre, txn, None, mode=mode) or could_be_model_call(treatment, txn)):
             # Nothing a parse could find would admit it: no job competes with a model call's.
-            _count_refusal(treatment, url_host, txn.path, bool(getattr(config, "debug", False)))
+            count_refusal(treatment, url_host, txn.path, bool(getattr(config, "debug", False)))
             return None
         return _PendingTxn(
             txn=txn,
@@ -872,15 +872,6 @@ def _should_capture(
         return True  # losing data is worse than noise (design §5.1)
 
 
-def _count_refusal(treatment: str | None, host: str, path: str, debug: bool) -> None:
-    """A refusal is counted for a Conversations-API path (provider state, no model) and recorded
-    for an unread model API (`report_unread_model_api`); any other is ordinary, uncounted."""
-    if treatment == "provider_state":
-        counters.bump("interceptors.seam.provider_state_dropped")
-    else:
-        report_unread_model_api(host, path, debug)
-
-
 def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> Any:
     """One sealed transaction, finished into a span — on whatever thread.
 
@@ -918,7 +909,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     # eviction fallback must not turn ordinary traffic into exported spans, or count it as lost.
     possible = unparsed and could_be_model_call(p.treatment, txn)
     if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=possible):
-        _count_refusal(p.treatment, p.url_host, txn.path, p.debug)
+        count_refusal(p.treatment, p.url_host, txn.path, p.debug)
         return None
     withhold_bodies = unparsed and not _should_capture(
         p.prefilter, txn, sem, mode=p.mode, unparsed=False
