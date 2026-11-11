@@ -233,10 +233,11 @@ _COMPUTED_SAMPLES: dict[str, Callable[[], str]] = {
 #: For each FRAMEWORK key, the framework's own code, run for real on an input
 #: whose output the card rule fires on.
 _FRAMEWORK_SAMPLES: dict[str, Callable[[], str]] = {
-    # The id LangGraph gives the pull task of a node `agent` at step 27026,
-    # the first step whose id has decimal 8-4-4 groups that pass the checksum.
+    # The id LangGraph gives the pull task of a node `agent` at step 503548,
+    # the first step whose id has decimal 8-4-4 groups that pass the checksum
+    # with no decimal digit in the group after them to join them into the id.
     "wardex.step.task_id": lambda: importlib.import_module("langgraph.pregel._algo")._xxhash_str(
-        bytes(range(16)), "agent", "27026", "agent", "__pregel_pull", "branch:to:agent"
+        bytes(range(16)), "agent", "503548", "agent", "__pregel_pull", "branch:to:agent"
     ),
 }
 

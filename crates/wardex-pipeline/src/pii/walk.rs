@@ -168,10 +168,10 @@ const CONVERSATION_ID_KEY: &str = "gen_ai.conversation.id";
 /// form is left alone too, since no byte says who wrote it. What that gives
 /// up is the card rule's matches on it and nothing else: no other built-in
 /// rule can match inside the form, and the card rule only on the UUID's own
-/// digit groups (`8-4-4` or `4-12`) when every hex digit in them happens to
-/// be decimal, which with the checksum is about one random id in seven
-/// thousand. Any other text, a UUID in capitals or of another version
-/// included, is judged as before.
+/// digit groups (`8-4-4` or `4-12`) when every hex digit in them is decimal,
+/// they pass the checksum, and the group beside them holds no decimal digit
+/// (one with a digit joins them into the id). Any other text, a UUID in
+/// capitals or of another version included, is judged as before.
 fn is_sdk_minted_id(text: &str) -> bool {
     let hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
     let variant = |c: u8| matches!(c, b'8' | b'9' | b'a' | b'b');
@@ -224,8 +224,9 @@ const STEP_TASK_ID_KEY: &str = "wardex.step.task_id";
 /// variant digit, so all thirty-two digits are free.
 ///
 /// When the 8-4-4 or the 4-12 groups are all decimal and pass the card
-/// checksum, about one task in eighteen thousand, the card rule rewrote the
-/// id and wrote `credit_card` into the span's record, and the id is the one
+/// checksum, and the group beside them holds no decimal digit to join them
+/// into the id, about one task in a million, the card rule would rewrite the
+/// id and write `credit_card` into the span's record, and the id is the one
 /// thing that tells a fan-out's sibling steps apart. The SDK does not make
 /// this value, but it copies it as LangGraph made it, and a host writing a
 /// text of exactly this form under the key loses what leaving the SDK's own
@@ -349,6 +350,48 @@ fn replace_text(m: &mut Masker<'_>, s: &mut String, rule: Rule, key: &str) -> bo
     *s = PLACEHOLDER.into();
     m.report.record(rule, Some(key));
     true
+}
+
+/// Attributes whose whole value is a host or peer address.
+const HOST_ATTRS: &[&str] = &["server.address", "network.peer.address"];
+
+/// Attributes whose value is a URL.
+const URL_ATTRS: &[&str] = &["url.full", "http.url"];
+
+/// A host or peer address field: a private address stays (see
+/// `PiiEngine::mask_host_into`), anything else is masked as text.
+fn mask_host(m: &mut Masker<'_>, s: &mut String) -> bool {
+    match m.engine.mask_host_into(s, &mut m.report) {
+        Some(masked) => {
+            *s = masked;
+            true
+        }
+        None => false,
+    }
+}
+
+/// A URL field: a private address as its host stays (see
+/// `PiiEngine::mask_url_into`), the rest is masked as text.
+fn mask_url(m: &mut Masker<'_>, s: &mut String) -> bool {
+    match m.engine.mask_url_into(s, &mut m.report) {
+        Some(masked) => {
+            *s = masked;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The address-aware masking of a string attribute whose key names a host
+/// or a URL, or None for any other key (masked as text by the caller).
+fn mask_address_attr(m: &mut Masker<'_>, key: &str, s: &mut String) -> Option<bool> {
+    if HOST_ATTRS.contains(&key) {
+        Some(mask_host(m, s))
+    } else if URL_ATTRS.contains(&key) {
+        Some(mask_url(m, s))
+    } else {
+        None
+    }
 }
 
 fn mask_string(m: &mut Masker<'_>, s: &mut String) -> bool {
@@ -577,6 +620,15 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
                 hit |= mask_keeping_task_ids(m, ns);
                 continue;
             }
+            if let Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::StringValue(text)),
+            }) = &mut kv.value
+            {
+                if let Some(masked) = mask_address_attr(m, &kv.key, text) {
+                    hit |= masked;
+                    continue;
+                }
+            }
         }
         hit |= mask_kvs(m, std::slice::from_mut(kv));
     }
@@ -608,7 +660,7 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         hit |= mask_transport(m, t);
     }
     hit |= mask_string(m, error_type);
-    hit |= mask_string(m, server_address);
+    hit |= mask_host(m, server_address);
     hit |= mask_string(m, workflow_name);
     if let Some(pb::CallSite {
         file,
@@ -710,7 +762,7 @@ fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
     }) = http
     {
         hit |= mask_string(m, method);
-        hit |= mask_string(m, url);
+        hit |= mask_url(m, url);
     }
     if let Some(pb::GrpcMeta {
         service,
@@ -949,6 +1001,15 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option
             {
                 hit |= mask_keeping_task_ids(m, ns);
                 continue;
+            }
+            if let Some(otlp_pb::common::AnyValue {
+                value: Some(otlp_pb::common::any_value::Value::StringValue(text)),
+            }) = &mut kv.value
+            {
+                if let Some(masked) = mask_address_attr(m, &kv.key, text) {
+                    hit |= masked;
+                    continue;
+                }
             }
         }
         hit |= mask_otlp_kvs(m, std::slice::from_mut(kv));
@@ -1364,11 +1425,19 @@ mod tests {
     #[test]
     fn a_minted_conversation_id_that_passes_the_card_checksum_is_left_alone() {
         // `wardex.conversation()` with no id: its first three groups are all
-        // decimal and pass the checksum, so the card rule would replace them.
-        let cid = "48620579-8682-4828-a0e5-0454f31af317";
+        // decimal and pass the checksum, and the group after them holds no
+        // decimal digit, so nothing joins them into the id and the card rule
+        // would replace them.
+        let cid = "48620579-8682-4828-abcd-0454f31af317";
         assert_eq!(
             engine().mask_text(cid).as_deref(),
-            Some("****-****-****-4828-a0e5-0454f31af317")
+            Some("****-****-****-4828-abcd-0454f31af317")
+        );
+        // With a decimal digit in that group the run is joined into the id
+        // and is no card anywhere.
+        assert_eq!(
+            engine().mask_text("48620579-8682-4828-a0e5-0454f31af317"),
+            None
         );
         let mut env = env_with(pb::Span {
             name: "chat".into(),
@@ -1385,7 +1454,7 @@ mod tests {
         // A host's id of any other form is judged as before.
         let mut env = env_with(pb::Span {
             conversation: Some(pb::ConversationContext {
-                conversation_id: "48620579-8682-4828-c0e5-0454f31af317".into(),
+                conversation_id: "48620579-8682-4828-cbcd-0454f31af317".into(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1394,7 +1463,7 @@ mod tests {
         let span = span_of(&env);
         assert_eq!(
             span.conversation.as_ref().unwrap().conversation_id,
-            "****-****-****-4828-c0e5-0454f31af317"
+            "****-****-****-4828-cbcd-0454f31af317"
         );
         assert_eq!(
             span.capture_integrity.as_ref().unwrap().redaction_rules,
@@ -1451,16 +1520,17 @@ mod tests {
     }
 
     /// What LangGraph's own `_xxhash_str` returns for the pull task of a node
-    /// `agent` at step 27026: its 8-4-4 groups are decimal and pass the card
-    /// checksum.
-    const CARD_SHAPED_TASK_ID: &str = "21085070-2022-5109-e53a-53cc476ce164";
+    /// `agent` at step 503548: its 8-4-4 groups are decimal and pass the card
+    /// checksum, and the group after them holds no decimal digit, so nothing
+    /// joins them into the id.
+    const CARD_SHAPED_TASK_ID: &str = "29789779-1380-0358-aadc-0e60d8deb4ab";
 
     #[test]
     fn a_langgraph_task_id_that_passes_the_card_checksum_is_left_alone() {
         let id = CARD_SHAPED_TASK_ID;
         assert_eq!(
             engine().mask_text(id).as_deref(),
-            Some("****-****-****-5109-e53a-53cc476ce164")
+            Some("****-****-****-0358-aadc-0e60d8deb4ab")
         );
         let with = |key: &str, value: &str| {
             env_with(pb::Span {
@@ -1524,7 +1594,7 @@ mod tests {
         }
         // The node names are the host's and are masked around the ids; text
         // that is not an id ending at `|` or at the end is masked whole.
-        let card = "****-****-****-5109-e53a-53cc476ce164";
+        let card = "****-****-****-0358-aadc-0e60d8deb4ab";
         for (ns, masked, rules) in [
             (
                 format!("ops@corp.example:{id}|4111-1111-1111-1111:{id}"),
@@ -1904,6 +1974,104 @@ mod tests {
             .as_ref()?
             .value
             .as_ref()
+    }
+
+    /// A private address in a field that names a host is where the traffic
+    /// went, not someone's data: `server.address`, `network.peer.address`
+    /// and the host of a URL attribute keep loopback, RFC 1918 and
+    /// link-local addresses. A public address there, and any address in
+    /// free text or another attribute, is masked as before.
+    #[test]
+    fn host_fields_keep_private_addresses_on_both_wires() {
+        let mut env = env_with(pb::Span {
+            name: "chat".into(),
+            server_address: "10.1.2.3".into(),
+            input_data: b"call 10.1.2.3 and 192.168.0.9".to_vec(),
+            transport: Some(pb::TransportAttributes {
+                http: Some(pb::HttpMeta {
+                    method: "POST".into(),
+                    status_code: 200,
+                    url: "http://127.0.0.1:8080/v1/chat?peer=10.0.0.7".into(),
+                }),
+                ..Default::default()
+            }),
+            extra: vec![
+                text_kv("server.address", "192.168.1.10"),
+                text_kv("network.peer.address", "169.254.169.254"),
+                text_kv("http.url", "http://user:pw@[::1]:9000/x"),
+                text_kv("url.full", "http://172.16.0.4/x"),
+                text_kv("app.note", "10.1.2.3"),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
+        let span = span_of(&env);
+        assert_eq!(span.server_address, "10.1.2.3");
+        assert_eq!(
+            span.input_data,
+            b"call [IP_ADDRESS] and [IP_ADDRESS]".to_vec()
+        );
+        let url = &span.transport.as_ref().unwrap().http.as_ref().unwrap().url;
+        assert_eq!(url, "http://127.0.0.1:8080/v1/chat?peer=[IP_ADDRESS]");
+        let extra: Vec<_> = span.extra.iter().map(|kv| pb_text(&kv.value)).collect();
+        assert_eq!(
+            extra,
+            vec![
+                Some("192.168.1.10"),
+                Some("169.254.169.254"),
+                Some("http://REDACTED:REDACTED@[::1]:9000/x"),
+                Some("http://172.16.0.4/x"),
+                Some("[IP_ADDRESS]"),
+            ]
+        );
+        let ci = span.capture_integrity.as_ref().unwrap();
+        assert_eq!(ci.redaction_count, 5);
+
+        let mut public = env_with(pb::Span {
+            server_address: "8.8.8.8".into(),
+            extra: vec![text_kv("url.full", "https://8.8.4.4/v1")],
+            ..Default::default()
+        });
+        assert_eq!(mask_envelope(&engine(), &mut public), 0);
+        let span = span_of(&public);
+        assert_eq!(span.server_address, "[IP_ADDRESS]");
+        assert_eq!(
+            pb_text(&span.extra[0].value),
+            Some("https://[IP_ADDRESS]/v1")
+        );
+
+        let mut req = otlp_pb::trace_service::ExportTraceServiceRequest {
+            resource_spans: vec![otlp_pb::trace::ResourceSpans {
+                scope_spans: vec![otlp_pb::trace::ScopeSpans {
+                    spans: vec![otlp_pb::trace::Span {
+                        attributes: vec![
+                            otlp_kv_str("server.address", "10.0.0.5"),
+                            otlp_kv_str("url.full", "http://10.0.0.5:11434/v1/chat/completions"),
+                            otlp_kv_str("gen_ai.input.messages", "ping 10.0.0.5"),
+                            otlp_kv_str("server.address", "1.1.1.1"),
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        assert_eq!(mask_otlp(&engine(), &mut req), 0);
+        let span = &req.resource_spans[0].scope_spans[0].spans[0];
+        let texts: Vec<_> = span.attributes[..4]
+            .iter()
+            .map(|kv| otlp_text(&kv.value))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                Some("10.0.0.5"),
+                Some("http://10.0.0.5:11434/v1/chat/completions"),
+                Some("ping [IP_ADDRESS]"),
+                Some("[IP_ADDRESS]"),
+            ]
+        );
     }
 
     #[test]

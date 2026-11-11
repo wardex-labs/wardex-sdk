@@ -61,6 +61,8 @@ pub enum PiiError {
 struct Compiled {
     regex: Regex,
     validator: Option<fn(&str) -> bool>,
+    /// `PatternDef::context`: the match judged against the text around it.
+    context: Option<fn(&str, usize, usize) -> bool>,
     replacement: &'static Replacement,
     rule: Rule,
     /// Rescan policy after a validator rejection. A rejected candidate
@@ -261,6 +263,7 @@ impl PiiEngine {
             active.push(Compiled {
                 regex,
                 validator: def.validator,
+                context: def.context,
                 replacement: &def.replacement,
                 rule: category_rule(def.category),
                 retry_on_reject: def.retry_on_reject,
@@ -297,26 +300,29 @@ impl PiiEngine {
     /// re-probe within a rejected candidate); replaced regions are never
     /// rescanned, so placeholders cannot re-match.
     #[must_use = "`None` means no change; ignoring `Some` ships the unmasked text"]
-    #[expect(
-        clippy::string_slice,
-        reason = "every edit bound is a regex match bound, the offset of an ASCII \
-                  delimiter found by the userinfo or name scanner, or the end of an \
-                  earlier edit, so each is a char boundary of `text`"
-    )]
     pub fn mask_text_into(&self, text: &str, report: &mut Report) -> Option<String> {
-        let edits = self.edits(text, report);
-        if edits.is_empty() {
+        rewrite(text, self.edits(text, report, None))
+    }
+
+    /// `mask_text_into` for a value that is, whole, a host or peer address
+    /// (`server.address`): a private address is where the traffic went, not
+    /// anyone's data, and stays as written. Anything else is masked as text.
+    #[must_use = "`None` means no change; ignoring `Some` ships the unmasked text"]
+    fn mask_host_into(&self, host: &str, report: &mut Report) -> Option<String> {
+        if is_private_address(host) {
             return None;
         }
-        let mut out = String::with_capacity(text.len());
-        let mut pos = 0usize;
-        for (start, end, replacement) in edits {
-            out.push_str(&text[pos..start]);
-            out.push_str(&replacement);
-            pos = end;
-        }
-        out.push_str(&text[pos..]);
-        Some(out)
+        self.mask_text_into(host, report)
+    }
+
+    /// `mask_text_into` for a URL: a private address as the URL's own host
+    /// stays as written; every other part of it (credentials, path, query)
+    /// and a public host are masked as text.
+    #[must_use = "`None` means no change; ignoring `Some` ships the unmasked text"]
+    fn mask_url_into(&self, url: &str, report: &mut Report) -> Option<String> {
+        let keep = url_host(url)
+            .filter(|&(start, end)| url.get(start..end).is_some_and(is_private_address));
+        rewrite(url, self.edits(url, report, keep))
     }
 
     /// Bytes that may not be UTF-8 as a whole. Each invalid byte is judged as
@@ -328,7 +334,7 @@ impl PiiEngine {
         let text = std::str::from_utf8(bytes)
             .map(std::borrow::Cow::Borrowed)
             .unwrap_or_else(|_| std::borrow::Cow::Owned(ascii_stand_in(bytes)));
-        let edits = self.edits(&text, report);
+        let edits = self.edits(&text, report, None);
         if edits.is_empty() {
             return None;
         }
@@ -344,13 +350,19 @@ impl PiiEngine {
     }
 
     /// Every replacement `text` needs, as non-overlapping `(start, end,
-    /// replacement)` in order, each recorded into `report`.
-    fn edits(&self, text: &str, report: &mut Report) -> Vec<(usize, usize, String)> {
+    /// replacement)` in order, each recorded into `report`. An address match
+    /// covering exactly `keep` is left out (a URL's private host).
+    fn edits(
+        &self,
+        text: &str,
+        report: &mut Report,
+        keep: Option<(usize, usize)>,
+    ) -> Vec<(usize, usize, String)> {
         let mut hits: Vec<Hit> = Vec::new();
         for p in &self.active {
             let mut at = 0;
             while let Some(m) = p.regex.find_at(text, at) {
-                if p.validator.is_none_or(|v| v(m.as_str())) {
+                if p.confirms(text, m.start(), m.end()) {
                     hits.push(Hit {
                         start: m.start(),
                         end: m.end(),
@@ -392,6 +404,9 @@ impl PiiEngine {
                     break;
                 }
             }
+        }
+        if keep.is_some() {
+            hits.retain(|h| !(h.rule == Rule::IpAddress && Some((h.start, h.end)) == keep));
         }
         if let Some(rules) = &self.names {
             let mut found = Vec::new();
@@ -452,6 +467,74 @@ impl PiiEngine {
     }
 }
 
+impl Compiled {
+    /// The validator and the context check both accept `text[start..end]`.
+    fn confirms(&self, text: &str, start: usize, end: usize) -> bool {
+        let Some(matched) = text.get(start..end) else {
+            return false;
+        };
+        self.validator.is_none_or(|v| v(matched))
+            && self.context.is_none_or(|c| c(text, start, end))
+    }
+}
+
+/// `text` with `edits` applied, or None when there are none.
+#[expect(
+    clippy::string_slice,
+    reason = "every edit bound is a regex match bound, the offset of an ASCII \
+              delimiter found by the userinfo or name scanner, or the end of an \
+              earlier edit, so each is a char boundary of `text`"
+)]
+fn rewrite(text: &str, edits: Vec<(usize, usize, String)>) -> Option<String> {
+    if edits.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0usize;
+    for (start, end, replacement) in edits {
+        out.push_str(&text[pos..start]);
+        out.push_str(&replacement);
+        pos = end;
+    }
+    out.push_str(&text[pos..]);
+    Some(out)
+}
+
+/// A loopback (`127.0.0.0/8`, `::1`), RFC 1918 private (`10/8`,
+/// `172.16/12`, `192.168/16`) or link-local (`169.254/16`) address literal,
+/// an IPv6 one with or without brackets. Only these: a public address names
+/// a party outside the host's own network.
+fn is_private_address(text: &str) -> bool {
+    let bare = text
+        .strip_prefix('[')
+        .and_then(|t| t.strip_suffix(']'))
+        .unwrap_or(text);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// The byte range of a URL's host in `scheme://userinfo@host:port/...`:
+/// after the last `@` of the authority and before its port, brackets kept
+/// around an IPv6 literal. None without a `://`.
+fn url_host(url: &str) -> Option<(usize, usize)> {
+    let start = url.find("://")?.checked_add(3)?;
+    let rest = url.get(start..)?;
+    let authority = rest.get(..rest.find(['/', '?', '#']).unwrap_or(rest.len()))?;
+    let from = authority.rfind('@').map_or(0, |at| at + 1);
+    let host_port = authority.get(from..)?;
+    let len = if host_port.starts_with('[') {
+        host_port
+            .find(']')
+            .map_or(host_port.len(), |close| close + 1)
+    } else {
+        host_port.find(':').unwrap_or(host_port.len())
+    };
+    Some((start + from, start + from + len))
+}
+
 /// After a rejected retry-on-reject candidate, probe progressively shorter
 /// end positions at the same start. The separator-tolerant card regex can
 /// greedily bleed into a trailing digit run ("4111 1111 1111 1111 999"), and
@@ -461,7 +544,7 @@ impl PiiEngine {
 /// minimum (`[0-9]` + `{12,18}` tail). The validator re-confirms each probe,
 /// longest first; the first pass wins.
 fn shrink_to_valid(p: &Compiled, text: &str, start: usize, end: usize) -> Option<(usize, String)> {
-    let validator = p.validator?;
+    p.validator?;
     // The matched span is pure ASCII (digits and `[ -]` separators), so byte
     // positions inside it are always char boundaries.
     let bytes = text.as_bytes();
@@ -475,7 +558,7 @@ fn shrink_to_valid(p: &Compiled, text: &str, start: usize, end: usize) -> Option
         if cand.bytes().filter(u8::is_ascii_digit).count() < 13 {
             break; // shorter probes only lose more digits
         }
-        if validator(cand) {
+        if p.confirms(text, start, e) {
             return Some((e, apply(p.replacement, cand)));
         }
     }
@@ -628,6 +711,104 @@ mod tests {
         }
     }
 
+    /// A dotted quad in a version context is a version, not an address: after
+    /// a pip comparison operator, touching a `v`, after `version ` or
+    /// `version=`, after a package name and `/` or `-`, or as part of a
+    /// longer dotted number. An address in free text, in a filter on an
+    /// address field or in a URL path is still an address.
+    #[test]
+    fn version_strings_are_not_ip_addresses() {
+        for text in [
+            "pkg numpy==1.26.4.1",
+            "requires torch>=2.1.0.1",
+            "pin foo~=1.2.3.4, bar!=1.2.3.4, baz<=1.2.3.4",
+            "build v1.2.3.4",
+            "v=1.2.3.4",
+            "version 1.2.3.4",
+            "Version=10.0.0.1",
+            "Server: nginx/1.2.3.4",
+            "ua python-requests/2.31.0.1",
+            "openssl-1.1.1.1",
+            "name-1.2.3.4",
+            "release 1.2.3.4.5",
+            "release 1.2.3.4.1000",
+            "release 1000.1.2.3.4",
+        ] {
+            let mut r = Report::default();
+            let _masked = engine().mask_text_into(text, &mut r);
+            assert!(!r.rules.contains(&Rule::IpAddress), "{text}: {r:?}");
+        }
+        for (text, masked) in [
+            ("host 10.0.0.5 down", "host [IP_ADDRESS] down"),
+            (
+                "server 10.1.2.3, build 1.2.3.4",
+                "server [IP_ADDRESS], build [IP_ADDRESS]",
+            ),
+            ("ssh root@8.8.8.8", "ssh root@[IP_ADDRESS]"),
+            ("ends at 10.0.0.1.", "ends at [IP_ADDRESS]."),
+            ("port 10.0.0.1:8080", "port [IP_ADDRESS]:8080"),
+            ("dev 10.0.0.1", "dev [IP_ADDRESS]"),
+            ("nginx v 203.0.113.9", "nginx v [IP_ADDRESS]"),
+            ("version: 203.0.113.9", "version: [IP_ADDRESS]"),
+            ("subversion 10.0.0.1", "subversion [IP_ADDRESS]"),
+            ("ip.addr==192.168.1.1", "ip.addr==[IP_ADDRESS]"),
+            ("filter src_ip>=10.0.0.1", "filter src_ip>=[IP_ADDRESS]"),
+            ("GET /hosts/10.0.0.5", "GET /hosts/[IP_ADDRESS]"),
+            ("see http://10.0.0.5/x", "see http://[IP_ADDRESS]/x"),
+            ("ops@10.0.0.5", "ops@[IP_ADDRESS]"),
+            ("range 10.0.0.1-10.0.0.9", "range [IP_ADDRESS]-[IP_ADDRESS]"),
+        ] {
+            assert_eq!(mask(text), masked, "{text}");
+        }
+    }
+
+    /// A card, SSN or routing number glued into a longer token is part of an
+    /// id, not a value of its own: joined by a letter, digit or `_`, or by a
+    /// `-` or `.` to another digit or hex group. The same digits standing
+    /// alone, or joined to a word by a `-` or `.`, are still masked.
+    #[test]
+    fn digits_inside_a_longer_token_are_not_cards_ssns_or_routing_numbers() {
+        for text in [
+            "id ord_4111111111111111x",
+            "uuid 41111111-1111-1111-1234-567890123456",
+            "uuid 48620579-8682-4828-a0e5-0454f31af317",
+            "ref 123-45-6789-01",
+            "ref 021000021_b",
+            "ref 2.021000021",
+        ] {
+            let mut r = Report::default();
+            let _masked = engine().mask_text_into(text, &mut r);
+            for rule in [Rule::CreditCard, Rule::UsSsn, Rule::UsBankRouting] {
+                assert!(!r.rules.contains(&rule), "{text}: {r:?}");
+            }
+        }
+        for (text, masked) in [
+            ("order 4111111111111111", "order ****-****-****-1111"),
+            ("card: 4111-1111-1111-1111.", "card: ****-****-****-1111."),
+            (
+                "\"pan\":\"4111111111111111\"",
+                "\"pan\":\"****-****-****-1111\"",
+            ),
+            ("id 123-45-6789", "id [SSN]"),
+            ("(123-45-6789)", "([SSN])"),
+            ("acct 021000021", "acct [BANK_ROUTING]"),
+            ("price -4111111111111111", "price -****-****-****-1111"),
+            ("card-4111111111111111", "card-****-****-****-1111"),
+            ("SSN-123-45-6789", "SSN-[SSN]"),
+            ("SSN 123-45-6789.Thanks", "SSN [SSN].Thanks"),
+            ("x-4111 1111 1111 1111", "x-****-****-****-1111"),
+            ("id.4111111111111111", "id.****-****-****-1111"),
+            ("4111111111111111.json", "****-****-****-1111.json"),
+            ("routing-021000021", "routing-[BANK_ROUTING]"),
+            ("id ord-4111111111111111", "id ord-****-****-****-1111"),
+            ("id 4111111111111111-a", "id ****-****-****-1111-a"),
+            ("ref INV-123-45-6789", "ref INV-[SSN]"),
+            ("ref acct-021000021", "ref acct-[BANK_ROUTING]"),
+        ] {
+            assert_eq!(mask(text), masked, "{text}");
+        }
+    }
+
     #[test]
     fn masks_south_korean_mobile_numbers() {
         for (text, masked) in [
@@ -759,13 +940,13 @@ mod tests {
 
     #[test]
     fn luhn_passing_bleed_never_ships_the_pan() {
-        // leading "0" from the IP octet keeps the Luhn sum valid -> the bled candidate
-        // is accepted, overlaps the IP hit, and must still mask its remainder.
-        // Output is deterministic: the IP hit consumes "10.0.0.0" (0..8), the
-        // card hit (7..28, overlapping) contributes only its replacement.
+        // The leading "0" from the IP octet keeps the Luhn sum valid, but that
+        // candidate is joined to the address by its dot, so the retry one
+        // character on finds the card itself. Whatever the path, the raw PAN
+        // never ships.
         let out = mask("10.0.0.0 4111 1111 1111 1111");
         assert!(!out.contains("4111"), "raw PAN leaked: {out}");
-        assert_eq!(out, "[IP_ADDRESS]****-****-****-1111");
+        assert_eq!(out, "[IP_ADDRESS] ****-****-****-1111");
     }
 
     #[test]
