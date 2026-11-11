@@ -23,7 +23,10 @@ WHAT COUNTS AS A GAP, and what does not:
   `FAILED`), or whose framework import is answered by a local package
   (`SHADOWED`);
 - an adapter installed on a framework release this wardex was not tested
-  against: it records, and parts of what it records may be wrong.
+  against: it records, and parts of what it records may be wrong;
+- requests held for a retry after a failed export (`export_held`): none of
+  them is confirmed delivered, and they become a loss only at `close()`, after
+  the last check could see it.
 
 Not a gap: a drop the host asked for (`nature == "none"`, a
 `before_send_envelope` hook that returned None), and an adapter whose framework
@@ -110,8 +113,26 @@ def gaps_between(
     the caller already holds, so the same reading can be its next baseline and
     nothing recorded in between two checks falls between them."""
     allowed = frozenset(allow)
-    found = _adapter_gaps(now, since) + _loss_gaps(now, since)
+    found = _adapter_gaps(now, since) + _loss_gaps(now, since) + _held_gaps(now, since)
     return tuple(gap for gap in found if not gap.allowed_by(allowed))
+
+
+#: The reason requests held for a retry after a failed export are reported under.
+EXPORT_HELD = "export_held"
+
+
+def _held_gaps(now: Diagnostics, since: Diagnostics | None) -> tuple[CaptureGap, ...]:
+    held = now.retry_queued or 0
+    grew = held - ((since.retry_queued or 0) if since is not None else 0)
+    if held <= 0 or grew <= 0 or now.last_export_error is None:
+        return ()
+    line = (
+        f"{EXPORT_HELD}: {grew} request(s) to {now.destination} held for a retry after a "
+        f"failed export ({now.last_export_error}). None of them is confirmed delivered, and "
+        "they are lost if the receiver does not answer before the process ends. Check that "
+        "the receiver is up and that its address is the right one."
+    )
+    return (CaptureGap(EXPORT_HELD, "request", grew, line),)
 
 
 def assert_no_capture_gaps(*, since: Diagnostics | None = None, allow: Iterable[str] = ()) -> None:

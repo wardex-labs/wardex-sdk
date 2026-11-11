@@ -226,7 +226,8 @@ for adapter in wardex.diagnostics().adapters:
 
 wardex never raises into your application, so what it misses (spans a full
 buffer evicted, an adapter that did not install or runs on an untested
-release, an error inside wardex itself) is one `[wardex]` line on stderr, or
+release, an error inside wardex itself, exports held for a retry because the
+collector did not take them) is one `[wardex]` line on stderr, or
 one record on the `wardex_sdk` logger when your app configures logging. In
 your test suite you can make it a failure instead:
 

@@ -168,7 +168,8 @@ All notable changes to this project are documented here. The format follows
 - **`pytest --wardex-strict` fails a test during which wardex missed
   something.** wardex never raises into the application it observes, so a
   span the buffer evicted, an adapter that did not install or runs on an
-  untested framework release, or an error wardex swallowed inside itself was
+  untested framework release, an error wardex swallowed inside itself, or an
+  export held for a retry because the collector refused it (`export_held`) was
   one line on stderr: easy to scroll past in CI, where the change that caused
   it is in front of the person who can undo it. With the flag, the plugin the
   package registers checks every test, and one during which wardex lost

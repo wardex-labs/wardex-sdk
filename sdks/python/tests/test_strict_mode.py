@@ -249,6 +249,44 @@ def test_spans_a_full_buffer_evicted_fail_the_test_that_made_them(run):
     assert "--wardex-strict-allow=queue_overflow" in out
 
 
+_COLLECTOR_DOWN_TEST = """
+import socket
+
+import wardex_sdk as wardex
+from wardex_sdk import AdaptersConfig, BackendConfig
+
+_s = socket.socket()
+_s.bind(("127.0.0.1", 0))
+_PORT = _s.getsockname()[1]
+_s.close()  # nothing listens: every export is refused
+wardex.init(
+    backend=BackendConfig(endpoint=f"http://127.0.0.1:{_PORT}"),
+    adapters=AdaptersConfig(enabled=()),
+)
+
+def test_a():
+    with wardex.span("x"):
+        pass
+    wardex.flush(3)
+
+def test_b():
+    with wardex.span("y"):
+        pass
+    wardex.flush(3)
+"""
+
+
+def test_a_suite_whose_collector_is_down_fails(run):
+    """A refused export waits in the retry queue and becomes a loss only at
+    close(), after the last check; held after a failure, it is a gap now."""
+    result = run(_COLLECTOR_DOWN_TEST, "--wardex-strict")
+    result.assert_outcomes(failed=2)
+    out = result.stdout.str()
+    assert "export_held: 1 request(s)" in out, out
+    assert "ConnectionRefusedError" in out
+    assert "--wardex-strict-allow=export_held" in out
+
+
 def test_an_allowed_eviction_passes(run):
     result = run(_SLOW_RECEIVER_TEST, "--wardex-strict", "--wardex-strict-allow=queue_overflow")
     result.assert_outcomes(passed=1)
@@ -487,6 +525,27 @@ def test_only_what_was_lost_after_the_baseline_is_a_gap(reading):
     assert [(g.reason, g.count) for g in gaps] == [("queue_overflow", 2), ("network_error", 1)]
     assert "queue_overflow: 2 span(s). queue_overflow happened" in gaps[0].line
     assert "do something about queue_overflow" in gaps[0].line
+
+
+def test_requests_held_after_a_failed_export_are_a_gap_until_they_go(reading):
+    def held(n, error="ConnectionRefusedError"):  # noqa: ANN001, ANN202
+        return Diagnostics(
+            initialized=True,
+            destination="http://collector:4318/v1/traces",
+            export_tracked=True,
+            last_export_error=error,
+            retry_queued=n,
+        )
+
+    reading["now"] = held(2)
+    [gap] = capture_gaps()
+    assert (gap.reason, gap.subject, gap.count) == ("export_held", "request", 2)
+    assert "http://collector:4318/v1/traces" in gap.line and "ConnectionRefusedError" in gap.line
+    assert capture_gaps(since=held(2)) == (), "the same queue is not said twice"
+    reading["now"] = held(3)
+    assert [g.count for g in capture_gaps(since=held(2))] == [1]
+    reading["now"] = held(0)
+    assert capture_gaps() == ()
 
 
 def test_a_drop_the_host_asked_for_is_not_a_gap(reading):
