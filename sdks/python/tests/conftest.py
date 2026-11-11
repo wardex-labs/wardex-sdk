@@ -35,6 +35,21 @@ def llm_fixture(case: str, name: str) -> bytes:
     return (LLM_FIXTURES / case / name).read_bytes()
 
 
+def project_key(region: str = "us", secret: str = "Q" * 43) -> str:
+    """A wardex project key that passes `init()`'s checksum: `wdx_<region>_`,
+    43 base62 secret characters, then the CRC32 of everything before it in 6
+    base62 characters. Not a key any receiver issued."""
+    import zlib
+
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    body = f"wdx_{region}_{secret[:43].ljust(43, '0')}"
+    value, digits = zlib.crc32(body.encode()), ""
+    while value:
+        value, digit = divmod(value, 62)
+        digits = alphabet[digit] + digits
+    return body + digits.rjust(6, "0")
+
+
 def client_spans() -> list:
     """The CLIENT spans the hub's client holds — after `_settle()`, because
     finalization runs on the worker and a bare read races it."""

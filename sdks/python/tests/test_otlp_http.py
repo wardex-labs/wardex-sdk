@@ -443,7 +443,6 @@ def test_a_split_export_that_runs_out_of_budget_says_how_far_it_got(monkeypatch,
     split can run out partway. The spans in the unsent chunks cannot be handed
     back (the earlier chunks are already at the backend and a retry would
     duplicate them), which leaves this line as their only channel."""
-    import urllib.request
 
     from wardex_sdk._assembly._diag import reset_reports_for_test
 
@@ -456,16 +455,19 @@ def test_a_split_export_that_runs_out_of_budget_says_how_far_it_got(monkeypatch,
 
     posted = {"n": 0}
 
-    def slow_urlopen(req, timeout=None):
+    def slow_post(url, body, headers, timeout):
         # Long relative to the encode on purpose: the budget below has to land
         # between two POSTs and three, and the slack in between is what keeps
-        # this from turning into a timing flake on a loaded machine.
+        # this from turning into a timing flake on a loaded machine. The
+        # transport's own `post` would cut the second request at the deadline;
+        # this one returns late, which is what leaves no budget for the third.
         posted["n"] += 1
         time.sleep(0.2)
-        return _Resp()
+
+    from wardex_sdk.transport import _otlp_http
 
     reset_reports_for_test()
-    monkeypatch.setattr(urllib.request, "urlopen", slow_urlopen)
+    monkeypatch.setattr(_otlp_http, "post", slow_post)
     spans = tuple(
         _span(
             name=f"chat model-{i}",
@@ -857,14 +859,15 @@ def test_the_report_says_delivery_is_unconfirmed_and_never_that_spans_were_lost(
     assert "10.0s timeout" in line, line
 
 
-def test_a_connect_phase_timeout_wrapped_by_urllib_is_recognized(monkeypatch, capsys):
-    """urllib reports a timeout during connect as `URLError(reason=TimeoutError)`
-    rather than raising `TimeoutError` itself, so a check that only looked at
-    the exception's own type would miss the commonest shape of this event."""
+def test_a_connect_phase_timeout_is_held_for_a_retry_not_reported_as_cut_short(monkeypatch, capsys):
+    """urllib reports a timeout during connect as `URLError(reason=TimeoutError)`.
+    The connection never opened, so nothing arrived: the batch is held for a
+    retry, and "cannot confirm whether it arrived" would be a false line."""
     import urllib.error
 
     err = _export_and_read(monkeypatch, capsys, urllib.error.URLError(TimeoutError("timed out")))
-    assert _cut_short_lines(err), f"a wrapped connect timeout went unreported: {err!r}"
+    assert not _cut_short_lines(err), err
+    assert "retries after" in err, f"the batch was not held for a retry: {err!r}"
 
 
 def test_an_ordinary_refusal_during_a_short_budget_is_not_reported(monkeypatch, capsys):

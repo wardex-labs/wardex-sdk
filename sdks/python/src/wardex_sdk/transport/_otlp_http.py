@@ -2,8 +2,10 @@
 
 Synchronous POST-on-flush: `export()` delegates to `_send_batch`, the single POST
 path that a manual `flush()` and the background batch worker both reach.
-Network errors are fail-silent (an observability SDK must never crash the app),
-counted, and said in one line per process -- the full error is the debug log's.
+Network errors are fail-silent (an observability SDK must never crash the app)
+and counted. A failure that proves nothing arrived, or a "later" from the
+receiver, is held for a retry (`_delivery`); every other one is said in one
+line per process naming the address -- the full error is the debug log's.
 
 One envelope may become SEVERAL POSTs. An OTLP request is accepted or rejected
 whole, so a batch over the receiver's body limit does not arrive short -- it
@@ -21,7 +23,6 @@ from __future__ import annotations
 
 import time
 import urllib.error
-import urllib.request
 
 from .._assembly import (
     DropReason,
@@ -38,6 +39,7 @@ from .._assembly._ledger import already_unsent, record_failed_send, unsent
 from .._native import NATIVE_OK, unavailable_reason
 from .._types import Envelope
 from ._base import (
+    DEFAULT_TIMEOUT,
     UNDELIVERED,
     CallerBudget,
     Transport,
@@ -45,6 +47,16 @@ from ._base import (
     _debug_enabled,
     _EncodeReports,
     _report_encode,
+)
+from ._delivery import (
+    Delivery,
+    ExportState,
+    Held,
+    describe,
+    hint_for,
+    http_status,
+    post,
+    retryable,
 )
 
 
@@ -160,35 +172,6 @@ def _classify_failure(exc: BaseException) -> tuple[DropReason, bool]:
     return DropReason.SEND_UNCONFIRMED, False
 
 
-def _describe_failure(exc: BaseException) -> tuple[str, int | None]:
-    """Why a POST failed, in words safe to print off-debug, and the HTTP status
-    the backend answered with (None when it never answered).
-
-    The HTTP status the backend answered with, or the exception's TYPE name --
-    never `str(exc)`. The message is not wardex's text: an `HTTPError` carries
-    the reason phrase the backend chose, a `ValueError` from a malformed
-    endpoint quotes the URL, and a URL can carry a credential in its query.
-    The type name says which failure it was (`ConnectionRefusedError`,
-    `gaierror`, `TimeoutError`) and leaves the specifics to the debug line,
-    which prints the whole exception. `HTTPError` is tested first because it
-    is a `URLError` too.
-
-    Every attribute read is inside the one `try`, because the exception may be
-    a subclass whose `code` or `reason` raises -- and this runs inside the
-    export's own `except`, where a raise would escape the fail-silent path.
-    """
-    try:
-        if isinstance(exc, urllib.error.HTTPError):
-            status = int(exc.code)
-            return f"HTTP {status}", status
-        reason = exc.reason if isinstance(exc, urllib.error.URLError) else None
-        if isinstance(reason, BaseException):
-            return type(reason).__name__, None
-        return type(exc).__name__, None
-    except Exception:  # noqa: BLE001 — a reporting probe, never a throw
-        return "an unreadable error", None
-
-
 class OtlpHttpTransport(Transport):
     def __init__(
         self,
@@ -204,6 +187,7 @@ class OtlpHttpTransport(Transport):
         self._timeout = timeout
         self._debug = debug
         self._compress = compress
+        self._delivery = Delivery(endpoint, wire="otlp", label="OTLP", classify=_classify_failure)
 
     @property
     def compress(self) -> bool:
@@ -242,6 +226,30 @@ class OtlpHttpTransport(Transport):
         """
         return self._timeout
 
+    @property
+    def export_state(self) -> ExportState:
+        """Where this transport sends, its last delivery and last failure, and
+        what its retry queue holds. A copy, read when asked."""
+        return self._delivery.state()
+
+    def at_fork_child(self) -> None:
+        self._delivery._at_fork_reinit()
+
+    def flush(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """Retry what the queue holds, inside `timeout` and this transport's own."""
+        budget = min(self._timeout, timeout)
+        if budget > 0 and not self._delivery.holding(budget):
+            self._delivery.resend(self._request_headers(), time.monotonic() + budget)
+
+    def close(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        self._delivery.close(self._request_headers(), min(self._timeout, timeout))
+
+    def _abandon_retries(self, why: str) -> None:
+        self._delivery.give_up(why)
+
+    def _receiver_unreachable(self) -> bool:
+        return self._delivery.unreachable
+
     def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
         return self._send_batch(envelope, timeout)
 
@@ -251,90 +259,7 @@ class OtlpHttpTransport(Transport):
         # debug=True, and either place they set it must reveal the names.
         _report_encode(reports, debug=self._debug or _debug_enabled())
 
-    def _send_batch(self, envelope: Envelope, timeout: float | None = None) -> Undelivered | None:
-        # zero spans means an empty batch — skip the POST. Not a decline: there
-        # is nothing here for a later attempt to deliver.
-        if not envelope.spans:
-            return None
-        if not NATIVE_OK:
-            # This transport is a published symbol: a host can construct it and
-            # call `export()` by hand without ever reaching `init()`, which is
-            # the only other place the missing extension is announced. Encoding
-            # is impossible and the envelope is lost either way, so say so
-            # rather than dropping spans in silence -- a silent exporter is
-            # indistinguishable from a backend that never got any traffic, and
-            # that is the failure nobody finds.
-            #
-            # Checked BEFORE the spent-budget skip below, which used to come
-            # first: a degraded process whose deadline had also run out got the
-            # debug-gated "deadline exhausted" line and never this one, i.e. the
-            # gated diagnosis suppressed the actionable one. A wheel with no
-            # working core is the finding; the deadline is a detail of a send
-            # that could not have happened anyway.
-            #
-            # `report_once` rather than a bare print because this is a per-call
-            # path: a host exporting in a loop wrote a line per envelope, which
-            # is the one site in this area not already bounded. Unconditional
-            # rather than debug-gated for the reason above, and affordable
-            # precisely because it is bounded to one line per process.
-            report_once(
-                f"OTLP export skipped, native extension unavailable ({unavailable_reason()})",
-                key="transport.otlp.native_unavailable",
-            )
-            # Deliberately NOT `UNDELIVERED`: that word promises a later attempt
-            # could succeed, and no attempt in this process ever can. Saying it
-            # would make a bounded flush hand the same unencodable batch back to
-            # the buffer forever. The line above is the report, and it is the
-            # one worth acting on.
-            return None
-        # The caller's remaining budget narrows the configured timeout, never
-        # widens it: a flush(99.0) must not turn a transport configured for 10s
-        # into one that blocks for 99. Without this, the drain's deadline stops
-        # at the drain — the process still hangs inside urlopen for the full
-        # configured timeout, which is the stall this parameter exists to end.
-        effective = self._timeout if timeout is None else min(self._timeout, timeout)
-        if effective <= 0:
-            # urlopen(timeout=0) is not "give up now", it is a non-blocking
-            # socket that raises on the first would-block. Skip instead: there
-            # is no time left to open one.
-            #
-            # And say so in the return value, which is the whole of what the
-            # client knows about this envelope's fate. Nothing was sent and
-            # nothing was consumed, so a drain that still owns the spans may
-            # keep them for a drain with budget; a final one now knows it is
-            # abandoning them instead of guessing.
-            if self._debug:
-                diag_info("OTLP export skipped (deadline exhausted)")
-            return UNDELIVERED
-        # The clock starts BEFORE the encode, not after it. `timeout` is a
-        # wall-clock bound on this whole call -- that is what `_client._drain`
-        # promises and what a SIGTERM handler's `flush(2.0)` relies on -- and
-        # the encode is not free: it serializes and compresses the batch, and a
-        # batch over the request cap is measured, split and measured again.
-        # Starting the clock after it would make the budget "the encode, PLUS
-        # the time you asked for".
-        started = time.monotonic()
-        deadline = started + effective
-        # THE SANCTIONED PATH, minus its counted reports: `_encode_requests` is
-        # `Transport.encode()` -- the native encoder with this transport's
-        # stored PII policy and limits, split at `max_otlp_request_bytes` --
-        # except that what the encode could not ship as captured
-        # (`_EncodeReports`: the spans the marshaller skipped, the
-        # reserved-name attributes the mapping replaced, the spans sent
-        # without their payload, the spans too large to send at all) comes
-        # back uncounted. It is counted below, where this batch's fate is
-        # decided: counting here, before a spent budget hands the batch back
-        # as `UNDELIVERED`, made the retry count the same span again. The
-        # `compress` constructor flag feeds it.
-        bodies, reports = self._encode_requests(envelope, compress=self._compress)
-        if not bodies:
-            # Every span in the batch was dropped -- by encode()'s over-cap
-            # guard, or skipped as unmarshallable. Nothing to POST, and not
-            # `UNDELIVERED`: a later attempt would encode to the same nothing.
-            # The fate is decided, so the skipped and over-cap spans (and any
-            # replaced reserved-name attributes) are counted now.
-            self._count_encode_reports(reports)
-            return None
+    def _request_headers(self, *, warn: bool = False) -> dict[str, str]:
         headers = {"Content-Type": "application/x-protobuf"}
         # Host headers next, as they always have been: a caller who sets one of
         # these means it.
@@ -344,14 +269,10 @@ class OtlpHttpTransport(Transport):
         # knows how it produced. Letting a host header win here ships a gzip
         # frame declared as something else -- a 400 from every conforming
         # receiver, which no retry fixes, and the exact failure the `compress`
-        # switch exists to avoid. `compress=False` is how a caller turns gzip
-        # off; the header is not a second, contradictory way to do it.
-        #
-        # Matched case-insensitively because that is how the header is: urllib
-        # normalizes `content-encoding` and `Content-Encoding` onto one key, so
-        # a host spelling would silently win the merge above.
+        # switch exists to avoid. Matched case-insensitively because urllib
+        # normalizes `content-encoding` and `Content-Encoding` onto one key.
         for name in [k for k in headers if k.lower() == "content-encoding"]:
-            if self._debug:
+            if warn and self._debug:
                 diag_warning(
                     f"ignoring host header {name}={headers[name]!r}: the OTLP "
                     f"transport owns Content-Encoding (use compress=False to send "
@@ -360,37 +281,89 @@ class OtlpHttpTransport(Transport):
             del headers[name]
         if self._compress:
             headers["Content-Encoding"] = "gzip"
+        return headers
 
-        from .._suppress import suppress_capture
+    def _hold(self, bodies: tuple[bytes, ...], spans: int | None) -> None:
+        """Queue `bodies` for a retry. A whole batch in one body is `spans`
+        spans; how many each of several bodies holds is the core's, so those
+        are counted as requests."""
+        whole = spans is not None and len(bodies) == 1
+        units = ((DropUnit.SPAN, spans),) if whole else ((DropUnit.REQUEST, 1),)
+        for body in bodies:
+            self._delivery.hold(Held(body, units, self._delivery.last_reason))
+
+    def _send_batch(self, envelope: Envelope, timeout: float | None = None) -> Undelivered | None:
+        # zero spans means an empty batch — skip the POST. Not a decline: there
+        # is nothing here for a later attempt to deliver.
+        if not envelope.spans:
+            return None
+        if not NATIVE_OK:
+            # A host can construct this transport and call `export()` by hand
+            # without ever reaching `init()`, the only other place the missing
+            # extension is announced. Checked before the spent-budget skip, so a
+            # degraded process gets this line rather than a debug-gated one, and
+            # bounded to one line per process because this is a per-call path.
+            report_once(
+                f"OTLP export skipped, native extension unavailable ({unavailable_reason()})",
+                key="transport.otlp.native_unavailable",
+            )
+            # Not `UNDELIVERED`: that promises a later attempt could succeed,
+            # and no attempt in this process ever can.
+            return None
+        # The caller's remaining budget narrows the configured timeout, never
+        # widens it: a flush(99.0) must not turn a transport configured for 10s
+        # into one that blocks for 99.
+        effective = self._timeout if timeout is None else min(self._timeout, timeout)
+        if effective <= 0 and not self._delivery.holding(effective):
+            # urlopen(timeout=0) is a non-blocking socket, not "give up now".
+            # Nothing was sent and nothing consumed, so say so in the return
+            # value: a non-final drain keeps the spans for a drain with budget,
+            # and a final one knows it is abandoning them.
+            if self._debug:
+                diag_info("OTLP export skipped (deadline exhausted)")
+            return UNDELIVERED
+        # The clock starts BEFORE the encode: `timeout` bounds this whole call
+        # (a SIGTERM handler's flush(2.0) relies on it), and the encode is not
+        # free -- it serializes, compresses, and splits at the request cap.
+        started = time.monotonic()
+        deadline = started + effective
+        # THE SANCTIONED PATH, minus its counted reports: `_encode_requests` is
+        # `Transport.encode()` -- masking, limits, the split at
+        # `max_otlp_request_bytes` -- with what it could not ship as captured
+        # handed back uncounted, to be counted below where this batch's fate is
+        # decided. Counting before an `UNDELIVERED` would count a retry twice.
+        bodies, reports = self._encode_requests(envelope, compress=self._compress)
+        if not bodies:
+            # Every span in the batch was dropped by the over-cap guard or
+            # skipped as unmarshallable: nothing to POST, and a later attempt
+            # would encode to the same nothing, so the fate is decided now.
+            self._count_encode_reports(reports)
+            return None
+        headers = self._request_headers(warn=True)
+        shipped = len(envelope.spans) - len(reports.unmarshalled) - reports.over_cap
+        # Held requests go first, so the receiver sees batches in capture order.
+        if not self._delivery.admits(headers, deadline):
+            # The receiver is backing us off: this batch waits in the queue
+            # rather than spending a POST the receiver asked us not to make.
+            self._count_encode_reports(reports)
+            self._hold(bodies, shipped)
+            return None
 
         for index, body in enumerate(bodies):
-            # Every request reads the same deadline, including the first: what
-            # the caller bounded is the call, and by here the encode has already
-            # spent part of it. Later requests therefore share what the earlier
-            # ones left, so an oversized batch cannot multiply the deadline the
-            # caller set by the number of chunks it happened to split into.
+            # Every request reads the same deadline: what the caller bounded is
+            # the call, so an oversized batch cannot multiply it by the number
+            # of chunks it happened to split into.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if index == 0:
-                    # Nothing went on the wire, so this is a decline rather than
-                    # a loss: `UNDELIVERED` lets a non-final drain keep the spans
-                    # for a drain with budget, and lets a final one account for
-                    # them instead of guessing. Same answer as the spent-budget
-                    # guard above, reached by the encode having eaten the budget
-                    # rather than the caller having arrived with none.
-                    # The skipped spans are NOT counted on this path: the batch
-                    # goes back to the buffer, and the attempt that finally
-                    # decides it meets and counts them -- once.
+                    # Nothing went on the wire: a decline, not a loss. The
+                    # skipped spans are counted by the attempt that decides.
                     if self._debug:
                         diag_info("OTLP export skipped (deadline spent encoding)")
                     return UNDELIVERED
-                # Past the first request the spans are already half-delivered,
-                # so the rest cannot be handed back -- `UNDELIVERED` promises a
-                # retry could not duplicate anything, and here it would. What is
-                # left is to say so. Unconditional and bounded, like the reports
-                # around it: off-debug this was a trace arriving with holes in
-                # the middle and nothing on any channel about it. Counted in
-                # requests: how many spans each unsent body held is the core's.
+                # Past the first request the batch is half-delivered and cannot
+                # be handed back without duplicating the half that went.
+                # Counted in requests: how many spans each body held is the core's.
                 record(DropReason.BUDGET_EXHAUSTED, len(bodies) - index, DropUnit.REQUEST)
                 report_once(
                     f"an OTLP export ran out of budget after {index} of "
@@ -404,109 +377,103 @@ class OtlpHttpTransport(Transport):
                 break
             if index == 0:
                 # The first request is going on the wire: this batch will not
-                # come back as `UNDELIVERED`, so its skipped spans are counted
-                # here, exactly once.
+                # come back as `UNDELIVERED`, so its skipped spans count now.
                 self._count_encode_reports(reports)
             try:
-                # Built inside the `try`: an address with no scheme makes the
-                # constructor raise `ValueError`, and that is a failed export
-                # to count, not a raise out of `export()`.
-                req = urllib.request.Request(
-                    self._endpoint, data=body, headers=headers, method="POST"
-                )
-                with suppress_capture():
-                    with urllib.request.urlopen(req, timeout=remaining):
-                        pass
+                post(self._endpoint, body, headers, remaining)
             except Exception as exc:  # fail-silent: never crash the app
-                # Every failed POST is counted, whichever line below says it,
-                # and before the debug line, whose `str(exc)` is host text.
                 counters.bump("transport.otlp.export_failed")
-                lost_as, definite = _classify_failure(exc)
-                # Counted before the settle: `unsent` folds, and a shutdown signal that
-                # lands in that fold runs as it ends, where the process dies.
-                if already_unsent(envelope):
-                    pass  # this batch is counted already
-                elif index:  # the requests not sent; how many spans they held is the core's
-                    record(lost_as, len(bodies) - index, DropUnit.REQUEST)
-                else:  # nothing of this batch was accepted; its over-cap spans were not in it
-                    lost = len(envelope.spans) - len(reports.unmarshalled) - reports.over_cap
-                    record(lost_as, lost)
-                record_failed_send()
-                unsent(envelope, definite=definite)
                 if self._debug:
                     debug_host_error(
                         "OTLP export failed", exc, unprintable="transport.otlp.error_unprintable"
                     )
-                cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
-                if cut_short_by is not None:
-                    # Reported, NOT re-queued: the POST was open, so the backend
-                    # may already hold this batch and a retry would duplicate
-                    # it. What the caller loses here is not the spans, it is the
-                    # KNOWLEDGE of whether they arrived -- and that is a fact
-                    # about the budget the caller chose, which nothing else on
-                    # this path will ever tell them. Off-debug this was silence
-                    # indistinguishable from a successful export.
-                    report_once(
-                        f"an OTLP export was cut off after "
-                        f"{time.monotonic() - started:.1f}s by the "
-                        f"{cut_short_by.requested:.1f}s budget its caller passed to "
-                        f"flush()/close(), which is shorter than this transport's own "
-                        f"{self._timeout:.1f}s timeout. "
-                        f"The POST had already been sent, so wardex cannot CONFIRM whether "
-                        f"the backend received these {len(envelope.spans)} span(s); they are "
-                        f"not resent, because the backend may hold them and a resend would "
-                        f"duplicate them. Pass a larger timeout to confirm delivery.",
-                        key="transport.otlp.caller_budget_cut_short",
-                    )
-                elif not index:
-                    # The ordinary failure: the backend refused us, or was not
-                    # there to ask. Nothing of this batch was accepted, so there
-                    # is no hole to explain -- only that the spans are gone.
-                    # Off-debug that used to be silence indistinguishable from a
-                    # working export, so a wrong endpoint or a refused key read
-                    # as "the install did not take". One line per process on a
-                    # key of its own, so it can spend neither the cut-short
-                    # report above nor the partial one below.
-                    reason, status = _describe_failure(exc)
-                    hint = (
-                        " The backend refused this request's credentials; check the "
-                        "headers configured for it."
-                        if status in (401, 403)
-                        else ""
-                    )
-                    report_export_failed(
-                        "an OTLP export",
-                        "transport.otlp.export_failed",
-                        reason,
-                        len(envelope.spans),
-                        hint,
-                    )
-                if index:
-                    # A PARTIAL export, which is new with splitting and is not
-                    # the same event as "the backend is down". Earlier requests
-                    # of this batch were accepted, so what the backend now holds
-                    # is a trace with a hole in the middle -- and a hole reads as
-                    # "this call never happened", which is a worse answer than a
-                    # missing trace. Reported off-debug, once per process,
-                    # because nothing else on any channel says it; a failure on
-                    # the FIRST request is the ordinary "your backend refused
-                    # us", said above with no partial state to explain.
-                    report_once(
-                        f"an OTLP export was abandoned after {index} of "
-                        f"{len(bodies)} requests failed to complete; the spans in the "
-                        f"remaining request(s) were not sent, so the trace(s) in this "
-                        f"batch may arrive incomplete.",
-                        key="transport.otlp.split_export_abandoned",
-                    )
-                # Stop rather than work through the rest of the batch. A
-                # backend that refused one request refuses the next, and trying
-                # anyway spends the caller's whole budget one timeout at a time
-                # -- the stall this transport's deadline exists to prevent,
-                # multiplied by the number of chunks.
+                if retryable(exc):
+                    # Nothing of these requests arrived, or the receiver said
+                    # "later": they wait in the queue instead of being lost.
+                    record_failed_send()
+                    self._hold(bodies[index:], shipped if index == 0 else None)
+                    self._delivery.failed(exc, spans=shipped if index == 0 else None)
+                    unsent(envelope, definite=False)
+                    break
+                self._delivery.refused(exc)
+                self._lost(envelope, exc, index, len(bodies), reports, timeout, effective, started)
+                # A backend that refused one request refuses the next, and
+                # trying anyway spends the caller's budget one timeout at a time.
                 break
-        # No `UNDELIVERED` on the failure path either, and not an oversight: the
-        # POST was attempted, so the backend may well hold this batch already.
-        # Handing it back for a retry would duplicate it, and against a backend
-        # that is simply down it would pin a full buffer for the life of the
-        # process. Retry belongs to a transport that can deduplicate, not here.
+        else:
+            self._delivery.succeeded(shipped)
+        # No `UNDELIVERED` on the failure path: the POST was attempted, so the
+        # backend may hold the batch, and a resend would duplicate it.
         return None
+
+    def _lost(
+        self,
+        envelope: Envelope,
+        exc: Exception,
+        index: int,
+        requests: int,
+        reports: _EncodeReports,
+        timeout: float | None,
+        effective: float,
+        started: float,
+    ) -> None:
+        """Account and say a request that failed for good, at `index` of `requests`."""
+        lost_as, definite = _classify_failure(exc)
+        # Counted before the settle: `unsent` folds, and a shutdown signal that
+        # lands in that fold runs as it ends, where the process dies.
+        if already_unsent(envelope):
+            pass  # this batch is counted already
+        elif index:  # the requests not sent; how many spans they held is the core's
+            record(lost_as, requests - index, DropUnit.REQUEST)
+        else:  # nothing of this batch was accepted; its over-cap spans were not in it
+            record(lost_as, len(envelope.spans) - len(reports.unmarshalled) - reports.over_cap)
+        record_failed_send()
+        unsent(envelope, definite=definite)
+        cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
+        if cut_short_by is not None:
+            # Reported, NOT re-queued: the POST was open, so the backend may
+            # already hold this batch. What the caller loses is the KNOWLEDGE
+            # of whether it arrived, a fact about the budget it chose.
+            report_once(
+                f"an OTLP export was cut off after "
+                f"{time.monotonic() - started:.1f}s by the "
+                f"{cut_short_by.requested:.1f}s budget its caller passed to "
+                f"flush()/close(), which is shorter than this transport's own "
+                f"{self._timeout:.1f}s timeout. "
+                f"The POST had already been sent, so wardex cannot CONFIRM whether "
+                f"the backend received these {len(envelope.spans)} span(s); they are "
+                f"not resent, because the backend may hold them and a resend would "
+                f"duplicate them. Pass a larger timeout to confirm delivery.",
+                key="transport.otlp.caller_budget_cut_short",
+            )
+        elif not index:
+            # The backend refused us. Named with the address it was sent to, so
+            # a wrong endpoint reads as one; a refused credential keeps a line
+            # of its own, so an earlier failure cannot use up "check the key".
+            status = http_status(exc)
+            report_export_failed(
+                f"an OTLP export to {self._delivery.destination}",
+                "transport.otlp.export_failed",
+                describe(exc),
+                len(envelope.spans),
+                hint_for(
+                    status,
+                    not_found="OTLP/HTTP receivers take traces at /v1/traces. Check the "
+                    "endpoint's path.",
+                    credentials="The backend refused this request's credentials; check the "
+                    "headers configured for it.",
+                    text=str,
+                ),
+                credentials=status in (401, 403),
+            )
+        if index:
+            # A PARTIAL export: earlier requests of this batch were accepted, so
+            # the backend holds a trace with a hole in the middle, which reads
+            # as "this call never happened". Said once per process.
+            report_once(
+                f"an OTLP export was abandoned after {index} of "
+                f"{requests} requests failed to complete; the spans in the "
+                f"remaining request(s) were not sent, so the trace(s) in this "
+                f"batch may arrive incomplete.",
+                key="transport.otlp.split_export_abandoned",
+            )

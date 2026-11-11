@@ -9,6 +9,7 @@ import warnings
 import pytest
 
 import wardex_sdk
+from conftest import project_key
 from wardex_sdk._config import (
     _MOVED,
     _REMOVED,
@@ -680,7 +681,7 @@ def test_a_scheme_less_wardex_endpoint_variable_is_refused_when_it_is_the_destin
     ("given", "says"),
     [
         ({"transport": "noop"}, "transport= carries its own address"),
-        ({"backend": BackendConfig(api_key="wdx_us_secret123")}, "api_key routes"),
+        ({"backend": BackendConfig(api_key=project_key())}, "api_key routes"),
     ],
     ids=["transport", "api_key"],
 )

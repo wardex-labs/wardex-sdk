@@ -14,9 +14,13 @@ of the contract:
     what makes an unconditional line affordable on a per-call path.
 
 The lines carry wardex's own words only: an exception's TYPE name or an HTTP
-status, never `str(exc)`, a URL, or the project key. A URL can carry a
-credential, and host text reaches stderr outside PII masking, so the full error
-stays where it was -- on the debug line.
+status, never `str(exc)` or the project key, and an address only as scheme,
+host and path -- a URL's query and userinfo can carry a credential. Host text
+reaches stderr outside PII masking, so the full error stays on the debug line.
+
+An export the receiver may still take (a refused connection, a 429/502/503/504)
+is held for a retry rather than lost; while it backs off, later batches queue
+behind it without a POST, so they add no failed attempt.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from conftest import project_key
 from wardex_sdk import _runtime
 from wardex_sdk._assembly import counters
 from wardex_sdk._assembly._diag import reset_reports_for_test
@@ -49,12 +54,12 @@ from wardex_sdk._types import (
     TraceId,
 )
 from wardex_sdk._worker import BatchWorker
-from wardex_sdk.transport import OtlpHttpTransport, WardexTransport
+from wardex_sdk.transport import OtlpHttpTransport, WardexTransport, _delivery
 from wardex_sdk.transport._base import Transport
 
 pytestmark = pytest.mark.usefixtures("fresh_counters")
 
-KEY = "wdx_us_census_secret"
+KEY = project_key(secret="CensusSecret")
 # A port nothing listens on: the connection is refused at once.
 CLOSED = "http://127.0.0.1:1"
 
@@ -153,16 +158,17 @@ def test_a_wardex_receiver_that_is_down_is_counted_and_said_once(capsys):
     transport = WardexTransport(CLOSED, KEY, timeout=2.0)
     capsys.readouterr()
     transport.export(_envelope(3))
-    transport.export(_envelope(2))
+    transport.export(_envelope(2))  # queued behind the first one's backoff
     err = capsys.readouterr().err
 
-    assert counters.get("transport.wardex.export_failed") == 2
-    [line] = _lines(err, "wardex export failed")
+    assert counters.get("transport.wardex.export_failed") == 1
+    assert transport.export_state.retry_queued == 2
+    [line] = _lines(err, "wardex export to")
     assert "ConnectionRefusedError" in line
     assert "3 span(s)" in line
     assert "transport.wardex.export_failed" in line
+    assert f"{CLOSED}/v1/envelope" in line, "the line does not say where it posted"
     assert KEY not in err
-    assert "127.0.0.1" not in err, "the URL reached stderr off-debug"
 
 
 def test_a_wardex_receiver_that_refuses_the_key_says_so(capsys, answering):
@@ -173,7 +179,7 @@ def test_a_wardex_receiver_that_refuses_the_key_says_so(capsys, answering):
     err = capsys.readouterr().err
 
     assert counters.get("transport.wardex.export_failed") == 1
-    [line] = _lines(err, "wardex export failed")
+    [line] = _lines(err, "HTTP 401")
     assert "HTTP 401" in line
     assert "WARDEX_API_KEY" in line, "a refused key did not say which setting to check"
     assert KEY not in err
@@ -186,8 +192,7 @@ def test_a_wardex_receiver_error_that_is_not_the_key_does_not_blame_the_key(caps
     transport.export(_envelope())
     err = capsys.readouterr().err
 
-    [line] = _lines(err, "wardex export failed")
-    assert "HTTP 503" in line
+    [line] = _lines(err, "HTTP 503")
     assert "WARDEX_API_KEY" not in line
 
 
@@ -205,16 +210,17 @@ def test_a_refused_key_is_said_even_after_another_failure_spent_a_line(capsys, m
         raise failures.pop(0)
 
     monkeypatch.setattr(urllib.request, "urlopen", fail)
+    monkeypatch.setattr(_delivery, "BACKOFF_FIRST_S", 0.0)  # the retry is due at once
     transport = WardexTransport("http://r.invalid", KEY, timeout=2.0)
     capsys.readouterr()
-    for _ in range(4):
+    for _ in range(3):
         transport.export(_envelope())
     err = capsys.readouterr().err
 
-    assert counters.get("transport.wardex.export_failed") == 4
+    assert counters.get("transport.wardex.export_failed") == 4  # the held one is retried once
     assert len(_lines(err, "(gaierror)")) == 1
-    [line] = _lines(err, "(HTTP 401)")
-    assert "WARDEX_API_KEY" in line
+    [line] = _lines(err, "WARDEX_API_KEY")
+    assert "(HTTP 401)" in line
 
 
 def test_the_far_end_cannot_choose_how_many_lines_are_printed(capsys, monkeypatch):
@@ -227,14 +233,17 @@ def test_the_far_end_cannot_choose_how_many_lines_are_printed(capsys, monkeypatc
         raise urllib.error.HTTPError("http://r.invalid", next(statuses), "x", {}, None)
 
     monkeypatch.setattr(urllib.request, "urlopen", fail)
+    monkeypatch.setattr(_delivery, "BACKOFF_FIRST_S", 0.0)  # keep every export attempting
     transport = WardexTransport("http://r.invalid", KEY, timeout=2.0)
     capsys.readouterr()
     for _ in range(200):
         transport.export(_envelope())
     err = capsys.readouterr().err
 
-    assert counters.get("transport.wardex.export_failed") == 200
-    assert len(_lines(err, "wardex export failed")) == 2  # one for 400, one for 401
+    assert counters.get("transport.wardex.export_failed") >= 200
+    # One for a refusal, one for a refused key, one when the outage began, one
+    # for a held request refused on its retry: four, whatever comes back.
+    assert len(_lines(err, "r.invalid")) == 4, err
 
 
 def test_an_exception_whose_attributes_raise_cannot_escape_the_export(capsys, monkeypatch):
@@ -263,15 +272,15 @@ def test_an_otlp_backend_that_is_down_is_counted_and_said_once(capsys):
     transport = OtlpHttpTransport(endpoint=f"{CLOSED}/v1/traces", timeout=2.0)
     capsys.readouterr()
     transport.export(_envelope(4))
-    transport.export(_envelope())
+    transport.export(_envelope())  # queued behind the first one's backoff
     err = capsys.readouterr().err
 
-    assert counters.get("transport.otlp.export_failed") == 2
-    [line] = _lines(err, "OTLP export failed")
+    assert counters.get("transport.otlp.export_failed") == 1
+    [line] = _lines(err, "OTLP export to")
     assert "ConnectionRefusedError" in line
     assert "4 span(s)" in line
     assert "transport.otlp.export_failed" in line
-    assert "127.0.0.1" not in err, "the URL reached stderr off-debug"
+    assert f"{CLOSED}/v1/traces" in line, "the line does not say where it posted"
 
 
 def test_an_otlp_rejection_names_the_status_and_not_the_message(capsys, monkeypatch):
@@ -287,8 +296,8 @@ def test_an_otlp_rejection_names_the_status_and_not_the_message(capsys, monkeypa
     transport.export(_envelope())
     err = capsys.readouterr().err
 
-    [line] = _lines(err, "OTLP export failed")
-    assert "HTTP 403" in line
+    [line] = _lines(err, "HTTP 403")
+    assert "http://collector.invalid/v1/traces" in line
     assert "secret-bearing phrase" not in err
     assert "t0k" not in err
 

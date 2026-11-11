@@ -45,6 +45,7 @@ from ._types import span_buffer_bytes as _span_size
 from ._version import __version__
 from ._worker import BatchWorker
 from .transport._base import DEFAULT_TIMEOUT, UNDELIVERED, CallerBudget, Transport
+from .transport._delivery import say_slow_close
 
 
 def build_sdk_info() -> SdkInfo:
@@ -57,15 +58,22 @@ def build_sdk_info() -> SdkInfo:
     )
 
 
-# Handed to Transport.flush() on the periodic path, which carries no deadline of
-# its own. Transport.flush() is a no-op for every transport we ship, so this is
-# only ever consumed by third-party transports that buffer.
-#
-# `DEFAULT_TIMEOUT` and not a literal that happens to equal it: the number this
-# path wants IS `Transport.flush`'s own default, so passing it explicitly says
-# "the default, deliberately" instead of quietly agreeing with it until one of
-# the two moves.
+# Handed to Transport.flush() (where the built-in transports retry what they
+# hold) on the periodic path: deliberately `Transport.flush`'s own default.
 _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT = DEFAULT_TIMEOUT
+
+
+def _left(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+def _receiver_unreachable(transport: Transport) -> bool:
+    """Whether the transport's last attempt could not connect. Never raises."""
+    try:
+        return bool(transport._receiver_unreachable())
+    except Exception:  # noqa: BLE001 — a third-party transport may not answer
+        return False
+
 
 # The default budget for close(), and the value an unusable argument falls back
 # to. An alias, not a second literal: this used to be its own `5.0` next to
@@ -1196,11 +1204,18 @@ class Client:
             dropped, self._dropped = self._dropped, 0
         if dropped:  # evicted since the last drain, which was the last one there will be
             report_buffer_evicted(dropped, debug=self._config.debug)
+        unreachable = _receiver_unreachable(self._transport)
         self._report_lost(
             lost,
-            why="an export was already in flight and did not finish inside close()'s "
+            why="a retry was in flight to a receiver the last attempt could not connect to, and "
+            "close() does not wait on one, so the final drain never ran."
+            if unreachable
+            else "an export was already in flight and did not finish inside close()'s "
             "timeout, so the final drain never ran.",
             key="client.close.behind_an_export",
+            fix="Check that the receiver is reachable."
+            if unreachable
+            else "Give wardex.close(timeout=...) a larger budget to keep them.",
         )
 
     def _undelivered(
@@ -1410,20 +1425,14 @@ class Client:
 
     def close(self, timeout: float = _SHUTDOWN_TIMEOUT) -> None:
         # Public API: sanitize before anything downstream is handed a value it
-        # would raise on -- Thread.join() in step 2, the deadline arithmetic and
-        # the timed acquire in step 3, a third-party Transport in step 4.
-        #
-        # The sentinel default carries two readings and neither is a second
-        # copy of a NUMBER. The first is WHOSE number it is: a bare close()
-        # spends wardex's own shutdown default, so an export that default cuts
-        # short is not something a caller chose and must not be reported as
-        # one; `close(t)` is. A host that writes `close(5.0)` named a number,
-        # and gets the number's reading -- which is why the test is on the
-        # sentinel TYPE and not on the value. The second is WHERE the default
-        # lives: `follows_shutdown_config` resolves it from THIS client's
-        # `batching.shutdown_timeout`, the one home the atexit hook, re-init's
-        # teardown and a bare `wardex.close()` all reach it through -- none of
-        # them restates a budget, so none of them can be blamed for one.
+        # would raise on (Thread.join(), the deadline arithmetic, a transport).
+        # The sentinel default carries two readings. WHOSE number it is: a
+        # bare close() spends wardex's own shutdown default, so an export that
+        # default cuts short must not be reported as the caller's; `close(t)`
+        # is, which is why the test is on the sentinel TYPE and not the value.
+        # WHERE the default lives: `follows_shutdown_config` resolves it from
+        # THIS client's `batching.shutdown_timeout`, the one home the atexit
+        # hook, re-init's teardown and a bare `wardex.close()` all reach.
         # Unlike flush() this path deliberately does not follow the transport.
         named_by_caller = _named_by_caller(timeout)
         if isinstance(timeout, _UnnamedTimeout) and timeout.follows_shutdown_config:
@@ -1433,32 +1442,23 @@ class Client:
             if self._closed:
                 return
             self._closed = True  # 1. reject new captures
-        # `budget` is a per-step budget, not a total for close(). The steps
-        # below can each spend it, so the worst case is roughly 4x — the two
-        # stops wait on the same events as the drains that follow them and do
-        # not add a full budget of their own, and the finalize drain is one
-        # budget. Each step is bounded, where the final drain previously had
-        # no bound at all: it inherited the rest of whatever POST the worker
-        # was still inside when the join gave up on it. Deliberately not one
-        # shared deadline: consecutive steps wait on the same event (the
-        # in-flight POST ending), so charging a later step for what an
-        # earlier one already spent would leave the final drain nothing and
-        # abandon tails close() can currently still deliver.
-        self._worker.stop(budget)  # 2. batch worker exits without draining
-        self._finalize.stop(budget)  # 3. finalize worker finishes its job, joins
-        # 4. every pending parse is finished — parsed while the budget lasts,
-        #    shipped as a PARSE_SKIPPED_AT_SHUTDOWN fallback after (FALLBACK
-        #    always leaves the queue empty; close has no later drain to KEEP
-        #    them for).
-        self._finalize.drain_all(time.monotonic() + budget, leftover=Leftover.FALLBACK)
-        # 4.5 raised BEFORE the final drain, not after: a flag raised after
-        #     leaves a window — final drain done, flag not yet up — in which
-        #     an in-flight job's late span sits in the buffer silently. Raised
-        #     before, that same span is (conservatively) reported as lost by
-        #     `_admit`; there is no silent branch either way.
+        # ONE deadline for all of close(): each step gets what the earlier ones left, so `budget`
+        # is the longest a host waits here. Once the last attempt could not even connect, nothing
+        # waits on an export in flight: the transport accounts for what it holds.
+        started = time.monotonic()
+        deadline = started + budget
+        wait_for_export = not _receiver_unreachable(self._transport)
+        self._worker.stop(_left(deadline) if wait_for_export else 0.0)  # 2. exits without draining
+        self._finalize.stop(_left(deadline))  # 3. finalize worker finishes its job, joins
+        # 4. every pending parse ends: parsed in budget, else a PARSE_SKIPPED_AT_SHUTDOWN fallback.
+        self._finalize.drain_all(deadline, leftover=Leftover.FALLBACK)
+        # 4.5 raised BEFORE the final drain: raised after, an in-flight job's late span could
+        #     sit in the buffer silently; raised before, `_admit` reports it as lost.
         self._finalize_drained = True
-        self._drain(budget, final=True, named_by_caller=named_by_caller)  # 5. final drain
-        self._close_transport(budget)  # 6.
+        final_budget = _left(deadline) if wait_for_export else 0.0
+        self._drain(final_budget, final=True, named_by_caller=named_by_caller)  # 5. final drain
+        self._close_transport(_left(deadline))  # 6.
+        say_slow_close(self._transport, time.monotonic() - started, budget)
 
     def _at_fork_reinit(self) -> None:
         """Fork-child reset — runs from `Runtime.after_in_child` step 2.

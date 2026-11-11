@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 import wardex_sdk
+from conftest import project_key
 from wardex_sdk import _wardex_native
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._types import (
@@ -30,7 +31,7 @@ from wardex_sdk._types import (
 )
 from wardex_sdk.transport import UNDELIVERED, CallerBudget, WardexTransport
 
-KEY = "wdx_us_c0ffee"
+KEY = project_key(secret="c0ffee")
 RAW_EMAIL = b"contact john.doe@acme.com about the invoice"
 
 

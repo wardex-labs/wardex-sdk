@@ -582,7 +582,11 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ),
     ("_assembly/_drops.py", "report_once", "'worker.drain_raised'"): L("INTERNAL_SDK_ERROR"),
     ("_assembly/_drops.py", "report_once", "counter"): L("SEND_ERROR"),
-    ("_assembly/_drops.py", "report_once", "f'{counter}:credentials' if hint else counter"): L(
+    (
+        "_assembly/_drops.py",
+        "report_once",
+        "f'{counter}:credentials' if credentials else counter",
+    ): L(
         "NETWORK_ERROR",
         "SEND_ERROR",
         "RATELIMIT_BACKOFF",
@@ -777,6 +781,32 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("transport/_base.py", "report_once", "key"): L("INTERNAL_SDK_ERROR"),
     ("transport/_base.py", "report_once", "'transport.otlp.span_unmarshalled'"): L(
         "UNMARSHALLABLE"
+    ),
+    ("transport/_delivery.py", "bump", "f'transport.{self._wire}.export_failed'"): L(
+        "NETWORK_ERROR",
+        "SEND_ERROR",
+        "RATELIMIT_BACKOFF",
+        "SEND_UNCONFIRMED",
+        "REQUEST_TOO_LARGE",
+        at="transport/_otlp_http.py",
+    ),
+    ("transport/_delivery.py", "bump", "f'transport.{self._wire}.retry_abandoned'"): L(
+        "NETWORK_ERROR", "RATELIMIT_BACKOFF", "SEND_UNCONFIRMED", at="transport/_otlp_http.py"
+    ),
+    ("transport/_delivery.py", "bump", "f'transport.{self._wire}.retry_queue_full'"): L(
+        "CACHE_OVERFLOW"
+    ),
+    ("transport/_delivery.py", "record", "reason"): Structural(
+        "Delivery.lose()'s own records; each lose() call is its own entry"
+    ),
+    ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.retry_abandoned'"): L(
+        "NETWORK_ERROR", "RATELIMIT_BACKOFF", "SEND_UNCONFIRMED", at="transport/_otlp_http.py"
+    ),
+    ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.retry_queue_full'"): L(
+        "CACHE_OVERFLOW"
+    ),
+    ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.retry_refused'"): L(
+        "SEND_ERROR", "REQUEST_TOO_LARGE", "SEND_UNCONFIRMED", at="transport/_otlp_http.py"
     ),
     ("transport/_otlp_http.py", "bump", "'transport.otlp.export_failed'"): L(
         "NETWORK_ERROR",

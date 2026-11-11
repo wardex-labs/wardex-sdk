@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager as _AbstractContextManager
 from contextlib import contextmanager as _contextmanager
 from typing import Any as _Any
 from urllib.parse import urlsplit as _urlsplit
+from urllib.parse import urlunsplit as _urlunsplit
 
 from . import _hub, _runtime
 from ._assembly import _ledger
@@ -99,6 +100,7 @@ from .transport._console import ConsoleTransport
 from .transport._noop import NoOpTransport
 from .transport._otlp_http import OtlpHttpTransport
 from .transport._wardex import WardexTransport
+from .transport._wardex import receiver_config_problem as _receiver_config_problem
 
 __all__ = [
     "__version__",
@@ -193,18 +195,33 @@ def _announce_pii_env(mode: PIIMode) -> None:
         )
 
 
-def _traces_endpoint(endpoint: str) -> str:
+def _traces_endpoint(endpoint: str, *, argument: str | None = None) -> str:
     """The URL the default OTLP/HTTP transport actually POSTs to.
 
-    THE ENDPOINT RULE (documented on `BackendConfig.endpoint`): a configured
-    URL whose path is empty or `/` is a collector base address, so the OTLP
-    traces path `/v1/traces` is appended; a URL with an explicit path is used
-    verbatim. Applied here, at transport construction, and NEVER written back
-    into `config.backend.endpoint` — the config reads back as written.
+    THE ENDPOINT RULE (documented on `BackendConfig.endpoint`), the OTel one:
+    an endpoint names a collector BASE, so `/v1/traces` is appended to its
+    path -- unless the path already ends with `/v1/traces`, which is the full
+    address written out. That covers `endpoint=`, `WARDEX_ENDPOINT` and the
+    generic `OTEL_EXPORTER_OTLP_ENDPOINT` (Langfuse documents
+    `https://host/api/public/otel`, which is posted to at
+    `.../api/public/otel/v1/traces`). `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is
+    the signal's own address and is used as written. `argument` is the
+    endpoint given to `init()`, which wins over every variable.
+
+    Applied here, at transport construction, and NEVER written back into
+    `config.backend.endpoint` — the config reads back as written.
     """
-    if _urlsplit(endpoint).path in ("", "/"):
-        return endpoint.rstrip("/") + "/v1/traces"
-    return endpoint
+    if (
+        not argument
+        and not _os.environ.get("WARDEX_ENDPOINT")
+        and _os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+    ):
+        return endpoint
+    parts = _urlsplit(endpoint)
+    path = parts.path.rstrip("/")
+    if path.endswith("/v1/traces"):
+        return endpoint
+    return _urlunsplit(parts._replace(path=path + "/v1/traces"))
 
 
 def init(
@@ -269,12 +286,15 @@ def init(
          built against the receiver the key's region names — or against
          `backend.base_url` for a self-hosted receiver; a `base_url` with no
          key is refused with `ValueError`, and a key whose region this build
-         does not know is refused the same way rather than sent anywhere;
+         does not know is refused the same way rather than sent anywhere. A
+         key that fails its checksum, or a `base_url` that is not an http(s)
+         URL, raises when passed as an argument and, read from the
+         environment, warns and exports nothing;
       3. `backend.endpoint` builds the OTLP/HTTP exporter against a
-         third-party collector (a bare collector address gets `/v1/traces`
-         appended; an explicit path is used verbatim — see
-         `BackendConfig.endpoint`), with `backend.headers` as its request
-         headers;
+         third-party collector (`/v1/traces` is appended unless the path
+         already ends with it; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is used as
+         written — see `BackendConfig.endpoint`), with `backend.headers` as
+         its request headers;
       4. with none of those, wardex installs `NoOpTransport`, captures into
          nothing, and says so once on stderr.
 
@@ -425,6 +445,22 @@ def init(
         _diag_info(f"resolved config: {config!r}")
     if transport is not None:
         resolved_transport = transport
+    elif config.backend.api_key and (
+        problem := _receiver_config_problem(config.backend.api_key, config.backend.base_url)
+    ):
+        # A key that fails its checksum, or a receiver address no POST can reach. Written as an
+        # argument, it is a programming error and raises; read from the environment, it must
+        # not stop a process from starting, so wardex warns and exports nothing.
+        message, setting = problem
+        if getattr(backend, setting, None):
+            raise ValueError(message)
+        variable = "WARDEX_API_KEY" if setting == "api_key" else "WARDEX_BASE_URL"
+        _warnings.warn(
+            f"{message} The value came from {variable}, so wardex starts without exporting.",
+            WardexConfigWarning,
+            stacklevel=2,
+        )
+        resolved_transport = NoOpTransport()
     elif config.backend.api_key:
         # `backend.api_key` is WIRED here: the project key names a wardex
         # project, so the default exporter is the wardex receiver's, and the
@@ -457,7 +493,9 @@ def init(
         # A third-party collector: the OTLP exporter, with whatever headers
         # that collector wants. The project key is NOT among them.
         resolved_transport = OtlpHttpTransport(
-            _traces_endpoint(config.backend.endpoint),
+            _traces_endpoint(
+                config.backend.endpoint, argument=backend.endpoint if backend is not None else None
+            ),
             headers=dict(config.backend.headers) if config.backend.headers else None,
             debug=config.debug,
         )

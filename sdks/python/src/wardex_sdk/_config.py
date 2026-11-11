@@ -203,14 +203,17 @@ class BackendConfig:
     reports and debugger output, none of which is a place for a credential:
     string forms of config objects never contain secret material.
 
-    Unset, `init()` reads `WARDEX_API_KEY` from the environment.
+    Unset, `init()` reads `WARDEX_API_KEY`. A `wdx_` key that fails its checksum was mistyped:
+    `init()` raises `ValueError`, or for the variable warns and exports nothing.
     """
 
     base_url: str | None = None
     """A wardex receiver's address, for a self-hosted receiver or a proxy in
-    front of ours -- `http://127.0.0.1:8080`, without the route. Unset, the receiver is the one the
-    key's region names (`WARDEX_INGEST_HOSTS`). Only meaningful with `api_key`: a receiver address
-    with no key cannot authenticate, and `init()` refuses the pair with a `ValueError`.
+    front of ours -- `http://127.0.0.1:8080`; a trailing `/v1/envelope` is not appended twice.
+    Unset, the receiver is the one the key's region names (`WARDEX_INGEST_HOSTS`). Only meaningful
+    with `api_key`: a receiver address with no key cannot authenticate, and `init()` refuses the
+    pair with a `ValueError`, as it does a value that is not an http(s) URL with a host (from
+    `WARDEX_BASE_URL`, that one warns and exports nothing).
 
     Unset, `init()` reads `WARDEX_BASE_URL` from the environment.
     """
@@ -223,10 +226,10 @@ class BackendConfig:
     Unset, `init()` reads `WARDEX_ENDPOINT`, then
     `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
-    THE ENDPOINT RULE: a URL whose path is empty or `/` gets `/v1/traces` appended when the default
-    transport is built -- `http://collector:4318` exports to `http://collector:4318/v1/traces` --
-    while a URL with an explicit path is used verbatim. The append happens at transport construction
-    and is never written back here: this field reads back exactly as configured.
+    THE ENDPOINT RULE (OpenTelemetry's): `/v1/traces` is appended to the path when the transport is
+    built -- `https://host/api/public/otel` exports to `.../api/public/otel/v1/traces` -- unless the
+    path already ends with it; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is used as written. The append
+    is never written back here: this field reads back exactly as configured.
 
     An explicit `transport=` wins over this field, and so does `api_key` (the
     project key routes to the wardex receiver); the losing endpoint is

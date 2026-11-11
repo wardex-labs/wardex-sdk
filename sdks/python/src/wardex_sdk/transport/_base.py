@@ -9,6 +9,7 @@ from .._types import Envelope
 
 if TYPE_CHECKING:
     from .._config import PIIConfig
+    from ._delivery import ExportState
 
 DEFAULT_TIMEOUT = 5.0
 """The one 5.0 in this SDK's timeout story, and the single place to change it.
@@ -373,7 +374,8 @@ class Transport(abc.ABC):
     holding a pooled `requests.Session`/`httpx.Client` shares live TCP
     sockets with the parent after a fork -- that library's classic fork
     hazard -- and only the transport knows how to rebuild its pool. wardex's
-    built-in transports hold no per-request state and do not implement it.
+    built-in transports implement it to drop their retry queue in the child:
+    the parent still holds those requests and sends them itself.
     """
 
     # PII policy applied by the native encoders on wire paths (design §4.2).
@@ -570,3 +572,20 @@ class Transport(abc.ABC):
 
     def close(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         return None
+
+    @property
+    def export_state(self) -> ExportState | None:
+        """What this transport knows about its own deliveries -- destination,
+        last success, last error, retry queue -- or None for a transport that
+        does not track them. The built-in network transports do."""
+        return None
+
+    def _abandon_retries(self, why: str) -> None:
+        """Drop and account whatever is held for a retry: the process is ending
+        without a `close()`. Plumbing for the built-in transports, not a hook."""
+        return None
+
+    def _receiver_unreachable(self) -> bool:
+        """Whether the last attempt could not connect, so that `close()` need
+        not wait on another. Plumbing for the built-in transports, not a hook."""
+        return False

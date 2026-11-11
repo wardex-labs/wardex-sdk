@@ -18,6 +18,7 @@ import warnings
 import pytest
 
 import wardex_sdk as wardex
+from conftest import project_key
 from wardex_sdk import _hub, _runtime
 from wardex_sdk._adapters._base import AdapterInterface
 from wardex_sdk._assembly import Limitation
@@ -331,16 +332,19 @@ def test_a_bare_collector_address_gets_the_traces_path_appended():
             wardex.close()
 
 
-def test_an_explicit_endpoint_path_is_used_verbatim():
-    wardex.init(
-        intercept=False,
-        backend=BackendConfig(endpoint="http://collector.invalid:4318/custom/route"),
-    )
-    client = _hub.get_client()
-    try:
-        assert client._transport._endpoint == "http://collector.invalid:4318/custom/route"
-    finally:
-        wardex.close()
+def test_an_endpoint_path_is_a_base_unless_it_ends_with_the_traces_path():
+    """The OTel rule: a path is a collector base and gets `/v1/traces`, unless
+    it is already the full traces address."""
+    for configured, posted in (
+        ("http://collector.invalid:4318/custom/route", "/custom/route/v1/traces"),
+        ("http://collector.invalid:4318/custom/v1/traces", "/custom/v1/traces"),
+    ):
+        wardex.init(intercept=False, backend=BackendConfig(endpoint=configured))
+        client = _hub.get_client()
+        try:
+            assert client._transport._endpoint == "http://collector.invalid:4318" + posted
+        finally:
+            wardex.close()
 
 
 def test_backend_api_key_authenticates_the_default_transport_on_the_wire():
@@ -368,9 +372,7 @@ def test_backend_api_key_authenticates_the_default_transport_on_the_wire():
     srv = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base_url = f"http://127.0.0.1:{srv.server_address[1]}"
-    wardex.init(
-        intercept=False, backend=BackendConfig(base_url=base_url, api_key="wdx_us_secret123")
-    )
+    wardex.init(intercept=False, backend=BackendConfig(base_url=base_url, api_key=project_key()))
     try:
         with wardex.span("authenticated"):
             pass
@@ -379,7 +381,7 @@ def test_backend_api_key_authenticates_the_default_transport_on_the_wire():
         wardex.close()
         srv.shutdown()
         srv.server_close()
-    assert seen == [("/v1/envelope", "Bearer wdx_us_secret123", "zstd")]
+    assert seen == [("/v1/envelope", f"Bearer {project_key()}", "zstd")]
 
 
 def test_a_project_key_alone_routes_to_the_receiver_its_region_names():
@@ -389,7 +391,7 @@ def test_a_project_key_alone_routes_to_the_receiver_its_region_names():
     from wardex_sdk._config import WARDEX_INGEST_HOSTS
     from wardex_sdk.transport import WardexTransport
 
-    wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_us_secret123"))
+    wardex.init(intercept=False, backend=BackendConfig(api_key=project_key()))
     client = _hub.get_client()
     try:
         assert isinstance(client._transport, WardexTransport)
@@ -405,7 +407,7 @@ def test_base_url_names_a_self_hosted_receiver_over_the_region_table():
 
     wardex.init(
         intercept=False,
-        backend=BackendConfig(api_key="wdx_us_secret123", base_url="http://127.0.0.1:1/"),
+        backend=BackendConfig(api_key=project_key(), base_url="http://127.0.0.1:1/"),
     )
     client = _hub.get_client()
     try:
@@ -426,7 +428,7 @@ def test_a_key_next_to_an_endpoint_routes_to_wardex_and_says_the_endpoint_lost()
         wardex.init(
             intercept=False,
             backend=BackendConfig(
-                api_key="wdx_us_secret123", endpoint="http://collector.invalid/v1/traces"
+                api_key=project_key(), endpoint="http://collector.invalid/v1/traces"
             ),
         )
     client = _hub.get_client()
@@ -449,7 +451,7 @@ def test_a_key_from_an_unknown_region_is_refused_rather_than_routed():
     receiver for must raise at `init()`, never fall back to some default host
     that would answer 401 to every batch."""
     with pytest.raises(ValueError, match="region 'mars'"):
-        wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_mars_secret123"))
+        wardex.init(intercept=False, backend=BackendConfig(api_key=project_key("mars")))
     with pytest.raises(ValueError, match="not a wardex project key"):
         wardex.init(intercept=False, backend=BackendConfig(api_key="k"))
     assert _hub.get_client() is None
@@ -490,14 +492,16 @@ def test_the_api_key_never_reaches_stderr(capsys):
     never echo the key."""
     wardex.init(
         intercept=False,
-        backend=BackendConfig(base_url="http://127.0.0.1:1", api_key="wdx_us_wk-secret-123"),
+        backend=BackendConfig(
+            base_url="http://127.0.0.1:1", api_key=project_key(secret="wkSecret123")
+        ),
         debug=True,
     )
     client = _hub.get_client()
     try:
-        assert client._transport._api_key == "wdx_us_wk-secret-123"
-        assert "wk-secret-123" not in repr(client._transport)
-        assert "wk-secret-123" not in capsys.readouterr().err
+        assert client._transport._api_key == project_key(secret="wkSecret123")
+        assert "wkSecret123" not in repr(client._transport)
+        assert "wkSecret123" not in capsys.readouterr().err
     finally:
         wardex.close()
 
@@ -543,7 +547,7 @@ def test_an_ambient_otel_endpoint_losing_to_a_project_key_is_not_announced(monke
     monkeypatch.setenv(name, "http://otel-collector.invalid:4318")
     with warnings.catch_warnings():
         warnings.simplefilter("error", wardex.WardexConfigWarning)
-        wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_us_secret123"))
+        wardex.init(intercept=False, backend=BackendConfig(api_key=project_key()))
     wardex.close()
 
 
@@ -560,7 +564,7 @@ def test_a_wardex_endpoint_variable_losing_to_a_transport_is_still_announced(mon
 def test_a_wardex_endpoint_variable_losing_to_a_project_key_is_still_announced(monkeypatch):
     monkeypatch.setenv("WARDEX_ENDPOINT", "http://collector.invalid:4318")
     with pytest.warns(wardex.WardexConfigWarning, match="api_key routes to the wardex receiver"):
-        wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_us_secret123"))
+        wardex.init(intercept=False, backend=BackendConfig(api_key=project_key()))
     wardex.close()
 
 
@@ -609,7 +613,7 @@ def test_debug_prints_the_resolved_config_once(capsys):
         err = capsys.readouterr().err
         assert err.count("[wardex] resolved config: ") == 1
         assert "WardexConfig(" in err
-        assert "wk-secret-123" not in err
+        assert "wkSecret123" not in err
     finally:
         wardex.close()
 

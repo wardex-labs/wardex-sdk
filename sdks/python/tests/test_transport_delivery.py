@@ -1,0 +1,599 @@
+"""Delivery as an installer meets it: retries, a bounded exit, and lines that say where data went.
+
+Each test drives the public transports (or a real `Client`) against a loopback
+receiver or a patched `urlopen`, and asserts what a developer can observe: the
+requests that arrived, how long a call held the caller, the `[wardex]` lines on
+stderr, `export_state`, and the drop ledger's counts.
+"""
+
+from __future__ import annotations
+
+import signal
+import socket
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from conftest import project_key
+from wardex_sdk import BackendConfig, BatchingConfig, WardexConfigWarning, _hub, _runtime
+from wardex_sdk import init as wardex_init
+from wardex_sdk._assembly import _ledger
+from wardex_sdk._assembly._diag import reset_reports_for_test
+from wardex_sdk._assembly._ledger import DropReason, DropUnit
+from wardex_sdk._client import Client
+from wardex_sdk._config import WardexConfig
+from wardex_sdk._enums import SpanKind
+from wardex_sdk._types import (
+    Envelope,
+    EnvelopeHeader,
+    InternalSpan,
+    SdkInfo,
+    SpanContext,
+    SpanId,
+    TraceId,
+)
+from wardex_sdk.transport import NoOpTransport, OtlpHttpTransport, WardexTransport, _delivery
+
+pytestmark = pytest.mark.usefixtures("fresh_counters")
+
+
+@pytest.fixture(autouse=True)
+def _fresh() -> Iterator[None]:
+    reset_reports_for_test()
+    _ledger._reset_for_tests()
+    _delivery._FIRST_SUCCESS_PID.clear()
+    yield
+    reset_reports_for_test()
+
+
+def _lines(err: str, needle: str = "") -> list[str]:
+    return [line for line in err.splitlines() if line.startswith("[wardex] ") and needle in line]
+
+
+def _span(name: str = "s") -> InternalSpan:
+    return InternalSpan(
+        context=SpanContext(TraceId.generate(), SpanId.generate()),
+        parent_span_id=None,
+        name=name,
+        kind=SpanKind.INTERNAL,
+        start_time_ns=1,
+        end_time_ns=2,
+    )
+
+
+def _envelope(n: int = 1) -> Envelope:
+    header = EnvelopeHeader(
+        event_id="evt",
+        sdk=SdkInfo(name="wardex.python", version="0", python_version="3", os="t", arch="t"),
+        sent_at_ns=1,
+    )
+    return Envelope(header=header, spans=tuple(_span(f"s{i}") for i in range(n)))
+
+
+def _lost(reason: DropReason, unit: DropUnit = DropUnit.SPAN) -> int:
+    return _ledger.snapshot().counts.get((reason, unit), 0)
+
+
+class _Receiver:
+    """A loopback receiver answering each POST with the next queued
+    `(status, headers, body)`, then 200 once the queue is empty."""
+
+    def __init__(self) -> None:
+        self.answers: list[tuple[int, dict[str, str], bytes]] = []
+        self.posts: list[tuple[str, bytes]] = []
+        receiver = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's handler name
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                receiver.posts.append((self.path, body))
+                status, headers, payload = (
+                    receiver.answers.pop(0) if receiver.answers else (200, {}, b"")
+                )
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        self.base = f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.fixture
+def receiver() -> Iterator[_Receiver]:
+    r = _Receiver()
+    try:
+        yield r
+    finally:
+        r.close()
+
+
+@pytest.fixture
+def black_hole() -> Iterator[str]:
+    """A receiver that takes the connection and never answers."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(8)
+    try:
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}/v1/traces"
+    finally:
+        sock.close()
+
+
+@pytest.fixture
+def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retries due at once, so a test does not sleep through the real backoff."""
+    monkeypatch.setattr(_delivery, "BACKOFF_FIRST_S", 0.0)
+
+
+# -- 35: the first successful export says where it went --------------------------
+
+
+def test_the_first_delivered_export_says_where_and_how_many(receiver, capsys):
+    transport = OtlpHttpTransport(f"{receiver.base}/v1/traces?token=t0k")
+    transport.export(_envelope(3))
+    transport.export(_envelope(2))
+    err = capsys.readouterr().err
+
+    [line] = _lines(err, "first export delivered")
+    assert "3 span(s)" in line
+    assert f"{receiver.base}/v1/traces" in line
+    assert "t0k" not in err
+    assert transport.export_state.last_success_at is not None
+
+
+def test_a_credential_in_the_address_never_reaches_stderr(capsys):
+    transport = OtlpHttpTransport("http://user:s3cret@127.0.0.1:1/v1/traces?token=t0k")
+    transport.export(_envelope())
+    transport.close(0.1)
+    err = capsys.readouterr().err
+
+    assert _lines(err, "127.0.0.1:1/v1/traces"), err
+    assert "s3cret" not in err and "user" not in err and "t0k" not in err
+
+
+# -- 36: a failure names the address it was posted to ---------------------------
+
+
+def test_a_404_names_the_url_and_points_at_the_path(receiver, capsys):
+    receiver.answers.append((404, {}, b""))
+    transport = OtlpHttpTransport(f"{receiver.base}/wrong/v1/traces?token=t0k")
+    transport.export(_envelope())
+    err = capsys.readouterr().err
+
+    [line] = _lines(err, "HTTP 404")
+    assert f"{receiver.base}/wrong/v1/traces" in line
+    assert "/v1/traces" in line.split("(HTTP 404)")[1], "no hint about the path"
+    assert "t0k" not in err
+    assert transport.export_state.last_error == "HTTP 404"
+
+
+def test_an_otlp_401_keeps_the_credentials_hint_and_not_the_body(receiver, capsys):
+    receiver.answers.append((401, {}, b"secret-bearing body"))
+    OtlpHttpTransport(f"{receiver.base}/v1/traces").export(_envelope())
+    err = capsys.readouterr().err
+
+    [line] = _lines(err, "HTTP 401")
+    assert "credentials" in line
+    assert "secret-bearing" not in err
+
+
+def test_a_wardex_401_says_what_the_receiver_said(receiver, capsys):
+    said = b"this key belongs to region eu; send to that region's receiver"
+    receiver.answers.append((401, {}, b"\x08\x00\x12" + bytes([len(said)]) + said))
+    WardexTransport(receiver.base, project_key()).export(_envelope())
+    err = capsys.readouterr().err
+
+    [line] = _lines(err, "HTTP 401")
+    assert f"{receiver.base}/v1/envelope" in line
+    assert "WARDEX_API_KEY" in line
+    assert "this key belongs to region eu" in line
+    assert project_key() not in err
+
+
+def test_a_refusal_body_is_cleaned_and_bounded(receiver, capsys):
+    receiver.answers.append((403, {}, b"\x1b[31mred\x00\x07" + b"x" * 5000))
+    WardexTransport(receiver.base, project_key()).export(_envelope())
+    [line] = _lines(capsys.readouterr().err, "HTTP 403")
+
+    assert "\x1b" not in line and "\x00" not in line and "\x07" not in line
+    assert line.count("x") <= 200
+
+
+# -- 20/21: retry what can be retried, and nothing else ---------------------------
+
+
+@pytest.mark.parametrize("status", [429, 502, 503, 504])
+def test_a_retry_later_answer_is_retried_with_the_same_body(receiver, no_backoff, status):
+    receiver.answers.append((status, {}, b""))
+    transport = OtlpHttpTransport(f"{receiver.base}/v1/traces")
+    transport.export(_envelope(2))
+    assert transport.export_state.retry_queued == 1
+    time.sleep(0.05)
+    transport.flush(2.0)
+
+    assert len(receiver.posts) == 2
+    assert receiver.posts[0][1] == receiver.posts[1][1]
+    assert transport.export_state.retry_queued == 0
+    assert not _ledger.snapshot().counts, "a delivered retry was counted as a loss"
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 500])
+def test_a_refusal_is_never_retried(receiver, no_backoff, status):
+    receiver.answers.append((status, {}, b""))
+    transport = OtlpHttpTransport(f"{receiver.base}/v1/traces")
+    transport.export(_envelope())
+    transport.flush(2.0)
+    transport.close(2.0)
+
+    assert len(receiver.posts) == 1
+    assert transport.export_state.retry_queued == 0
+
+
+def test_a_refused_connection_is_retried_when_the_receiver_comes_back(monkeypatch, no_backoff):
+    sent: list[bytes] = []
+
+    def urlopen(request, timeout=None):
+        if not sent and not getattr(urlopen, "failed", False):
+            urlopen.failed = True
+            raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+        sent.append(request.data)
+
+        class _Answer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Answer()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    transport.export(_envelope(1))
+    assert transport.export_state.last_error == "ConnectionRefusedError"
+    time.sleep(0.05)
+    transport.export(_envelope(1))
+
+    assert len(sent) == 2, "the refused batch was not resent before the next one"
+    assert not _ledger.snapshot().counts
+
+
+def test_retry_after_is_honoured(receiver):
+    receiver.answers.append((429, {"Retry-After": "1"}, b""))
+    transport = OtlpHttpTransport(f"{receiver.base}/v1/traces")
+    transport.export(_envelope())
+    transport.export(_envelope())  # inside the window: queued, not posted
+    transport.flush(2.0)
+    assert len(receiver.posts) == 1
+    assert transport.export_state.retry_queued == 2
+
+    time.sleep(1.1)
+    transport.flush(2.0)
+    assert len(receiver.posts) == 3
+    assert transport.export_state.retry_queued == 0
+
+
+def test_a_full_retry_queue_drops_the_oldest_and_records_it(monkeypatch, capsys):
+    monkeypatch.setattr(_delivery, "RETRY_MAX_BATCHES", 2)
+
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    for n in (1, 2, 3, 4):  # the first fails, the rest queue behind its backoff
+        transport.export(_envelope(n))
+    err = capsys.readouterr().err
+
+    assert transport.export_state.retry_queued == 2
+    assert _lost(DropReason.CACHE_OVERFLOW) == 1 + 2, "the two oldest batches (1 and 2 spans)"
+    assert len(_lines(err, "retry queue")) == 1
+
+
+def test_an_outage_is_said_again_with_its_totals_not_once_per_process(monkeypatch, capsys):
+    monkeypatch.setattr(_delivery, "BACKOFF_FIRST_S", 0.0)
+
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    transport.export(_envelope())
+    transport.export(_envelope())
+    assert len(_lines(capsys.readouterr().err, "collector.invalid")) == 1, "repeated at once"
+
+    monkeypatch.setattr(_delivery, "REPEAT_EVERY_S", 0.0)
+    transport.export(_envelope())
+    [line] = _lines(capsys.readouterr().err, "still failing")
+    assert "3 failed attempt(s)" in line
+    assert "ConnectionRefusedError" in line
+
+
+def test_close_gives_up_on_held_requests_at_once_after_a_failed_connect(monkeypatch, capsys):
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    transport.export(_envelope(3))
+    started = time.monotonic()
+    transport.close(5.0)
+
+    assert time.monotonic() - started < 0.5
+    assert transport.export_state.retry_queued == 0
+    assert _lost(DropReason.NETWORK_ERROR) == 3
+    [line] = _lines(capsys.readouterr().err, "dropped at close()")
+    assert "could not connect" in line
+
+
+def test_a_wardex_receiver_503_is_retried_and_its_report_is_not_lost(receiver, no_backoff):
+    receiver.answers.append((503, {}, b""))
+    transport = WardexTransport(receiver.base, project_key())
+    transport.export(_envelope(2))
+    time.sleep(0.05)
+    transport.flush(2.0)
+
+    assert len(receiver.posts) == 2 and receiver.posts[0][1] == receiver.posts[1][1]
+    assert not _ledger.snapshot().counts
+
+
+# -- 37: the OTel endpoint rule ----------------------------------------------------
+
+
+def _resolved_url(monkeypatch: pytest.MonkeyPatch, **env: str) -> str:
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    wardex_init(intercept=False)
+    try:
+        return _hub.get_client()._transport._endpoint
+    finally:
+        _runtime.runtime()._at_exit()
+
+
+def test_the_generic_otel_endpoint_with_a_base_path_gets_the_traces_path(monkeypatch):
+    url = _resolved_url(
+        monkeypatch, OTEL_EXPORTER_OTLP_ENDPOINT="https://cloud.example/api/public/otel"
+    )
+    assert url == "https://cloud.example/api/public/otel/v1/traces"
+
+
+def test_an_endpoint_already_ending_in_the_traces_path_is_kept(monkeypatch):
+    url = _resolved_url(monkeypatch, WARDEX_ENDPOINT="https://cloud.example/otel/v1/traces")
+    assert url == "https://cloud.example/otel/v1/traces"
+
+
+def test_the_traces_specific_variable_is_used_as_written(monkeypatch):
+    url = _resolved_url(
+        monkeypatch, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="https://cloud.example/custom/ingest"
+    )
+    assert url == "https://cloud.example/custom/ingest"
+
+
+def test_an_endpoint_argument_with_a_base_path_gets_the_traces_path():
+    wardex_init(intercept=False, backend=BackendConfig(endpoint="http://c.invalid/otel?x=1"))
+    try:
+        assert _hub.get_client()._transport._endpoint == "http://c.invalid/otel/v1/traces?x=1"
+    finally:
+        _runtime.runtime()._at_exit()
+
+
+# -- 40: base_url gets the checks endpoint gets -------------------------------------
+
+
+def test_a_base_url_without_a_scheme_is_refused_as_an_argument():
+    with pytest.raises(ValueError, match="base_url must be an absolute http"):
+        wardex_init(intercept=False, backend=BackendConfig(api_key=project_key(), base_url="r:80"))
+
+
+def test_a_base_url_without_a_scheme_from_the_environment_warns_and_exports_nothing(monkeypatch):
+    monkeypatch.setenv("WARDEX_BASE_URL", "receiver:8080")
+    with pytest.warns(WardexConfigWarning, match="WARDEX_BASE_URL"):
+        wardex_init(intercept=False, backend=BackendConfig(api_key=project_key()))
+    try:
+        assert isinstance(_hub.get_client()._transport, NoOpTransport)
+    finally:
+        _runtime.runtime()._at_exit()
+
+
+def test_a_base_url_that_names_the_route_is_not_given_it_twice():
+    for base in ("http://r.invalid/v1/envelope", "http://r.invalid/v1/envelope/"):
+        assert WardexTransport(base, project_key()).url == "http://r.invalid/v1/envelope"
+
+
+# -- 41: a mistyped key is caught at init() ------------------------------------------
+
+
+def _mistyped() -> str:
+    key = project_key()
+    return key[:10] + ("A" if key[10] != "A" else "B") + key[11:]
+
+
+def test_a_mistyped_key_argument_raises():
+    with pytest.raises(ValueError, match="looks mistyped"):
+        wardex_init(intercept=False, backend=BackendConfig(api_key=_mistyped()))
+    with pytest.raises(ValueError, match="looks mistyped"):
+        wardex_init(intercept=False, backend=BackendConfig(api_key=project_key()[:-1]))
+
+
+def test_a_mistyped_key_in_the_environment_warns_and_exports_nothing(monkeypatch):
+    monkeypatch.setenv("WARDEX_API_KEY", _mistyped())
+    with pytest.warns(WardexConfigWarning, match="looks mistyped") as caught:
+        wardex_init(intercept=False)
+    try:
+        assert isinstance(_hub.get_client()._transport, NoOpTransport)
+        assert _mistyped() not in str(caught[0].message)
+    finally:
+        _runtime.runtime()._at_exit()
+
+
+def test_a_well_formed_key_passes_and_a_foreign_one_is_left_to_a_self_hosted_receiver():
+    wardex_init(intercept=False, backend=BackendConfig(api_key=project_key()))
+    _runtime.runtime()._at_exit()
+    wardex_init(intercept=False, backend=BackendConfig(api_key="k", base_url="http://r.invalid"))
+    _runtime.runtime()._at_exit()
+
+
+# -- 11: every network step is bounded by the deadline, name resolution included ----
+
+
+def test_a_resolver_that_never_answers_cannot_hold_an_export_past_its_budget(monkeypatch):
+    release = threading.Event()
+
+    def stalled_resolver(*args, **kwargs):
+        release.wait(10.0)
+        raise socket.gaierror("stalled")
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled_resolver)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces", timeout=10.0)
+    started = time.monotonic()
+    try:
+        transport.export(_envelope(), timeout=0.5)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert elapsed < 1.0, f"the export held its caller {elapsed:.2f}s on a 0.5s budget"
+
+
+# -- 10/12: close() has one deadline, and says when it held the process -------------
+
+
+def _client(transport, *, flush_interval: float = 3600.0, shutdown: float = 5.0) -> Client:
+    config = WardexConfig(
+        backend=BackendConfig(api_key="k"),
+        batching=BatchingConfig(flush_interval=flush_interval, shutdown_timeout=shutdown),
+    )
+    return Client(config, transport)
+
+
+def test_close_spends_one_budget_however_many_steps_wait(black_hole, capsys):
+    transport = OtlpHttpTransport(black_hole, timeout=10.0)
+    client = _client(transport, flush_interval=0.05, shutdown=1.0)
+    client.capture_span(_span())
+    time.sleep(0.3)  # the worker is now inside a POST nobody answers
+    client.capture_span(_span())
+    started = time.monotonic()
+    client.close()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.5, f"close() took {elapsed:.2f}s on a 1.0s budget"
+    [line] = _lines(capsys.readouterr().err, "delayed shutdown")
+    assert black_hole in line
+    assert "batching.shutdown_timeout" in line
+
+
+def test_after_a_failed_connect_close_does_not_wait_on_another(monkeypatch):
+    """The worker's retry is in flight against a receiver that could not be
+    reached a moment ago; close() must not spend its budget waiting on it."""
+    release = threading.Event()
+    calls: list[int] = []
+
+    def urlopen(request, timeout=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+        release.wait(timeout)  # a connect that hangs
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(_delivery, "BACKOFF_FIRST_S", 0.1)
+    client = _client(OtlpHttpTransport("http://collector.invalid/v1/traces"), shutdown=3.0)
+    client.capture_span(_span())
+    client.flush(1.0)
+    time.sleep(0.15)  # the backoff has run out: the next flush retries
+    stuck = threading.Thread(target=client.flush, args=(5.0,), daemon=True)
+    stuck.start()
+    time.sleep(0.2)
+    assert len(calls) == 2, "the retry is not in flight"
+    client.capture_span(_span())
+    started = time.monotonic()
+    try:
+        client.close()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        stuck.join(5.0)
+    assert elapsed < 0.5, f"close() waited {elapsed:.2f}s on a receiver it could not reach"
+
+
+# -- 13: Ctrl-C reaches a program that keeps running, at once ------------------------
+
+
+class _Slow(NoOpTransport):
+    def __init__(self) -> None:
+        self.exported = 0
+
+    def export(self, envelope, *, timeout=None):
+        time.sleep(1.0)
+        self.exported += len(envelope.spans)
+
+
+@pytest.fixture
+def handler_with(monkeypatch):
+    runtime = _runtime.runtime()
+    monkeypatch.setattr(runtime, "_close_units", None)
+
+    def install(client: Client, signum: int, prev: object) -> None:
+        monkeypatch.setattr(runtime, "_client", client)
+        monkeypatch.setattr(runtime, "_prev_handlers", {signum: prev})
+
+    return install
+
+
+def test_sigint_with_a_handler_above_it_chains_at_once_and_exports_nothing(handler_with):
+    seen: list[int] = []
+    transport = _Slow()
+    client = _client(transport)
+    client.capture_span(_span())
+    handler_with(client, signal.SIGINT, lambda signum, frame: seen.append(signum))
+    started = time.monotonic()
+    _runtime._handler(signal.SIGINT, None)
+
+    assert time.monotonic() - started < 0.2
+    assert seen == [signal.SIGINT]
+    assert transport.exported == 0
+    assert len(client._spans) == 1, "the span left the buffer although nothing ended"
+    client.close(0.1)
+
+
+def test_sigint_that_ends_the_process_still_flushes_first(handler_with, monkeypatch):
+    kills: list[int] = []
+    monkeypatch.setattr(_runtime.os, "kill", lambda pid, signum: kills.append(signum))
+    monkeypatch.setattr(_runtime.signal, "signal", lambda signum, handler: None)
+    transport = _Slow()
+    client = _client(transport)
+    client.capture_span(_span())
+    handler_with(client, signal.SIGINT, signal.SIG_DFL)
+    _runtime._handler(signal.SIGINT, None)
+
+    assert transport.exported == 1
+    assert kills == [signal.SIGINT]
+    client.close(0.1)
+
+
+def test_a_fork_child_does_not_resend_what_its_parent_holds(monkeypatch):
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    transport.export(_envelope())
+    assert transport.export_state.retry_queued == 1
+    transport.at_fork_child()  # what the runtime's fork hook calls in the child
+    assert transport.export_state.retry_queued == 0

@@ -87,7 +87,9 @@ def count_drain_drop(cause: str, envelope: Envelope, spans: deque, snapshots: de
     return f"{n_spans} span(s)" + (f" and {n_snapshots} state snapshot(s)" if n_snapshots else "")
 
 
-def report_export_failed(what: str, counter: str, reason: str, spans: int, hint: str = "") -> None:
+def report_export_failed(
+    what: str, counter: str, reason: str, spans: int, hint: str = "", *, credentials: bool = False
+) -> None:
     """A POST that failed outright -- refused, unanswered, or answered with an error.
 
     `what` names the exporter ("a wardex export", "an OTLP export"), `counter` is
@@ -95,19 +97,19 @@ def report_export_failed(what: str, counter: str, reason: str, spans: int, hint:
     exception TYPE name, never the exception's message. One wording for both
     exporters, so they cannot drift about what a failed export means.
 
-    TWO keys per exporter, and the split is the hint's. With one, the first
-    failure -- a DNS blip or a 503 while the receiver boots -- spent the line,
-    and a 401 after it never got to say "check the key" for the rest of the
-    process. Not one key per reason: a status is whatever the receiver, or a
-    proxy in front of it, sends back, so per-status keys let the far end choose
-    how many lines this process prints. A refused credential gets its own line;
-    every other failure shares one.
+    TWO keys per exporter, split by `credentials` (the receiver refused the
+    credentials). With one, the first failure -- a DNS blip or a 503 while the
+    receiver boots -- spent the line, and a 401 after it never got to say
+    "check the key" for the rest of the process. Not one key per reason: a
+    status is whatever the receiver, or a proxy in front of it, sends back, so
+    per-status keys let the far end choose how many lines this process prints.
+    A refused credential gets its own line; every other failure shares one.
     """
     report_once(
         f"{what} failed ({reason}); its {spans} span(s) were not confirmed delivered and are "
         f"not resent.{hint} Every failed export is counted under {counter}; re-run with "
         "debug=True to see each failure.",
-        key=f"{counter}:credentials" if hint else counter,
+        key=f"{counter}:credentials" if credentials else counter,
     )
 
 

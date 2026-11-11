@@ -139,15 +139,33 @@ def test_atexit_registered_exactly_once(monkeypatch):
 def test_signal_handler_flushes_then_chains_to_callable_prev():
     seen = []
     prev = lambda signum, frame: seen.append(signum)  # noqa: E731
+    old = signal.signal(signal.SIGTERM, prev)
+    try:
+        t = _Recording()
+        c = _client(t, batching=BatchingConfig(flush_interval=3600.0))
+        _runtime.runtime().install(c, c.config)
+        c.capture_span(_span())
+        _runtime._handler(signal.SIGTERM, None)  # invoke directly — no real signal
+        assert sum(len(e.spans) for e in t.envelopes) == 1  # flushed first
+        assert seen == [signal.SIGTERM]  # then chained
+    finally:
+        signal.signal(signal.SIGTERM, old)
+
+
+def test_sigint_under_a_callable_prev_chains_without_flushing():
+    """A SIGINT the program may survive (a REPL, a caught KeyboardInterrupt)
+    reaches it at once; the atexit close() flushes if it does end."""
+    seen = []
+    prev = lambda signum, frame: seen.append(signum)  # noqa: E731
     old = signal.signal(signal.SIGINT, prev)
     try:
         t = _Recording()
         c = _client(t, batching=BatchingConfig(flush_interval=3600.0))
         _runtime.runtime().install(c, c.config)
         c.capture_span(_span())
-        _runtime._handler(signal.SIGINT, None)  # invoke directly — no real signal
-        assert sum(len(e.spans) for e in t.envelopes) == 1  # flushed first
-        assert seen == [signal.SIGINT]  # then chained
+        _runtime._handler(signal.SIGINT, None)
+        assert t.envelopes == []
+        assert seen == [signal.SIGINT]
     finally:
         signal.signal(signal.SIGINT, old)
 
@@ -224,7 +242,7 @@ def test_partial_signal_install_rolls_back(monkeypatch):
 def test_signal_handler_chains_even_if_flush_raises(monkeypatch):
     seen = []
     prev = lambda signum, frame: seen.append(signum)  # noqa: E731
-    old = signal.signal(signal.SIGINT, prev)
+    old = signal.signal(signal.SIGTERM, prev)
     try:
         c = _client()
         _runtime.runtime().install(c, c.config)
@@ -235,10 +253,10 @@ def test_signal_handler_chains_even_if_flush_raises(monkeypatch):
             raise ValueError("boom")
 
         monkeypatch.setattr(c, "flush", boom)
-        _runtime._handler(signal.SIGINT, None)  # must not raise, must still chain
-        assert seen == [signal.SIGINT]
+        _runtime._handler(signal.SIGTERM, None)  # must not raise, must still chain
+        assert seen == [signal.SIGTERM]
     finally:
-        signal.signal(signal.SIGINT, old)
+        signal.signal(signal.SIGTERM, old)
 
 
 def test_init_twice_closes_previous_client():
