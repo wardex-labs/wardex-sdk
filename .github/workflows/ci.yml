@@ -176,13 +176,21 @@ jobs:
           scripts/check-buf-exceptions.sh ".git#format=git,ref=$BUF_BREAKING_BASE"
 
   python:
-    name: python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    name: python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # The byte seams patch socket, ssl and the event loops, whose behaviour
+        # differs between Linux and macOS, and macOS is where most hosts
+        # develop. One interpreter there covers the platform without
+        # doubling the matrix.
+        include:
+          - os: macos-14
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: install the pinned toolchain (rust-toolchain.toml)
