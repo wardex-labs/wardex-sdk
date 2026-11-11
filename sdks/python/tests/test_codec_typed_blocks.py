@@ -457,7 +457,7 @@ def test_a_keyboard_interrupt_while_marshalling_is_not_an_unmarshallable_span():
 
 def test_a_failure_outside_the_typed_blocks_still_raises_on_the_export_path():
     """The skip is for HOST values the marshaller cannot read, not for the
-    encoder's own fields: a span whose wardex-owned `events` cannot be
+    encoder's own fields: a span whose wardex-owned `links` cannot be
     walked is an encoder bug, and the export encoder raises it rather than
     dropping the span as one more unmarshallable."""
     from dataclasses import replace
@@ -467,7 +467,7 @@ def test_a_failure_outside_the_typed_blocks_still_raises_on_the_export_path():
     from wardex_sdk.testing import RecordingTransport
 
     before = counters.get("transport.otlp.span_unmarshalled")
-    broken = replace(_span(name="broken"), events=object())  # type: ignore[arg-type]
+    broken = replace(_span(name="broken"), links=object())  # type: ignore[arg-type]
     env = Envelope(header=_env(broken).header, spans=(broken,))
     with pytest.raises(Exception):  # noqa: B017 - the exact type is the encoder's
         RecordingTransport().encode(env, compress=False)

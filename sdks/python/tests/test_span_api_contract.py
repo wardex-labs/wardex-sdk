@@ -92,6 +92,58 @@ def test_an_enum_field_takes_its_value_string(wire):
     assert _losses() == []
 
 
+_NOT_UTF8 = b"report-\xff.pdf".decode("utf-8", "surrogateescape")  # as os.listdir hands it back
+
+
+def test_text_that_is_not_utf8_ships_escaped_and_costs_nothing(wire):
+    """A file name from the file system or argv holds a lone surrogate. Written
+    as an event name, an attribute, a tag or a user id, it is sent with the
+    surrogate escaped, and the spans around it ship."""
+    for i in range(3):
+        with wardex.span(f"other-{i}"):
+            pass
+    wardex.set_tag("file", _NOT_UTF8)
+    wardex.set_user(_NOT_UTF8)
+    with wardex.span("upload") as s:
+        s.add_event("file " + _NOT_UTF8, {"name": _NOT_UTF8})
+        s.set_attribute("path", _NOT_UTF8)
+    shipped = _shipped(wire)
+    assert set(shipped) == {"other-0", "other-1", "other-2", "upload"}
+    upload = shipped["upload"]
+    escaped = "report-\\udcff.pdf"
+    assert upload["events"][0]["name"] == "file " + escaped
+    assert upload["events"][0]["attributes"]["name"] == escaped
+    assert upload["attributes"]["path"] == escaped
+    assert upload["attributes"]["file"] == escaped
+    assert upload["attributes"]["user.id"] == escaped
+    assert _losses() == []
+
+
+def test_an_event_a_before_send_hook_broke_costs_its_span_alone():
+    import dataclasses
+
+    def rename_events(envelope):
+        spans = tuple(
+            dataclasses.replace(
+                sp, events=tuple(dataclasses.replace(ev, name=_NOT_UTF8) for ev in sp.events)
+            )
+            for sp in envelope.spans
+        )
+        return dataclasses.replace(envelope, spans=spans)
+
+    _hub.reset_for_test()
+    wire = _Wire()
+    config = WardexConfig(backend=BackendConfig(api_key="k"), before_send_envelope=rename_events)
+    _hub.set_client(Client(config, wire))
+    for i in range(3):
+        with wardex.span(f"other-{i}"):
+            pass
+    with wardex.span("upload") as s:
+        s.add_event("done")
+    assert set(_shipped(wire)) == {"other-0", "other-1", "other-2"}
+    assert _losses() == [("unmarshallable", 1)]
+
+
 def test_text_given_for_bytes_is_sent_as_utf8(wire):
     with wardex.span("io") as s:
         s.input_data = "héllo"

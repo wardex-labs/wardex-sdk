@@ -208,7 +208,7 @@ class Span:
         """
         self._draft._events.append(
             InternalSpanEvent(
-                name=_values.text("Span.add_event() name", name),
+                name=_values.wire_text(_values.text("Span.add_event() name", name)),
                 timestamp_ns=time.time_ns(),
                 attributes=_values.event_attributes("Span.add_event", attributes),
             )

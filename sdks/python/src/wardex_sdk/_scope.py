@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from ._types import ConversationContext, SpanContext
-from ._values import AttributeValue, attribute_value
+from ._values import AttributeValue, attribute_value, wire_text
 
 #: The tag key `wardex.set_account()` writes: the customer's own customer, the
 #: unit a dashboard compares behaviour across.
@@ -43,7 +43,9 @@ class UserInfo:
                 object.__setattr__(self, "id", str(value))
             elif value == "":
                 object.__setattr__(self, spec.name, None)
-            elif value is not None and not isinstance(value, str):
+            elif isinstance(value, str):
+                object.__setattr__(self, spec.name, wire_text(value))
+            elif value is not None:
                 allowed = "a str, an int or None" if spec.name == "id" else "a str or None"
                 raise TypeError(
                     f"UserInfo.{spec.name} must be {allowed}, got {type(value).__name__}"
@@ -115,7 +117,9 @@ def context_entries(name: object, value: object) -> tuple[dict[str, Any], list[s
         if not isinstance(key, str) or not isinstance(item, _STAMPABLE):
             skipped.append(str(key))
         elif len(stamped) < MAX_CONTEXT_KEYS:
-            stamped[f"{CONTEXT_PREFIX}{name}.{key}"] = item
+            stamped[f"{CONTEXT_PREFIX}{name}.{key}"] = (
+                wire_text(item) if isinstance(item, str) else item
+            )
         else:
             over += 1
     return stamped, skipped, over

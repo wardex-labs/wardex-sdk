@@ -62,7 +62,9 @@ def attribute_value(api: str, key: object, value: object) -> AttributeValue | No
             f"write {api}(str(key), value)"
         )
     kind = type(value)
-    if kind is str or kind is float or kind is bool:
+    if kind is str:
+        return wire_text(value)  # type: ignore[arg-type]
+    if kind is float or kind is bool:
         return value  # type: ignore[return-value]
     if kind is int:
         if _INT_MIN <= value <= _INT_MAX:  # type: ignore[operator]
@@ -72,14 +74,16 @@ def attribute_value(api: str, key: object, value: object) -> AttributeValue | No
         return None
     if issubclass(kind, (list, tuple, dict)):
         try:
-            return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            return wire_text(
+                json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            )
         except (TypeError, ValueError) as exc:
             raise TypeError(
                 f"{api}({key!r}, ...): the {kind.__name__} is not JSON-serialisable ({exc}); "
                 f"the value must be {_ATTRIBUTE_ACCEPTS}"
             ) from None
     if issubclass(kind, str):
-        return value  # type: ignore[return-value]
+        return wire_text(value)  # type: ignore[arg-type]
     if not issubclass(kind, (bytes, bytearray)) and (
         hasattr(kind, "__index__") or hasattr(kind, "__float__")
     ):
@@ -89,6 +93,23 @@ def attribute_value(api: str, key: object, value: object) -> AttributeValue | No
         f"{api}({key!r}, ...): got a {kind.__name__}; the value must be "
         f"{_ATTRIBUTE_ACCEPTS}. Convert it first, e.g. str(value)"
     )
+
+
+def wire_text(value: str) -> str:
+    """`value` with any lone surrogate escaped as `\\udcff`, as `raw` does.
+
+    The wire is UTF-8, and a str read from the file system, argv or the
+    environment holds a lone surrogate where its bytes were not UTF-8: sent
+    as it is, the exporter cannot encode it. ASCII, the common case, is
+    returned without a scan.
+    """
+    if value.isascii():
+        return value
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "backslashreplace").decode("utf-8")
+    return value
 
 
 def _wire_int(api: str, key: str, value: int) -> int:

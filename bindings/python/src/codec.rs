@@ -1095,7 +1095,9 @@ fn flatten_typed_blocks(
 }
 
 /// The wardex-owned blocks after the typed ones: transport, integrity,
-/// correlation, events and links. Encoder-owned, so a failure raises.
+/// correlation and links. Encoder-owned, so a failure raises. Events are not
+/// among them: they carry host text (`Span.add_event`), and are marshalled
+/// with the head.
 fn span_tail_to_proto(sp: &Bound<'_, PyAny>, span: &mut pb::Span) -> PyResult<()> {
     if let Some(t) = opt(sp, "transport")? {
         span.transport = Some(transport_to_proto(&t)?);
@@ -1120,7 +1122,6 @@ fn span_tail_to_proto(sp: &Bound<'_, PyAny>, span: &mut pb::Span) -> PyResult<()
     if let Some(c) = opt(sp, "correlation")? {
         span.correlation = Some(correlation_to_proto(&c)?);
     }
-    events_to_proto(sp, &mut span.events)?;
     links_to_proto(sp, &mut span.links)?;
     Ok(())
 }
@@ -1299,9 +1300,10 @@ where
 /// the flag set the bad span is skipped and named — `"{span name}: {reason}"`,
 /// host text, for the caller to count and to show only under debug; the
 /// fidelity encoders keep raising, because a round-trip tool that hides a span
-/// is lying about what it round-tripped. The wardex-owned tail is not
-/// skippable: a failure there is an encoder bug, and the flag does not turn
-/// that into a quiet per-span loss.
+/// is lying about what it round-tripped. Events are host text too
+/// (`Span.add_event`, a `before_send_envelope` edit) and are skipped the
+/// same way. The wardex-owned tail is not skippable: a failure there is an
+/// encoder bug, and the flag does not turn that into a quiet per-span loss.
 fn envelope_to_proto(
     env: &Bound<'_, PyAny>,
     non_span_items: bool,
@@ -1322,6 +1324,8 @@ fn envelope_to_proto(
         let marshalled = span_head_to_proto(&sp, &mut not_as_given).and_then(|mut span| {
             flatten_typed_blocks(&sp, &mut span, &mut not_as_given).map(|()| span)
         });
+        let marshalled =
+            marshalled.and_then(|mut span| events_to_proto(&sp, &mut span.events).map(|()| span));
         let mut span = match marshalled {
             Ok(span) => span,
             // Only an `Exception` is a value the marshaller could not read. A
