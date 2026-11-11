@@ -783,6 +783,50 @@ def test_an_export_still_in_flight_when_close_returns_is_counted_once(monkeypatc
     assert "3 span(s)" in line
 
 
+@pytest.mark.parametrize("wire", ["otlp", "wardex"])
+def test_a_signal_that_ends_the_process_behind_a_hung_export_counts_what_dies(
+    monkeypatch, capsys, handler_with, wire
+):
+    """SIGTERM while the worker's export hangs: the signal's flush cannot get
+    the export slot, and the process then dies with the batch in flight and the
+    spans behind it. Both are counted and said before it does."""
+    release, calls = _hanging_urlopen(monkeypatch)
+    monkeypatch.setattr(_runtime, "_SIGNAL_FLUSH_TIMEOUT", 0.3)
+    monkeypatch.setattr(_runtime.os, "kill", lambda pid, signum: None)
+    monkeypatch.setattr(_runtime.signal, "signal", lambda signum, handler: None)
+    if wire == "otlp":
+        transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+        where = "http://collector.invalid/v1/traces"
+    else:
+        transport = WardexTransport("http://receiver.invalid", project_key())
+        where = "http://receiver.invalid/v1/envelope"
+    client = _client(transport)
+    for _ in range(3):
+        client.capture_span(_span())
+    worker = threading.Thread(target=client.flush, args=(5.0,), daemon=True)
+    worker.start()
+    time.sleep(0.2)
+    assert len(calls) == 1, "the export is not in flight"
+    client.capture_span(_span())
+    client.capture_span(_span())
+    handler_with(client, signal.SIGTERM, signal.SIG_DFL)
+    try:
+        _runtime._handler(signal.SIGTERM, None)
+    finally:
+        release.set()
+        worker.join(5.0)
+
+    assert _lost(DropReason.SEND_UNCONFIRMED) == 3, "the batch in flight when the process ended"
+    assert _lost(DropReason.SHUTDOWN_TAIL) == 2, "the spans behind it"
+    assert _lost(DropReason.NETWORK_ERROR) == 0, "counted again when its POST failed later"
+    err = capsys.readouterr().err
+    [line] = _lines(err, "ended on a signal")
+    assert where in line and "3 span(s)" in line
+    [tail] = _lines(err, "2 buffered span(s)")
+    assert where in tail
+    client.close(0.1)
+
+
 def test_a_request_that_fails_after_close_is_counted_not_queued(monkeypatch, capsys):
     def refuse(request, timeout=None):
         raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))

@@ -45,7 +45,7 @@ from ._types import span_buffer_bytes as _span_size
 from ._version import __version__
 from ._worker import BatchWorker
 from .transport._base import DEFAULT_TIMEOUT, UNDELIVERED, CallerBudget, Transport
-from .transport._delivery import say_slow_close
+from .transport._delivery import bound_for, say_slow_close
 
 
 def build_sdk_info() -> SdkInfo:
@@ -1183,9 +1183,9 @@ class Client:
         except Exception as exc:  # fail-silent: never crash the app or the exit path
             report_transport_raised("flush", exc, debug=self._config.debug)
 
-    def _abandon(self) -> None:
+    def _abandon(self, *, signalled: bool = False) -> None:
         """Take the tail close()'s final drain never got a slot for, and account
-        for it.
+        for it. `signalled`: the tail a shutdown signal's flush left as the process ends.
 
         Everywhere else a declined drain is free, because a later drain picks
         the spans up. After close() there is no later drain -- `_closed` is set,
@@ -1204,6 +1204,15 @@ class Client:
             dropped, self._dropped = self._dropped, 0
         if dropped:  # evicted since the last drain, which was the last one there will be
             report_buffer_evicted(dropped, debug=self._config.debug)
+        if signalled:
+            self._report_lost(
+                lost,
+                why="the process is ending on a signal, and an export still in flight held "
+                "the slot the signal's flush needed to send them.",
+                key="client.signal.behind_an_export",
+                fix="Check that the receiver is reachable and answering.",
+            )
+            return
         unreachable = _receiver_unreachable(self._transport)
         self._report_lost(
             lost,
@@ -1380,18 +1389,9 @@ class Client:
         per process, however many times the site trips. A shutdown path that
         abandons a tail on every re-init still writes one line.
 
-        Reachable only from a client that is closing or already closed, and
-        never from the signal path (see `_close_lock`).
-
-        That used to be load-bearing for a second reason, and no longer is: the
-        old note here argued `report_once` was safe to call because a plain-Lock
-        dedup set could deadlock a re-entering signal handler, and no site the
-        handler reaches called it. That was an argument about the CALLERS, and it
-        expired the moment the flush-budget work put a `report_once` on the
-        transport's export path -- which the handler's `flush(2.0)` runs on the
-        interrupted thread. The lock is an RLock now, so the property belongs to
-        `report_once` itself and holds whoever calls it. Adding a `report_once`
-        somewhere new is no longer a decision that has to be audited from here.
+        Reached from a client that is closing or already closed, and from a
+        shutdown signal's handler as the process ends on it. `report_once`'s
+        lock is re-entrant, so a handler that interrupted its holder can call it.
         """
         if not lost:
             return
@@ -1399,7 +1399,7 @@ class Client:
             self._lost += lost
         ledger.record(DropReason.SHUTDOWN_TAIL, lost)
         report_once(
-            f"could not ship {lost} buffered span(s): {why} "
+            f"could not ship {lost} buffered span(s){bound_for(self._transport)}: {why} "
             f"They are out of the buffer and nothing will retry them. {fix}",
             key=key,
         )

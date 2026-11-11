@@ -243,7 +243,8 @@ def test_with_no_way_to_drain_the_handler_keeps_finished_spans_and_counts_the_re
 ):
     """A buffer that cannot be drained in time: the open spans fill only the
     room there is, oldest entries first, the finished spans stay, and the rest
-    is counted under its own counter with one line."""
+    is counted under its own counter with one line. What the buffer then holds
+    dies with the process, and is counted and said too."""
     reset_reports_for_test()
     monkeypatch.setattr(_runtime, "_SIGNAL_FLUSH_TIMEOUT", _UnnamedTimeout(0.2, "<test budget>"))
     transport, client = _install(max_buffer_spans=10)
@@ -251,19 +252,26 @@ def test_with_no_way_to_drain_the_handler_keeps_finished_spans_and_counts_the_re
     managers = _open_nested(8)
     before = counters.snapshot().get("_runtime.open_spans_unshipped", 0)
     release = _an_export_in_flight(client)
+    buffered: list[str] = []
+    abandon = client._abandon
+
+    def note_then_abandon(**kwargs):
+        buffered.extend(sp.name for sp in client._spans)
+        abandon(**kwargs)
+
+    monkeypatch.setattr(client, "_abandon", note_then_abandon)
     _signal_with(signal.SIG_DFL, monkeypatch)
     release.set()
     assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before + 4
-    lines = [ln for ln in capsys.readouterr().err.splitlines() if "under shutdown_tail" in ln]
+    err = capsys.readouterr().err.splitlines()
+    lines = [ln for ln in err if "under shutdown_tail" in ln]
     assert len(lines) == 1 and "4 span(s)" in lines[0]
-    client.flush()
-    names = [sp.name for sp in transport.spans()]
-    finished = sorted(n for n in names if n.startswith("finished-"))
+    finished = sorted(n for n in buffered if n.startswith("finished-"))
     assert finished == [f"finished-{i}" for i in range(6)]
-    assert sorted(n for n in names if n.startswith("open-")) == [f"open-{i}" for i in range(4)]
+    assert sorted(n for n in buffered if n.startswith("open-")) == [f"open-{i}" for i in range(4)]
+    assert [ln for ln in err if "could not ship 10 buffered span(s)" in ln]
+    assert not client._spans, "the process ends here: nothing is left for a drain"
     _close_all(managers)
-    client.flush()
-    assert len([sp for sp in transport.spans() if sp.name.startswith("open-")]) == 4
 
 
 def test_close_drains_between_chunks_so_every_open_span_ships():

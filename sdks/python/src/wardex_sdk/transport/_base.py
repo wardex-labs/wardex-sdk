@@ -604,8 +604,9 @@ class Transport(abc.ABC):
         return None
 
     def _abandon_retries(self, why: str) -> None:
-        """Drop and account whatever is held for a retry: the process is ending
-        without a `close()`. Plumbing for the built-in transports, not a hook."""
+        """Drop and account whatever is held for a retry or still in flight on
+        another thread: the process is ending without a `close()`. Plumbing for
+        the built-in transports, not a hook."""
         return None
 
     def _receiver_unreachable(self) -> bool:

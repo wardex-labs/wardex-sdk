@@ -684,8 +684,9 @@ class Runtime:
             # SIG_DFL this line is the only record that the buffered tail went down with it.
             report_signal_flush_raised()
         if ending:
-            # Held retries die with the process: count them, then say it all on stderr.
+            # What the flush could not send dies with the process: count it, then say it all.
             with guard("_runtime.signal_abandon_retries"):
+                client._abandon(signalled=True)
                 client._transport._abandon_retries("because the process is ending on a signal.")
             report_undelivered_drops(client, who="a shutdown signal's flush")
 

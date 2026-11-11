@@ -431,7 +431,7 @@ class WardexTransport(Transport):
         self._delivery.close(self._request_headers(), min(self._timeout, timeout))
 
     def _abandon_retries(self, why: str) -> None:
-        self._delivery.give_up(why)
+        self._delivery.abandon(why)
 
     def _receiver_unreachable(self) -> bool:
         return self._delivery.unreachable
