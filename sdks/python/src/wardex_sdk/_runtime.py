@@ -687,7 +687,7 @@ class Runtime:
         if ending:
             # Held retries die with the process: count them, then say it all on stderr.
             with guard("_runtime.signal_abandon_retries"):
-                client._transport._abandon_retries("the process is ending on a signal.")
+                client._transport._abandon_retries("because the process is ending on a signal.")
             report_undelivered_drops(client, who="a shutdown signal's flush")
 
     def _signal_state(self, signum: int) -> tuple[Client | None, Any, Any]:

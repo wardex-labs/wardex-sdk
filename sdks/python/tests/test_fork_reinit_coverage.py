@@ -44,15 +44,17 @@ import pytest
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "wardex_sdk"
 
 #: Function names that ARE fork-reset paths. `_at_fork_reinit` is the
-#: protocol; the other three are the special entry points the design names
-#: (the runtime's own hook, the diagnostics' no-acquire reset, and the
-#: receiver's child-safe teardown).
+#: protocol; the others are the special entry points the design names
+#: (the runtime's own hook, the diagnostics' no-acquire reset, the
+#: receiver's child-safe teardown, and the transport hook the runtime calls
+#: on the active transport in the child).
 _RESET_FNS = frozenset(
     {
         "_at_fork_reinit",
         "after_in_child",
         "diag_reset_for_new_process",
         "close_inherited_after_fork",
+        "at_fork_child",
     }
 )
 

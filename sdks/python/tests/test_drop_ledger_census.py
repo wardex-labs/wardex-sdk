@@ -799,6 +799,12 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("transport/_delivery.py", "record", "reason"): Structural(
         "Delivery.lose()'s own records; each lose() call is its own entry"
     ),
+    ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.failed_after_close'"): L(
+        "NETWORK_ERROR", "RATELIMIT_BACKOFF", "SEND_UNCONFIRMED", at="transport/_otlp_http.py"
+    ),
+    ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.in_flight_at_close'"): L(
+        "SEND_UNCONFIRMED"
+    ),
     ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.retry_abandoned'"): L(
         "NETWORK_ERROR", "RATELIMIT_BACKOFF", "SEND_UNCONFIRMED", at="transport/_otlp_http.py"
     ),

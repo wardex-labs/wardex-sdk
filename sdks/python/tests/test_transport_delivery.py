@@ -24,6 +24,7 @@ from wardex_sdk import BackendConfig, BatchingConfig, WardexConfigWarning, _hub,
 from wardex_sdk import init as wardex_init
 from wardex_sdk._assembly import _ledger
 from wardex_sdk._assembly._diag import reset_reports_for_test
+from wardex_sdk._assembly._drop_reasons import REASONS
 from wardex_sdk._assembly._ledger import DropReason, DropUnit
 from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
@@ -38,6 +39,7 @@ from wardex_sdk._types import (
     TraceId,
 )
 from wardex_sdk.transport import NoOpTransport, OtlpHttpTransport, WardexTransport, _delivery
+from wardex_sdk.transport._base import CallerBudget
 
 pytestmark = pytest.mark.usefixtures("fresh_counters")
 
@@ -597,3 +599,178 @@ def test_a_fork_child_does_not_resend_what_its_parent_holds(monkeypatch):
     assert transport.export_state.retry_queued == 1
     transport.at_fork_child()  # what the runtime's fork hook calls in the child
     assert transport.export_state.retry_queued == 0
+
+
+# -- an export close() stops waiting for is counted, once ----------------------------
+
+
+def _hanging_urlopen(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, list[int]]:
+    """Every POST hangs until the event is set, then fails to connect."""
+    release = threading.Event()
+    calls: list[int] = []
+
+    def urlopen(request, timeout=None):
+        calls.append(1)
+        release.wait(10.0)
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return release, calls
+
+
+@pytest.mark.parametrize("wire", ["otlp", "wardex"])
+def test_an_export_still_in_flight_when_close_returns_is_counted_once(monkeypatch, capsys, wire):
+    release, calls = _hanging_urlopen(monkeypatch)
+    if wire == "otlp":
+        transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+        where = "http://collector.invalid/v1/traces"
+    else:
+        transport = WardexTransport("http://receiver.invalid", project_key())
+        where = "http://receiver.invalid/v1/envelope"
+    client = _client(transport)
+    for _ in range(3):
+        client.capture_span(_span())
+    worker = threading.Thread(target=client.flush, args=(5.0,), daemon=True)
+    worker.start()
+    time.sleep(0.2)
+    assert len(calls) == 1, "the export is not in flight"
+    client.capture_span(_span())
+    try:
+        client.close(0.3)
+    finally:
+        release.set()
+        worker.join(5.0)
+
+    assert _lost(DropReason.SEND_UNCONFIRMED) == 3, "the batch close() stopped waiting for"
+    assert _lost(DropReason.SHUTDOWN_TAIL) == 1, "the span behind it"
+    assert _lost(DropReason.NETWORK_ERROR) == 0, "counted again when its POST failed later"
+    assert transport.export_state.retry_queued == 0, "queued in a closed transport"
+    [line] = _lines(capsys.readouterr().err, "when close() returned")
+    assert where in line
+    assert "3 span(s)" in line
+
+
+def test_a_request_that_fails_after_close_is_counted_not_queued(monkeypatch, capsys):
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    transport.close(1.0)
+    transport.export(_envelope(2))
+    err = capsys.readouterr().err
+
+    assert transport.export_state.retry_queued == 0
+    assert _lost(DropReason.NETWORK_ERROR) == 2
+    assert not _lines(err, "retries after"), "a closed transport retries nothing"
+    assert _lines(err, "collector.invalid")
+
+
+# -- every failure line names the address ---------------------------------------------
+
+
+@pytest.mark.parametrize("wire", ["otlp", "wardex"])
+def test_a_post_cut_short_by_the_callers_budget_names_the_address(black_hole, capsys, wire):
+    base = black_hole.rsplit("/v1/", 1)[0]
+    if wire == "otlp":
+        transport, where = OtlpHttpTransport(black_hole, timeout=10.0), black_hole
+    else:
+        transport = WardexTransport(base, project_key(), timeout=10.0)
+        where = f"{base}/v1/envelope"
+    transport.export(_envelope(3), timeout=CallerBudget(0.3, 0.3))
+    [line] = _lines(capsys.readouterr().err, "cut off")
+    assert where in line
+
+
+def test_a_stalled_request_says_how_long_it_waited_not_a_class_name(monkeypatch, capsys):
+    release = threading.Event()
+
+    def stalled_resolver(*args, **kwargs):
+        release.wait(10.0)
+        raise socket.gaierror("stalled")
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled_resolver)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces", timeout=0.4)
+    try:
+        transport.export(_envelope())
+    finally:
+        release.set()
+    err = capsys.readouterr().err
+    assert "DeadlineOverrun" not in err
+    [line] = _lines(err, "collector.invalid")
+    assert "no answer within" in line
+
+
+# -- lines say what is true in the case that prints them --------------------------------
+
+
+def test_a_signal_flush_does_not_promise_a_retry_it_will_not_make(monkeypatch, capsys):
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    with _delivery.posts_inline():
+        transport.export(_envelope(5))
+    transport._abandon_retries("because the process is ending on a signal.")
+    err = capsys.readouterr().err
+
+    assert not _lines(err, "retries after")
+    [line] = _lines(err, "were dropped")
+    assert "close()" not in line
+    assert "ConnectionRefusedError" in line
+    assert _lost(DropReason.NETWORK_ERROR) == 5
+
+
+def test_close_after_a_refusal_does_not_blame_its_budget(receiver, no_backoff, capsys):
+    receiver.answers += [(503, {}, b""), (503, {}, b"")]
+    transport = OtlpHttpTransport(f"{receiver.base}/v1/traces")
+    transport.export(_envelope(2))
+    transport.close(2.0)
+    [line] = _lines(capsys.readouterr().err, "dropped at close()")
+    assert "HTTP 503" in line
+    assert "larger timeout" not in line
+
+
+def test_the_retry_queue_overflow_points_only_at_settings_that_exist():
+    info = REASONS[DropReason.CACHE_OVERFLOW]
+    assert "bound" not in info.next_step
+    assert "Restore the receiver" in info.next_step
+
+
+def test_a_batch_waiting_behind_a_held_retry_is_counted_when_close_returns(monkeypatch, capsys):
+    """After a failed connect the next export first retries what is held; the
+    new batch waits behind that retry. close() must count both."""
+    release = threading.Event()
+    calls: list[int] = []
+
+    def urlopen(request, timeout=None):
+        calls.append(1)
+        if len(calls) > 1:
+            release.wait(10.0)  # the retry hangs
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(_delivery, "BACKOFF_FIRST_S", 0.3)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    client = _client(transport)
+    client.capture_span(_span())
+    client.flush(1.0)  # refused: 1 span held
+    time.sleep(0.35)  # the backoff has run out: the next export retries it first
+    for _ in range(4):
+        client.capture_span(_span())
+    worker = threading.Thread(target=client.flush, args=(5.0,), daemon=True)
+    worker.start()
+    time.sleep(0.2)
+    assert len(calls) == 2, "the retry is not in flight"
+    try:
+        client.close(0.3)
+    finally:
+        release.set()
+        worker.join(5.0)
+
+    assert _lost(DropReason.SEND_UNCONFIRMED) == 1 + 4, "the retry and the batch behind it"
+    assert _lost(DropReason.NETWORK_ERROR) == 0
+    assert transport.export_state.retry_queued == 0
+    [line] = _lines(capsys.readouterr().err, "when close() returned")
+    assert "5 span(s)" in line

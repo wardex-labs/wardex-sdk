@@ -202,8 +202,9 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
         _R.CACHE_OVERFLOW: ReasonInfo(
             _U.REQUEST,
             "loss",
-            "The queue holding batches for a retry was full, so a held batch was dropped.",
-            "Raise the retry queue's bound, or restore the receiver sooner.",
+            "The queue holding batches for a retry was full, so a held batch was dropped "
+            "(counted in spans, or in requests for part of a split batch).",
+            "Restore the receiver sooner, or check that the export address is the right one.",
         ),
         _R.BEFORE_SEND: ReasonInfo(
             _U.SPAN,

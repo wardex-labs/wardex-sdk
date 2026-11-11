@@ -283,14 +283,22 @@ class OtlpHttpTransport(Transport):
             headers["Content-Encoding"] = "gzip"
         return headers
 
-    def _hold(self, bodies: tuple[bytes, ...], spans: int | None) -> None:
-        """Queue `bodies` for a retry. A whole batch in one body is `spans`
-        spans; how many each of several bodies holds is the core's, so those
-        are counted as requests."""
-        whole = spans is not None and len(bodies) == 1
-        units = ((DropUnit.SPAN, spans),) if whole else ((DropUnit.REQUEST, 1),)
+    @staticmethod
+    def _units(bodies: tuple[bytes, ...], spans: int | None) -> tuple[tuple[DropUnit, int], ...]:
+        """What `bodies` hold: a whole batch in one body is `spans` spans; how
+        many each of several bodies holds is the core's, so those are requests."""
+        if spans is not None and len(bodies) == 1:
+            return ((DropUnit.SPAN, spans),)
+        return ((DropUnit.REQUEST, len(bodies)),)
+
+    def _hold(
+        self, bodies: tuple[bytes, ...], spans: int | None, reason: DropReason | None = None
+    ) -> None:
+        """Queue `bodies` for a retry, each counted as `_units` says and lost
+        as `reason` (the failure that held them) if it never arrives."""
+        units = self._units(bodies, spans) if len(bodies) == 1 else ((DropUnit.REQUEST, 1),)
         for body in bodies:
-            self._delivery.hold(Held(body, units, self._delivery.last_reason))
+            self._delivery.hold(Held(body, units, reason or self._delivery.last_reason))
 
     def _send_batch(self, envelope: Envelope, timeout: float | None = None) -> Undelivered | None:
         # zero spans means an empty batch — skip the POST. Not a decline: there
@@ -341,12 +349,18 @@ class OtlpHttpTransport(Transport):
             return None
         headers = self._request_headers(warn=True)
         shipped = len(envelope.spans) - len(reports.unmarshalled) - reports.over_cap
+        # In flight from here until its fate is decided: what close() counts if
+        # it returns first. `units` shrinks as requests are accepted.
+        flight = self._delivery.begin(
+            Held(b"", self._units(bodies, shipped), DropReason.SEND_UNCONFIRMED)
+        )
         # Held requests go first, so the receiver sees batches in capture order.
         if not self._delivery.admits(headers, deadline):
             # The receiver is backing us off: this batch waits in the queue
             # rather than spending a POST the receiver asked us not to make.
             self._count_encode_reports(reports)
-            self._hold(bodies, shipped)
+            if self._delivery.end(flight):
+                self._hold(bodies, shipped)
             return None
 
         for index, body in enumerate(bodies):
@@ -355,6 +369,8 @@ class OtlpHttpTransport(Transport):
             # of chunks it happened to split into.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if not self._delivery.end(flight):
+                    return None  # close() counted it
                 if index == 0:
                     # Nothing went on the wire: a decline, not a loss. The
                     # skipped spans are counted by the attempt that decides.
@@ -366,7 +382,8 @@ class OtlpHttpTransport(Transport):
                 # Counted in requests: how many spans each body held is the core's.
                 record(DropReason.BUDGET_EXHAUSTED, len(bodies) - index, DropUnit.REQUEST)
                 report_once(
-                    f"an OTLP export ran out of budget after {index} of "
+                    f"an OTLP export to {self._delivery.destination} ran out of budget after "
+                    f"{index} of "
                     f"{len(bodies)} requests; the spans in the remaining request(s) were "
                     f"not sent. This batch was split because it exceeded "
                     f"max_otlp_request_bytes, and the split shares ONE export timeout. "
@@ -387,11 +404,17 @@ class OtlpHttpTransport(Transport):
                     debug_host_error(
                         "OTLP export failed", exc, unprintable="transport.otlp.error_unprintable"
                     )
+                if not self._delivery.end(flight):
+                    # close() counted these requests already; its reports are resent.
+                    record_failed_send()
+                    unsent(envelope, definite=False)
+                    break
                 if retryable(exc):
                     # Nothing of these requests arrived, or the receiver said
                     # "later": they wait in the queue instead of being lost.
                     record_failed_send()
-                    self._hold(bodies[index:], shipped if index == 0 else None)
+                    reason = _classify_failure(exc)[0]
+                    self._hold(bodies[index:], shipped if index == 0 else None, reason)
                     self._delivery.failed(exc, spans=shipped if index == 0 else None)
                     unsent(envelope, definite=False)
                     break
@@ -400,7 +423,12 @@ class OtlpHttpTransport(Transport):
                 # A backend that refused one request refuses the next, and
                 # trying anyway spends the caller's budget one timeout at a time.
                 break
+            if index + 1 < len(bodies):
+                if not self._delivery.owns(flight):
+                    break  # close() counted the rest; none of it is sent after close()
+                flight.units = self._units(bodies[index + 1 :], None)
         else:
+            self._delivery.end(flight)
             self._delivery.succeeded(shipped)
         # No `UNDELIVERED` on the failure path: the POST was attempted, so the
         # backend may hold the batch, and a resend would duplicate it.
@@ -435,7 +463,7 @@ class OtlpHttpTransport(Transport):
             # already hold this batch. What the caller loses is the KNOWLEDGE
             # of whether it arrived, a fact about the budget it chose.
             report_once(
-                f"an OTLP export was cut off after "
+                f"an OTLP export to {self._delivery.destination} was cut off after "
                 f"{time.monotonic() - started:.1f}s by the "
                 f"{cut_short_by.requested:.1f}s budget its caller passed to "
                 f"flush()/close(), which is shorter than this transport's own "
@@ -471,7 +499,7 @@ class OtlpHttpTransport(Transport):
             # the backend holds a trace with a hole in the middle, which reads
             # as "this call never happened". Said once per process.
             report_once(
-                f"an OTLP export was abandoned after {index} of "
+                f"an OTLP export to {self._delivery.destination} was abandoned after {index} of "
                 f"{requests} requests failed to complete; the spans in the "
                 f"remaining request(s) were not sent, so the trace(s) in this "
                 f"batch may arrive incomplete.",

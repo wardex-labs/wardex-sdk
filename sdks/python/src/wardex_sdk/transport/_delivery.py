@@ -12,6 +12,16 @@ A signal handler is the exception: it may have interrupted the main thread
 inside `threading`'s own bookkeeping, where starting a thread can wait on a
 lock the interrupted frame holds, so the handler posts inline (`posts_inline`).
 
+AN EXPORT STILL RUNNING WHEN close() RETURNS IS ACCOUNTED BY close(). close()
+does not wait past its budget, and at interpreter exit the thread running it
+dies with the process, so its outcome would never be counted. Each export
+registers what it has not yet had confirmed -- from before it waits on held
+requests until its fate is decided -- and so does each held request while it is
+retried (`begin`/`end`). close() claims all of it and records it as not
+confirmed delivered; the exporter, finding its claim gone, accounts nothing
+more, and nothing reaches the queue of a closed transport (`hold` drops and
+records it).
+
 ONLY A FAILURE THAT PROVES NOTHING ARRIVED IS RETRIED, plus the statuses a
 receiver uses to say "later": a connection that never opened, or a 429, 502,
 503 or 504. A 4xx other than 429 is the request itself being wrong, and a
@@ -106,7 +116,8 @@ class ExportState:
 
 class DeadlineOverrun(TimeoutError):
     """The request did not finish inside its deadline, and the caller stopped
-    waiting. It may still have been sent, so it is never retried."""
+    waiting. It may still have been sent, so it is never retried. Its text
+    (`no answer within N s`) is wardex's own, so it is safe to print."""
 
 
 _INLINE = threading.local()
@@ -275,6 +286,8 @@ def describe(exc: BaseException) -> str:
     status = http_status(exc)
     if status is not None:
         return f"HTTP {status}"
+    if isinstance(exc, DeadlineOverrun):
+        return str(exc)
     try:
         reason = exc.reason if isinstance(exc, urllib.error.URLError) else None
         return type(reason if isinstance(reason, BaseException) else exc).__name__
@@ -287,7 +300,11 @@ def _span_text(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
 
 
-@dataclass
+def units_text(units: tuple[tuple[DropUnit, int], ...]) -> str:
+    return " and ".join(f"{n} {unit.value}(s)" for unit, n in units if n) or "its requests"
+
+
+@dataclass(eq=False)
 class Held:
     """One request body waiting for a retry, and what is lost if it never arrives."""
 
@@ -336,6 +353,12 @@ class Delivery:
         self._outage_attempts = 0
         self._outage_dropped = 0
         self._outage_said_at: float | None = None
+        # Guards `_flights` and `_closed`: close() and the exporter settle who
+        # accounts what is in flight. Re-entrant, so a signal handler that
+        # interrupts its holder on the same thread cannot deadlock on it.
+        self._lock = threading.RLock()
+        self._flights: list[Held] = []
+        self._closed = False
 
     # -- state -------------------------------------------------------------
 
@@ -366,6 +389,8 @@ class Delivery:
         sends them itself; a copy here would be a duplicate. The child's own
         first delivery is its own news."""
         _FIRST_SUCCESS_PID.clear()
+        self._lock = threading.RLock()
+        self._flights = []
         self._held = deque()
         self._failures = 0
         self._not_before = 0.0
@@ -373,9 +398,42 @@ class Delivery:
         self._outage_since = self._outage_said_at = None
         self._outage_attempts = self._outage_dropped = 0
 
+    # -- in flight ---------------------------------------------------------
+
+    def begin(self, item: Held) -> Held:
+        """Register `item` as in flight, for close() to claim. Its `units` may
+        shrink as parts of it are confirmed."""
+        with self._lock:
+            self._flights.append(item)
+        return item
+
+    def end(self, item: Held) -> bool:
+        """Whether the exporter still accounts `item`: False when close()
+        claimed it meanwhile, and has counted it already."""
+        with self._lock:
+            for i, flight in enumerate(self._flights):
+                if flight is item:
+                    del self._flights[i]
+                    return True
+            return False
+
+    def owns(self, item: Held) -> bool:
+        with self._lock:
+            return any(flight is item for flight in self._flights)
+
     # -- queue -------------------------------------------------------------
 
     def hold(self, item: Held) -> None:
+        if self._closed:
+            # Nothing will ever send it: a closed transport is not flushed again.
+            self.lose(item, item.reason)
+            report_once(
+                f"{self._article} {self._label} export to {self.destination} failed "
+                f"after close(); its {units_text(item.units)} were dropped, because a "
+                "closed transport sends nothing again.",
+                key=f"transport.{self._wire}.failed_after_close",
+            )
+            return
         self._held.append(item)
         while len(self._held) > 1 and (
             len(self._held) > RETRY_MAX_BATCHES
@@ -388,8 +446,8 @@ class Delivery:
             report_once(
                 f"the retry queue for {self._label} exports to {self.destination} was full "
                 f"({RETRY_MAX_BATCHES} requests or {RETRY_MAX_BYTES // (1024 * 1024)} MiB), so "
-                "the oldest held request was dropped, and every one after it while the "
-                "receiver stays unreachable (counted under "
+                "the oldest held request was dropped, and every one after it while "
+                f"exports keep failing ({self._last_error}; counted under "
                 f"transport.{self._wire}.retry_queue_full). Restore the receiver, or check "
                 "that this address is the right one.",
                 key=f"transport.{self._wire}.retry_queue_full",
@@ -415,11 +473,13 @@ class Delivery:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or time.monotonic() < self._not_before:
                 return True
-            item = self._held[0]
+            item = self.begin(self._held[0])
             try:
                 post(self.url, item.body, headers, remaining)
             except Exception as exc:  # fail-silent: never crash the app
                 counters.bump(f"transport.{self._wire}.export_failed")
+                if not self.end(item):
+                    return True  # close() took it, and the queue with it
                 if retryable(exc):
                     self.failed(exc, spans=None)
                     return False
@@ -432,6 +492,8 @@ class Delivery:
                     key=f"transport.{self._wire}.retry_refused",
                 )
                 continue
+            if not self.end(item):
+                return True
             self._popleft(item)
             spans = sum(n for unit, n in item.units if unit is DropUnit.SPAN)
             self.succeeded(spans or None)
@@ -443,7 +505,8 @@ class Delivery:
 
     def give_up(self, why: str) -> None:
         """Drop everything held, record each body under the failure that put it
-        there, and say so once."""
+        there, and say so once. `why` ends the sentence "... were dropped": it
+        says when and why ("at close(): ...", "because ...")."""
         dropped = 0
         while self._held:
             item = self._held.popleft()
@@ -452,30 +515,56 @@ class Delivery:
         if dropped:
             counters.bump(f"transport.{self._wire}.retry_abandoned")
             report_once(
-                f"{dropped} {self._label} request(s) held for a retry to {self.destination} "
-                f"were dropped at close(): {why} (counted under "
-                f"transport.{self._wire}.retry_abandoned)",
+                f"{dropped} {self._label} request(s) to {self.destination} held for a retry "
+                f"after a failed attempt ({self._last_error}) were dropped {why} (counted "
+                f"under transport.{self._wire}.retry_abandoned)",
                 key=f"transport.{self._wire}.retry_abandoned",
             )
 
     def close(self, headers: dict[str, str], timeout: float) -> None:
         """The last chance for the queue. After a failed connect nothing is
         attempted, because a second one would only delay the process's exit;
-        otherwise the bodies get one try inside `timeout`."""
+        otherwise the bodies get one try inside `timeout`. A request still in
+        flight is claimed first and counted as not confirmed delivered."""
+        with self._lock:
+            self._closed = True
+            flights, self._flights = self._flights, []
+        if flights:
+            self._held = deque(h for h in self._held if all(h is not f for f in flights))
+            totals: dict[DropUnit, int] = {}
+            for flight in flights:
+                self.lose(flight, DropReason.SEND_UNCONFIRMED)
+                for unit, n in flight.units:
+                    totals[unit] = totals.get(unit, 0) + n
+            fix = (
+                "The last attempt could not connect, so close() did not wait for this one; "
+                "check that the receiver is reachable."
+                if self._unreachable
+                else "close()'s budget ran out first; give close() a larger timeout "
+                "(batching.shutdown_timeout) to wait for the answer."
+            )
+            report_once(
+                f"{units_text(tuple(totals.items()))} of {self._label} exports to "
+                f"{self.destination} were still waiting for an answer when close() returned, "
+                f"so wardex cannot confirm they arrived and counts them as lost. {fix}",
+                key=f"transport.{self._wire}.in_flight_at_close",
+            )
         if not self._held:
             return
         if self._unreachable:
             self.give_up(
-                f"the last attempt could not connect ({self._last_error}), and waiting "
-                "for another would only delay this process's exit."
+                "at close(): the last attempt could not connect, and waiting for another "
+                "would only delay this process's exit."
             )
             return
         self._not_before = 0.0  # one last try, whatever the receiver asked for
-        self.resend(headers, time.monotonic() + timeout)
+        failed_again = not self.resend(headers, time.monotonic() + timeout)
         if self._held:
             self.give_up(
-                f"the last attempt failed ({self._last_error}) or close()'s budget ran out. "
-                "Give close() a larger timeout (batching.shutdown_timeout) to wait longer."
+                "at close(): the last try failed too."
+                if failed_again
+                else "at close(): its budget ran out before they were sent. Give close() a "
+                "larger timeout (batching.shutdown_timeout) to wait longer."
             )
 
     # -- outcomes ----------------------------------------------------------
@@ -508,7 +597,9 @@ class Delivery:
 
     def failed(self, exc: BaseException, *, spans: int | None) -> None:
         """A retryable failure: back off, and say so -- at once the first time,
-        then at most every `REPEAT_EVERY_S` while it lasts, with totals."""
+        then at most every `REPEAT_EVERY_S` while it lasts, with totals. Not
+        said on a signal handler's flush or after close(): no retry follows
+        those, and what they drop is said where it is dropped."""
         now = time.monotonic()
         self._last_error = describe(exc)
         self._last_error_at = time.time()
@@ -523,6 +614,8 @@ class Delivery:
         self._outage_attempts += 1
         if self._outage_since is None:
             self._outage_since = now
+        if self._closed or getattr(_INLINE, "depth", 0):
+            return
         if self._outage_said_at is not None and now - self._outage_said_at < REPEAT_EVERY_S:
             return
         if self._outage_said_at is None:

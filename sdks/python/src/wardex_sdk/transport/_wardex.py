@@ -298,21 +298,21 @@ class WardexTransport(Transport):
         headers = self._request_headers()
         spans = len(envelope.spans) - len(unmarshalled)
         units = ((DropUnit.SPAN, spans), (DropUnit.SNAPSHOT, len(envelope.state_snapshots)))
+        # In flight from here until its fate is decided: what close() counts if
+        # it returns first.
+        flight = self._delivery.begin(Held(body, units, DropReason.SEND_UNCONFIRMED))
         # Held requests go first, so the receiver sees batches in capture order.
-        if not self._delivery.admits(headers, deadline):
-            # The receiver is backing us off: this batch waits in the queue
-            # rather than spending a POST the receiver asked us not to make.
-            # Its drop reports ride the next envelope too; if the held copy
-            # also arrives, the receiver folds the repeat by its timestamp.
-            self._delivery.hold(Held(body, units, self._delivery.last_reason))
-            ledger.unsent(envelope, definite=False)
-            return None
+        admitted = self._delivery.admits(headers, deadline)
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            # Held requests took the budget. This batch is encoded and counted,
-            # so it waits in the queue for the next attempt rather than going
-            # back to be encoded, and counted, again.
-            self._delivery.hold(Held(body, units, self._delivery.last_reason))
+        if not admitted or remaining <= 0:
+            # The receiver is backing us off, or held requests took the budget:
+            # this batch, encoded and counted, waits in the queue rather than
+            # spending a POST the receiver asked us not to make, or going back
+            # to be encoded and counted again. Its drop reports ride the next
+            # envelope too; if the held copy also arrives, the receiver folds
+            # the repeat by its timestamp.
+            if self._delivery.end(flight):
+                self._delivery.hold(Held(body, units, self._delivery.last_reason))
             ledger.unsent(envelope, definite=False)
             return None
         try:
@@ -326,17 +326,22 @@ class WardexTransport(Transport):
                     "wardex export failed", exc, unprintable="transport.wardex.error_unprintable"
                 )
             ledger.record_failed_send()
+            if not self._delivery.end(flight):
+                # close() counted this batch already; its drop reports are resent.
+                ledger.unsent(envelope, definite=False)
+                return None
             if retryable(exc):
                 # Nothing arrived, or the receiver said "later": the request
                 # waits in the queue. Its drop reports ride the next envelope
                 # as well, and the receiver folds the repeat.
-                self._delivery.hold(Held(body, units, self._delivery.last_reason))
+                self._delivery.hold(Held(body, units, _classify_failure(exc)[0]))
                 self._delivery.failed(exc, spans=spans)
                 ledger.unsent(envelope, definite=False)
                 return None
             self._delivery.refused(exc)
             self._lost(envelope, exc, spans, timeout, effective, started)
             return None
+        self._delivery.end(flight)
         self._delivery.succeeded(spans)
         # No `UNDELIVERED` on the failure path either: the POST was attempted,
         # so the receiver may hold the batch, and a resend would duplicate it.
@@ -366,7 +371,7 @@ class WardexTransport(Transport):
             # already hold this batch. What the caller loses is the KNOWLEDGE
             # of whether it arrived.
             report_once(
-                f"a wardex export was cut off after "
+                f"a wardex export to {self._delivery.destination} was cut off after "
                 f"{time.monotonic() - started:.1f}s by the "
                 f"{cut_short_by.requested:.1f}s budget its caller passed to "
                 f"flush()/close(), which is shorter than this transport's own "
