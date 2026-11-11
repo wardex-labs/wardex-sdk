@@ -223,8 +223,8 @@ def test_every_span_inside_a_conversation_carries_its_id(llm):
     assert names == sorted(
         [
             "support-chat",
-            "turn",
-            "lookup",
+            "invoke_workflow turn",
+            "execute_tool lookup",
             "rank",
             "HTTP POST /v1/responses",
             "HTTP POST /v1/responses",

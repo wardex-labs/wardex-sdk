@@ -642,9 +642,6 @@ def test_wheel_declares_zero_runtime_dependencies():
 #: docstring removes the name from this set in the same commit.
 _UNDOCUMENTED_BUDGET = frozenset(
     {
-        "workflow",
-        "agent",
-        "tool",
         "get_traceparent",
         "get_trace_headers",
         "WardexAsgiMiddleware",

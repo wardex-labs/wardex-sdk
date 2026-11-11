@@ -328,11 +328,11 @@ def test_a_span_sent_without_its_payload_names_the_request_cap_and_is_counted_on
 
 @pytest.mark.usefixtures("fresh_counters")
 def test_a_non_str_attribute_key_costs_that_attribute_not_the_batch():
-    """Through the public path: `set_attribute(123, ...)` used to raise inside
-    the encoder, and the client's drain then dropped the whole batch -- every
-    span in it -- counted only as an export that raised. The attribute is left
-    out now, named by a placeholder rather than by the key's own text, and the
-    batch ships."""
+    """A non-str key used to raise inside the encoder, and the client's drain
+    then dropped the whole batch -- every span in it -- counted only as an
+    export that raised. The attribute is left out now, named by a placeholder
+    rather than by the key's own text, and the batch ships. `set_attribute`
+    refuses such a key at the call, so it is written to the span's draft."""
     import wardex_sdk
     from wardex_sdk._assembly import counters
 
@@ -346,7 +346,9 @@ def test_a_non_str_attribute_key_costs_that_attribute_not_the_batch():
         with wardex_sdk.span("first"):
             pass
         with wardex_sdk.span("odd-key") as span:
-            span.set_attribute(123, "x")  # type: ignore[arg-type]
+            with pytest.raises(TypeError, match="key must be a str"):
+                span.set_attribute(123, "x")  # type: ignore[arg-type]
+            span._draft.set_extra(123, "x")  # type: ignore[arg-type]
             span.set_attribute("kept", "yes")
         with wardex_sdk.span("last"):
             pass
@@ -1002,11 +1004,14 @@ def test_the_missing_wheel_is_named_off_debug_even_with_a_spent_deadline(monkeyp
 
 def _bad_span_envelope(*names_ok: str) -> Envelope:
     """Spans named in `names_ok`, plus one whose tool block holds an int for a
-    name -- a value the marshaller cannot read, so the export skips it."""
+    name -- a value the marshaller cannot read, so the export skips it. The
+    constructor refuses that int, so it is written past it."""
     from wardex_sdk._types import ToolAttributes
 
     spans = tuple(_span(name=n) for n in names_ok)
-    bad = _span(name="SKIPPED-SPAN", tool=ToolAttributes(name=1))  # type: ignore[arg-type]
+    tool = ToolAttributes(name="placeholder")
+    object.__setattr__(tool, "name", 1)
+    bad = _span(name="SKIPPED-SPAN", tool=tool)
     return Envelope(header=_header(), spans=(*spans, bad))
 
 

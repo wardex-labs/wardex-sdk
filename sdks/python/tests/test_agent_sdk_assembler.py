@@ -291,6 +291,23 @@ def test_subagent_span_attribution():
     assert tool.parent_span_id == sub.context.span_id
 
 
+def test_a_subagent_hook_with_a_non_text_id_still_opens_the_subagent_span():
+    """The hook payload is the CLI's JSON, not a typed value: an id that
+    arrives as a number is the same id, written as text."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": 42, "agent_type": "r"}, None)
+    asm.on_hook("SubagentStop", {"session_id": "s-1", "agent_id": 42}, None)
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    sub = next(s for s in client.spans if s.name == "invoke_agent r")
+    assert sub.agent.id == "42"
+    assert sub.agent.name == "r"
+
+
 def test_abort_closes_open_spans_with_markers():
     client = FakeClient()
     asm = SessionAssembler(client)

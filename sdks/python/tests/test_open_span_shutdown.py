@@ -443,7 +443,7 @@ def test_close_from_another_thread_ships_the_open_run_marked_once():
         return "done"
 
     assert run() == "done"
-    (root,) = transport.named("run")
+    (root,) = transport.named("invoke_workflow run")
     (child,) = transport.named("child")
     assert Limitation.UNIT_INTERRUPTED in _markers(root)
     assert child.parent_span_id.value == root.context.span_id.value
@@ -492,10 +492,10 @@ def test_an_open_decorated_generator_ships_marked_at_close():
     items = stream()
     assert next(items) == 1
     wardex.close()
-    (shipped,) = transport.named("stream")
+    (shipped,) = transport.named("execute_tool stream")
     assert Limitation.UNIT_INTERRUPTED in _markers(shipped)
     assert list(items) == [2]  # the host's generator is not disturbed
-    assert len(transport.named("stream")) == 1
+    assert len(transport.named("execute_tool stream")) == 1
 
 
 # ==========================================================================

@@ -384,11 +384,12 @@ def test_gen_ai_property_assignment_counts_a_non_inclusive_block():
 def test_set_gen_ai_tolerates_non_numeric_counts():
     """A block carrying a string where a count belongs must not raise.
 
-    `GenAIAttributes` is a plain public dataclass with no runtime validation,
-    and `set_gen_ai` runs inside the host's own `with wardex.span(...)` block,
+    `GenAIAttributes` refuses such a string when it is built, so this one is
+    written past the constructor, the one way left to reach `set_gen_ai` with
+    it. `set_gen_ai` runs inside the host's own `with wardex.span(...)` block,
     outside every guard — a `TypeError` out of the inclusivity comparison
     would be wardex breaking the host over a diagnostic. Unknown types are
-    not violations: the tally stays at 0 and the block ships as given.
+    not violations: the tally stays at 0.
     """
     from wardex_sdk._assembly import AMBIENT, Ambient, SpanDraft, SpanIntent, resolve_parentage
     from wardex_sdk._enums import CaptureSource, OperationName
@@ -400,17 +401,14 @@ def test_set_gen_ai_tolerates_non_numeric_counts():
         source=CaptureSource.ADAPTER,
         start_ns=1,
     )
-    draft.set_gen_ai(
-        GenAIAttributes(
-            operation=OperationName.CHAT,
-            request_model="claude-sonnet-4-6",
-            input_tokens="1000",  # a JSON-borne string, not a count
-            cache_read_input_tokens=8000,
-        )
+    block = GenAIAttributes(
+        operation=OperationName.CHAT,
+        request_model="claude-sonnet-4-6",
+        cache_read_input_tokens=8000,
     )
+    object.__setattr__(block, "input_tokens", "1000")  # a JSON-borne string, not a count
+    draft.set_gen_ai(block)
     assert counters.get("assembly.builder.gen_ai_usage_not_inclusive") == 0
-    span = draft.finish(2)
-    assert span is not None and span.gen_ai.input_tokens == "1000"  # shipped as given
 
 
 def test_set_gen_ai_does_not_count_an_inclusive_block():

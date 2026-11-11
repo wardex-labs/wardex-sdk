@@ -21,19 +21,24 @@ wardex, or a span that silently covered nothing.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import inspect
+import json
 import types
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ParamSpec, TypeVar, overload
 
-from . import _hub
+from . import _hub, _values
 from ._assembly import degraded_run, guard, report_once
-from ._enums import OperationName, SpanKind
+from ._enums import OperationName, SpanKind, ToolExecutionType
 from ._source_paths import _call_site_file
-from ._tracing import _NULL_PARENTAGE, Span, _debug_enabled, _span, _WithOnly
+from ._tracing import _CURRENT_SPAN, _NULL_PARENTAGE, Span, _debug_enabled, _span, _WithOnly
 from ._types import AgentAttributes, CallSite, ToolAttributes
 from .context._contextvar import fork_scope
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 _FUNCTION = "function"
 _ASYNC = "async function"
@@ -144,10 +149,35 @@ def _keep_api(wrapper: Any, obj: object) -> None:
 
 
 def _name_of(fn: object, code: Any) -> str:
+    """The function's qualified name, `Researcher.run` rather than `run`.
+
+    Qualified so two classes' `run` methods are two names. Everything up to a
+    function's last `<locals>.` is dropped: the enclosing function of a closure
+    or a factory is where it was defined, not what it is, so
+    `make_app.<locals>.Researcher.run` reads as `Researcher.run`.
+    """
+    for candidate in (
+        getattr(fn, "__qualname__", None),
+        getattr(code, "__qualname__", None),
+        getattr(fn, "__name__", None),
+        getattr(code, "__name__", None),
+    ):
+        if isinstance(candidate, str) and candidate:
+            return candidate.rsplit("<locals>.", 1)[-1]
+    return type(fn).__name__
+
+
+def _identity_of(fn: object, code: Any) -> str | None:
+    """The function's own name, `run` rather than `Researcher.run`.
+
+    What the identity keys (`gen_ai.tool.name`, ...) carry: the name a model
+    calls the tool by and an adapter reports for it, so the same tool is one
+    identity whichever way it was traced. The span name stays qualified.
+    """
     for candidate in (getattr(fn, "__name__", None), getattr(code, "__name__", None)):
         if isinstance(candidate, str) and candidate:
             return candidate
-    return type(fn).__name__
+    return None
 
 
 def _call_site(code: Any) -> CallSite | None:
@@ -182,21 +212,29 @@ class _Steps:
     taking the installation down from a step resumed on another thread or task
     would raise. So the span's scope goes in for exactly one step and comes out
     after it, and whatever the body left installed (a `with wardex.span()` still
-    open across a `yield`) is what its next step resumes under. Only wardex's own
-    scope variable moves; the host's context variables are left as they are.
+    open across a `yield`) is what its next step resumes under, as the parent of
+    new work and as `current_span()`. Only wardex's own variables move; the
+    host's context variables are left as they are.
 
     A span wardex failed to open has no scope to install. Its steps run with the
     degraded-run flag up instead, which is what `_begin` does for a whole block.
     """
 
-    __slots__ = ("_degraded", "_outer", "_scope")
+    __slots__ = ("_current", "_degraded", "_inner", "_outer", "_scope", "_span")
 
-    def __init__(self, scope: Any, *, degraded: bool) -> None:
+    def __init__(self, scope: Any, span: Span, *, degraded: bool) -> None:
         self._scope = scope
+        self._span = span
         self._degraded = degraded
         self._outer: Any = None
+        self._current: Any = None
+        self._inner: Span | None = None  # a body's span still open after its last step
 
     def __enter__(self) -> None:
+        self._span._outer = _CURRENT_SPAN.get()
+        inner = self._inner
+        # A closed inner span is fine here: `current_span()` steps past it.
+        self._current = _CURRENT_SPAN.set(self._span if inner is None else inner)
         if self._degraded:
             flag = degraded_run()
             flag.__enter__()
@@ -206,6 +244,10 @@ class _Steps:
             _hub._current_scope.set(self._scope)
 
     def __exit__(self, *exc: object) -> None:
+        current, self._current = self._current, None
+        left = _CURRENT_SPAN.get()
+        self._inner = None if left is self._span else left
+        _CURRENT_SPAN.reset(current)  # one step runs in one Context
         if self._degraded:
             flag, self._outer = self._outer, None
             flag.__exit__(None, None, None)
@@ -217,7 +259,7 @@ class _Steps:
 
 def _steps_for(span: Span) -> _Steps:
     if span._draft._parentage is _NULL_PARENTAGE:
-        return _Steps(None, degraded=True)
+        return _Steps(None, span, degraded=True)
     scope = None
     with guard("tracing.generator_scope", debug=_debug_enabled()):
         scope = fork_scope(span.context)
@@ -228,7 +270,7 @@ def _steps_for(span: Span) -> _Steps:
             "(re-run with debug=True for the traceback)",
             key="wardex.span.generator_scope",
         )
-    return _Steps(scope, degraded=False)
+    return _Steps(scope, span, degraded=False)
 
 
 def _decorate(
@@ -236,19 +278,40 @@ def _decorate(
     *,
     api: str,
     name: str | None,
-    op: OperationName | None,
-    kind: SpanKind = SpanKind.INTERNAL,
+    op: OperationName,
     agent: AgentAttributes | None = None,
     tool: ToolAttributes | None = None,
-    names_workflow: bool = False,
-) -> Callable[..., Any]:
+    capture_io: bool = False,
+) -> Any:
     """The one body behind the four decorators.
 
     `fn` is non-None exactly when the decorator was applied BARE (`@wardex.tool`
     over the function itself); with keywords, `fn` is None and the returned
-    `deco` is what wraps. `name=None` resolves to the function's name at
-    decoration time, so the two forms name spans identically.
+    `deco` is what wraps. `name=None` resolves at decoration time to the
+    attributes' name, else the function's name, so the two forms name spans
+    identically.
+
+    The span is shaped like the one an adapter opens for the same operation:
+    named `"{operation} {subject}"` (`invoke_agent researcher`), and carrying
+    the identity semconv key: `gen_ai.agent.name` from an `AgentAttributes`,
+    `gen_ai.tool.name` from a `ToolAttributes`, `gen_ai.workflow.name`, or
+    `wardex.step.name`. Without a given name, the span name is the qualified
+    one (`Researcher.run`, so two classes' methods differ) and the identity
+    key the function's own (`run`), the name an adapter would report. An
+    agent block built here states no `wardex.agent.type`: running a function
+    shows neither that it is the primary agent nor whose sub-agent it is.
     """
+    if name is not None:
+        _values.text(f"wardex.{api}() name", name)
+    _values.block(f"wardex.{api}() attributes", AgentAttributes, agent)
+    _values.block(f"wardex.{api}() attributes", ToolAttributes, tool)
+    given = agent if agent is not None else tool
+    if given is not None and name is not None and given.name != name:
+        raise ValueError(
+            f"wardex.{api}(name={name!r}) disagrees with attributes.name={given.name!r}: "
+            "the span would name one and export the other. Give one of them, or the "
+            "same name in both."
+        )
 
     def deco(fn: Any) -> Any:
         if isinstance(fn, (staticmethod, classmethod)):
@@ -263,19 +326,61 @@ def _decorate(
         return wrapper
 
     def shaped(fn: Any, shape: str, code: Any) -> Any:
-        span_name = name if name is not None else _name_of(fn, code)
-        workflow_name = span_name if names_workflow else None
+        chosen = name or (given.name if given is not None else None)
+        span_name = f"{op.value} {chosen or _name_of(fn, code)}"
+        identity = chosen or _identity_of(fn, code) or _name_of(fn, code)
+        agent_block = agent
+        tool_block = tool
+        if api == "agent" and agent_block is None:
+            agent_block = AgentAttributes(name=identity, agent_type=None)
+        if api == "tool":
+            # The decorator ran the body in this process, which is the one fact
+            # about the tool's execution it observed.
+            if tool_block is None:
+                tool_block = ToolAttributes(
+                    name=identity, execution_type=ToolExecutionType.IN_PROCESS
+                )
+            elif tool_block.execution_type is ToolExecutionType.UNKNOWN:
+                tool_block = dataclasses.replace(
+                    tool_block, execution_type=ToolExecutionType.IN_PROCESS
+                )
+        workflow_name = identity if api == "workflow" else None
+        step_name = identity if api == "step" else None
         cs = _call_site(code)
+        signature = _signature(fn) if capture_io else None
 
         def opened(*, stepped: bool = False) -> _WithOnly:
-            return _WithOnly("span", _span(span_name, op, kind, agent, tool, stepped=stepped))
+            return _WithOnly(
+                "span",
+                _span(span_name, op, SpanKind.INTERNAL, agent_block, tool_block, stepped=stepped),
+            )
+
+        def begin(s: Span, args: Any, kwargs: Any) -> None:
+            draft = s._draft
+            draft.set_call_site(cs)
+            draft.set_workflow_name(workflow_name)
+            if step_name is not None:
+                draft.set_extra("wardex.step.name", step_name)
+            if capture_io:
+                with guard("tracing.decorator_capture_input", debug=_debug_enabled()):
+                    limit = _capture_limit()
+                    if limit is not None:
+                        draft._input_data = _arguments_json(signature, args, kwargs, limit)
+
+        def end(s: Span, result: Any) -> Any:
+            if capture_io:
+                with guard("tracing.decorator_capture_output", debug=_debug_enabled()):
+                    limit = _capture_limit()
+                    if limit is not None:
+                        s._draft._output_data = _result_bytes(result, limit)
+            return result
 
         if shape == _ASYNC_GENERATOR:
 
             @functools.wraps(fn)
             async def agen_wrapper(*args: Any, **kwargs: Any) -> Any:
                 with opened(stepped=True) as s:
-                    s.call_site, s.workflow_name = cs, workflow_name
+                    begin(s, args, kwargs)
                     steps = _steps_for(s)
                     with steps:
                         agen = fn(*args, **kwargs)
@@ -304,7 +409,7 @@ def _decorate(
             @functools.wraps(fn)
             def gen_wrapper(*args: Any, **kwargs: Any) -> Any:
                 with opened(stepped=True) as s:
-                    s.call_site, s.workflow_name = cs, workflow_name
+                    begin(s, args, kwargs)
                     steps = _steps_for(s)
                     with steps:
                         gen = fn(*args, **kwargs)
@@ -333,16 +438,16 @@ def _decorate(
             @functools.wraps(fn)
             async def awrapper(*args: Any, **kwargs: Any) -> Any:
                 with opened() as s:
-                    s.call_site, s.workflow_name = cs, workflow_name
-                    return await fn(*args, **kwargs)
+                    begin(s, args, kwargs)
+                    return end(s, await fn(*args, **kwargs))
 
             return awrapper
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             with opened() as s:
-                s.call_site, s.workflow_name = cs, workflow_name
-                return fn(*args, **kwargs)
+                begin(s, args, kwargs)
+                return end(s, fn(*args, **kwargs))
 
         return wrapper
 
@@ -351,39 +456,224 @@ def _decorate(
     return deco
 
 
+# -- capture_io: what the decorated function was called with and returned ----
+
+#: The longest `repr()` kept for an argument JSON cannot hold. A repr is the
+#: object's own code, and a host opting in to argument capture is not opting in
+#: to one object's megabyte repr per call.
+_REPR_MAX_CHARS = 1024
+
+
+def _signature(fn: Any) -> inspect.Signature | None:
+    try:
+        return inspect.signature(fn)
+    except (TypeError, ValueError):  # a builtin with no signature: arguments by position
+        return None
+
+
+def _repr_of(value: object) -> str:
+    """`repr(value)`, cut; never raises, because a host's `__repr__` may."""
+    try:
+        text = repr(value)
+    except Exception:
+        return f"<unprintable {type(value).__name__}>"
+    if len(text) > _REPR_MAX_CHARS:
+        return text[:_REPR_MAX_CHARS] + "...<truncated>"
+    return text
+
+
+_ENCODER = json.JSONEncoder(ensure_ascii=False, default=_repr_of)
+
+#: What JSON encoding raises for a value it cannot write: a key that is not a
+#: str or number, a reference cycle, nesting past the recursion limit.
+_UNENCODABLE = (TypeError, ValueError, RecursionError)
+
+
+#: The last client's limits and the cap they resolve to: resolving reads the
+#: core's table, which is not worth repeating on every captured call.
+_resolved_cap: tuple[object, int] | None = None
+
+
+def _capture_limit() -> int | None:
+    """How many characters of a captured value are worth encoding, or None to skip.
+
+    The export cap, `LimitsConfig.max_otlp_attribute_bytes`: past it the
+    exporter cuts the value anyway, so encoding more would cost the host's
+    thread and the span buffer for bytes that never ship. None before
+    `init()`, where the span records nothing.
+    """
+    global _resolved_cap
+    client = _hub.get_client()
+    if client is None:
+        return None
+    limits = client.config.limits
+    cached = _resolved_cap
+    if cached is None or cached[0] is not limits:
+        cached = _resolved_cap = (limits, limits.resolved()["max_otlp_attribute_bytes"])
+    return cached[1]
+
+
+def _bounded_json(value: object, limit: int) -> bytes:
+    """`value`'s JSON text, encoded only until it is longer than `limit` characters.
+
+    A value that does not fit is cut one character past `limit`, so the
+    exporter still sees it over the cap, cuts it there and marks the span
+    `otlp_attribute_truncated` as it does any payload it shortens. The
+    incremental encoder is what stops early: a ten-million-item list costs
+    what its first `limit` characters cost.
+    """
+    pieces: list[str] = []
+    size = 0
+    for piece in _ENCODER.iterencode(value):
+        pieces.append(piece)
+        size += len(piece)
+        if size > limit:
+            break
+    return "".join(pieces)[: limit + 1].encode("utf-8", "backslashreplace")
+
+
+def _encodable(value: object, limit: int) -> object:
+    """`value` if JSON can write it, else its `repr()`."""
+    try:
+        _bounded_json(value, limit)
+    except _UNENCODABLE:
+        return _repr_of(value)
+    return value
+
+
+def _arguments_json(
+    signature: inspect.Signature | None, args: Any, kwargs: Any, limit: int
+) -> bytes:
+    """The call's arguments by parameter name, as JSON; `repr()` for what JSON cannot hold.
+
+    A method's `self` or `cls` is left out: it is the object, not an input.
+    """
+    arguments: dict[str, Any] | None = None
+    if signature is not None:
+        try:
+            arguments = dict(signature.bind_partial(*args, **kwargs).arguments)
+        except TypeError:  # the call itself is wrong, and the body will say so
+            arguments = None
+        else:
+            first = next(iter(signature.parameters), None)
+            if first in ("self", "cls"):
+                arguments.pop(first, None)
+    if arguments is None:
+        arguments = {"args": list(args), **kwargs}
+    try:
+        return _bounded_json(arguments, limit)
+    except _UNENCODABLE:
+        return _bounded_json({key: _encodable(v, limit) for key, v in arguments.items()}, limit)
+
+
+def _result_bytes(result: object, limit: int) -> bytes:
+    if isinstance(result, str):
+        return _values.raw("capture_io", result[: limit + 1])
+    if isinstance(result, (bytes, bytearray)):
+        return bytes(result[: limit + 1])
+    if isinstance(result, memoryview):
+        return bytes(result)[: limit + 1]
+    try:
+        return _bounded_json(result, limit)
+    except _UNENCODABLE:
+        return _bounded_json(_repr_of(result), limit)
+
+
+# -- the four decorators ------------------------------------------------------
+#
+# Each has two overloads, so a type checker sees the wrapped function's own
+# signature through both `@wardex.agent` and `@wardex.agent(name=...)`.
+
+
+@overload
+def workflow(fn: Callable[P, R]) -> Callable[P, R]: ...
+@overload
 def workflow(
-    fn: Callable[..., Any] | None = None, *, name: str | None = None
-) -> Callable[..., Any]:
-    return _decorate(
-        fn, api="workflow", name=name, op=OperationName.INVOKE_WORKFLOW, names_workflow=True
-    )
+    fn: None = None, *, name: str | None = None
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+def workflow(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
+    """A whole run: `invoke_workflow {name}`, with `gen_ai.workflow.name`."""
+    return _decorate(fn, api="workflow", name=name, op=OperationName.INVOKE_WORKFLOW)
 
 
+@overload
+def agent(fn: Callable[P, R]) -> Callable[P, R]: ...
+@overload
+def agent(
+    fn: None = None,
+    *,
+    name: str | None = None,
+    attributes: AgentAttributes | None = None,
+    capture_io: bool = False,
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 def agent(
     fn: Callable[..., Any] | None = None,
     *,
     name: str | None = None,
     attributes: AgentAttributes | None = None,
-) -> Callable[..., Any]:
-    return _decorate(fn, api="agent", name=name, op=OperationName.INVOKE_AGENT, agent=attributes)
+    capture_io: bool = False,
+) -> Any:
+    """An agent's invocation: `invoke_agent {name}`, with `gen_ai.agent.name`.
+
+    `attributes` adds the rest of the agent's identity; its `name` must match
+    `name=` when both are given. `capture_io=True` records the call's arguments
+    and return value as the span's input and output (JSON, `repr()` for what
+    JSON cannot hold), masked and capped at export like any payload.
+    """
+    return _decorate(
+        fn,
+        api="agent",
+        name=name,
+        op=OperationName.INVOKE_AGENT,
+        agent=attributes,
+        capture_io=capture_io,
+    )
 
 
+@overload
+def tool(fn: Callable[P, R]) -> Callable[P, R]: ...
+@overload
+def tool(
+    fn: None = None,
+    *,
+    name: str | None = None,
+    attributes: ToolAttributes | None = None,
+    capture_io: bool = False,
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 def tool(
     fn: Callable[..., Any] | None = None,
     *,
     name: str | None = None,
     attributes: ToolAttributes | None = None,
-) -> Callable[..., Any]:
-    return _decorate(fn, api="tool", name=name, op=OperationName.EXECUTE_TOOL, tool=attributes)
+    capture_io: bool = False,
+) -> Any:
+    """A tool call: `execute_tool {name}`, with `gen_ai.tool.name`.
+
+    The execution type is `in_process` (the decorator ran the body) unless
+    `attributes` names another. `capture_io=True` records the arguments and
+    result as `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`.
+    """
+    return _decorate(
+        fn,
+        api="tool",
+        name=name,
+        op=OperationName.EXECUTE_TOOL,
+        tool=attributes,
+        capture_io=capture_io,
+    )
 
 
-def step(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Callable[..., Any]:
+@overload
+def step(fn: Callable[P, R]) -> Callable[P, R]: ...
+@overload
+def step(
+    fn: None = None, *, name: str | None = None
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+def step(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
     """One step of a larger run — a graph node, a pipeline stage, a phase.
 
-    Maps to `OperationName.EXECUTE_STEP`, so its spans appear on
-    operation-keyed dashboards like every other decorator's (the old `task()`
-    mapped no operation, and its spans vanished from any view keyed on
-    `gen_ai.operation.name`). "step" also stays clear of the "task" asyncio,
-    Celery and LangGraph each already mean something else by.
+    `execute_step {name}`, with `wardex.step.name`, as an adapter names a graph
+    node. "step" also stays clear of the "task" asyncio, Celery and LangGraph
+    each already mean something else by.
     """
     return _decorate(fn, api="step", name=name, op=OperationName.EXECUTE_STEP)

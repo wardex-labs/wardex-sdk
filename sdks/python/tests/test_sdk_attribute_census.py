@@ -218,7 +218,9 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_GENAI, "REQUEST_CONVERSATION_KEY", "stated", HOST),
     (_GENAI, "REQUEST_CONVERSATION_KEY", "stated", HOST),
     # -- the published API: `Span.set_attribute` and a snapshot's attributes --
-    ("_tracing.py", "key", "value", HOST),
+    ("_tracing.py", "key", "stored", HOST),
+    # The name a host gave `@wardex.step`, or its function's name: the host's.
+    ("_decorators.py", "'wardex.step.name'", "step_name", HOST),
     ("_assembly/_snapshot.py", "key", "value", HOST),
 ]
 

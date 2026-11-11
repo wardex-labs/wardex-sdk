@@ -84,7 +84,7 @@ from ._scope import NO_USER as _NO_USER
 from ._scope import Scope, UserInfo
 from ._scope import user_from_call as _user_from_call
 from ._snapshot_api import capture_state_snapshot
-from ._tracing import Span, conversation, span
+from ._tracing import Span, conversation, current_span, span
 from ._types import (
     AgentAttributes,
     BeforeSendEnvelopeCallback,
@@ -120,6 +120,7 @@ __all__ = [
     "init",
     "conversation",
     "span",
+    "current_span",
     "workflow",
     "agent",
     "step",

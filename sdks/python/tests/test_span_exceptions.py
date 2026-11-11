@@ -64,8 +64,17 @@ class ToolFailed(Exception):
 
 
 def _spans(t: _Recording) -> dict:
+    """Spans keyed by subject: `execute_tool search` is `search` here."""
     _hub.get_client().flush()
-    return {sp.name: sp for env in t.envelopes for sp in env.spans}
+    return {_subject(sp.name): sp for env in t.envelopes for sp in env.spans}
+
+
+def _subject(name: str) -> str:
+    """A span name without the operation a decorator's span name starts with."""
+    for operation in ("invoke_workflow", "invoke_agent", "execute_tool", "execute_step"):
+        if name.startswith(operation + " "):
+            return name[len(operation) + 1 :]
+    return name
 
 
 def _exception_events(sp) -> list[dict]:
@@ -85,7 +94,12 @@ def _otlp_events(t: _Recording, name: str) -> list[dict]:
             decoded = native.codec.decode_otlp_traces(gzip.decompress(body))
             for rs in decoded["resource_spans"]:
                 for ss in rs["scope_spans"]:
-                    out += [ev for sp in ss["spans"] if sp["name"] == name for ev in sp["events"]]
+                    out += [
+                        ev
+                        for sp in ss["spans"]
+                        if _subject(sp["name"]) == name
+                        for ev in sp["events"]
+                    ]
     return out
 
 
@@ -98,7 +112,7 @@ def _envelope_events(t: _Recording, name: str) -> list[dict]:
         )
         for item in decode(wire)["items"]:
             sp = item.get("span")
-            if sp and sp["name"] == name:
+            if sp and _subject(sp["name"]) == name:
                 out += [
                     {**ev, "attributes": {a["key"]: a["value"] for a in ev["attributes"]}}
                     for ev in sp["events"]

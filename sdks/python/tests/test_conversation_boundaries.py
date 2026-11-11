@@ -116,7 +116,11 @@ def test_a_trace_continued_inside_a_conversation_keeps_the_conversation(llm, ent
         _post(host, port, "after-block")
 
     spans = _shipped(run)
-    for span in (_named(spans, "handle"), _named(spans, "lookup"), _call(spans, "in-request")):
+    for span in (
+        _named(spans, "handle"),
+        _named(spans, "execute_tool lookup"),
+        _call(spans, "in-request"),
+    ):
         assert _conv(span) == "X", span.name
     assert _conv(_call(spans, "after-block")) is None
 

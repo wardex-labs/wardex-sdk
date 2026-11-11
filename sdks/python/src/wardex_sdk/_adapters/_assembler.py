@@ -500,7 +500,7 @@ class SessionAssembler:
                     )
                     draft.set_agent(
                         AgentAttributes(
-                            name=agent_type, id=agent_id, agent_type=AgentType.SUB_AGENT
+                            name=str(agent_type), id=str(agent_id), agent_type=AgentType.SUB_AGENT
                         )
                     )
                     draft.add_limitation(_BASE_LIMITATION)

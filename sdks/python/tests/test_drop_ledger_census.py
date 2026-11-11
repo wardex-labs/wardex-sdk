@@ -686,6 +686,9 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_tracing.py", "bump", "'tracing.block_scope_retired'"): NotADrop(
         "a block taken down from another context; the consumer gets its own scope back"
     ),
+    ("_tracing.py", "bump", "'tracing.manual_span_unshippable'"): L("UNMARSHALLABLE"),
+    ("_tracing.py", "record", "DropReason.UNMARSHALLABLE"): L("UNMARSHALLABLE"),
+    ("_tracing.py", "report_once", "'tracing.manual_span_unshippable'"): L("UNMARSHALLABLE"),
     # -- the byte seams and protocols
     ("_interceptors/_http1_requests.py", "bump", "'protocol.http1.request_unfinished'"): _SEAM,
     ("_interceptors/_http1_requests.py", "bump", "'protocol.http1.request_unobserved'"): _SEAM,

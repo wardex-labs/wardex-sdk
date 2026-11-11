@@ -625,7 +625,11 @@ def test_a_lazy_proxy_attribute_neither_runs_nor_loses_the_span(thunk):
     """Counting dispatched on `isinstance`, which reads `__class__`: the proxy
     evaluated what it wraps on the capture path, then claimed to be a `str`
     that `str.__len__` refused, or raised outright -- and the manual span was
-    lost. The count reads the real type, which runs nothing."""
+    lost. The count reads the real type, which runs nothing.
+
+    `set_attribute` refuses the proxy at the call, also without running it, so
+    the value reaches the span the way an attribute that skipped that check
+    would: through the draft."""
     import wardex_sdk
     from wardex_sdk import _hub
 
@@ -635,7 +639,9 @@ def test_a_lazy_proxy_attribute_neither_runs_nor_loses_the_span(thunk):
         client = _hub.get_client()
         client._worker.stop()
         with wardex_sdk.span("request") as span:
-            span.set_attribute("user", proxy)  # type: ignore[arg-type]
+            with pytest.raises(TypeError, match="_LazyProxy"):
+                span.set_attribute("user", proxy)  # type: ignore[arg-type]
+            span._draft.set_extra("user", proxy)  # type: ignore[arg-type]
         client._settle()
         assert [s.name for s in client._spans] == ["request"]
         assert proxy.evaluations == 0, "counting the span ran the proxy's code"

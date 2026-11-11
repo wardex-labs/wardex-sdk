@@ -204,6 +204,15 @@ def _counter(name: str) -> int:
     return counters.get(name)
 
 
+def _unchecked_tool(**fields: object) -> ToolAttributes:
+    """A tool block holding values its constructor refuses: written past the
+    constructor, the one way such a value still reaches the encoder."""
+    block = ToolAttributes(name="placeholder")
+    for field, value in fields.items():
+        object.__setattr__(block, field, value)
+    return block
+
+
 def test_one_unmarshallable_span_costs_that_span_not_the_batch(receiver):
     """End to end through the client's drain. A tool block holding an int for
     a name cannot be marshalled; on this wire that used to raise out of the
@@ -214,8 +223,8 @@ def test_one_unmarshallable_span_costs_that_span_not_the_batch(receiver):
     wardex_sdk.init(transport=WardexTransport(receiver, KEY), intercept=False)
     with wardex_sdk.span("good-a"):
         pass
-    with wardex_sdk.span("bad", tool=ToolAttributes(name=123)):  # type: ignore[arg-type]
-        pass
+    with wardex_sdk.span("bad") as bad:
+        bad._draft._tool = _unchecked_tool(name=123)
     with wardex_sdk.span("good-b"):
         pass
     wardex_sdk.flush()
@@ -240,7 +249,7 @@ def test_a_batch_with_no_marshallable_span_is_not_posted(receiver):
     every retry and pin the buffer."""
     before = _counter("transport.wardex.span_unmarshalled")
     t = WardexTransport(receiver, KEY)
-    bad = _span("bad", tool=ToolAttributes(name=123))  # type: ignore[arg-type]
+    bad = _span("bad", tool=_unchecked_tool(name=123))
     assert t.export(_envelope(bad)) is None
     assert _Handler.received == {}
     assert _counter("transport.wardex.span_unmarshalled") == before + 1
@@ -271,7 +280,7 @@ def test_an_unmarshallable_span_puts_no_host_text_on_stderr_off_debug(receiver):
         level = logger.level
         logger.setLevel(logging.DEBUG)
         try:
-            bad = _span("SECRET-SPAN-NAME", tool=ToolAttributes(name=4711))  # type: ignore[arg-type]
+            bad = _span("SECRET-SPAN-NAME", tool=_unchecked_tool(name=4711))
             WardexTransport(receiver, KEY, debug=debug).export(_envelope(_span("good"), bad))
         finally:
             logger.removeHandler(handler)
@@ -289,7 +298,7 @@ def test_the_fidelity_encoder_still_raises_on_an_unmarshallable_span():
     """The skip belongs to the export path only. The round-trip encoder raises,
     because a round trip that silently lost a span would misreport what it
     round-tripped."""
-    bad = _span("bad", tool=ToolAttributes(name=123))  # type: ignore[arg-type]
+    bad = _span("bad", tool=_unchecked_tool(name=123))
     with pytest.raises(Exception):  # noqa: B017 - the exact type is the marshaller's
         _wardex_native.codec.encode_envelope(_envelope(_span("good"), bad))
 
@@ -322,7 +331,7 @@ def test_a_keyboard_interrupt_while_marshalling_reaches_the_host(receiver):
     calls is the host's control flow: it propagates, it is not counted as one
     more skipped span, and nothing is posted."""
     before = _counter("transport.wardex.span_unmarshalled")
-    bad = _span("bad", tool=ToolAttributes(name="t", type=_InterruptingType()))  # type: ignore[arg-type]
+    bad = _span("bad", tool=_unchecked_tool(name="t", type=_InterruptingType()))
     with pytest.raises(KeyboardInterrupt):
         WardexTransport(receiver, KEY).export(_envelope(_span("good"), bad))
     assert _Handler.received == {}
@@ -335,7 +344,7 @@ def test_a_retried_batch_counts_its_unmarshallable_span_once(receiver):
     it is counted on the attempt that decides its fate, not on every one."""
     before = _counter("transport.wardex.span_unmarshalled")
     t = WardexTransport(receiver, KEY)
-    env = _envelope(_span("good"), _span("bad", tool=ToolAttributes(name=123)))  # type: ignore[arg-type]
+    env = _envelope(_span("good"), _span("bad", tool=_unchecked_tool(name=123)))
     assert t.export(env, timeout=1e-9) is UNDELIVERED
     assert _counter("transport.wardex.span_unmarshalled") == before
     assert t.export(env) is None
@@ -367,7 +376,7 @@ def test_init_debug_reveals_the_skipped_span_names_for_a_hand_built_transport(re
     level = logger.level
     logger.setLevel(logging.DEBUG)
     try:
-        bad = _span("NAMED-BAD-SPAN", tool=ToolAttributes(name=123))  # type: ignore[arg-type]
+        bad = _span("NAMED-BAD-SPAN", tool=_unchecked_tool(name=123))
         t.export(_envelope(_span("good"), bad))
     finally:
         logger.removeHandler(handler)
@@ -397,7 +406,7 @@ def test_a_host_exception_that_cannot_be_displayed_still_costs_one_span(receiver
             raise _Undisplayable("x")
 
     before = _counter("transport.wardex.span_unmarshalled")
-    bad = _span("bad", tool=ToolAttributes(name="t", type=_RaisesUndisplayable()))  # type: ignore[arg-type]
+    bad = _span("bad", tool=_unchecked_tool(name="t", type=_RaisesUndisplayable()))
     assert WardexTransport(receiver, KEY).export(_envelope(_span("good"), bad)) is None
     decoded = _wardex_native.codec.decode_envelope(_Handler.received["body"])
     assert [item["span"]["name"] for item in decoded["items"]] == ["good"]
@@ -433,7 +442,7 @@ def test_a_keyboard_interrupt_while_naming_a_skipped_span_reaches_the_host(recei
             raise raised("x")
 
     before = _counter("transport.wardex.span_unmarshalled")
-    bad = _span("bad", tool=ToolAttributes(name="t", type=_Raises()))  # type: ignore[arg-type]
+    bad = _span("bad", tool=_unchecked_tool(name="t", type=_Raises()))
     with pytest.raises(KeyboardInterrupt):
         WardexTransport(receiver, KEY).export(_envelope(_span("good"), bad))
     assert _Handler.received == {}

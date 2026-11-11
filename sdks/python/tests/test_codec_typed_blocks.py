@@ -331,6 +331,20 @@ def test_a_turn_index_past_int32_is_named_not_wrapped():
     assert _extra_dict(span)["wardex.codec.unmarshalled"] == "wardex.conversation.turn_index"
 
 
+def _unchecked_tool(**fields: object) -> ToolAttributes:
+    """A tool block holding values its constructor refuses.
+
+    `ToolAttributes` checks its fields when built, so a wrong type reaches the
+    encoder only by a route that skipped the constructor (a field written with
+    `object.__setattr__`, as here). The encoder still has to cost such a block
+    its own span and nothing else.
+    """
+    block = ToolAttributes(name="placeholder")
+    for field, value in fields.items():
+        object.__setattr__(block, field, value)
+    return block
+
+
 def test_a_batch_with_one_unmarshallable_span_ships_the_other_spans():
     """The EXPORT path. One span whose tool block holds an int for a name
     cannot be marshalled at all; before, that raise reached the client's
@@ -342,7 +356,7 @@ def test_a_batch_with_one_unmarshallable_span_ships_the_other_spans():
     from wardex_sdk.testing import RecordingTransport
 
     good_a = _span(name="good-a")
-    bad = _span(name="bad", tool=ToolAttributes(name=123))  # type: ignore[arg-type]
+    bad = _span(name="bad", tool=_unchecked_tool(name=123))
     good_b = _span(name="good-b")
     env = Envelope(header=_env(good_a).header, spans=(good_a, bad, good_b))
     bodies = RecordingTransport().encode(env, compress=False)
@@ -434,7 +448,7 @@ def test_a_keyboard_interrupt_while_marshalling_is_not_an_unmarshallable_span():
             raise KeyboardInterrupt("ctrl-c while wardex read a host value")
 
     before = counters.get("transport.otlp.span_unmarshalled")
-    bad = _span(name="bad", tool=ToolAttributes(name="t", type=_Interrupting()))  # type: ignore[arg-type]
+    bad = _span(name="bad", tool=_unchecked_tool(name="t", type=_Interrupting()))
     env = Envelope(header=_env(bad).header, spans=(_span(name="good"), bad))
     with pytest.raises(KeyboardInterrupt):
         RecordingTransport().encode(env, compress=False)
