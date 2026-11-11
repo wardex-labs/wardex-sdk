@@ -45,6 +45,7 @@ WARDEX_ENV_NAMES = (
     "WARDEX_RELEASE",
     "WARDEX_ENVIRONMENT",
     "WARDEX_DEBUG",
+    "WARDEX_PII",
 )
 
 #: `WARDEX_*` names the SDK never reads that are nonetheless not mistakes: this
@@ -58,6 +59,23 @@ _RESERVED_ENV_NAMES = frozenset(
 #: The OpenTelemetry spellings `backend.endpoint` falls back to after
 #: `WARDEX_ENDPOINT`, specific before generic.
 _OTEL_ENDPOINT_NAMES = ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT")
+
+
+#: The spellings `WARDEX_PII` accepts, compared stripped and lowercased.
+_PII_ON = frozenset({"on", "1", "true", "yes"})
+_PII_OFF = frozenset({"off", "0", "false", "no"})
+
+
+def pii_off_from_env() -> bool | None:
+    """`WARDEX_PII` read as a switch: True for `off` (`init()` says so once on stderr), False for
+    `on`, None when it is unset, empty or neither. None keeps the default, masking on: a typo
+    must not export unmasked text."""
+    raw = os.environ.get("WARDEX_PII", "").strip().lower()
+    if raw in _PII_OFF:
+        return True
+    if raw in _PII_ON:
+        return False
+    return None
 
 
 def closest(name: str, candidates: Iterable[str]) -> str | None:

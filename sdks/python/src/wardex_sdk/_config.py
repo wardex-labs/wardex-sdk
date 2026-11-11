@@ -63,6 +63,7 @@ from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from urllib.parse import unquote
 
+from . import _config_checks
 from ._config_checks import endpoint_from_env, refuses_unknown_keywords, require_http_url
 from ._enums import (
     AdapterName,
@@ -285,6 +286,7 @@ class PIIConfig:
     """What leaves the process, and in what shape."""
 
     mode: PIIMode = PIIMode.MASK
+    """Without a `pii=` argument, `init()` reads `WARDEX_PII` (`off` turns masking off)."""
     disabled_categories: AbstractSet[PIICategory] = frozenset()
     """Categories exempted from masking. Accepts any iterable of
     `PIICategory`; reads back as a `frozenset`. Has no effect when `mode` is
@@ -763,6 +765,7 @@ def _resolve_config(
     keeps `()` distinct from `None`: an empty tuple is a choice, not the
     absence of one.
     """
+    off = _config_checks.pii_off_from_env()
     given = backend if backend is not None else BackendConfig()
     resolved_backend = BackendConfig(
         api_key=given.api_key or os.environ.get("WARDEX_API_KEY"),
@@ -772,7 +775,7 @@ def _resolve_config(
     )
     return WardexConfig(
         backend=resolved_backend,
-        pii=pii if pii is not None else PIIConfig(),
+        pii=pii if pii is not None else PIIConfig(mode=PIIMode.OFF if off else PIIMode.MASK),
         batching=batching if batching is not None else BatchingConfig(),
         limits=limits if limits is not None else LimitsConfig(),
         propagation=propagation if propagation is not None else PropagationConfig(),

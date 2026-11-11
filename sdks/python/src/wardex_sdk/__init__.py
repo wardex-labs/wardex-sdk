@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os as _os
 import warnings as _warnings
 from collections.abc import Iterator as _Iterator
 from collections.abc import Sequence as _Sequence
@@ -34,6 +35,7 @@ from ._config import _resolve_config as _resolve_config_from_env
 from ._config import region_of_key as _region_of_key
 from ._config_checks import endpoint_named_for_wardex as _endpoint_named_for_wardex
 from ._config_checks import env_typo_messages as _env_typo_messages
+from ._config_checks import pii_off_from_env as _pii_off_from_env
 from ._config_checks import unusable_env_endpoint as _unusable_env_endpoint
 from ._decorators import agent, step, tool, workflow
 from ._diagnostics import AdapterStatus, Diagnostics, Loss
@@ -175,6 +177,22 @@ __all__ = [
 ]
 
 
+def _announce_pii_env(mode: PIIMode) -> None:
+    """Say on stderr what `WARDEX_PII` did to an `init()` with no `pii=` argument: masking off, or
+    a value that is neither on nor off and so left masking on."""
+    raw = _os.environ.get("WARDEX_PII", "")
+    if mode is PIIMode.OFF:
+        _diag_info(
+            f"PII masking is off (WARDEX_PII={raw.strip()}): captured text is exported as "
+            "written, URL credentials excepted. Unset WARDEX_PII or set it to on to mask it."
+        )
+    elif raw.strip() and _pii_off_from_env() is None:
+        _diag_warning(
+            f"WARDEX_PII={raw[:40]!r} is not on or off, so masking stays on. "
+            "Set WARDEX_PII=off to turn masking off, or on to keep it."
+        )
+
+
 def _traces_endpoint(endpoint: str) -> str:
     """The URL the default OTLP/HTTP transport actually POSTs to.
 
@@ -228,6 +246,7 @@ def init(
         release              WARDEX_RELEASE
         environment          WARDEX_ENVIRONMENT
         debug                WARDEX_DEBUG=true (case-insensitive)
+        pii.mode             WARDEX_PII=off (on, the default, masks)
 
     so `wardex.init()` with only `WARDEX_API_KEY` set is a working first run.
     A set `WARDEX_*` variable outside this table is named in a
@@ -397,6 +416,8 @@ def init(
                     WardexConfigWarning,
                     stacklevel=2,
                 )
+    if pii is None:
+        _announce_pii_env(config.pii.mode)
     if config.debug:
         # One line, at install time, with the RESOLVED config — the env
         # fallbacks and canonicalized collections included. `api_key` is
