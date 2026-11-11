@@ -29,7 +29,8 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub, _source_paths, _tracing
-from wardex_sdk._assembly import counters
+from wardex_sdk._assembly import _ledger, counters
+from wardex_sdk._assembly._ledger import DropReason
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import StatusCode
@@ -773,23 +774,42 @@ def _stack_depth() -> int:
     return n
 
 
+def _lowest_recursion_limit() -> int:
+    """The lowest limit `sys.setrecursionlimit` accepts from the caller's depth.
+
+    This is the only floor that means the same on every interpreter: 3.10 counts
+    C-level calls in the depth it checks the new limit against, so from inside a
+    test runner its floor sits several frames above the Python frames
+    `_stack_depth` counts, while 3.12+ counts Python frames alone.
+    """
+    n = _stack_depth()
+    while True:
+        try:
+            sys.setrecursionlimit(n)
+        except RecursionError:
+            n += 1
+        else:
+            return n
+
+
 #: Recursion limit above the test's own frame: about 200 decorated levels, deep
 #: enough for the cut to bite on every span and well under any default limit.
 _HEADROOM = 400
 
 
-# Both parities of the limit, because where the limit lands decides the exception's
-# SHAPE. Each level of the recursion adds the decorator's wrapper and the host's
-# function; opening the next span briefly goes deeper, through wardex's own frames.
-# On 3.11+ one parity of the limit lands on `_tracing._debug_enabled`, whose guard
-# swallows that RecursionError and then raises a second one from its own
-# `counters.bump`, at the same depth: the host receives a RecursionError chained
-# onto wardex's, exactly what Python prints for it too, and the span records that
-# chain. The other parity raises a plain one. With the default limit, the parity
-# was the depth pytest happened to start the test at, and a pytest-xdist worker
-# starts it a frame or so deeper than a plain run: the chained shape failed under
-# `-n` and passed without it. Setting the limit relative to the current depth runs
-# both shapes on every runner.
+# Both parities of the limit, because where the limit lands used to decide the
+# exception's SHAPE. Each level of the recursion adds the decorator's wrapper and the
+# host's function; opening the next span briefly goes deeper, through wardex's own
+# frames. On 3.11+ one parity landed on `_tracing._debug_enabled`, whose guard
+# swallowed that RecursionError and then raised a second one from its own
+# `counters.bump`, at the same depth: the host received a RecursionError chained onto
+# wardex's, counted as a wardex internal failure. The guard now lets a RecursionError
+# through untouched, so both parities give the host its own exception alone and
+# count nothing. The parametrization stays as the guard against that coming back:
+# with the default limit, the parity was the depth pytest happened to start the test
+# at, and a pytest-xdist worker starts it a frame or so deeper than a plain run, so
+# the chained shape showed under `-n` and hid without it. Setting the limit relative
+# to the current depth runs both parities on every runner.
 @pytest.mark.parametrize("parity", [0, 1])
 def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording, parity):
     """Every span an exception leaves records it, and each used to format the whole
@@ -803,6 +823,8 @@ def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording,
     def descend(n):
         return descend(n + 1)
 
+    counters.reset()
+    _ledger._reset_for_tests()
     limit = sys.getrecursionlimit()
     sys.setrecursionlimit(_stack_depth() + _HEADROOM + parity)
     try:
@@ -810,6 +832,12 @@ def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording,
             descend(0)
     finally:
         sys.setrecursionlimit(limit)
+
+    # The host's own RecursionError, with nothing of wardex's chained onto it, and
+    # nothing in wardex's diagnostics blaming wardex for the host's stack.
+    assert _chain_length(caught.value) == 1
+    assert _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR) == 0
+    assert {k: n for k, n in counters.snapshot().items() if k.startswith("tracing.")} == {}
 
     _hub.get_client().flush()
     spans = [sp for env in recording.envelopes for sp in env.spans]
@@ -827,14 +855,153 @@ def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording,
 
     (outermost,) = [sp for sp in spans if sp.parent_span_id is None]
     trace = traces[outermost.context.span_id]
-    # The outermost span records the exception the host caught, chain and all.
-    assert len(_segments(trace)) == _chain_length(caught.value)
+    # The outermost span records the exception the host caught: one traceback.
+    assert len(_segments(trace)) == 1
     # The last segment is the host's own traceback; the test's own frame is the one
     # frame of it above the span.
     last = _segments(trace)[-1]
     depth = sum(1 for _ in traceback.walk_tb(caught.tb)) - 1
     assert _frame_count(last) == _source_paths._MAX_FRAMES
     assert _left_out(last) == [depth - _source_paths._MAX_FRAMES]
+
+
+def _descend_generator():
+    @wardex.tool
+    def descend(n):
+        yield from descend(n + 1)
+
+    for _ in descend(0):
+        pass
+
+
+def _descend_async_generator():
+    @wardex.tool
+    async def descend(n):
+        async for item in descend(n + 1):
+            yield item
+
+    async def consume():
+        async for _ in descend(0):
+            pass
+
+    asyncio.run(consume())
+
+
+# A decorated generator does not leave through `_WithOnly.__exit__` alone: each
+# step of its body runs under its own `with steps:` block, so the host's
+# RecursionError unwinds through two wardex exits per level instead of one. Each
+# level adds the wrapper's frame and the host's, so both parities of the limit are
+# run, for the same reason as the test above.
+@pytest.mark.parametrize("parity", [0, 1])
+@pytest.mark.parametrize(
+    "descend", [_descend_generator, _descend_async_generator], ids=["sync", "async"]
+)
+def test_a_deep_recursion_through_a_decorated_generator_reaches_the_host_alone(
+    recording, descend, parity
+):
+    """The host's RecursionError, unwinding through every decorated generator's step
+    and span exits, arrives with nothing of wardex's chained onto it, and wardex
+    counts none of it as its own failure. Before the guard let a RecursionError
+    through, one parity of the limit chained one, and both counted two to four
+    internal errors, depending on which wardex frame the limit landed on."""
+    counters.reset()
+    _ledger._reset_for_tests()
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(_stack_depth() + _HEADROOM + parity)
+    try:
+        with pytest.raises(RecursionError) as caught:
+            descend()
+    finally:
+        sys.setrecursionlimit(limit)
+
+    assert _chain_length(caught.value) == 1
+    assert _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR) == 0
+    assert {k: n for k, n in counters.snapshot().items() if k.startswith("tracing.")} == {}
+
+    _hub.get_client().flush()
+    spans = [sp for env in recording.envelopes for sp in env.spans]
+    # Every level's span shipped, closed as failed, under one root.
+    assert len(spans) > 100
+    assert {sp.status for sp in spans} == {StatusCode.ERROR}
+    assert len([sp for sp in spans if sp.parent_span_id is None]) == 1
+
+
+def _descend_span_block():
+    def descend(n):
+        with wardex.span("level"):
+            descend(n + 1)
+
+    descend(0)
+
+
+# A `with wardex.span(...)` block never chained a second RecursionError onto the
+# host's, but it did count the host's recursion as four to eight wardex internal
+# failures. Both parities of the limit, for the reason the tests above give.
+@pytest.mark.parametrize("parity", [0, 1])
+def test_a_deep_recursion_through_a_span_block_reaches_the_host_alone(recording, parity):
+    """The host's RecursionError, unwinding through a `with wardex.span(...)` block at
+    every level, arrives alone, and wardex counts none of it as its own failure."""
+    counters.reset()
+    _ledger._reset_for_tests()
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(_stack_depth() + _HEADROOM + parity)
+    try:
+        with pytest.raises(RecursionError) as caught:
+            _descend_span_block()
+    finally:
+        sys.setrecursionlimit(limit)
+
+    assert _chain_length(caught.value) == 1
+    assert _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR) == 0
+    assert {k: n for k, n in counters.snapshot().items() if k.startswith("tracing.")} == {}
+
+    _hub.get_client().flush()
+    spans = [sp for env in recording.envelopes for sp in env.spans]
+    assert len(spans) > 100
+    assert {sp.status for sp in spans} == {StatusCode.ERROR}
+    assert len([sp for sp in spans if sp.parent_span_id is None]) == 1
+
+
+# The limit lowered INSIDE a block, so the block closes with fewer free frames than
+# it opened with: the close stops partway, or before wardex's part of it starts.
+# Every headroom up to the depth the close needs is run; past it the close completes.
+# The headroom counts up from the lowest limit the interpreter accepts there, not
+# from the Python frame count, which is the same thing only on 3.12+. From 1: at 0
+# the interpreter itself has no room to finalize the suspended generator when the
+# block drops it, and pytest's unraisable hook has none to report that with.
+@pytest.mark.parametrize("headroom", range(1, 12))
+@pytest.mark.parametrize("raises", [True, False], ids=["raise", "return"])
+def test_a_span_block_that_closes_without_room_leaves_no_parent_behind(recording, headroom, raises):
+    """However little room the close has, the block's span leaves the open-span
+    table and stops being the active parent: the next span on the thread is a root,
+    not the child of a span that never ships. The host's exception, or none, is what
+    leaves the block."""
+    from wardex_sdk import _runtime
+
+    scope = _hub.get_current_scope()
+    limit = sys.getrecursionlimit()
+    caught = None
+    try:
+        with wardex.span("outer"), wardex.span("inner"):
+            sys.setrecursionlimit(_lowest_recursion_limit() + headroom)
+            if raises:
+                raise RecursionError("host")
+    except RecursionError as e:
+        caught = e
+    finally:
+        sys.setrecursionlimit(limit)
+
+    if raises:
+        assert caught is not None and str(caught) == "host"
+        assert _chain_length(caught) == 1
+    else:
+        assert caught is None
+    assert len(_runtime.runtime()._open_spans) == 0
+    assert _hub.get_current_scope() is scope
+    with wardex.span("after") as after:
+        pass
+    assert after.context.trace_id != getattr(scope.active_span_context, "trace_id", None)
+    assert after._draft._parentage.parent_span_id is None
 
 
 def _sink(n: int) -> None:

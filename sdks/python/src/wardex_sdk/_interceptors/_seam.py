@@ -23,6 +23,7 @@ from .._assembly import (
     TransportLabel,
     capture_mode_of,
     counters,
+    demote_late_usage,
     guard,
     in_degraded_run,
     report_connection_parser_disabled,
@@ -97,16 +98,14 @@ if TYPE_CHECKING:
 # CONTEXT-DEPENDENT — an answer about ONE transaction, and only ever correct for the instant it was
 # asked, so they live in the module `_should_capture` on the response side: the shared policy's
 # ambient-span clause and the LLM-semantic claim `_parse_semantics` earns. An agent unit can
-# ACTIVATE after a connection was opened — a pooled keep-alive socket outlives any single run — so
-# a per-connection early-out on "no agent unit is ambient right now" would silently drop every
-# later request on that socket. That is data loss, and the parse it would save is the one the gate
-# needs.
+# ACTIVATE after a connection was opened — a pooled keep-alive socket outlives any single run — so a
+# per-connection early-out on "no agent unit is ambient right now" would silently drop every later
+# request on that socket. That is data loss, and the parse it would save is the one the gate needs.
 #
-# And a THIRD moment since the parse moved off the caller's thread: the gate now usually runs on
-# the finalize WORKER, over a `_PendingTxn` sealed at the response instant. What keeps its answer
-# honest there is the seal — the prefilter verdict, the mode, and `copy_context()` all travel with
-# the job — so the gate reads the response instant's facts wherever and whenever it actually
-# executes.
+# And a THIRD moment since the parse moved off the caller's thread: the gate now usually runs on the
+# finalize WORKER, over a `_PendingTxn` sealed at the response instant. What keeps its answer honest
+# there is the seal — the prefilter verdict, the mode, and `copy_context()` all travel with the job
+# — so the gate reads the response instant's facts wherever and whenever it actually executes.
 #
 # NOT here, deliberately: "the transport is a NoOpTransport". `init()` resolves a missing
 # `transport=` argument to exactly that, so it is the out-of-the-box configuration rather than a
@@ -213,36 +212,32 @@ class ByteSeamInterceptor(InterceptorInterface):
     def __init__(self) -> None:
         self._client: Client | None = None
         self._conns: dict[int, _ConnectionState] = {}
-        # ids of connections that were being tracked when an os.fork() reset
-        # this seam in the child — consumed one id at a time by `_state`, so
-        # the first span on an INHERITED socket can say its tracking restarted
-        # mid-stream (`TRACKING_RESET_AT_FORK`). Bounded by max_connections at
-        # the only site that fills it (`_at_fork_reinit`).
+        # ids of connections that were being tracked when an os.fork() reset this seam in the child
+        # — consumed one id at a time by `_state`, so the first span on an INHERITED socket can say
+        # its tracking restarted mid-stream (`TRACKING_RESET_AT_FORK`). Bounded by max_connections
+        # at the only site that fills it (`_at_fork_reinit`).
         self._reset_at_fork_ids: set[int] = set()
         self._patches = PatchSet(f"interceptors.{self.name()}")
         self._installed = False
-        # Does THIS seam hold a reference on the shared timing probe? A second
-        # field rather than a reading of `_installed`, because `uninstall()` is
-        # now total: it runs after an `install()` that raised, where the two
-        # answers differ. Releasing a reference this seam never took decrements
-        # the shared refcount to zero underneath the OTHER seam and rips
-        # `socket.connect` back out from under a live installation.
+        # Does THIS seam hold a reference on the shared timing probe? A second field rather than a
+        # reading of `_installed`, because `uninstall()` is now total: it runs after an `install()`
+        # that raised, where the two answers differ. Releasing a reference this seam never took
+        # decrements the shared refcount to zero underneath the OTHER seam and rips `socket.connect`
+        # back out from under a live installation.
         self._timing_held = False
-        # The same bookkeeping for the shared close probe, and a SECOND flag for
-        # the same reason: the two probes are refcounted independently, so a
-        # single "did I acquire anything" answer would release one of them on
-        # behalf of a seam that only ever took the other.
+        # The same bookkeeping for the shared close probe, and a SECOND flag for the same reason:
+        # the two probes are refcounted independently, so a single "did I acquire anything" answer
+        # would release one of them on behalf of a seam that only ever took the other.
         self._close_hook_held = False
         # Defaults match the core's, so behavior is unchanged until _load_limits
         # resolves an actual config at install() time.
         self._limits: dict[str, int] = LimitsConfig().resolved()
-        # The WS tracker's projected keywords, built ONCE per limits load rather
-        # than per upgrade: a tracker is constructed on every WebSocket
-        # handshake, and this is the one projection on a path whose rate is set
-        # by the host's traffic. Initialized HERE as well as in `_load_limits`
-        # because a seam driven without `install()` is a real shape in this
-        # suite, and an attribute missing there would raise inside the host's
-        # own socket call rather than anywhere a test looks.
+        # The WS tracker's projected keywords, built ONCE per limits load rather than per upgrade: a
+        # tracker is constructed on every WebSocket handshake, and this is the one projection on a
+        # path whose rate is set by the host's traffic. Initialized HERE as well as in
+        # `_load_limits` because a seam driven without `install()` is a real shape in this suite,
+        # and an attribute missing there would raise inside the host's own socket call rather than
+        # anywhere a test looks.
         self._ws_kwargs: dict[str, int] = limits_kwargs(LimitsConsumer.WS_TRACKER, self._limits)
         self._native_limits: Any = None
 
@@ -619,8 +614,8 @@ class ByteSeamInterceptor(InterceptorInterface):
             connect_ms, handshake_ms, reused, timing_markers = got
         # Classified once, carried on the job: `_assemble` reuses it for the provider-state count.
         treatment = classify_path(txn.path)
-        if treatment == "llm_call":  # a model call: before any policy return (`_usage_hold`)
-            witness_request(txn.parent)
+        # A model call, witnessed before any policy return; the answer may demote its usage.
+        late = treatment == "llm_call" and witness_request(txn.witness) == "promoted"
         if st.server_port == UNRESOLVED_PORT:  # counted even if excluded; see `_peer.py`
             timing_markers = (*timing_markers, Limitation.PEER_UNRESOLVED)
             counters.bump("interceptors.seam.peer_unresolved")
@@ -662,6 +657,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             ctx=contextvars.copy_context(),
             scope=txn.scope,
             size=len(txn.request_body) + len(txn.response_body),
+            usage_already_promoted=late,
         )
 
     def _stamp_fork_reset(self, st: _ConnectionState, draft: Any) -> None:
@@ -842,6 +838,7 @@ class _PendingTxn:
     ctx: contextvars.Context
     scope: Any  # `_issue_scope.ScopeSnapshot`, or None for a hand-built `_Txn`
     size: int
+    usage_already_promoted: bool  # the seal's witness: its unit already shipped this call's usage
 
     def run(self) -> Any:
         return _assemble(self, parse=True, extra=())
@@ -1039,7 +1036,10 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             # agent traffic and then shipped with `gen_ai=None`.
             identified = _is_llm_traffic(txn, sem)
             if identified:
-                draft.set_gen_ai(build_gen_ai(sem))
+                gen_ai = build_gen_ai(sem)
+                if p.usage_already_promoted:  # counted once: on the unit (`_usage_hold`)
+                    gen_ai = demote_late_usage(draft, gen_ai)
+                draft.set_gen_ai(gen_ai)
                 if status_code is not StatusCode.ERROR and (declared := declared_error_type(sem)):
                     status_code, error_type = StatusCode.ERROR, declared  # failed in-stream
                 known = txn.issuer_proven and not txn.parent_closed  # closed: refused at the edge

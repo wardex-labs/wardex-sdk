@@ -47,7 +47,8 @@ from test_langgraph_adapter import (  # noqa: F401 — `_clean_scope` is an auto
     traces,
 )
 from test_langgraph_adapter import installed as _installed_fixture
-from wardex_sdk._assembly import Limitation
+from wardex_sdk._assembly import Limitation, _ledger
+from wardex_sdk._assembly._ledger import DropReason
 from wardex_sdk._enums import StatusCode
 from wardex_sdk._limits import LimitsConfig
 
@@ -894,3 +895,70 @@ def test_nothing_derives_from_a_task_path_because_a_task_path_is_nested(installe
         pass
     assert len(steps(installed.spans)) == 3, "all three spans survived describe"
     assert "adapters.langgraph.describe_node_extras" not in adapter_counters()
+
+
+# --------------------------------------------------------------------------
+# the host's RecursionError through a unit's exit
+# --------------------------------------------------------------------------
+
+
+def _chain_length(exc: BaseException | None) -> int:
+    n = 0
+    while exc is not None:
+        n += 1
+        exc = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+    return n
+
+
+def _stack_depth() -> int:
+    frame, n = sys._getframe(1), 0
+    while frame is not None:
+        n += 1
+        frame = frame.f_back
+    return n
+
+
+class _Depth(TypedDict):
+    n: int
+
+
+# Set relative to the current depth, as `test_span_exceptions.py` sets its own, so
+# where the limit lands inside a level is the same on every runner, and two
+# adjacent limits land it on different wardex frames.
+@pytest.mark.parametrize("parity", [0, 1])
+def test_a_host_recursion_through_nested_runs_reaches_the_host_alone(installed, parity):
+    """A node that invokes its own graph recurses through a run unit and a step unit
+    per level, until the interpreter's limit. That RecursionError is the host's:
+    it must arrive alone, and nothing may be counted as wardex's own failure. The
+    guards on the unit's open and close used to swallow and count it at whichever
+    wardex frame the limit landed on (one to four internal errors per run), and
+    could chain a second RecursionError onto it. Measured, a unit's close needs
+    fewer frames than its open, from the same frame, so a recursion through units
+    leaves every exit room to finish."""
+    graph = None
+
+    def node(state: _Depth) -> _Depth:
+        return graph.invoke({"n": state["n"] + 1})
+
+    builder = StateGraph(_Depth)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    builder.add_edge("node", END)
+    graph = builder.compile()
+
+    _ledger._reset_for_tests()
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(_stack_depth() + 400 + parity)
+    try:
+        with pytest.raises(RecursionError) as caught:
+            graph.invoke({"n": 0})
+    finally:
+        sys.setrecursionlimit(limit)
+
+    assert _chain_length(caught.value) == 1
+    assert _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR) == 0
+    assert not [k for k in adapter_counters() if ".enter" in k or ".describe" in k]
+    assert assembly_counters() == {}
+    (root,) = [s for s in runs(installed.spans) if s.parent_span_id is None]
+    assert (root.status, root.error_type) == (StatusCode.ERROR, "RecursionError")
+    assert len(steps(installed.spans)) > 10

@@ -86,8 +86,10 @@ def _clean(monkeypatch):
     monkeypatch.setattr(_bridge_latch, "_RESOLVERS", ())
     monkeypatch.setattr(_bridge_latch, "_TOOL_RESOLVERS", ())
     _usage_hold._HOLDERS.clear()
+    _usage_hold._PROMOTED_RECENTLY.clear()
     yield
     _usage_hold._HOLDERS.clear()
+    _usage_hold._PROMOTED_RECENTLY.clear()
     _ambient_unit.reset(token)
     reset_for_test()
     counters.reset()
@@ -356,6 +358,107 @@ def test_a_request_issued_but_never_sealed_promotes_the_usage():
     assert counters.get("assembly._usage_hold.usage_kept_demoted") == 0
     assert counters.get("assembly._usage_hold.usage_promoted") == 3
     assert all(Limitation.NO_WIRE_EVIDENCE in _limitations(d.finish()) for d in sink.drafts)
+
+
+def _h2_frame(frame_type: int, flags: int, stream_id: int, payload: bytes) -> bytes:
+    head = len(payload).to_bytes(3, "big") + bytes([frame_type, flags])
+    return head + stream_id.to_bytes(4, "big") + payload
+
+
+_SSE_ANSWER = (
+    b'data: {"id":"x","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,'
+    b'"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
+    b'data: {"id":"x","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[],'
+    b'"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}\n\n'
+    b"data: [DONE]\n\n"
+)
+_JSON_ANSWER = (
+    b'{"id":"x","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,'
+    b'"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],'
+    b'"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}'
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "reset_three", "answer", "witnessed"),
+    [
+        ("/v1/chat/completions", True, "sse", True),
+        ("/v1/chat/completions", False, "sse", True),
+        ("/v1/chat/completions", False, "json", True),
+        ("/v1/chat/completions", False, None, False),
+        ("/v1/anything/else", True, None, False),
+    ],
+    ids=[
+        "parser-still-holds-it",
+        "parser-evicted-it-too",
+        "parser-evicted-it-too-json",
+        "never-answered",
+        "not-a-model-call",
+    ],
+)
+def test_a_model_call_the_h2_latch_cap_evicts_is_counted_once(path, reset_three, answer, witnessed):
+    """`max_streams=2`, three streams under a held chat unit: the cap evicts stream 1's latch
+    entry, so its answer reaches the seal parentless, and without a witness the unit would promote
+    the framework's usage while the wire span ships its own: one call counted twice.
+
+    With stream 3 reset the parser still holds stream 1's request; without it the parser's table
+    evicts it in the same write, and the answer would ship `? /` with its usage read from the body
+    alone. The tracker kept the path from the stream's opening, so either way the answer ships under
+    its model-call path and the seal witnesses the evicted parent. A call never answered leaves the
+    unit's number promoted, and is counted."""
+    from hpack import Encoder
+
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+    from wardex_sdk._limits import LimitsConfig
+
+    ctx, sink = context()
+    chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 11, "gen_ai.usage.output_tokens": 4})
+    assert ctx.hold_framework_usage(chat, prefix=PREFIX) is True
+    chat.pin(driver=_here())
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
+    enc, renc = Encoder(), Encoder()
+
+    def opened(stream_id: int) -> bytes:
+        block = enc.encode([(b":method", b"POST"), (b":path", path.encode())])
+        return _h2_frame(0x1, 0x4 | 0x1, stream_id, block)  # END_HEADERS | END_STREAM
+
+    tracker.on_request_bytes(opened(1))
+    tracker.on_request_bytes(opened(3))
+    if reset_three:
+        tracker.on_request_bytes(_h2_frame(0x3, 0x0, 3, b"\x00\x00\x00\x08"))  # RST_STREAM
+    tracker.on_request_bytes(opened(5))
+    assert 1 not in tracker._latch, "precondition: the cap evicted stream 1's latch entry"
+    txns = []
+    if answer is None:
+        tracker.on_connection_close(Limitation.FRAME_PARSE_FAILED)
+    else:
+        kind = b"text/event-stream" if answer == "sse" else b"application/json"
+        body = _SSE_ANSWER if answer == "sse" else _JSON_ANSWER
+        head = renc.encode([(b":status", b"200"), (b"content-type", kind)])
+        txns = tracker.on_response_bytes(
+            _h2_frame(0x1, 0x4, 1, head) + _h2_frame(0x0, 0x1, 1, body)  # END_STREAM on the DATA
+        )
+    seam, client = _Seam(), _QueueOnly()
+    seam._client = client
+    for txn in txns:
+        seam._emit_span(SimpleNamespace(), _ConnectionState(None, "api.openai.com", 443), txn)
+    wire = [job.run() for job in client.jobs]
+    chat.unpin()
+    chat.close()
+
+    unit = sink.span("chat m")
+    carriers = [s for s in [unit, *wire] if s is not None and s.gen_ai and s.gen_ai.input_tokens]
+    assert [(s.gen_ai.input_tokens, s.gen_ai.output_tokens) for s in carriers] == [(11, 4)]
+    assert (carriers[0] is unit) is not witnessed
+    assert (Limitation.NO_WIRE_EVIDENCE in _limitations(unit)) is not witnessed
+    assert counters.get("protocol.http2.evicted_witnessed") == int(witnessed)
+    assert counters.get("assembly._usage_hold.usage_kept_demoted") == int(witnessed)
+    unanswered = path == "/v1/chat/completions" and answer is None
+    assert counters.get("protocol.http2.evicted_call_unanswered") == int(unanswered)
+    if witnessed:
+        assert [s.name for s in wire] == [
+            "HTTP POST /v1/chat/completions" if reset_three else "HTTP ? /v1/chat/completions"
+        ]
 
 
 def test_a_held_chat_unit_with_no_request_promotes_every_spelling_and_says_so():
@@ -702,6 +805,58 @@ def test_a_tool_call_is_never_latched_to_a_unit_whose_arguments_differ():
     del token
 
 
+def test_a_prefixed_tool_unit_is_a_candidate_only_by_arguments_and_never_beside_the_exact_name():
+    """A framework's prefixed toolset calls the server's `add` as `srv_add`; the wire says `add`.
+    The prefixed unit is found by its arguments, never by the suffix of its name. A unit of the
+    exact name beside it is no tiebreak: an exact name may itself be a prefixed one (`srv_add` is
+    also the framework's name for `add` under prefix `srv`), so both present is ambiguity."""
+    ctx, _ = context()
+    run = _run(ctx)
+    prefixed, t1 = _tool(ctx, "srv_add", arguments='{"a": 2, "b": 3}')
+    ctx.follow_tool_calls(_tool_call)
+    here = _ambient_of(run)
+    ambient, nested = latch_tool_call(EMPTY_AMBIENT, "add", {"b": 3, "a": 2})
+    assert nested is True and ambient.span_context == prefixed.draft.context, "proved by arguments"
+    assert latch_tool_call(here, "add", {"a": 9}) == (here, False), "other arguments"
+    assert latch_tool_call(here, "srv", {"a": 2, "b": 3}) == (here, False), "a prefix, not a name"
+    assert latch_tool_call(here, "rv_add", {"a": 2, "b": 3}) == (here, False), "not after a `_`"
+
+    exact, t2 = _tool(ctx, "add", arguments='{"a": 2, "b": 3}')
+    assert latch_tool_call(here, "add", {"a": 2, "b": 3}) == (here, False), "exact beside prefixed"
+    ambient, nested = latch_tool_call(here, "add", {"a": 4, "b": 5})
+    assert nested is False, "neither unit holds these arguments"
+    exact.close()
+    by_name, t3 = _tool(ctx, "add")
+    assert latch_tool_call(here, "add", {"a": 2, "b": 3}) == (here, False), "even by name only"
+    by_name.close()
+    twin, t4 = _tool(ctx, "web_add", arguments='{"a": 2, "b": 3}')
+    assert latch_tool_call(here, "add", {"a": 2, "b": 3}) == (here, False), "two prefixed twins"
+    assert counters.get("adapters.test.tool_call_ambiguous") == 3
+    for h in (twin, prefixed):
+        h.close()
+    run.unpin()
+    run.close()
+    del t1, t2, t3, t4
+
+
+def test_a_prefixed_tool_unit_that_recorded_no_arguments_is_refused_and_counted():
+    """A framework told not to record content leaves the unit only its name. `srv_add` ending in
+    `_add` is too weak to move the wire call, even below the ambient unit."""
+    ctx, _ = context()
+    run = _run(ctx)
+    tool, token = _tool(ctx, "srv_add")
+    ctx.follow_tool_calls(_tool_call)
+    here = _ambient_of(run)
+    assert latch_tool_call(here, "add", {"a": 2}) == (here, False)
+    assert latch_tool_call(EMPTY_AMBIENT, "add", {"a": 2}) == (EMPTY_AMBIENT, False)
+    assert counters.get("adapters.test.tool_call_prefix_unproved") == 2
+    assert counters.get("assembly._bridge_latch.tool_call_resolved") == 0
+    tool.close()
+    run.unpin()
+    run.close()
+    del token
+
+
 def test_concurrent_calls_of_one_tool_are_told_apart_by_their_arguments():
     ctx, _ = context()
     run = _run(ctx)
@@ -922,3 +1077,124 @@ def test_a_fork_child_starts_with_no_usage_holds():
     source = open(_runtime.__file__, encoding="utf-8").read()
     assert '_fork_reinit_module("_assembly._usage_hold")' in source
     chat.close()
+
+
+# --------------------------------------------------------------------------
+# A model call sealed after its unit already promoted the usage
+# --------------------------------------------------------------------------
+
+_LATE_PATH = "/v1/chat/completions"
+
+
+def _promoted_chat(ctx: AdapterContext) -> RunHandle:
+    """A held chat unit closed with no model call sealed under it: it promotes and remembers."""
+    chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 11, "gen_ai.usage.output_tokens": 4})
+    assert ctx.hold_framework_usage(chat, prefix=PREFIX) is True
+    chat.close()
+    return chat
+
+
+def test_the_seal_witness_answers_held_promoted_or_nothing():
+    """`held` for a live holder, `promoted` for a holder that already shipped the numbers, None for
+    everything else: no parent, a span nobody held, a holder that settled keeping them demoted."""
+    ctx, _ = context()
+    held = _chat(ctx, **{"gen_ai.usage.input_tokens": 11})
+    ctx.hold_framework_usage(held, prefix=PREFIX)
+    assert _usage_hold.witness_request(held.draft.context) == "held"
+    held.close()
+    assert _usage_hold.witness_request(held.draft.context) is None, "kept demoted: not promoted"
+
+    promoted = _promoted_chat(ctx)
+    assert counters.get("assembly._usage_hold.usage_promoted") == 1
+    assert _usage_hold.witness_request(promoted.draft.context) == "promoted"
+
+    assert _usage_hold.witness_request(None) is None
+    plain = _run(ctx)
+    assert _usage_hold.witness_request(plain.draft.context) is None
+    plain.unpin()
+    plain.close()
+
+
+def test_only_the_first_late_seal_under_a_promoted_unit_is_answered_promoted():
+    """The answer is consumed: a second late model call under the same unit is a second call, whose
+    usage nobody else carries, so its seal is answered None and its wire span keeps the usage."""
+    ctx, _ = context()
+    chat = _promoted_chat(ctx)
+    first, second = _seal(chat.draft.context, _LATE_PATH), _seal(chat.draft.context, _LATE_PATH)
+    assert first.jobs[0].usage_already_promoted is True
+    assert second.jobs[0].usage_already_promoted is False
+    assert not _usage_hold._PROMOTED_RECENTLY
+
+
+def test_a_seal_under_a_live_holder_or_no_holder_carries_no_late_verdict():
+    """The flag the seam's assembly demotes on is set only by a `promoted` answer."""
+    ctx, _ = context()
+    chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 11})
+    ctx.hold_framework_usage(chat, prefix=PREFIX)
+    assert _seal(chat.draft.context, _LATE_PATH).jobs[0].usage_already_promoted is False
+    assert _seal(None, _LATE_PATH).jobs[0].usage_already_promoted is False
+    chat.close()
+    # A request wardex does not read as a model call is never witnessed, so the memory stays.
+    late = _promoted_chat(ctx)
+    assert _seal(late.draft.context, "/v1/anything/else").jobs[0].usage_already_promoted is False
+    assert late.draft.context.span_id in _usage_hold._PROMOTED_RECENTLY
+
+
+def test_the_promoted_memory_keeps_only_the_last_256_units():
+    """Most promoted units never see a late seal, so their entries are never consumed: the table is
+    bounded, and the oldest promotion is the one forgotten."""
+    ctx, _ = context()
+    chats = [_promoted_chat(ctx) for _ in range(_usage_hold._PROMOTED_CAP + 1)]
+    assert _usage_hold._PROMOTED_CAP == 256
+    assert len(_usage_hold._PROMOTED_RECENTLY) == 256
+    assert _usage_hold.witness_request(chats[0].draft.context) is None, "forgotten"
+    assert _usage_hold.witness_request(chats[1].draft.context) == "promoted"
+    assert _usage_hold.witness_request(chats[-1].draft.context) == "promoted"
+
+
+def test_a_fork_child_forgets_the_parents_promoted_units():
+    ctx, _ = context()
+    _promoted_chat(ctx)
+    assert _usage_hold._PROMOTED_RECENTLY
+    _runtime._fork_reinit_module("_assembly._usage_hold")
+    assert not _usage_hold._PROMOTED_RECENTLY
+
+
+def test_demoting_a_late_wire_block_moves_every_typed_count_to_extras():
+    """The block keeps everything but its usage; the numbers stay on the span under
+    `wardex.usage_late.*`, with the flag, and the demotion is counted."""
+    ctx, sink = context()
+    h = _chat(ctx)
+    block = GenAIAttributes(
+        operation=OperationName.CHAT,
+        request_model="m",
+        input_tokens=11,
+        output_tokens=4,
+        cache_read_input_tokens=2,
+        reasoning_output_tokens=1,
+    )
+    out = _usage_hold.demote_late_usage(h.draft, block)
+    assert (out.input_tokens, out.output_tokens, out.cache_read_input_tokens) == (None,) * 3
+    assert out.reasoning_output_tokens is None and out.request_model == "m"
+    h.draft.set_gen_ai(out)
+    h.close()
+    extra = _extras(sink.span("chat m"))
+    assert {k: v for k, v in extra.items() if k.startswith("wardex.usage_late.")} == {
+        "wardex.usage_late.input_tokens": 11,
+        "wardex.usage_late.output_tokens": 4,
+        "wardex.usage_late.cache_read_input_tokens": 2,
+        "wardex.usage_late.reasoning_output_tokens": 1,
+        "wardex.usage_late.demoted": True,
+    }
+    assert counters.get("assembly._usage_hold.late_wire_usage_demoted") == 1
+
+
+def test_a_late_wire_block_without_usage_is_left_alone():
+    """Nothing was counted twice, so nothing is written and nothing is counted."""
+    ctx, _ = context()
+    h = _chat(ctx)
+    block = GenAIAttributes(operation=OperationName.CHAT, request_model="m")
+    assert _usage_hold.demote_late_usage(h.draft, block) is block
+    assert not [k for k, _ in h.draft._extra if k.startswith("wardex.usage_late.")]
+    assert counters.get("assembly._usage_hold.late_wire_usage_demoted") == 0
+    h.close()

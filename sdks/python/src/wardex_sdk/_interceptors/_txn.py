@@ -49,6 +49,10 @@ class _Txn:
     #: nothing the gate acts on, and calling it degraded let bodies out under a mode that had
     #: filtered the traffic. `parent_evicted` alone stays the marker (`resolve_observed`).
     parent_lost: bool = False
+    #: The parent the latch cap evicted from a model call's entry (`_Http2Tracker`): never placed,
+    #: only handed to the seal's model-call witness (`witness_request`), so a bridge chat unit above
+    #: a parentless answer still learns that the wire carries the call's usage.
+    evicted_parent: SpanContext | None = None
     #: The conversation the request was ISSUED in, latched beside `parent` for the same reason.
     conversation: ConversationContext | None = None
     #: The tags and user the span is stamped with, snapshotted beside `parent` for the same reason
@@ -105,6 +109,11 @@ class _Txn:
     #: The seam counts it (`interceptors.seam.ws_llm_endpoint_unconfirmed`) when it builds the
     #: connection's span. Exclusive with `ws_llm_call`.
     ws_llm_unconfirmed: bool = False
+
+    @property
+    def witness(self) -> SpanContext | None:
+        """Whom the seal's model-call witness names: the latched parent, else the evicted one."""
+        return self.parent if self.parent is not None else self.evicted_parent
 
 
 def _name_path(target: str) -> str:

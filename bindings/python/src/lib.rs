@@ -161,6 +161,12 @@ impl Http2Transaction {
     fn request_ended(&self) -> bool {
         self.inner.request_ended
     }
+    /// The response half ended: false only for a transaction `finish` handed
+    /// back at connection close, whose response body is what arrived so far.
+    #[getter]
+    fn response_ended(&self) -> bool {
+        self.inner.response_ended
+    }
     #[getter]
     fn content_type(&self) -> Option<String> {
         self.inner.content_type.clone()
@@ -225,6 +231,26 @@ impl Http2Parser {
     /// still parsing normally.
     fn disabled_reason(&self) -> PyResult<Option<&'static str>> {
         shielded(|| Ok(self.inner.disabled_reason()))
+    }
+
+    /// The connection closed: every stream whose response status arrived and
+    /// whose response never ended, as transactions with `response_ended`
+    /// false. Later frames for those streams are discarded.
+    fn finish(&mut self) -> PyResult<Vec<Http2Transaction>> {
+        shielded(|| {
+            Ok(self
+                .inner
+                .finish()
+                .into_iter()
+                .map(|inner| Http2Transaction { inner })
+                .collect())
+        })
+    }
+
+    /// The request `:path` of `stream_id` while the stream table holds its
+    /// request half; None when unknown, evicted, completed or reset.
+    fn request_path(&self, stream_id: u32) -> PyResult<Option<String>> {
+        shielded(|| Ok(self.inner.request_path(stream_id)))
     }
 }
 

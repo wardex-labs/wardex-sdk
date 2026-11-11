@@ -226,6 +226,11 @@ _SITES: list[tuple[str, str, str, str]] = [
     # Traffic, so judged like any other text the request carried.
     (_GENAI, "REQUEST_CONVERSATION_KEY", "stated", HOST),
     (_GENAI, "REQUEST_CONVERSATION_KEY", "stated", HOST),
+    # -- the usage hold --
+    # A late wire span's typed token counts, moved out of its usage block
+    # because the unit above it already shipped them, and the flag saying so.
+    ("_assembly/_usage_hold.py", "LATE_USAGE_PREFIX + field", "value", NUMBER),
+    ("_assembly/_usage_hold.py", "LATE_USAGE_DEMOTED_KEY", "True", NUMBER),
     # -- the published API: `Span.set_attribute` and a snapshot's attributes --
     ("_tracing.py", "key", "value", HOST),
     ("_assembly/_snapshot.py", "key", "value", HOST),

@@ -126,7 +126,7 @@ from ._units import (
     ambient_stated_conversation,
     parent_is_closed_unit,
 )
-from ._usage_hold import hold_framework_usage, witness_request
+from ._usage_hold import demote_late_usage, hold_framework_usage, witness_request
 from ._vocab import (
     Block,
     LinkReason,
@@ -182,6 +182,7 @@ __all__ = [
     "counters",
     "debug_host_error",
     "degraded_run",
+    "demote_late_usage",
     "diag_info",
     "diag_warning",
     "guard",

@@ -226,6 +226,13 @@ pub struct Http2Transaction {
     /// `request_body` holds only what was sent so far and its length is not
     /// the size of the request.
     pub request_ended: bool,
+    /// The server's END_STREAM for this stream arrived. False only for a
+    /// transaction `finish` hands back at connection close: the response's
+    /// header block (a status) arrived and its end never did — a client that
+    /// stopped reading a stream at its last event and closed the connection —
+    /// so `response_body` holds what arrived and its length is not the size of
+    /// the response.
+    pub response_ended: bool,
     /// The stream table evicted this stream's request half before its
     /// response completed, so `method`, `path`, the request body and the
     /// request's content type are absent rather than empty. The status, the
@@ -253,6 +260,7 @@ impl std::fmt::Debug for Http2Transaction {
             request_truncated,
             response_truncated,
             request_ended,
+            response_ended,
             request_evicted,
         } = self;
         f.debug_struct("Http2Transaction")
@@ -270,6 +278,7 @@ impl std::fmt::Debug for Http2Transaction {
             .field("request_truncated", request_truncated)
             .field("response_truncated", response_truncated)
             .field("request_ended", request_ended)
+            .field("response_ended", response_ended)
             .field("request_evicted", request_evicted)
             .finish()
     }
@@ -317,6 +326,33 @@ struct StreamState {
     /// Recreated for an id the table had already evicted with its request
     /// half. Carried to `Http2Transaction::request_evicted`.
     request_evicted: bool,
+}
+
+impl StreamState {
+    fn into_transaction(self, stream_id: u32, response_ended: bool) -> Http2Transaction {
+        Http2Transaction {
+            stream_id,
+            method: self.method.unwrap_or_default(),
+            path: self.path.unwrap_or_default(),
+            status: self.status.unwrap_or(0),
+            // One field for the transaction, so when both HEADERS blocks set
+            // it the response's declared type wins, falling back to the
+            // request's. Cap selection in on_data does *not* use this merged
+            // value — see the comment there.
+            content_type: self.resp_content_type.or(self.req_content_type),
+            content_encoding: self.resp_content_encoding,
+            grpc_status: self.grpc_status,
+            grpc_message: self.grpc_message,
+            request_body: self.req_body,
+            response_body: self.resp_body,
+            truncated: self.req_truncated || self.resp_truncated,
+            request_truncated: self.req_truncated,
+            response_truncated: self.resp_truncated,
+            request_ended: self.req_ended,
+            response_ended,
+            request_evicted: self.request_evicted,
+        }
+    }
 }
 
 /// Why a frame stopped this connection's capture for good. The string is the
@@ -493,6 +529,64 @@ impl Http2Connection {
             self.evict_past_bound();
         }
         result
+    }
+
+    /// The connection closed: hand back, in stream id order, every stream
+    /// whose response header block (a final status) arrived and whose
+    /// response never ended, as a transaction with `response_ended == false`,
+    /// the response body as far as it got and the request half as held.
+    ///
+    /// This is the close of a stream the peer left open, not a loss the
+    /// parser invents: a status is an observation, and a client that read a
+    /// streamed reply up to its last event and then closed the connection
+    /// never waited for the empty DATA frame carrying END_STREAM. Without this
+    /// such a reply produced no transaction at all. A stream with no status
+    /// (or only an interim 1xx) yields nothing: no reply was observed, and the
+    /// HTTP/1 parser's `finish` likewise returns nothing for a response whose
+    /// header block never completed. A stream whose response ended is not
+    /// here: `mark_ended` already took it out when it shipped.
+    ///
+    /// Each stream handed back is remembered as reset, so a frame for it
+    /// that arrives anyway is discarded rather than recreating the entry. The
+    /// rest of the connection is left as it was: the caller is closing it and
+    /// feeds nothing more, and a caller that does finds the HPACK tables and
+    /// the eviction memory unchanged rather than a parser that went silent.
+    /// A second call returns nothing.
+    pub fn finish(&mut self) -> Vec<Http2Transaction> {
+        let answered: Vec<u32> = self
+            .streams
+            .iter()
+            .chain(self.orphans.iter())
+            .filter(|(_, s)| s.status.is_some_and(|code| code >= 200))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut out = Vec::with_capacity(answered.len());
+        for id in answered {
+            let held = self
+                .streams
+                .remove(&id)
+                .or_else(|| self.orphans.remove(&id));
+            if let Some(s) = held {
+                out.push(s.into_transaction(id, false));
+                self.reset.insert(id);
+            }
+        }
+        let cap = self.limits.max_streams.max(1);
+        while self.reset.len() > cap {
+            self.reset.pop_first();
+        }
+        out.sort_by_key(|t| t.stream_id);
+        out
+    }
+
+    /// The `:path` of the request on `stream_id`, while the stream table
+    /// holds its request half. None when the path is unknown: no client
+    /// header block for that id was seen, the table evicted the request half,
+    /// or the stream already completed or was reset. The host asks this of a
+    /// stream whose correlation entry it is about to drop, to decide what
+    /// that stream was, and must read None as "cannot say".
+    pub fn request_path(&self, stream_id: u32) -> Option<String> {
+        self.streams.get(&stream_id).and_then(|s| s.path.clone())
     }
 
     /// Bytes both frame decoders copied into their buffers or relocated
@@ -857,27 +951,9 @@ impl Http2Connection {
         if st.resp_ended {
             let s = self.streams.remove(&stream_id);
             if let Some(s) = s.or_else(|| self.orphans.remove(&stream_id)) {
-                result.transactions.push(Http2Transaction {
-                    stream_id,
-                    method: s.method.unwrap_or_default(),
-                    path: s.path.unwrap_or_default(),
-                    status: s.status.unwrap_or(0),
-                    // One field for the transaction, so when both HEADERS
-                    // blocks set it the response's declared type wins,
-                    // falling back to the request's. Cap selection in on_data
-                    // does *not* use this merged value — see the comment there.
-                    content_type: s.resp_content_type.or(s.req_content_type),
-                    content_encoding: s.resp_content_encoding,
-                    grpc_status: s.grpc_status,
-                    grpc_message: s.grpc_message,
-                    request_body: s.req_body,
-                    response_body: s.resp_body,
-                    truncated: s.req_truncated || s.resp_truncated,
-                    request_truncated: s.req_truncated,
-                    response_truncated: s.resp_truncated,
-                    request_ended: s.req_ended,
-                    request_evicted: s.request_evicted,
-                });
+                result
+                    .transactions
+                    .push(s.into_transaction(stream_id, true));
             }
         }
     }
@@ -2033,5 +2109,108 @@ mod tests {
         assert!(!shown.contains("planted-secret-7f3a"), "{shown}");
         assert!(!shown.contains("112, 108, 97"), "{shown}");
         assert!(shown.contains("response_body_len: 19"), "{shown}");
+    }
+
+    #[test]
+    fn finish_hands_back_a_response_whose_end_never_arrived() {
+        // A streamed reply read up to its last event: the client closed the
+        // connection before the empty DATA frame carrying END_STREAM.
+        let mut c = Http2Connection::new(Limits::default());
+        let req = hpack(&[(b":method", b"POST"), (b":path", b"/v1/chat/completions")]);
+        let mut buf = frame(FRAME_HEADERS, FH, 1, &req);
+        buf.extend_from_slice(&frame(FRAME_DATA, FS, 1, b"{}"));
+        assert_eq!(c.feed(true, &buf).opened_request_streams, vec![1]);
+        let mut resp = frame(FRAME_HEADERS, FH, 1, &hpack(&[(b":status", b"200")]));
+        resp.extend_from_slice(&frame(FRAME_DATA, 0, 1, b"data: [DONE]\n\n"));
+        assert!(c.feed(false, &resp).transactions.is_empty());
+        // A stream still waiting for its status, and one with only an interim
+        // 1xx: neither observed a reply, so neither comes back.
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, 3, &req));
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, 5, &req));
+        feed_setup(
+            &mut c,
+            false,
+            &frame(FRAME_HEADERS, FH, 5, &hpack(&[(b":status", b"103")])),
+        );
+
+        let out = c.finish();
+        assert_eq!(out.len(), 1);
+        let t = &out[0];
+        assert_eq!((t.stream_id, t.status), (1, 200));
+        assert!(!t.response_ended);
+        assert!(t.request_ended);
+        assert_eq!(t.path, "/v1/chat/completions");
+        assert_eq!(t.request_body, b"{}");
+        assert_eq!(t.response_body, b"data: [DONE]\n\n");
+
+        // The END_STREAM nobody waited for, arriving anyway, is discarded
+        // like a reset stream's, and a second finish has nothing left.
+        let late = frame(FRAME_DATA, FS, 1, b"");
+        assert!(c.feed(false, &late).transactions.is_empty());
+        assert!(c.finish().is_empty());
+        // Streams that had no reply are still held: closing is the caller's.
+        assert!(c.streams.contains_key(&3) && c.streams.contains_key(&5));
+    }
+
+    #[test]
+    fn finish_does_not_repeat_a_stream_that_already_shipped() {
+        let mut c = Http2Connection::new(Limits::default());
+        let req = hpack(&[(b":method", b"GET"), (b":path", b"/a")]);
+        let ok = hpack(&[(b":status", b"200")]);
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, 1, &req));
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, 3, &req));
+        let mut resp = frame(FRAME_HEADERS, FH, 1, &ok);
+        resp.extend_from_slice(&frame(FRAME_DATA, FS, 1, b"done"));
+        resp.extend_from_slice(&frame(FRAME_HEADERS, FH, 3, &ok));
+        resp.extend_from_slice(&frame(FRAME_DATA, 0, 3, b"part"));
+        let shipped = c.feed(false, &resp).transactions;
+        assert_eq!(shipped.len(), 1);
+        assert!(shipped[0].response_ended);
+        // Nothing left in the table has a status AND an ended response:
+        // `mark_ended` takes a stream out the moment its response ends.
+        assert!(c
+            .streams
+            .values()
+            .chain(c.orphans.values())
+            .all(|s| !(s.status.is_some() && s.resp_ended)));
+
+        let out = c.finish();
+        assert_eq!(out.iter().map(|t| t.stream_id).collect::<Vec<_>>(), [3]);
+        assert_eq!(out[0].response_body, b"part");
+    }
+
+    #[test]
+    fn request_path_answers_while_the_table_holds_the_request() {
+        let limits = Limits {
+            max_streams: 2,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = |p: &[u8]| hpack(&[(b":method", b"POST"), (b":path", p)]);
+        assert_eq!(c.request_path(1), None, "never seen");
+        feed_setup(
+            &mut c,
+            true,
+            &frame(FRAME_HEADERS, FH | FS, 1, &block(b"/one")),
+        );
+        assert_eq!(c.request_path(1).as_deref(), Some("/one"));
+
+        // Completed: the entry left with its transaction.
+        let mut resp = frame(FRAME_HEADERS, FH, 1, &hpack(&[(b":status", b"200")]));
+        resp.extend_from_slice(&frame(FRAME_DATA, FS, 1, b""));
+        assert_eq!(c.feed(false, &resp).transactions.len(), 1);
+        assert_eq!(c.request_path(1), None);
+
+        // Evicted by the bound: the lowest id goes, and its path with it.
+        for (sid, p) in [(3u32, b"/three"), (5, b"/five_"), (7, b"/seven")] {
+            feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, sid, &block(p)));
+        }
+        assert_eq!(c.request_path(3), None);
+        assert_eq!(c.request_path(5).as_deref(), Some("/five_"));
+
+        // Reset: forgotten too.
+        feed_setup(&mut c, true, &frame(FRAME_RST_STREAM, 0, 5, &[0, 0, 0, 8]));
+        assert_eq!(c.request_path(5), None);
+        assert_eq!(c.request_path(7).as_deref(), Some("/seven"));
     }
 }

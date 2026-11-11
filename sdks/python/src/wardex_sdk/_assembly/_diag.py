@@ -86,8 +86,11 @@ class Counters:
     def bump(self, where: str) -> None:
         """Count one at `where`. The fold is `_fold` written out, calling no
         Python function: `guard.__exit__` bumps here at whatever depth the
-        swallowed error left, and a frame pushed on every `_FOLD_AT`th bump
-        would let a `RecursionError` escape the guard on that bump only."""
+        swallowed error left, which can be one frame short of the recursion
+        limit. This call already needs that frame; a second one, pushed by the
+        fold on every `_FOLD_AT`th bump, would make whether the guard swallows
+        there depend on how full the inbox happened to be. (A `RecursionError`
+        itself never reaches this bump: the guard lets it through first.)"""
         self._inbox.append(where)
         if len(self._inbox) >= _FOLD_AT and self._lock.acquire(blocking=False):
             try:
@@ -436,7 +439,9 @@ class guard:  # noqa: N801 — a context manager reads as a verb at the call sit
     """Swallow instrumentation failures at `where`, loudly enough to be found.
 
     `ignored` lists the host's control-flow exceptions: they are re-raised
-    untouched and are NOT counted, because they are not failures.
+    untouched and are NOT counted, because they are not failures. A
+    `RecursionError` is treated the same way without being listed: it is the
+    host's stack reaching the interpreter's limit, not a wardex failure.
 
     Usable as a context manager or as a decorator; a single instance is reusable
     and reentrant, because it holds no per-entry state.
@@ -485,6 +490,16 @@ class guard:  # noqa: N801 — a context manager reads as a verb at the call sit
         tb: TracebackType | None,
     ) -> bool:
         if exc_type is None:
+            return False
+        if issubclass(exc_type, RecursionError):
+            # Checked first, because everything below may push a frame
+            # (`counters.bump` is itself a Python call, and `ignored` may name
+            # a class whose metaclass answers `issubclass` in Python). A
+            # RecursionError can only mean the interpreter's limit was reached:
+            # that depth is the host's stack, not a wardex failure, so it is
+            # neither counted nor a loss. Nor could it be handled here: at the
+            # limit every frame a handler pushes raises it again, and the host
+            # would receive a second RecursionError chained onto its own.
             return False
         if self._ignored and issubclass(exc_type, self._ignored):
             return False  # control-flow exceptions reach the host, uncounted

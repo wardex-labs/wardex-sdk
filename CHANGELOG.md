@@ -109,10 +109,14 @@ All notable changes to this project are documented here. The format follows
   way: the request's span has no usage, and the model call carries
   pydantic-ai's numbers and `no_wire_evidence`, counted once. So does a model
   call whose response never completed (a timeout, a cancellation) or that was
-  sent over a WebSocket connection. Calling `Agent.instrument_all(...)` or
-  `logfire.instrument_pydantic_ai()` after `init()` replaces wardex's setup,
-  and your setup stays in place after `close()`; wardex attaches to the new
-  setup and keeps recording, said once on stderr. `Agent.instrument_all(True)`
+  sent over a WebSocket connection. When the request's span ships only later,
+  at connection close (an HTTP/2 stream whose end the server sent after the
+  client stopped reading), it carries no token usage; its numbers are under
+  `wardex.usage_late.*`, so the call is still counted once. Calling
+  `Agent.instrument_all(...)` or `logfire.instrument_pydantic_ai()` after
+  `init()` replaces wardex's setup, and your setup stays in place after
+  `close()`; wardex attaches to the new setup and keeps recording, said once on
+  stderr. `Agent.instrument_all(True)`
   with no OpenTelemetry provider configured keeps wardex's own setup, as at
   `init()`. Instrumentation turned off after `init()`, or moved to a setup that
   accepts no span processor, is said once and the adapter records nothing from
@@ -124,9 +128,13 @@ All notable changes to this project are documented here. The format follows
   tool call is the framework's `execute_tool` span under the run, and the
   stdio interceptor's `MCP tools/call` span, carrying the JSON-RPC request and
   response, nests under it in both connect orders and under a toolset shared
-  by several agents. The two are matched by tool name and arguments: two calls
-  of one tool in flight at once each nest under their own span, and another MCP
-  client's call with other arguments is never nested under the agent's. When
+  by several agents. The two are matched by tool name and arguments, and a
+  prefixed toolset (`.prefixed("srv")` or `MCP(tool_prefix="srv")`) nests too,
+  matched by its arguments (a prefixed name alone is never enough, and a call
+  that could belong to an exact name or a prefixed one nests under neither):
+  two calls of one tool in flight at once each nest under their own span, and
+  another MCP client's call with other arguments is never nested under the
+  agent's. When
   two calls with the same arguments are in flight at once, the interceptor's
   span keeps its own placement (under the run, or in a trace of its own when
   the agent was entered with `async with agent` before the run) and the
@@ -492,6 +500,44 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A `RecursionError` from your own code now reaches you as raised.** Before,
+  when the limit was hit inside a decorated function, a decorated generator or
+  an adapter's span (a LangGraph node that re-invokes its graph), a second
+  `RecursionError` from wardex's own frames could come chained onto yours. In
+  those cases, and in a `wardex.span` block, wardex also counted the error as
+  one of its own internal failures. Now nothing is chained onto it and wardex
+  no longer counts it as its own error, as long as the limit is the same when
+  the span closes as when it opened: code that lowers
+  `sys.setrecursionlimit` inside an adapter's span can still see one chained
+  on. If a `wardex.span` block closes with too little room left for wardex to
+  finish it (the limit was lowered inside it), its span is lost, but it no
+  longer stays the parent of the next span on the thread.
+- **A streamed model call over HTTP/2 is recorded even when your client stops
+  reading at the last event.** The OpenAI SDK stops reading an HTTP/2 stream at
+  `[DONE]` and leaves it open, so a server or proxy that sends the stream's end
+  in a separate, later frame left that call with no wire span, and the token
+  usage it carried never reached your traces. Now, when the connection closes,
+  such a stream ships with everything that arrived, usage included. It is
+  marked `frame_parse_failed` and its status is left unset, because its end
+  was never seen, as an HTTP/1 response cut by a close already was. Under a
+  bridge adapter's chat span (pydantic-ai) the call is still counted once: the
+  chat span keeps pydantic-ai's numbers and `no_wire_evidence`, and the HTTP/2
+  span ships under it without token usage, the numbers it read kept under
+  `wardex.usage_late.*` with `wardex.usage_late.demoted` set to say so.
+- **A model call on an HTTP/2 connection with more open streams than
+  `max_streams` is no longer counted twice under a bridge adapter's chat
+  span.** When the per-connection bound dropped a stream's parent, the chat
+  span reported the framework's token usage as if no wire call had been seen,
+  and the wire span reported the same usage again. wardex now remembers a
+  model call's path from the moment its stream opens. Its answer ships under
+  that path even when the bound also dropped the request (named
+  `HTTP ? /v1/chat/completions` and marked `h2_request_evicted`, where it used
+  to be `HTTP ? /`). The chat span keeps the framework's numbers aside, as it
+  does for every other call. If the answer arrives after the chat span has
+  closed, the wire span's numbers move to `wardex.usage_late.*` instead.
+  `protocol.http2.evicted_witnessed` counts each such answer.
+  `protocol.http2.evicted_call_unanswered` counts a dropped model call whose
+  answer never arrived; its usage stays on the chat span.
 - **A read made of many small HTTP/2, WebSocket or JSON-RPC frames no longer
   stalls your thread.** Each of those parsers removed every frame it parsed
   from the front of its buffer, moving the rest of the read once per frame, on

@@ -20,7 +20,7 @@ from .._assembly import (
     should_capture,
 )
 from .._enums import CaptureMode
-from .._protocol import WsParser
+from .._protocol import WsParser, classify_path
 from .._protocol._http1 import Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, ParsedMessage, SpanContext
@@ -345,6 +345,13 @@ class _Http2Tracker:
         self._evicted_admitting: set[int] = set()
         #: Who opened each stream, read in the opening call itself (`_h2_issuer`).
         self._issuers = IssuerLink(self._latch_cap)
+        #: The request path of each latched stream that is a model call (`classify_path`), read when
+        #: the stream opens: the native table evicts with the same cap in the same `feed`, so by the
+        #: time the latch evicts a stream its path may already be gone. Keys are latch keys.
+        self._model_paths: dict[int, str] = {}
+        #: Model calls whose latch entry the cap evicted, with the parent it held and the path,
+        #: until their answer arrives (`_mk`). Bounded by the cap, lowest id dropped first.
+        self._evicted_calls: dict[int, tuple[SpanContext, str]] = {}
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         self._issuers.see(data)
@@ -360,6 +367,9 @@ class _Http2Tracker:
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
             self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed), now)
+            path = self._conn.request_path(sid)
+            if path is not None and classify_path(path) == "llm_call":
+                self._model_paths[sid] = path
         if opened:
             low = min(opened)
             self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)
@@ -372,7 +382,9 @@ class _Http2Tracker:
         # keys, run only on the writes that overflow the cap.
         while len(self._latch) > self._latch_cap:
             evicted = min(self._latch)
-            if _admits(*self._latch.pop(evicted)[:2]):
+            dropped = self._latch.pop(evicted)
+            self._remember_evicted_call(evicted, dropped[0])
+            if _admits(*dropped[:2]):
                 self._evicted_admitting.add(evicted)
                 if len(self._evicted_admitting) > self._latch_cap:
                     # A late answer to the forgotten stream is refused under AGENT like traffic
@@ -381,6 +393,21 @@ class _Http2Tracker:
                     counters.bump("protocol.http2.evicted_parent_forgotten")
             self._latch_evicted_below = max(self._latch_evicted_below, evicted)
         return self._ship(txns)
+
+    def _remember_evicted_call(self, stream_id: int, parent: SpanContext | None) -> None:
+        """Keep what the seal's model-call witness (`witness_request`) needs for a model call whose
+        latch entry the cap evicted: its answer reaches `_seal` with no parent, so the seal would
+        witness nothing, and a bridge chat unit above it would promote its framework usage while the
+        wire span ships its own, one call counted twice. The witness is handed over with the answer
+        (`_Txn.evicted_parent`), not given here: a call whose answer never arrives must leave the
+        unit's number promoted, or the usage is lost with no wire span to carry it."""
+        path = self._model_paths.pop(stream_id, None)
+        if parent is None or path is None:
+            return
+        self._evicted_calls[stream_id] = (parent, path)
+        if len(self._evicted_calls) > self._latch_cap:
+            del self._evicted_calls[min(self._evicted_calls)]
+            counters.bump("protocol.http2.evicted_call_unanswered")
 
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
         # server push (PUSH_PROMISE) unsupported — response-side stream_id ignored
@@ -425,9 +452,14 @@ class _Http2Tracker:
         process does. This is the release that costs nothing, where it is
         reachable; the cap bounds the paths where it is not.
 
-        No transactions come back. A stream that never produced a response
-        produced no status either, and the seam has nothing to say about it that
-        would not be invented.
+        At a real close (not `still_open`), a stream whose response status
+        arrived and whose end never did ships as what arrived, marked
+        `FRAME_PARSE_FAILED` and `response_cut` (`_mk`), as HTTP/1's response in
+        flight does: a client that stops reading a stream at its last event
+        never waits for the empty DATA frame carrying END_STREAM, and the usage
+        that stream carried belongs on the wire record. A stream with no status
+        ships nothing; the seam has nothing to say about it that would not be
+        invented.
 
         The eviction bookkeeping goes with the entries, and it has to: h2 stream
         ids restart at 1 on the next connection, so a mark or a floor taken on
@@ -437,18 +469,28 @@ class _Http2Tracker:
         that, and the cost of a stale mark is every unlatched stream on the new
         connection reporting a parent wardex never lost.
         """
+        out = [] if still_open else self._ship(self._conn.finish())
+        for _ in self._evicted_calls:  # its usage stays on the unit, promoted; no wire span has it
+            counters.bump("protocol.http2.evicted_call_unanswered")
+        self._evicted_calls.clear()
+        self._model_paths.clear()
         self._latch.clear()
         self._issuers.clear()
         self._evicted_admitting.clear()
         self._latch_evicted_below = 0
         self._latch_first = 0
-        return []
+        return out
 
     def _mk(self, t: Any) -> _Txn:
         now = time.time_ns()
         entry = self._latch.pop(t.stream_id, None)
+        model_path = self._model_paths.pop(t.stream_id, None)
+        witness = None
         if entry is None:
             parent, parent_closed, conversation, proven, start = None, False, None, False, now
+            if (call := self._evicted_calls.pop(t.stream_id, None)) is not None:
+                witness, model_path = call  # the seal witnesses the call it evicted the parent of
+                counters.bump("protocol.http2.evicted_witnessed")
             scope = UNKNOWN_ISSUER  # whoever issued it, nothing here says who
             # The DECISION the cap owes the span. An absent latch entry has two causes that look
             # identical here and mean opposite things: nothing was ambient when the request went out
@@ -497,14 +539,17 @@ class _Http2Tracker:
         request_evicted = bool(t.request_evicted)
         if request_evicted:
             counters.bump("protocol.http2.stream_evicted")
+        cut = not t.response_ended  # handed back at close (`on_connection_close`): a partial body
+        target = t.path or model_path or "/"  # a request the native table evicted: path kept here
         return _Txn(
             method=t.method or "?",
-            path=_name_path(t.path or "/"),
-            target=t.path or "/",
+            path=_name_path(target),
+            target=target,
             status=t.status,
             request_body=t.request_body,
             response_body=t.response_body,
             parent=parent,
+            evicted_parent=witness,
             parent_closed=parent_closed,
             parent_evicted=parent_evicted,
             parent_lost=parent_lost,
@@ -519,6 +564,7 @@ class _Http2Tracker:
             # sent so far (an upload refused part-way): like HTTP/1's unfinished request, no size.
             request_counted=t.request_ended and not (t.request_truncated or request_evicted),
             response_counted=not t.response_truncated,
+            response_cut=cut,
             stream_id=t.stream_id,
             # A body past its cap carries the marker HTTP/1 gives the same cut (`append_capped`), so
             # one query finds every capped body whatever version carried it. HTTP/2 reports the cut
@@ -526,6 +572,7 @@ class _Http2Tracker:
             limitations=_merge_markers(
                 (Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
                 (Limitation.BODY_CAP_EXCEEDED,) if t.truncated else (),
+                (Limitation.FRAME_PARSE_FAILED,) if cut else (),
             ),
             version="2",
             ttft_ms=None,  # per-h2-stream first-body-byte not tracked: not measured

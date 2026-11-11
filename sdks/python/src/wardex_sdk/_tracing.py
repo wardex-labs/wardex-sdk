@@ -348,32 +348,37 @@ def _begin(
         tracked = _runtime.runtime().track_open_span(
             id(builder), functools.partial(_interrupt, builder)
         )
+    # What `_WithOnly.__exit__` undoes when this close cannot run at all (see there).
+    builder._undo = (tracked, installed)  # type: ignore[attr-defined]
     try:
         yield builder
     finally:
-        if installed is not None:
-            with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
-                installed.take_down()
-        # Finished, and its client found, BEFORE it leaves the table: a signal
-        # landing between the pop and the capture finds the span neither
-        # tracked nor buffered, so that gap is kept to the capture alone.
-        finished = None
-        # `_finish()` validates, and a vocabulary breach must not reach the host
-        # (I6) — a `with wardex.span(...)` block would otherwise raise on the
-        # way out of code that has nothing to do with wardex.
-        with guard("tracing.manual_span", debug=_debug_enabled()):
-            finished = builder._finish()
-        client = None
-        with guard("tracing.manual_client", debug=_debug_enabled()):
-            client = _hub.get_client()
-        # Gone from the table means a shutdown already shipped this span,
-        # marked as cut off, while the block was still open; a second copy
-        # under the same span id would contradict it. No `return` here: in a
-        # `finally` it would swallow the host's exception.
-        untaken = tracked is None or tracked.pop(id(builder), None) is not None
-        if untaken and client is not None and finished is not None:
-            with guard("tracing.manual_emit", debug=_debug_enabled()):
-                client.capture_span(finished)
+        # None: `_WithOnly.__exit__` gave this close up, and a late close of the suspended
+        # generator must neither take the scope down again nor ship the span.
+        if getattr(builder, "_undo", None) is not None:
+            if installed is not None:
+                with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
+                    installed.take_down()
+            # Finished, and its client found, BEFORE it leaves the table: a signal
+            # landing between the pop and the capture finds the span neither
+            # tracked nor buffered, so that gap is kept to the capture alone.
+            finished = None
+            # `_finish()` validates, and a vocabulary breach must not reach the host
+            # (I6) — a `with wardex.span(...)` block would otherwise raise on the
+            # way out of code that has nothing to do with wardex.
+            with guard("tracing.manual_span", debug=_debug_enabled()):
+                finished = builder._finish()
+            client = None
+            with guard("tracing.manual_client", debug=_debug_enabled()):
+                client = _hub.get_client()
+            # Gone from the table means a shutdown already shipped this span,
+            # marked as cut off, while the block was still open; a second copy
+            # under the same span id would contradict it. No `return` here: in a
+            # `finally` it would swallow the host's exception.
+            untaken = tracked is None or tracked.pop(id(builder), None) is not None
+            if untaken and client is not None and finished is not None:
+                with guard("tracing.manual_emit", debug=_debug_enabled()):
+                    client.capture_span(finished)
 
 
 def _interrupt(span: Span, marker: Limitation, end_ns: int) -> InternalSpan | None:
@@ -487,15 +492,43 @@ class _WithOnly(WithOnly):
         # `__class__`, which is the host's code and can raise in place of the
         # exception the host is raising. `type()` and a subclass check against a
         # builtin run nothing of the host's.
-        if issubclass(type(exc), Exception) and self._span is not None:
-            try:
-                _record_exception(self._span, exc, tb)
-            except BaseException:
-                # A signal landing mid-record must not leave the span unfinished
-                # and its fork installed as the active parent.
-                self._cm.__exit__(exc_type, exc, tb)
-                raise
-        return self._cm.__exit__(exc_type, exc, tb)
+        #
+        # A RecursionError out of the work below is wardex's own bookkeeping
+        # meeting the interpreter's limit on the host's stack, typically while
+        # the host's own RecursionError unwinds through each decorated level.
+        # Raised, it would reach the host chained onto whatever the block was
+        # leaving with. So it is dropped, uncounted (counting pushes a frame),
+        # and the block leaves exactly as it would have without wardex: with the
+        # host's exception, or with none. `except` and `return` push no frame.
+        try:
+            if issubclass(type(exc), Exception) and self._span is not None:
+                try:
+                    _record_exception(self._span, exc, tb)
+                except BaseException:
+                    # A signal landing mid-record must not leave the span
+                    # unfinished and its fork installed as the active parent.
+                    self._cm.__exit__(exc_type, exc, tb)
+                    raise
+            return self._cm.__exit__(exc_type, exc, tb)
+        except RecursionError:
+            # The close may have stopped before `_begin`'s `finally` ran, or partway through it
+            # (the limit was lowered inside the block, so it closes with fewer free frames than it
+            # opened with). The span is lost either way; it must not also stay in the open-span
+            # table, nor stay installed as the parent of what this thread opens next, an edge to a
+            # span that never ships. C calls only, which push no frame: a Token already used, or
+            # made in another Context, is refused, and the scope stays as `take_down` left it.
+            # `_undo = None` makes a later close of the suspended generator do nothing.
+            undo = getattr(self._span, "_undo", None)
+            if undo is not None:
+                self._span._undo = None  # type: ignore[union-attr]
+                if undo[0] is not None:
+                    undo[0].pop(id(self._span), None)
+                if undo[1] is not None:
+                    try:
+                        _hub._current_scope.reset(undo[1]._token)
+                    except (RuntimeError, ValueError):
+                        pass
+            return False
 
 
 @contextmanager
