@@ -789,13 +789,3 @@ class BeforeSendEnvelopeCallback(TypingProtocol):
     def __call__(self, envelope: Envelope) -> Envelope | None:
         """Return the received envelope to send, None to cancel the batch."""
         ...
-
-
-class SpanEnrichCallback(TypingProtocol):
-    """Used when Interceptors enrich an existing Span with transport attributes."""
-
-    def __call__(self, span: InternalSpan, transport: TransportAttributes) -> InternalSpan: ...
-
-
-class FlushCallback(TypingProtocol):
-    def __call__(self, envelope: Envelope) -> None: ...

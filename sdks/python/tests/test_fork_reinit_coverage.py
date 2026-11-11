@@ -144,7 +144,7 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_runtime.py", "_prev_handlers"): "signal dispositions survive fork by design (§3.8)",
     # -- what the last init() said about its configuration: the child inherits
     #    that configuration with the memory image, so the account stays true.
-    ("__init__.py", "_said"): "init()'s account of the configuration the child also runs",
+    ("transport/_resolve.py", "said"): "init()'s account of the configuration the child also runs",
     # -- the owner-typed scan counts a lock at its allocation site AND at the
     #    site holding the instance; this is the one same-module double count.
     ("_runtime.py", "_RUNTIME"): (

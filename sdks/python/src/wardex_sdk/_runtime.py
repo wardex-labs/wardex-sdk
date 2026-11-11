@@ -499,11 +499,9 @@ class Runtime:
     def reset(self) -> None:
         """Undo everything and forget it. TEST-ONLY.
 
-        Every state this object owns, not one of them. The predecessor reset the
-        client slot alone, so an interceptor, an adapter, a chained signal
-        handler or a raised timing refcount left behind by one test was charged
-        to whichever test ran next — the failure landing in a file that had done
-        nothing wrong.
+        Every state this object owns, so an interceptor, an adapter, a chained
+        signal handler or a raised timing refcount one test leaves behind is
+        never charged to the test that runs next.
         """
         with self._lock:
             self._teardown(self._client)
