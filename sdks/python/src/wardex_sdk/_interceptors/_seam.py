@@ -1145,7 +1145,7 @@ def _latched(txn: _Txn) -> Ambient:
     tracker does not latch it, and widening to a full `Ambient` belongs with the seam decomposition
     (design §3.3).
     """
-    return Ambient(span_context=txn.parent, conversation=txn.conversation, tracestate=None)
+    return Ambient(txn.parent, txn.conversation, None, txn.unseen_parent)
 
 
 def _url_host(obj: Any | None, st: _ConnectionState) -> str:

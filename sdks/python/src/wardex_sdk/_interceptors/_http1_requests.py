@@ -49,6 +49,9 @@ class Issue:
     #: The tags and user the span is stamped with (`_issue_scope`): read here, not where the reply
     #: is read or the socket closed, which may be another request's context.
     scope: ScopeSnapshot
+    #: With no parent: why one may exist that this context could not see (`_hub.unseen_parent`).
+    #: Readable only here, where the request is issued; the reply is parsed on another thread.
+    unseen_parent: str | None = None
 
 
 #: What a reply pairs with when no request byte was latched: its start is the reply's own, and no
@@ -73,7 +76,8 @@ def _issued_here() -> Issue:
     scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
     parent = scope.active_span_context
     closed = parent_is_closed_unit(parent)
-    return Issue(time.time_ns(), parent, closed, scope.conversation, issued_scope())
+    unseen = None if parent is not None else _hub.unseen_parent(scope)
+    return Issue(time.time_ns(), parent, closed, scope.conversation, issued_scope(), unseen)
 
 
 class _Reading:

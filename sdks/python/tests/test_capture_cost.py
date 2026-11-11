@@ -10,6 +10,7 @@ request head, the budget across bodies, and the account a refusal leaves.
 from __future__ import annotations
 
 import contextlib
+import functools
 import http.client
 import http.server
 import json
@@ -421,6 +422,30 @@ def test_without_debug_a_refused_call_prints_no_debug_line(server, capsys):
     wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
     _post(server.port, "/internal/search", b"{}")
     assert "debug:" not in capsys.readouterr().err
+
+
+# --- a model call from a thread wardex cannot see into ---------------------------------------
+
+
+@pytest.mark.parametrize("bound", [False, True], ids=["plain-thread", "bound-thread"])
+def test_a_model_call_from_an_unbound_thread_while_a_span_is_open_is_not_a_confident_root(
+    server, caplog, bound
+):
+    """A plain thread starts with an empty context, so its call cannot see the span open on the
+    main thread. It may belong under that span: shipped as a trace root it would look measured."""
+    _hub._said.clear()
+    server.post_reply = _CHAT_REPLY
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
+    call = functools.partial(_post, server.port, "/v1/chat/completions", _CHAT_REQUEST)
+    with caplog.at_level("WARNING", logger="wardex_sdk"), wardex.span("agent"):
+        thread = threading.Thread(target=wardex.bind_context(call) if bound else call)
+        thread.start()
+        thread.join()
+    (span,) = [s for s in client_spans() if s.name == "HTTP POST /v1/chat/completions"]
+    assert (span.parent_span_id is not None) is bound
+    assert (Limitation.PARENT_UNRESOLVED in span.capture_integrity.limitations) is not bound
+    said = [r for r in caplog.records if "wardex.bind_context(fn)" in r.getMessage()]
+    assert len(said) == (0 if bound else 1)
 
 
 # --- intercept_hosts names a TLS host too ---------------------------------------------------

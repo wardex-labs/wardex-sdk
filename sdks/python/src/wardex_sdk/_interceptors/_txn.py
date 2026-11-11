@@ -49,6 +49,10 @@ class _Txn:
     #: nothing the gate acts on, and calling it degraded let bodies out under a mode that had
     #: filtered the traffic. `parent_evicted` alone stays the marker (`resolve_observed`).
     parent_lost: bool = False
+    #: With no parent: why one may exist that the issuing context could not see
+    #: (`_hub.unseen_parent`), latched beside `parent` for the same reason. It makes the span's
+    #: root edge unresolved rather than a confident trace root.
+    unseen_parent: str | None = None
     #: The conversation the request was ISSUED in, latched beside `parent` for the same reason.
     conversation: ConversationContext | None = None
     #: The tags and user the span is stamped with, snapshotted beside `parent` for the same reason

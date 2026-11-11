@@ -180,6 +180,7 @@ class _Http1Tracker:
                         response_body=b"",
                         parent=issue.parent,
                         parent_closed=issue.parent_closed,
+                        unseen_parent=issue.unseen_parent,
                         conversation=issue.conversation,
                         scope=issue.scope,
                         start_ns=issue.start_ns or now,
@@ -273,6 +274,7 @@ class _Http1Tracker:
             response_body=msg.body,
             parent=issue.parent,
             parent_closed=issue.parent_closed,
+            unseen_parent=issue.unseen_parent,
             conversation=issue.conversation,
             scope=issue.scope,
             start_ns=issue.start_ns or now,
@@ -382,10 +384,12 @@ class _Http2Tracker:
         # of them flushes the others' queued frames. So it is the parent only of
         # a stream with no proven issuer, and never anyone's conversation or
         # identity (`IssuerLink.latch`).
-        parent = _hub.get_current_scope().active_span_context
+        scope = _hub.get_current_scope()
+        parent = scope.active_span_context
         parent_closed = parent_is_closed_unit(parent) if opened else False
+        unseen = _hub.unseen_parent(scope) if opened and parent is None else None
         for sid in opened:
-            self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed), now)
+            self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed, unseen), now)
         if opened:
             low = min(opened)
             self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)
@@ -475,6 +479,7 @@ class _Http2Tracker:
         entry = self._latch.pop(t.stream_id, None)
         if entry is None:
             parent, parent_closed, conversation, proven, start = None, False, None, False, now
+            unseen = None
             scope = UNKNOWN_ISSUER  # whoever issued it, nothing here says who
             # The DECISION the cap owes the span. An absent latch entry has two causes that look
             # identical here and mean opposite things: nothing was ambient when the request went out
@@ -510,7 +515,7 @@ class _Http2Tracker:
             parent_lost = t.stream_id in self._evicted_admitting
             self._evicted_admitting.discard(t.stream_id)
         else:
-            parent, parent_closed, conversation, scope, proven, start = entry
+            parent, parent_closed, conversation, scope, unseen, proven, start = entry
             parent_evicted = parent_lost = False
         # The OTHER half of the same bound: the native stream table evicted this stream's request
         # before its response completed. The response is a real observation — a status, an end — so
@@ -534,6 +539,7 @@ class _Http2Tracker:
             parent_closed=parent_closed,
             parent_evicted=parent_evicted,
             parent_lost=parent_lost,
+            unseen_parent=unseen,
             conversation=conversation,
             scope=scope,
             issuer_proven=proven,
