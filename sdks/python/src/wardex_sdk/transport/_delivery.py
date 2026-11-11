@@ -56,6 +56,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .._assembly import DropReason, DropUnit, counters, diag_info, diag_warning, record, report_once
 from .._suppress import suppress_capture
+from ._otlp_answer import MAX_ANSWER_BYTES, Answer, read_answer
 
 #: How many encoded bodies the retry queue holds, and how many bytes in all.
 RETRY_MAX_BATCHES = 64
@@ -134,11 +135,23 @@ def posts_inline() -> Iterator[None]:
         _INLINE.depth = depth
 
 
-def _attempt(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
+def _attempt(
+    url: str, body: bytes, headers: dict[str, str], timeout: float, accepted: list[bool]
+) -> Answer | None:
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout):
-            pass
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            # Marked before the body is read: a 2xx whose answer does not
+            # arrive in time is still a request the receiver accepted.
+            accepted.append(True)
+            try:
+                data = response.read(MAX_ANSWER_BYTES)
+            except Exception:  # noqa: BLE001 — accepted already; its answer is optional
+                return None
+            headers_in = response.headers
+            return read_answer(
+                headers_in.get("content-type", ""), headers_in.get("content-encoding", ""), data
+            )
     except urllib.error.HTTPError as exc:
         # Read here, while the connection is open and inside the deadline.
         try:
@@ -148,23 +161,23 @@ def _attempt(url: str, body: bytes, headers: dict[str, str], timeout: float) -> 
         raise
 
 
-def post(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None:
-    """POST `body`, returning when the receiver accepted it and raising what
-    went wrong otherwise -- `DeadlineOverrun` when `timeout` seconds passed
-    first, whatever the request was waiting on."""
+def post(url: str, body: bytes, headers: dict[str, str], timeout: float) -> Answer | None:
+    """POST `body`, returning the receiver's answer when it accepted it (None
+    when the answer could not be read in time) and raising what went wrong
+    otherwise -- `DeadlineOverrun` when `timeout` seconds passed first,
+    whatever the request was waiting on."""
     socket_timeout = max(0.001, timeout - min(0.1, timeout * 0.05))
     if getattr(_INLINE, "depth", 0):
         with suppress_capture():
-            _attempt(url, body, headers, socket_timeout)
-        return
-    outcome: list[BaseException | None] = []
+            return _attempt(url, body, headers, socket_timeout, [])
+    outcome: list[Answer | BaseException | None] = []
+    accepted: list[bool] = []
     with suppress_capture():  # what wardex sends is never recorded as a span
         context = contextvars.copy_context()
 
     def run() -> None:
         try:
-            context.run(_attempt, url, body, headers, socket_timeout)
-            outcome.append(None)
+            outcome.append(context.run(_attempt, url, body, headers, socket_timeout, accepted))
         except BaseException as exc:  # noqa: BLE001 — handed back to the caller below
             outcome.append(exc)
 
@@ -172,13 +185,15 @@ def post(url: str, body: bytes, headers: dict[str, str], timeout: float) -> None
     try:
         helper.start()
     except RuntimeError:  # no thread to be had: post inline, bounded per socket step
-        context.run(_attempt, url, body, headers, socket_timeout)
-        return
+        return context.run(_attempt, url, body, headers, socket_timeout, [])
     helper.join(timeout)
     if not outcome:
+        if accepted:
+            return None
         raise DeadlineOverrun(f"no answer within {timeout:.1f}s")
-    if outcome[0] is not None:
+    if isinstance(outcome[0], BaseException):
         raise outcome[0]
+    return outcome[0]
 
 
 def http_status(exc: BaseException) -> int | None:
@@ -236,9 +251,14 @@ def refusal_text(exc: BaseException) -> str:
     text = _protobuf_string_field(body, 2)
     if text is None:
         text = body.decode("utf-8", errors="replace")
+    return printable(text)
+
+
+def printable(text: str) -> str:
+    """The far end's text, safe to print: printable characters only, spaces
+    collapsed, at most `_BODY_TEXT_MAX` of them."""
     cleaned = "".join(ch if ch.isprintable() else " " for ch in text)
-    cleaned = " ".join(cleaned.split())
-    return cleaned[:_BODY_TEXT_MAX]
+    return " ".join(cleaned.split())[:_BODY_TEXT_MAX]
 
 
 def _protobuf_string_field(data: bytes, field: int) -> str | None:
@@ -453,6 +473,22 @@ class Delivery:
                 key=f"transport.{self._wire}.retry_queue_full",
             )
 
+    def answered(self, answer: Answer | None, at_most: int) -> int:
+        """Record the spans an OTLP receiver rejected in an answer that accepted
+        the request, at most `at_most` of them, and say so once; how many."""
+        if self._wire != "otlp" or answer is None or answer.rejected <= 0 or at_most <= 0:
+            return 0
+        rejected = min(answer.rejected, at_most)
+        record(DropReason.PARTIAL_SUCCESS, rejected)
+        report_once(
+            f"the OTLP receiver at {self.destination} accepted a request but rejected "
+            f"{rejected} of its span(s), saying {printable(answer.message) or 'nothing'!r}. "
+            "wardex.diagnostics().losses counts them under partial_success; the receiver's own "
+            "logs say why it refuses them.",
+            key=f"transport.{self._wire}.partial_success",
+        )
+        return rejected
+
     @staticmethod
     def lose(item: Held, reason: DropReason) -> None:
         for unit, n in item.units:
@@ -475,7 +511,7 @@ class Delivery:
                 return True
             item = self.begin(self._held[0])
             try:
-                post(self.url, item.body, headers, remaining)
+                answer = post(self.url, item.body, headers, remaining)
             except Exception as exc:  # fail-silent: never crash the app
                 counters.bump(f"transport.{self._wire}.export_failed")
                 if not self.end(item):
@@ -496,7 +532,7 @@ class Delivery:
                 return True
             self._popleft(item)
             spans = sum(n for unit, n in item.units if unit is DropUnit.SPAN)
-            self.succeeded(spans or None)
+            self.succeeded((spans - self.answered(answer, spans)) or None)
         return True
 
     def _popleft(self, item: Held) -> None:

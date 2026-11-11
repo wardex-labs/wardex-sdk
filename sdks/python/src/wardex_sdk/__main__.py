@@ -19,6 +19,7 @@ captured payload.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 import time
@@ -124,28 +125,44 @@ def _observe_exports(transport: Any) -> list[object]:
     return seen
 
 
+class _Replayed:
+    """A 2xx answer the doctor read first, handed to the exporter to read again."""
+
+    def __init__(self, response: Any, body: bytes) -> None:
+        self.headers, self.status = response.headers, response.status
+        self._response, self._body = response, io.BytesIO(body)
+
+    def read(self, amt: int = -1) -> bytes:
+        return self._body.read(amt)
+
+    def __enter__(self) -> _Replayed:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._response.close()
+
+
 def _observe_answers() -> tuple[list[tuple[int, Answer]], Callable[[], None]]:
     """Keep the status and the classified body of every 2xx answer the
     exporter reads, by wrapping `urllib.request.urlopen` for the send, and
-    return them with the call that puts urlopen back. The exporter never reads
-    an answer's body, so reading it here changes nothing it does. The doctor
-    owns its process, so it may."""
+    return them with the call that puts urlopen back. The exporter reads the
+    same bytes after the doctor, so what it records is what it would have. The
+    doctor owns its process, so it may."""
     answers: list[tuple[int, Answer]] = []
     real = urllib.request.urlopen
 
     def urlopen(*args: Any, **kwargs: Any) -> Any:
         response = real(*args, **kwargs)
         try:
+            body = response.read(MAX_ANSWER_BYTES)
             headers = response.headers
             answer = read_answer(
-                headers.get("content-type", ""),
-                headers.get("content-encoding", ""),
-                response.read(MAX_ANSWER_BYTES),
+                headers.get("content-type", ""), headers.get("content-encoding", ""), body
             )
             answers.append((int(response.status), answer))
         except Exception:  # noqa: BLE001 — an unreadable answer is judged as no answer
-            pass
-        return response
+            return response
+        return _Replayed(response, body)
 
     def restore() -> None:
         urllib.request.urlopen = real
@@ -188,9 +205,15 @@ def _verdict(
     started: float,
     where: str,
 ) -> tuple[int, str]:
-    """OK only on evidence the exporter took the span; otherwise the first
-    loss recorded since `before`, with its fix, what the receiver answered,
-    or what the exporter did."""
+    """OK only on evidence the exporter took the span; otherwise what the
+    receiver answered (its own words name the cause best), the first loss
+    recorded since `before` with its fix, or what the exporter did."""
+    unconfirmed = None
+    for status, answer in answers:
+        judged = _judge_answer(status, answer, where)
+        if judged is not None and judged[0]:
+            return judged
+        unconfirmed = unconfirmed or judged
     new = [
         loss
         for loss in wardex.diagnostics().losses
@@ -199,12 +222,6 @@ def _verdict(
     if new:
         loss = new[0]
         return 1, f"FAIL: {loss.reason}: {loss.meaning} {loss.next_step}"
-    unconfirmed = None
-    for status, answer in answers:
-        judged = _judge_answer(status, answer, where)
-        if judged is not None and judged[0]:
-            return judged
-        unconfirmed = unconfirmed or judged
     if unconfirmed is not None:
         return unconfirmed
     state = getattr(transport, "export_state", None)

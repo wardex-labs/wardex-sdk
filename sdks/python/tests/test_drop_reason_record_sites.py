@@ -23,7 +23,6 @@ from wardex_sdk._assembly._ledger import DropReason
 
 #: Reasons with no record site, and why. Delete an entry when its reason gains one.
 _NOT_YET_RECORDED: dict[str, str] = {
-    "PARTIAL_SUCCESS": "the OTLP exporter does not read a partial-success answer's rejected count",
     "TRANSPORT_UNSUPPORTED": "the OTLP exporter skips state snapshots without counting them",
     "EXCLUDED_BY_POLICY": "the byte seam's path exclusion is a counter only",
     "RESPONSE_UNOBSERVED": "no seam counts a request whose response never came",

@@ -161,6 +161,83 @@ def test_the_first_delivered_export_says_where_and_how_many(receiver, capsys):
     assert transport.export_state.last_success_at is not None
 
 
+#: `ExportTraceServiceResponse{partial_success{rejected_spans: 2, error_message: "too old\x07"}}`.
+_PARTIAL = b"\x0a\x0c\x08\x02\x12\x08too old\x07"
+
+
+@pytest.mark.parametrize(
+    ("content_type", "payload"),
+    [
+        ("application/x-protobuf", _PARTIAL),
+        ("application/json", b'{"partialSuccess":{"rejectedSpans":"2","errorMessage":"too old"}}'),
+    ],
+    ids=["protobuf", "json"],
+)
+def test_spans_a_receiver_rejects_in_a_200_are_counted_and_said_once(
+    receiver, capsys, content_type, payload
+):
+    receiver.answers += [(200, {"Content-Type": content_type}, payload)] * 2
+    transport = OtlpHttpTransport(f"{receiver.base}/v1/traces?token=t0k")
+    transport.export(_envelope(3))
+    transport.export(_envelope(3))
+    err = capsys.readouterr().err
+
+    assert _lost(DropReason.PARTIAL_SUCCESS) == 4
+    [line] = _lines(err, "rejected 2")
+    assert f"{receiver.base}/v1/traces" in line and "t0k" not in err
+    assert "'too old'" in line and "\x07" not in line, "the receiver's words, printable only"
+    assert "wardex.diagnostics().losses" in line
+    [first] = _lines(err, "first export delivered")
+    assert "1 span(s)" in first, "only what the receiver kept was delivered"
+
+
+def test_a_200_without_a_partial_success_counts_nothing(receiver, capsys):
+    receiver.answers.append((200, {"Content-Type": "application/x-protobuf"}, b""))
+    OtlpHttpTransport(f"{receiver.base}/v1/traces").export(_envelope(2))
+    assert _lost(DropReason.PARTIAL_SUCCESS) == 0
+    assert not _lines(capsys.readouterr().err, "rejected")
+
+
+def test_a_held_request_rejected_in_part_on_its_retry_is_counted(receiver, no_backoff):
+    receiver.answers += [
+        (503, {}, b""),
+        (200, {"Content-Type": "application/x-protobuf"}, _PARTIAL),
+    ]
+    transport = OtlpHttpTransport(f"{receiver.base}/v1/traces")
+    transport.export(_envelope(3))
+    assert transport.export_state.retry_queued == 1
+    transport.flush(5.0)
+    assert transport.export_state.retry_queued == 0
+    assert _lost(DropReason.PARTIAL_SUCCESS) == 2
+
+
+def test_reading_the_answer_stays_inside_the_export_budget(monkeypatch):
+    """An answer that trickles in must not hold the export past its deadline,
+    nor turn the receiver's 200 into a failure."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(8)
+    stop = threading.Event()
+
+    def serve() -> None:
+        conn, _ = sock.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nx")
+        stop.wait(10)
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    transport = OtlpHttpTransport(f"http://127.0.0.1:{sock.getsockname()[1]}/v1/traces")
+    started = time.monotonic()
+    try:
+        transport.export(_envelope(), timeout=CallerBudget(0.5, 0.5))
+        assert time.monotonic() - started < 2.0
+        assert transport.export_state.last_success_at is not None, "a 200 is a delivery"
+    finally:
+        stop.set()
+        sock.close()
+
+
 def test_a_credential_in_the_address_never_reaches_stderr(capsys):
     transport = OtlpHttpTransport("http://user:s3cret@127.0.0.1:1/v1/traces?token=t0k")
     transport.export(_envelope())

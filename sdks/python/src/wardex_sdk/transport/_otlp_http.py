@@ -363,6 +363,7 @@ class OtlpHttpTransport(Transport):
                 self._hold(bodies, shipped)
             return None
 
+        rejected = 0
         for index, body in enumerate(bodies):
             # Every request reads the same deadline: what the caller bounded is
             # the call, so an oversized batch cannot multiply it by the number
@@ -397,7 +398,7 @@ class OtlpHttpTransport(Transport):
                 # come back as `UNDELIVERED`, so its skipped spans count now.
                 self._count_encode_reports(reports)
             try:
-                post(self._endpoint, body, headers, remaining)
+                answer = post(self._endpoint, body, headers, remaining)
             except Exception as exc:  # fail-silent: never crash the app
                 counters.bump("transport.otlp.export_failed")
                 if self._debug:
@@ -423,13 +424,14 @@ class OtlpHttpTransport(Transport):
                 # A backend that refused one request refuses the next, and
                 # trying anyway spends the caller's budget one timeout at a time.
                 break
+            rejected += self._delivery.answered(answer, shipped - rejected)
             if index + 1 < len(bodies):
                 if not self._delivery.owns(flight):
                     break  # close() counted the rest; none of it is sent after close()
                 flight.units = self._units(bodies[index + 1 :], None)
         else:
             self._delivery.end(flight)
-            self._delivery.succeeded(shipped)
+            self._delivery.succeeded((shipped - rejected) or None)
         # No `UNDELIVERED` on the failure path: the POST was attempted, so the
         # backend may hold the batch, and a resend would duplicate it.
         return None

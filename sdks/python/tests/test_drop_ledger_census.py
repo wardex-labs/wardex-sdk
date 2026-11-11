@@ -864,8 +864,12 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("transport/_delivery.py", "bump", "f'transport.{self._wire}.retry_queue_full'"): L(
         "CACHE_OVERFLOW"
     ),
+    ("transport/_delivery.py", "record", "DropReason.PARTIAL_SUCCESS"): L("PARTIAL_SUCCESS"),
     ("transport/_delivery.py", "record", "reason"): Structural(
         "Delivery.lose()'s own records; each lose() call is its own entry"
+    ),
+    ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.partial_success'"): L(
+        "PARTIAL_SUCCESS"
     ),
     ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.failed_after_close'"): L(
         "NETWORK_ERROR", "RATELIMIT_BACKOFF", "SEND_UNCONFIRMED", at="transport/_otlp_http.py"
