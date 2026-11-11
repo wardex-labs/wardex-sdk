@@ -127,7 +127,7 @@ class _Reading:
 class RequestSide:
     """The request half of one HTTP/1 connection: what the next final reply pairs with."""
 
-    __slots__ = ("_fresh", "_just_orphaned", "_limits", "_reading", "_tied")
+    __slots__ = ("_fresh", "_just_orphaned", "_keep_all", "_limits", "_reading", "_tied")
 
     def __init__(self, limits: object | None = None) -> None:
         self._limits = limits
@@ -142,6 +142,8 @@ class RequestSide:
         #: method, and the bytes could not say which one the next reply answers. Cleared when it is
         #: taken.
         self._tied = False
+        #: The body policy the next request's parser applies (`keep_bodies`).
+        self._keep_all = True
 
     @property
     def request(self) -> ParsedMessage | None:
@@ -168,11 +170,21 @@ class RequestSide:
     def disabled_reason(self) -> str | None:
         return self._reading.parser.disabled_reason()
 
+    def keep_bodies(self, keep_all: bool) -> None:
+        """Which request bodies the parsers store from the next header block on (see
+        `Http1Parser.set_body_policy`): the seam's answer for a request issued right now."""
+        if keep_all != self._keep_all:
+            self._keep_all = keep_all
+            self._reading.parser.set_body_policy(keep_all)
+            if self._fresh is not None:
+                self._fresh.parser.set_body_policy(keep_all)
+
     def feed(self, data: bytes) -> None:
         if self._just_orphaned:
             self._just_orphaned = False
             if _opens_like_a_request(data):
                 self._fresh = _Reading(self._limits)
+                self._fresh.parser.set_body_policy(self._keep_all)
         fresh = self._fresh
         if fresh is not None:
             fresh.feed(data)

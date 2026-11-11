@@ -245,8 +245,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # --- caps ---
     # HTTP/2's half of the body cap: the h2 tracker's `_mk` turns the native
     # transaction's per-direction truncation flags into the member. HTTP/1's half
-    # is a Rust string, recorded in `_CENSUS_RUST`.
-    "BODY_CAP_EXCEEDED": frozenset({"_interceptors/_trackers.py"}),
+    # is a Rust string, recorded in `_CENSUS_RUST`. The seam reads the member on a
+    # span that ships, to count the cut in the drop ledger (`body_cap`).
+    "BODY_CAP_EXCEEDED": frozenset({"_interceptors/_trackers.py", "_interceptors/_seam.py"}),
     "GRPC_MESSAGE_TRUNCATED": frozenset({"_semantics/_grpc.py"}),
     "WS_PAYLOAD_TRUNCATED": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
     "CONNECTION_EVICTED": frozenset({"_interceptors/_seam.py"}),

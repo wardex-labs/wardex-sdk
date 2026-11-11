@@ -22,6 +22,9 @@
 //!   latches off) + one read + the body of the message in flight, stored up to
 //!   `max_body_bytes` (`max_opaque_body_bytes` for content types with no
 //!   extractable meaning).
+//! * Every HTTP/1 and HTTP/2 body still arriving, summed over the process:
+//!   `max_in_flight_body_bytes`. The per-parser terms above are what each
+//!   parser may hold; this one is what they may hold together.
 //! * HTTP/2, per connection: two frame decoders, each holding at most one
 //!   frame — 16 MiB + 9 bytes, the most the 24-bit length field can declare —
 //!   plus one read; `max_stream_buffer_bytes` of header blocks awaiting their
@@ -79,6 +82,21 @@ pub struct Limits {
     /// Body cap for every other content type. Opaque bytes yield no semantics,
     /// so a small sample is kept purely for diagnostics.
     pub max_opaque_body_bytes: usize,
+    /// Body bytes the HTTP/1 and HTTP/2 parsers may hold at once, summed over
+    /// every message still arriving in the process. `max_body_bytes` bounds
+    /// one message; this bounds them together, which nothing did before: a
+    /// process downloading eight large bodies at once held eight capped
+    /// bodies. A byte is counted from the moment a parser stores it until its
+    /// message leaves the parser (completed, ended, or dropped with the
+    /// connection). Over it, the body that needs the next byte stops being
+    /// stored where it stands, as at its own cap: the message is marked
+    /// `body_cap_exceeded` and its framing keeps advancing.
+    ///
+    /// A completed message is the host SDK's to bound once handed over (in the
+    /// Python SDK, the deferred-parse queue's `max_parse_backlog_bytes`).
+    /// Sized at twice `max_body_bytes`, so two model requests at the API's own
+    /// ceiling fit at the same instant.
+    pub max_in_flight_body_bytes: usize,
     /// Maximum size of the incomplete-message buffer held by a stream parser.
     /// Exceeding it means the peer is not speaking the expected protocol.
     ///
@@ -358,6 +376,7 @@ impl Default for Limits {
             max_headers: 96,
             max_body_bytes: 32 * 1024 * 1024,
             max_opaque_body_bytes: 256 * 1024,
+            max_in_flight_body_bytes: 64 * 1024 * 1024,
             max_stream_buffer_bytes: 16 * 1024 * 1024,
             max_decoded_bytes: 8 * 1024 * 1024,
             max_streams: 1024,
@@ -395,6 +414,7 @@ mod tests {
         assert_eq!(l.max_headers, 96);
         assert_eq!(l.max_body_bytes, 32 * 1024 * 1024);
         assert_eq!(l.max_opaque_body_bytes, 256 * 1024);
+        assert_eq!(l.max_in_flight_body_bytes, 64 * 1024 * 1024);
         assert_eq!(l.max_stream_buffer_bytes, 16 * 1024 * 1024);
         assert_eq!(l.max_decoded_bytes, 8 * 1024 * 1024);
         assert_eq!(l.max_streams, 1024);

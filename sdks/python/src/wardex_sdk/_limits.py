@@ -57,6 +57,7 @@ class LimitsConfig:
     max_headers: int | None = None
     max_body_bytes: int | None = None
     max_opaque_body_bytes: int | None = None
+    max_in_flight_body_bytes: int | None = None
     max_stream_buffer_bytes: int | None = None
     max_decoded_bytes: int | None = None
     max_streams: int | None = None

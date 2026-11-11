@@ -631,8 +631,10 @@ class WardexConfig:
     `intercept=False` is the documented opt-out."""
 
     intercept_hosts: Iterable[str] | None = None
-    """Plaintext peers — `host` or `host:port` — captured whatever the capture
-    mode says. Accepts any iterable of strings; reads back as a tuple. Matched
+    """Peers — `host` or `host:port` — captured whatever the capture mode says,
+    over plaintext HTTP or TLS. A TLS peer matches by the server name the client
+    connected with (an LLM gateway on its own domain); either kind matches by its
+    peer address. Accepts any iterable of strings; reads back as a tuple. Matched
     CASE-INSENSITIVELY. `None` leaves every connection to the shared policy.
 
     Naming a host by hand is a more specific opt-in than a global mode, so it

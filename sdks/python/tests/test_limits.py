@@ -30,7 +30,8 @@ def test_limits_defaults_returns_every_field():
     assert d["max_otel_bridge_spans_per_session"] == 2048
     assert d["max_parse_backlog"] == 2048
     assert d["max_parse_backlog_bytes"] == 64 * 1024 * 1024
-    assert len(d) == 26
+    assert d["max_in_flight_body_bytes"] == 64 * 1024 * 1024
+    assert len(d) == 27
 
 
 def test_limits_construction_defaults_unspecified_fields():
@@ -547,6 +548,23 @@ def _probe_max_opaque_body_bytes() -> bool:
     tight = _http1_body("application/octet-stream", body, _native(max_opaque_body_bytes=4))
     loose = _http1_body("application/octet-stream", body, None)
     return tight == b"0123" and loose == body
+
+
+def _probe_max_in_flight_body_bytes() -> bool:
+    """Two bodies in flight at once on two parsers: the second gets only what the first left of
+    the budget. Offset by what other parsers in this process already hold, which the budget
+    counts too."""
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n"
+
+    def second_body(limits) -> bytes:
+        first = _wardex_native.protocol.Http1Parser(False, limits)
+        second = _wardex_native.protocol.Http1Parser(False, limits)
+        first.feed(head + b"012345")  # six bytes held, four still to come
+        return second.feed(head + b"abcdefghij")[0].body
+
+    held = _wardex_native.protocol.in_flight_body_bytes()
+    tight = second_body(_native(max_in_flight_body_bytes=held + 10))
+    return tight == b"abcd" and second_body(None) == b"abcdefghij"
 
 
 def _probe_max_stream_buffer_bytes() -> bool:
@@ -1303,6 +1321,7 @@ _PROBES = {
     "max_headers": _probe_max_headers,
     "max_body_bytes": _probe_max_body_bytes,
     "max_opaque_body_bytes": _probe_max_opaque_body_bytes,
+    "max_in_flight_body_bytes": _probe_max_in_flight_body_bytes,
     "max_stream_buffer_bytes": _probe_max_stream_buffer_bytes,
     "max_decoded_bytes": _probe_max_decoded_bytes,
     "max_streams": _probe_max_streams,

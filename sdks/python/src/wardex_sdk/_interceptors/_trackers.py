@@ -118,10 +118,29 @@ class _Http1Tracker:
         request = self._requests.request
         return request is not None and _is_ws_upgrade_request(request.headers)
 
+    def keep_bodies(self, keep_all: bool) -> None:
+        """The seam's answer, for the request bytes it feeds next, to "could the capture policy use
+        this exchange whatever its response says?". False stores a request body only for an LLM
+        endpoint path, and the reply's only when it declares an event stream (`_admitted`)."""
+        self._requests.keep_bodies(keep_all)
+
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         self._requests.feed(data)
         self._expect_ws = self._upgrade_requested()
         return []
+
+    def _admitted(self) -> bool:
+        """Did the request a reply is about to open answer get its body stored? Then the reply's is
+        stored too. No complete request waiting (one still arriving, or none seen) keeps it too:
+        nothing says the policy can do without it."""
+        request = self._requests.request
+        return request is None or not request.body_skipped
+
+    def pass_unseen(self, n: int) -> bool:
+        """Take `n` response bytes without seeing them, when they can only be a body this tracker
+        is not storing and they do not end it (`Http1Parser.pass_unseen_body`). They leave no byte
+        mark, so such a response has no TTFT (`_response_txn`)."""
+        return self._resp.pass_unseen_body(n)
 
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
         if self._requests.decide():
@@ -130,6 +149,7 @@ class _Http1Tracker:
             # These bytes open a response, so its request is settled: HEAD and CONNECT frame their
             # answers, and only the request side knows which one this reply answers.
             self._resp.expect_response_to(self._requests.method)
+            self._resp.set_body_policy(self._admitted())
         now = time.time_ns()
         if self._resp_first_ns == 0:
             self._resp_first_ns = now
@@ -229,9 +249,15 @@ class _Http1Tracker:
             if issue.start_ns and self._resp_first_ns
             else None
         )
-        ttft = _ttft_from_marks(self._resp_marks, msg.header_len, issue.start_ns)
+        # Reads inside a body left unstored may have gone by unseen (`pass_unseen`): not measured.
+        ttft = (
+            None
+            if msg.body_skipped
+            else _ttft_from_marks(self._resp_marks, msg.header_len, issue.start_ns)
+        )
         path = (request.url if request is not None else None) or "/"
         cut = (Limitation.FRAME_PARSE_FAILED,) if msg.incomplete else ()
+        request_kept = request is None or not request.body_skipped
         return _Txn(
             method=(request.method if request is not None else None) or "?",
             path=_name_path(path),
@@ -247,8 +273,10 @@ class _Http1Tracker:
             end_ns=now,
             ttfb_ms=ttfb,
             truncated=(request is not None and request.truncated) or msg.truncated,
-            request_counted=request is not None and not request.truncated,
-            response_counted=not msg.truncated,
+            request_counted=request is not None and not request.truncated and request_kept,
+            response_counted=not msg.truncated and not msg.body_skipped,
+            request_body_kept=request_kept,
+            response_body_kept=not msg.body_skipped,
             response_cut=msg.incomplete,
             limitations=_merge_markers(
                 request.limitations if request is not None else (), msg.limitations, cut

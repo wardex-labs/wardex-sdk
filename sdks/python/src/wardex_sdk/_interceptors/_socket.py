@@ -320,7 +320,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             n = real(this, buffer, *args, **kwargs)
             try:
                 if n and self._capture_possible(this):
-                    self._on_response_bytes(this, bytes(buffer[:n]))
+                    self._on_response_view(this, buffer, n)
                 elif n == 0 and _asked_for_bytes(args[0] if args else kwargs.get("nbytes"), buffer):
                     self._on_response_eof(this)
             except Exception:

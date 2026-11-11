@@ -69,7 +69,7 @@ caps in `CaptureLimits`. Being uncollected also excludes it from the 3.10 floor
 check, which runs pytest — so after editing it, run it once more under
 `.venv-py310/bin/python`. Nothing else will catch a 3.11+-only call in there.
 
-Four more files are uncollected for the same reason and run only when a
+Five more files are uncollected for the same reason and run only when a
 person does. Each names the change that should trigger it:
 
 | File | Run it when you touch | Needs |
@@ -78,6 +78,7 @@ person does. Each names the change that should trigger it:
 | `sdks/python/tests/e2e_usage_pricing_langfuse.py` | usage fields, the OTel bridge's usage keys, or the OTLP exporter (asserts Langfuse prices the export exactly once; `--dry-run` is the syntax pass for 3.10) | a live Langfuse with `WARDEX_E2E_LANGFUSE*` set |
 | `sdks/python/tests/bench_parse_off_loop.py` | the parse-off-loop worker, the GIL release in `parse_llm_semantics`, or anything on the streaming hot path (event-loop drift, throughput, the GIL budget the bench itself prints) | nothing; `--quick` for a smoke run, report the full run |
 | `sdks/python/tests/bench_fork_semantics.py` | the fork hook, `Runtime._fork_reinit_us`, or the per-batch pid stamp | nothing |
+| `sdks/python/tests/bench_host_overhead.py` | the byte seams' send/recv wrappers, the HTTP/1 tracker or parser, the request-head capture decision (`_interceptors/_admission.py`), or anything else a request wardex does not keep passes through (budget: the added host-thread CPU per request the bench prints) | nothing; `--quick` for a smoke run, report the full run |
 
 The Rust core carries eight more. They are marked `#[ignore]`, so `cargo test
 --workspace` compiles them and runs none of them — it counts them in the

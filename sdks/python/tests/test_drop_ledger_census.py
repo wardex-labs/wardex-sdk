@@ -114,6 +114,10 @@ _TOOL_CEDED = NotADrop(
 # -- the census ------------------------------------------------------------------
 
 _CENSUS: dict[tuple[str, str, str], object] = {
+    # -- interceptors: what a request head decides
+    ("_interceptors/_admission.py", "lose", "f'interceptors.admission.unread_model_api.{api}'"): L(
+        "MODE_REFUSED"
+    ),
     # -- adapters: registry and status
     ("_adapters/__init__.py", "bump", "f'adapters.{name}.distribution_absent'"): NotADrop(
         "the framework is not installed, so there is nothing of it to capture"
@@ -711,6 +715,8 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "PEER_UNRESOLVED", at="_interceptors/_seam.py"
     ),
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.provider_state_dropped'"): _MODE,
+    ("_interceptors/_seam.py", "record", "DropReason.BACKPRESSURE"): L("BACKPRESSURE"),
+    ("_interceptors/_seam.py", "record", "DropReason.BODY_CAP"): L("BODY_CAP"),
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.stream_unterminated'"): _SEAM,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.tracking_reset_at_fork'"): Marker(
         "TRACKING_RESET_AT_FORK", at="_interceptors/_seam.py"

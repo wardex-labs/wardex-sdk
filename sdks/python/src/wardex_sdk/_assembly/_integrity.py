@@ -668,8 +668,8 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     BODY_CAP_EXCEEDED = "body_cap_exceeded"
-    """An HTTP body was stored up to ``max_body_bytes`` / ``max_opaque_body_bytes``
-    and the rest was consumed without being kept.
+    """An HTTP body was stored up to ``max_body_bytes`` / ``max_opaque_body_bytes`` or the room
+    ``max_in_flight_body_bytes`` left, and the rest was consumed without being kept.
 
     On HTTP/1 the marker is produced in Rust: ``crates/wardex-protocol/src/http1.rs``,
     ``append_capped``. It crosses the PyO3 boundary as ``Vec<&'static str>``

@@ -37,7 +37,7 @@ use wardex_core::protocol::grpc::{
     grpc_status_name as core_grpc_status_name, parse_grpc_frames as core_parse_grpc_frames,
     GrpcFrames as CoreGrpcFrames, GrpcMessage as CoreGrpcMessage,
 };
-use wardex_core::protocol::http1::{Http1Stream, ParsedHttp};
+use wardex_core::protocol::http1::{BodyPolicy, Http1Stream, ParsedHttp};
 use wardex_core::protocol::http2::{Http2Connection, Http2Transaction as CoreHttp2Txn};
 use wardex_core::protocol::json_rpc::{JsonRpcKind, JsonRpcMessage as CoreJsonRpc, JsonRpcStream};
 use wardex_core::protocol::semantic::{
@@ -106,6 +106,12 @@ impl RawHttpMessage {
     #[getter]
     fn limitations(&self) -> Vec<&'static str> {
         self.inner.limitations.clone()
+    }
+    /// The stream's body policy left this message's body unstored: `body` is
+    /// empty and is not the body's size. See `Http1Parser.set_body_policy`.
+    #[getter]
+    fn body_skipped(&self) -> bool {
+        self.inner.body_skipped
     }
 }
 
@@ -256,6 +262,28 @@ impl Http1Parser {
                 .map(|inner| RawHttpMessage { inner })
                 .collect())
         })
+    }
+
+    /// Which bodies to store from the next header block on. `keep_all` True
+    /// stores every body; False stores only a body that can still prove a
+    /// model call (a request to an LLM endpoint path, a response that declares
+    /// an event stream) and marks the others `body_skipped`.
+    fn set_body_policy(&mut self, keep_all: bool) -> PyResult<()> {
+        shielded(|| {
+            self.inner.set_body_policy(if keep_all {
+                BodyPolicy::Keep
+            } else {
+                BodyPolicy::ModelCallsOnly
+            });
+            Ok(())
+        })
+    }
+
+    /// Accounts for `n` bytes not handed over when they can only be unstored
+    /// body that does not end the message in flight; False (nothing changed)
+    /// means the caller must `feed` them.
+    fn pass_unseen_body(&mut self, n: usize) -> PyResult<bool> {
+        shielded(|| Ok(self.inner.pass_unseen_body(n)))
     }
 
     /// The request the next final response answers used `method`: a response
@@ -1098,6 +1126,13 @@ fn classify_path(path: &str) -> PyResult<Option<&'static str>> {
     })
 }
 
+/// Body bytes the HTTP parsers in this process hold for messages still
+/// arriving: what `max_in_flight_body_bytes` bounds.
+#[pyfunction]
+fn in_flight_body_bytes() -> PyResult<usize> {
+    shielded(|| Ok(wardex_core::protocol::budget::held()))
+}
+
 /// "known_provider" | "unknown_host" | None — the WS-transport question, see
 /// endpoint.rs.
 #[pyfunction]
@@ -1128,6 +1163,7 @@ fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     protocol.add_function(wrap_pyfunction!(sniff_event_stream, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(classify_path, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(classify_ws_upgrade, &protocol)?)?;
+    protocol.add_function(wrap_pyfunction!(in_flight_body_bytes, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(normalize_finish_reason, &protocol)?)?;
     protocol.add_class::<WsParser>()?;
     protocol.add_class::<WsFeedResult>()?;

@@ -5,6 +5,7 @@
 //! `claude_stream_json`, `codex_exec_json`) and, above them, `semantic`, which turns a parsed
 //! request/response pair into provider-neutral message parts.
 
+pub mod budget;
 pub mod claude_stream_json;
 pub mod codex_exec_json;
 pub mod grpc;

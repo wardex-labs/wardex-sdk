@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._assembly import (
     Ambient,
+    DropReason,
     Limitation,
     PatchSet,
     Prefilter,
@@ -25,6 +26,7 @@ from .._assembly import (
     counters,
     guard,
     in_degraded_run,
+    record,
     report_connection_parser_disabled,
     resolve_observed,
     should_capture,
@@ -58,11 +60,13 @@ from .._types import (
     TransportAttributes,
     TransportTiming,
 )
+from ._admission import _accepted_prefix as _accepted_prefix
+from ._admission import keeps_bodies, named_in, report_unread_model_api
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
 from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
-from ._trackers import _WebSocketTracker
+from ._trackers import _Http1Tracker, _WebSocketTracker
 from ._txn import _Txn, _url_target
 
 if TYPE_CHECKING:
@@ -72,73 +76,7 @@ if TYPE_CHECKING:
 # recorded, and their PII is masked later — in the Rust core, at encode time
 # (`codec.encode_otlp_traces` takes the mode and the disabled categories), not here.
 #
-# --- Where "do we capture this?" is asked, and why it is asked twice ---
-#
-# The question has two halves, split by WHEN each can be answered rather than by what it means.
-# Getting that split wrong is expensive in one direction and WRONG in the other, so it is written
-# down here.
-#
-# INVARIANT — settled for the life of the connection, so `_capture_possible` answers them in the
-# patch wrapper, before the send/recv buffer is copied and before a single byte reaches a tracker:
-#
-#   * no client on this seam. Both emit paths already returned on a `None` client, so nothing behind
-#     one was ever going to become a span — but the bodies were still accumulated in a tracker that
-#     is kept for the life of the connection, which is memory held for an output that cannot exist.
-#   * the self-exclusion flag. The exporter's own POST, which must never be re-captured whatever
-#     else is true.
-#   * a connection the sniff-latch already classified "ignore". `_gate` is latched once, from the
-#     first bytes, and never re-decided — so a TLS-backed Redis, Postgres or Kafka connection is
-#     settled for its whole life, and every call on one was still materializing its buffer
-#     (`bytes(data)`, a real copy whenever the caller passes a memoryview or a bytearray, which is
-#     the shape the asyncio and httpx paths use) to re-derive a verdict that was reached on the
-#     first write.
-#
-# CONTEXT-DEPENDENT — an answer about ONE transaction, and only ever correct for the instant it was
-# asked, so they live in the module `_should_capture` on the response side: the shared policy's
-# ambient-span clause and the LLM-semantic claim `_parse_semantics` earns. An agent unit can
-# ACTIVATE after a connection was opened — a pooled keep-alive socket outlives any single run — so
-# a per-connection early-out on "no agent unit is ambient right now" would silently drop every
-# later request on that socket. That is data loss, and the parse it would save is the one the gate
-# needs.
-#
-# And a THIRD moment since the parse moved off the caller's thread: the gate now usually runs on
-# the finalize WORKER, over a `_PendingTxn` sealed at the response instant. What keeps its answer
-# honest there is the seal — the prefilter verdict, the mode, and `copy_context()` all travel with
-# the job — so the gate reads the response instant's facts wherever and whenever it actually
-# executes.
-#
-# NOT here, deliberately: "the transport is a NoOpTransport". `init()` resolves a missing
-# `transport=` argument to exactly that, so it is the out-of-the-box configuration rather than a
-# statement that capture is off, and reading it as one would turn `wardex.init(intercept=True)`
-# into a silent no-op.
-
-
-def _accepted_prefix(data: Any, n: int) -> Any:
-    """The first `n` bytes of a send buffer, without materializing the rest.
-
-    `send`/`write` may report a SHORT write, and the caller then keeps the tail and calls again with
-    the whole remainder: asyncio's plaintext writer does, with `send(self._buffer)` on 3.10/3.11
-    and, from 3.12, `send` for a `write()`'s first attempt and `sendmsg` for the rest
-    (`_socket._accepted_prefix_vectored`). `bytes(data)[:n]` copies that entire remainder before
-    throwing away everything the kernel refused, so a multi-megabyte body costs a copy per call:
-    quadratic in body size, and on the branch the gate deliberately leaves OPEN — a local plaintext
-    model server is HTTP, so it latches "http" and pays this on every partial write.
-
-    Returns something `bytes()` accepts rather than `bytes`, so that an exact `bytes` argument
-    written in full stays the same object and costs nothing at all; the caller materializes once,
-    immediately.
-
-    The three arms are an isinstance chain rather than a `try`, because a handler here would be a
-    silent swallow on a path that has a correct answer without one: anything that is not one of the
-    three buffer types the socket API actually takes falls through to what this line used to be.
-    """
-    if isinstance(data, bytes):
-        return data[:n]
-    if isinstance(data, (bytearray, memoryview)):
-        # `.cast("B")` so `n` is read as bytes for an itemsize > 1 view too,
-        # which is what the caller's `n` counts.
-        return memoryview(data).cast("B")[:n]
-    return bytes(data)[:n]
+# Where "do we capture this?" is asked, and why at more than one moment: see `_admission`.
 
 
 def _is_llm_traffic(txn: Any, sem: Any) -> bool:
@@ -178,6 +116,8 @@ class _ConnectionState:
         self.read_shut = False  # the client shut its own read side: see `_on_read_shutdown`
         self.h2_opening: tuple[Any, ...] | None = None  # see `opening_timing`
         self.gate: str | None = None  # None=undetermined, "http", "h2c", "h2", "ignore"
+        # The seam's opinion about the peer, asked once: see `_connection_prefilter`.
+        self.prefilter: Prefilter | None = None
         # This state was built for a socket that OUTLIVED an os.fork(): the tracker starts
         # mid-stream, so the first span assembled from it carries `TRACKING_RESET_AT_FORK` (once —
         # the stamp clears it). Set by `_state` from the seam's fork latch, never by the trackers.
@@ -209,8 +149,9 @@ class ByteSeamInterceptor(InterceptorInterface):
     """Shared byte seam base — tracker feed + span assembly.
     Seam-specific behavior is a subclass hook."""
 
-    def __init__(self) -> None:
+    def __init__(self, intercept_hosts: list[str] | None = None) -> None:
         self._client: Client | None = None
+        self._allow: set[str] = {h.lower() for h in intercept_hosts or ()}  # hosts: no case
         self._conns: dict[int, _ConnectionState] = {}
         # ids of connections that were being tracked when an os.fork() reset
         # this seam in the child — consumed one id at a time by `_state`, so
@@ -246,8 +187,9 @@ class ByteSeamInterceptor(InterceptorInterface):
         self._native_limits: Any = None
 
     def _load_limits(self, client: Client | None) -> None:
-        """Cache resolved limits at install time; config is frozen after init."""
+        """Cache resolved limits and add `intercept_hosts` at install; config is frozen then."""
         config = getattr(client, "config", None)
+        self._allow |= {h.lower() for h in getattr(config, "intercept_hosts", None) or ()}
         lim = config.limits if config is not None else LimitsConfig()
         self._limits = lim.resolved()
         self._ws_kwargs = limits_kwargs(LimitsConsumer.WS_TRACKER, self._limits)
@@ -423,12 +365,15 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _transport_prefilter(self, st: _ConnectionState) -> Prefilter:
         """This seam's opinion about the connection itself, before the policy.
 
-        `DEFER` is the base answer, and it is the honest one for a TLS seam: it knows nothing about
-        the peer that `assembly.should_capture` does not already know better. A seam that DOES know
-        something — the plaintext socket seam, which must never read a link-local metadata endpoint
-        and must always honour `intercept_hosts` — overrides this, and only this. Overriding
-        `_should_capture` itself is what produced the two bugs design §4.4 names.
+        `ALLOW` for a peer named in `intercept_hosts` (`named_in`): a hand-named host bypasses the
+        mode. Else `DEFER`, the honest answer for a TLS seam. A seam that knows more — the
+        plaintext seam, which must never read a link-local metadata endpoint — overrides this, and
+        only this. Overriding `_should_capture` itself produced the two bugs design §4.4 names.
         """
+        if self._allow and named_in(
+            self._allow, st.server_hostname, st.server_address, st.server_port
+        ):
+            return Prefilter.ALLOW
         return Prefilter.DEFER
 
     def _capture_source(self) -> CaptureSource:
@@ -506,6 +451,8 @@ class ByteSeamInterceptor(InterceptorInterface):
             return
         if st.server_address == UNRESOLVED_HOST:  # only a TLS name can still arrive; see `_peer.py`
             st.server_address = placeholder_host(obj)
+        if type(st.tracker) is _Http1Tracker:
+            st.tracker.keep_bodies(keeps_bodies(self._connection_prefilter(st), self._client))
         for txn in st.tracker.on_request_bytes(data):
             if txn.version == "websocket":
                 self._emit_ws(st, txn)
@@ -554,6 +501,14 @@ class ByteSeamInterceptor(InterceptorInterface):
             else:
                 self._emit_span(obj, st, txn)
 
+    def _on_response_view(self, obj: Any, buffer: Any, n: int) -> None:
+        """`buffer[:n]`, just read into the host's buffer, copied only if the tracker must read
+        it: a read inside a body the HTTP/1 parser is not storing is counted, never copied."""
+        st = self._conns.get(id(obj))
+        if st is not None and type(st.tracker) is _Http1Tracker and st.tracker.pass_unseen(n):
+            return
+        self._on_response_bytes(obj, bytes(buffer[:n]))
+
     def _on_response_eof(self, obj: Any) -> None:
         """A read that asked for bytes got none: the peer closed its side. The HTTP/1 tracker ends
         a body with no framing here (`on_response_eof`) and its span ships while `obj` is live."""
@@ -585,6 +540,13 @@ class ByteSeamInterceptor(InterceptorInterface):
             pre = self._transport_prefilter(st)
         return pre
 
+    def _connection_prefilter(self, st: _ConnectionState) -> Prefilter:
+        """`_prefilter_of` once per connection: its inputs are fixed for the connection's life."""
+        pre = st.prefilter
+        if pre is None:
+            pre = st.prefilter = self._prefilter_of(st)
+        return pre
+
     def _seal(
         self, obj: Any | None, st: _ConnectionState, txn: _Txn, client: Client
     ) -> _PendingTxn | None:
@@ -596,9 +558,9 @@ class ByteSeamInterceptor(InterceptorInterface):
         comment), the prefilter, a handful of attribute reads, and `copy_context()` (HAMT sharing,
         O(1)). The parse, the gate and the draft belong to the worker.
 
-        `None` means the prefilter DENIED the connection, or the path is one the endpoint table
-        EXCLUDES (`classify_path`) — either way cheaper than today, because the parse this skips was
-        unconditionally paid before.
+        `None` means the prefilter DENIED the connection, the path is one the endpoint table
+        EXCLUDES (`classify_path`), or the two heads leave the policy nothing to admit
+        — each cheaper than a parse, which is what a refusal used to cost.
 
         The fork latch is consumed here rather than at assembly: `st` must not travel with the job
         (I-F1), so the first transaction SEALED on a fork-crossing connection carries the marker in
@@ -636,10 +598,19 @@ class ByteSeamInterceptor(InterceptorInterface):
             st.reset_at_fork = False
             timing_markers = (*timing_markers, Limitation.TRACKING_RESET_AT_FORK)
             counters.bump("interceptors.seam.tracking_reset_at_fork")
-        pre = self._prefilter_of(st)
+        pre = self._connection_prefilter(st)
         if pre is Prefilter.DENY:
             return None
         config = getattr(client, "config", None)
+        mode = capture_mode_of(client)
+        if not (
+            treatment == "llm_call"
+            or txn.event_stream
+            or _should_capture(pre, txn, None, mode=mode)
+        ):
+            # Nothing a parse could find would admit it: no job competes with a model call's.
+            _count_refusal(treatment, url_host, txn.path, bool(getattr(config, "debug", False)))
+            return None
         return _PendingTxn(
             txn=txn,
             url_host=url_host,
@@ -651,7 +622,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             is_grpc=is_grpc,
             treatment=treatment,
             prefilter=pre,
-            mode=capture_mode_of(client),
+            mode=mode,
             connect_ms=connect_ms,
             handshake_ms=handshake_ms,
             reused=reused,
@@ -905,6 +876,15 @@ def _should_capture(
         return True  # losing data is worse than noise (design §5.1)
 
 
+def _count_refusal(treatment: str | None, host: str, path: str, debug: bool) -> None:
+    """A refusal is counted for a Conversations-API path (provider state, no model) and recorded
+    for an unread model API (`report_unread_model_api`); any other is ordinary, uncounted."""
+    if treatment == "provider_state":
+        counters.bump("interceptors.seam.provider_state_dropped")
+    else:
+        report_unread_model_api(host, path, debug)
+
+
 def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> Any:
     """One sealed transaction, finished into a span — on whatever thread.
 
@@ -938,13 +918,11 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         if not parsed:
             parse_failed = True
     unparsed = ((not parse) or parse_failed) and not p.is_grpc
-    if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=unparsed):
-        if p.treatment == "provider_state":
-            # A Conversations-API-shaped path (provider-owned agent state, no model, no usage) the
-            # mode refused. Not an LLM call, so refusing is right — but a recognised provider path
-            # must never vanish uncounted. Generic refusals stay uncounted: they are every non-LLM
-            # request.
-            counters.bump("interceptors.seam.provider_state_dropped")
+    # A skipped parse leaves the claim unanswered only where a head made a model call possible: an
+    # eviction fallback must not turn ordinary traffic into exported spans.
+    possible = p.treatment == "llm_call" or txn.event_stream
+    if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=unparsed and possible):
+        _count_refusal(p.treatment, p.url_host, txn.path, p.debug)
         return None
     withhold_bodies = unparsed and not _should_capture(
         p.prefilter, txn, sem, mode=p.mode, unparsed=False
@@ -1116,7 +1094,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     # it as SSE, or the part the SDK read (cut by its cap as sent, or once inflated) shows event
     # lines. Not SSE only if the WHOLE body read as something else; a cut body showing none, one in
     # a coding the SDK did not undo (`br`, raw deflate), not text, or not parsed: unset.
-    body_read = parse and not parse_failed and not p.is_grpc
+    body_read = parse and not parse_failed and not p.is_grpc and txn.response_body_kept
     if txn.event_stream or (body_read and getattr(sem, "reassembled_from_stream", False)):
         streamed = True
     elif body_read:
@@ -1146,11 +1124,22 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         # "attempted and succeeded", not "non-empty": the seam read both
         # bodies off the tracker, and a zero-length body is a captured
         # zero-length body. Withheld only under §3.9's restraint above.
+        # A body the parser never stored (`*_body_kept`) was not attempted.
         input_data, input_cut = inflate_body(txn.request_body, p.limits)
         txn.truncated |= input_cut
-        draft.set_io(input_data=input_data, output_data=output_data)
+        draft.set_io(
+            input_data=input_data,
+            output_data=output_data,
+            input_attempted=txn.request_body_kept,
+            output_attempted=txn.response_body_kept,
+        )
     draft.integrity.truncated(txn.truncated)
-    return draft.finish(txn.end_ns)
+    span = draft.finish(txn.end_ns)  # the two losses below are parts of a span that ships
+    if Limitation.PARSE_BACKLOG_FULL in extra:
+        record(DropReason.BACKPRESSURE, where="interceptors.seam.parse_backlog_full")
+    if Limitation.BODY_CAP_EXCEEDED in txn.limitations:
+        record(DropReason.BODY_CAP, where="interceptors.seam.body_cap_exceeded")
+    return span
 
 
 def _latched(txn: _Txn) -> Ambient:

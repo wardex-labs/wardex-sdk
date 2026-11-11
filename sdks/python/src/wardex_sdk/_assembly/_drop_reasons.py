@@ -361,7 +361,8 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             _U.SPAN,
             "partial",
             "A body was cut at its capture limit.",
-            "Raise the body capture limit.",
+            "Raise LimitsConfig(max_body_bytes=...), or max_in_flight_body_bytes when many "
+            "bodies arrive at once.",
         ),
         _R.WS_SAMPLE_CAP: ReasonInfo(
             _U.SPAN,

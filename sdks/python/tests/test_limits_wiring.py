@@ -842,6 +842,10 @@ _DELIVERY: dict[str, tuple[tuple[str, Any], ...]] = {
         ("native", _nat("ssl_seam", "max_opaque_body_bytes")),
         ("native", _nat("mcp", "max_opaque_body_bytes")),
     ),
+    "max_in_flight_body_bytes": (
+        ("native", _nat("ssl_seam", "max_in_flight_body_bytes")),
+        ("native", _nat("socket_seam", "max_in_flight_body_bytes")),
+    ),
     "max_stream_buffer_bytes": (
         ("native", _nat("ssl_seam", "max_stream_buffer_bytes")),
         ("native", _nat("mcp", "max_stream_buffer_bytes")),
@@ -920,6 +924,7 @@ _ROUND_A = LimitsConfig(
     max_headers=7,
     max_body_bytes=4096,
     max_opaque_body_bytes=8192,
+    max_in_flight_body_bytes=3145728,
     max_stream_buffer_bytes=16384,
     max_decoded_bytes=32768,
     max_streams=3,
@@ -946,6 +951,7 @@ _ROUND_B = LimitsConfig(
     max_headers=41,
     max_body_bytes=8192,
     max_opaque_body_bytes=16384,
+    max_in_flight_body_bytes=6291456,
     max_stream_buffer_bytes=32768,
     max_decoded_bytes=65536,
     max_streams=43,
