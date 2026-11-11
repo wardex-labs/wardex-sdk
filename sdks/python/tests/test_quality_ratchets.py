@@ -341,22 +341,22 @@ def test_a_wrapped_expect_attribute_still_sanctions_its_item(tmp_path: pathlib.P
     src = tmp_path / "src"
     src.mkdir()
     (src / "lib.rs").write_text(
-        "#[expect(clippy::expect_used, reason = \"length was just checked\")]\n"
+        '#[expect(clippy::expect_used, reason = "length was just checked")]\n'
         "fn short(v: &[u8]) -> u8 {\n"
-        "    *v.first().expect(\"length was just checked\")\n"
+        '    *v.first().expect("length was just checked")\n'
         "}\n"
         "\n"
         "#[expect(\n"
         "    clippy::expect_used,\n"
-        "    reason = \"the slice was checked non-empty two lines above, so first() cannot fail\"\n"
+        '    reason = "the slice was checked non-empty two lines above, so first() cannot fail"\n'
         ")]\n"
         "fn long(v: &[u8]) -> u8 {\n"
-        "    *v.first().expect(\"checked non-empty above\")\n"
+        '    *v.first().expect("checked non-empty above")\n'
         "}\n"
         "\n"
-        "#[expect(clippy::string_slice, reason = \"not a panic lint\")]\n"
+        '#[expect(clippy::string_slice, reason = "not a panic lint")]\n'
         "fn other(v: &[u8]) -> u8 {\n"
-        "    *v.first().expect(\"this one is counted\")\n"
+        '    *v.first().expect("this one is counted")\n'
         "}\n",
         encoding="utf-8",
     )
