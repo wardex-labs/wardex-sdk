@@ -338,7 +338,7 @@ class WardexTransport(Transport):
                 self._delivery.failed(exc, spans=spans)
                 ledger.unsent(envelope, definite=False)
                 return None
-            self._delivery.refused(exc)
+            self._delivery.refused(exc, waited=time.monotonic() - started)
             self._lost(envelope, exc, spans, timeout, effective, started)
             return None
         self._delivery.end(flight)

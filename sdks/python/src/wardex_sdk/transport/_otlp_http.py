@@ -355,7 +355,9 @@ class OtlpHttpTransport(Transport):
             Held(b"", self._units(bodies, shipped), DropReason.SEND_UNCONFIRMED)
         )
         # Held requests go first, so the receiver sees batches in capture order.
-        if not self._delivery.admits(headers, deadline):
+        # A spent budget got this far only because `holding` said so (close()'s
+        # final drain after a failed connect): held for close() to try.
+        if effective <= 0 or not self._delivery.admits(headers, deadline):
             # The receiver is backing us off: this batch waits in the queue
             # rather than spending a POST the receiver asked us not to make.
             self._count_encode_reports(reports)
@@ -419,7 +421,7 @@ class OtlpHttpTransport(Transport):
                     self._delivery.failed(exc, spans=shipped if index == 0 else None)
                     unsent(envelope, definite=False)
                     break
-                self._delivery.refused(exc)
+                self._delivery.refused(exc, waited=time.monotonic() - started)
                 self._lost(envelope, exc, index, len(bodies), reports, timeout, effective, started)
                 # A backend that refused one request refuses the next, and
                 # trying anyway spends the caller's budget one timeout at a time.

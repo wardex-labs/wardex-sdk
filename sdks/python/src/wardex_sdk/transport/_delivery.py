@@ -32,9 +32,10 @@ bound the oldest body is dropped and recorded as `cache_overflow`.
 
 `Retry-After` is honoured, and between attempts the delay doubles up to a
 minute, with jitter so that a fleet restarted together does not retry in step.
-While a delay runs nothing is posted: new batches join the queue. That is also
-what keeps a process's exit fast during an outage -- after a failed connect,
-close() does not wait for another one.
+A request that got no answer starts the same delay, so a silent receiver costs
+one timeout and not one per flush(). While a delay runs nothing is posted: new
+batches join the queue. That is also what keeps a process's exit fast during an
+outage -- after a failed connect, close() gives the receiver one short try.
 """
 
 from __future__ import annotations
@@ -69,6 +70,9 @@ BACKOFF_MAX_S = 60.0
 #: A `Retry-After` longer than this is shortened to it: the queue is bounded,
 #: and a receiver asking for hours would only see the queue overflow first.
 RETRY_AFTER_MAX_S = 900.0
+
+#: How long close() tries a receiver the last attempt could not connect to.
+CLOSE_PROBE_S = 1.0
 
 #: An outage that goes on is said again at most this often, with its totals.
 REPEAT_EVERY_S = 60.0
@@ -510,6 +514,7 @@ class Delivery:
             if remaining <= 0 or time.monotonic() < self._not_before:
                 return True
             item = self.begin(self._held[0])
+            posted = time.monotonic()
             try:
                 answer = post(self.url, item.body, headers, remaining)
             except Exception as exc:  # fail-silent: never crash the app
@@ -521,12 +526,14 @@ class Delivery:
                     return False
                 self._popleft(item)
                 self.lose(item, self._classify(exc)[0])
-                self.refused(exc)
+                self.refused(exc, waited=time.monotonic() - posted)
                 report_once(
                     f"a held {self._label} request to {self.destination} was refused on retry "
                     f"({describe(exc)}) and dropped; it is not retried again.",
                     key=f"transport.{self._wire}.retry_refused",
                 )
+                if time.monotonic() < self._not_before:
+                    return False  # it got no answer: the rest wait out the delay
                 continue
             if not self.end(item):
                 return True
@@ -591,10 +598,12 @@ class Delivery:
         self.give_up(why)
 
     def close(self, headers: dict[str, str], timeout: float) -> None:
-        """The last chance for the queue. After a failed connect nothing is
-        attempted, because a second one would only delay the process's exit;
-        otherwise the bodies get one try inside `timeout`. A request still in
-        flight is claimed first and counted as not confirmed delivered."""
+        """The last chance for the queue: the bodies get one try inside
+        `timeout`. After a failed connect the first of them gets only
+        `CLOSE_PROBE_S`: a receiver still down refuses in milliseconds or costs
+        the exit that much, and one that has come up since (a sidecar started a
+        moment after the app) takes the rest. A request still in flight is
+        claimed first and counted as not confirmed delivered."""
         self._claim_flights(
             "close() returned",
             "The last attempt could not connect, so close() did not wait for this one; "
@@ -606,14 +615,13 @@ class Delivery:
         )
         if not self._held:
             return
-        if self._unreachable:
-            self.give_up(
-                "at close(): the last attempt could not connect, and waiting for another "
-                "would only delay this process's exit."
-            )
-            return
         self._not_before = 0.0  # one last try, whatever the receiver asked for
-        failed_again = not self.resend(headers, time.monotonic() + timeout)
+        start = time.monotonic()
+        failed_again = self._unreachable and not self.resend(
+            headers, start + min(timeout, CLOSE_PROBE_S)
+        )
+        if not failed_again:
+            failed_again = not self.resend(headers, start + timeout)
         if self._held:
             self.give_up(
                 "at close(): the last try failed too."
@@ -644,11 +652,25 @@ class Delivery:
             _FIRST_SUCCESS_PID[:] = [pid]
             diag_info(f"first export delivered: {spans} span(s) accepted by {self.destination}")
 
-    def refused(self, exc: BaseException) -> None:
-        """A failure that is not retried: only the state changes."""
+    def refused(self, exc: BaseException, *, waited: float = 0.0) -> None:
+        """A failure that is not retried. One that got no answer (the receiver
+        took the connection and stayed silent) also holds the next POST back,
+        for the backoff delay and at least as long as it `waited`, and what
+        comes meanwhile waits in the queue: every flush() posting into the
+        silence would wait the whole timeout again."""
         self._last_error = describe(exc)
         self._last_error_at = time.time()
         self._unreachable = False
+        if isinstance(exc, TimeoutError):  # a connect timeout is a URLError, retried instead
+            self._failures += 1
+            self._not_before = time.monotonic() + max(self._backoff(), waited)
+
+    def _backoff(self) -> float:
+        """The next delay: doubling per failure up to the cap, half of it jitter."""
+        # The exponent stops growing long before the cap is reached: past a
+        # thousand doublings the float overflows, some thirteen hours into an outage.
+        ceiling = min(BACKOFF_MAX_S, BACKOFF_FIRST_S * 2 ** min(self._failures - 1, 16))
+        return ceiling / 2 + random.uniform(0, ceiling / 2)  # noqa: S311 — jitter, not crypto
 
     def failed(self, exc: BaseException, *, spans: int | None) -> None:
         """A retryable failure: back off, and say so -- at once the first time,
@@ -663,8 +685,7 @@ class Delivery:
         self._failures += 1
         delay = retry_after(exc)
         if delay is None:
-            ceiling = min(BACKOFF_MAX_S, BACKOFF_FIRST_S * 2 ** (self._failures - 1))
-            delay = ceiling / 2 + random.uniform(0, ceiling / 2)  # noqa: S311 — jitter, not crypto
+            delay = self._backoff()
         self._not_before = now + delay
         self._outage_attempts += 1
         if self._outage_since is None:

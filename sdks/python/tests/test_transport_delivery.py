@@ -88,7 +88,7 @@ class _Receiver:
     """A loopback receiver answering each POST with the next queued
     `(status, headers, body)`, then 200 once the queue is empty."""
 
-    def __init__(self) -> None:
+    def __init__(self, port: int = 0) -> None:
         self.answers: list[tuple[int, dict[str, str], bytes]] = []
         self.posts: list[tuple[str, bytes]] = []
         receiver = self
@@ -110,7 +110,7 @@ class _Receiver:
             def log_message(self, *args: object) -> None:
                 pass
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         self.base = f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -412,6 +412,44 @@ def test_retry_after_is_honoured(receiver):
     assert transport.export_state.retry_queued == 0
 
 
+def test_a_long_outage_keeps_backing_off_and_holding(monkeypatch):
+    """Past a thousand failed attempts (about thirteen hours of a dead collector
+    at the cap) the delay stays at the cap and new batches are still held."""
+
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    delivery = transport._delivery
+    for _ in range(1100):
+        delivery._not_before = 0.0  # the delay has run out
+        transport.export(_envelope())
+    left = delivery._not_before - time.monotonic()
+    assert _delivery.BACKOFF_MAX_S / 2 - 1 <= left <= _delivery.BACKOFF_MAX_S
+    assert transport.export_state.retry_queued == _delivery.RETRY_MAX_BATCHES
+    assert _lost(DropReason.SEND_ERROR) == 0, "a batch dropped instead of held"
+
+
+@pytest.mark.parametrize("wire", ["otlp", "wardex"])
+def test_a_receiver_that_never_answers_costs_one_timeout_not_one_per_flush(black_hole, wire):
+    """A receiver that takes the connection and stays silent: the first export
+    waits its timeout, and the ones after it are held for a backoff delay
+    instead of each waiting the whole timeout again."""
+    base = black_hole.rsplit("/v1/", 1)[0]
+    if wire == "otlp":
+        transport = OtlpHttpTransport(black_hole, timeout=0.5)
+    else:
+        transport = WardexTransport(base, project_key(), timeout=0.5)
+    transport.export(_envelope(2))
+    started = time.monotonic()
+    for _ in range(3):
+        transport.export(_envelope(1))
+        transport.flush(0.5)
+    assert time.monotonic() - started < 0.3
+    assert transport.export_state.retry_queued == 3, "held, not posted into the silence"
+
+
 def test_a_full_retry_queue_drops_the_oldest_and_records_it(monkeypatch, capsys):
     monkeypatch.setattr(_delivery, "RETRY_MAX_BATCHES", 2)
 
@@ -448,7 +486,59 @@ def test_an_outage_is_said_again_with_its_totals_not_once_per_process(monkeypatc
     assert "ConnectionRefusedError" in line
 
 
-def test_close_gives_up_on_held_requests_at_once_after_a_failed_connect(monkeypatch, capsys):
+def test_close_sends_the_tail_to_a_receiver_that_came_up_after_a_refused_connect():
+    """A sidecar collector that starts a moment after the app's first export:
+    the refused batch and the one close() drains still arrive."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()  # nothing listens: the first export is refused
+    transport = OtlpHttpTransport(f"http://127.0.0.1:{port}/v1/traces")
+    client = _client(transport)
+    client.capture_span(_span())
+    client.flush(2.0)
+    assert transport.export_state.retry_queued == 1
+    late = _Receiver(port)
+    try:
+        client.capture_span(_span())
+        started = time.monotonic()
+        client.close(5.0)
+        assert time.monotonic() - started < 2.0
+        assert len(late.posts) == 2, "the held batch and the final one"
+    finally:
+        late.close()
+    assert _lost(DropReason.NETWORK_ERROR) == 0
+
+
+def test_close_after_a_refused_connect_waits_no_longer_than_a_short_try(monkeypatch, capsys):
+    """After a failed connect the receiver gets one short try at close(), so an
+    address that now swallows packets costs the exit about a second, not the
+    whole budget."""
+    calls: list[float] = []
+
+    def urlopen(request, timeout=None):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+        time.sleep(timeout)  # the connect times out
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    transport.export(_envelope(2))
+    started = time.monotonic()
+    transport.close(5.0)
+
+    assert time.monotonic() - started < 1.5
+    assert len(calls) == 2, "one short try at close()"
+    assert transport.export_state.retry_queued == 0
+    assert _lost(DropReason.NETWORK_ERROR) == 2
+    assert _lines(capsys.readouterr().err, "the last try failed too")
+
+
+def test_close_gives_up_on_held_requests_at_once_when_the_receiver_still_refuses(
+    monkeypatch, capsys
+):
     def refuse(request, timeout=None):
         raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
 
@@ -462,7 +552,7 @@ def test_close_gives_up_on_held_requests_at_once_after_a_failed_connect(monkeypa
     assert transport.export_state.retry_queued == 0
     assert _lost(DropReason.NETWORK_ERROR) == 3
     [line] = _lines(capsys.readouterr().err, "dropped at close()")
-    assert "could not connect" in line
+    assert "ConnectionRefusedError" in line and "the last try failed too" in line
 
 
 def test_a_wardex_receiver_503_is_retried_and_its_report_is_not_lost(receiver, no_backoff):
