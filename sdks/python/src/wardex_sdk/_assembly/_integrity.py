@@ -882,8 +882,8 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     PROVIDER_INFERRED = "provider_inferred"
-    """``gen_ai.provider.name`` is a guess: not read off the provider's own host but off a hostname
-    that merely contains its name (proxy, mock, Azure deployment), the body shape, or the API shape.
+    """An LLM call on a host no known provider operates (a gateway, a local server, a mock), so
+    ``gen_ai.provider.name`` is left off rather than guessed from the API shape.
 
     Decided by ``_semantics/_genai.py::provider_limitation`` from the native ``provider_inferred``,
     counted as ``protocol.semantic.provider_inferred``, attached by ``_seam.py::_assemble`` on an

@@ -21,7 +21,8 @@ from .._enums import OperationName, ProviderName
 from .._types import ConversationContext, EmbeddingsAttributes, GenAIAttributes
 
 _OPERATION_MAP = {"chat": OperationName.CHAT, "embeddings": OperationName.EMBEDDINGS}
-_PROVIDER_MAP = {"openai": ProviderName.OPENAI, "anthropic": ProviderName.ANTHROPIC}
+#: Every registry name the native parser can read off a host, to its enum member.
+_PROVIDER_MAP = {member.value: member for member in ProviderName}
 
 #: LlmSemantics getter -> GenAIAttributes field, SAME name on both sides,
 #: value copied as-is. Everything needing a conversion is spelled out in
@@ -89,33 +90,35 @@ def has_core_semantics(sem: Any) -> bool:
 
 
 def identifies_llm_call(sem: Any) -> bool:
-    """True if the REQUEST named a provider, an operation and a model.
+    """True if the REQUEST reached a recognized LLM endpoint and named an operation and a model.
 
     All three, and by truthiness rather than `is not None`: `provider` and
     `operation` cross from Rust as non-Optional strings, so an emptiness check
     is the only one that means anything, and a lone `provider` would make this
     read as "the parser produced something" — which is `sem is not None`, and
     lets a batches endpoint with no model in the body pass for a chat call.
+    An empty `provider` with `provider_inferred` set is a recognized call whose
+    host names no provider (a gateway, a local server): still a call.
 
     `getattr` with defaults, unusually for this codebase, because this runs
     inside the seam's fail-open `try` and is driven by hand-built doubles in the
     capture-policy tests; raising here would fail OPEN and capture everything.
     """
     return (
-        bool(getattr(sem, "provider", ""))
+        bool(getattr(sem, "provider", "") or getattr(sem, "provider_inferred", False))
         and bool(getattr(sem, "operation", ""))
         and getattr(sem, "request_model", None) is not None
     )
 
 
 def provider_limitation(sem: Any) -> Limitation | None:
-    """`PROVIDER_INFERRED` when the provider label is a guess, else None.
+    """`PROVIDER_INFERRED` when the provider could not be named, else None.
 
-    The native parser proves a label only off the provider's own host; a
-    hostname that merely contains the name, a body shape or an API shape sets
-    `provider_inferred`. The count travels with the marker as one fact, so the
-    seam asks this only for a span that will carry the label (`build_gen_ai`
-    ran). `getattr` for the same reason as `identifies_llm_call`.
+    The native parser reads a label only off a host a known provider operates; on any other host
+    (a gateway, a local server, a name that merely contains a provider's) it leaves the label empty
+    and sets `provider_inferred`. The count travels with the marker as one fact, so the seam asks
+    this only for an identified span (`build_gen_ai` ran). `getattr` for the same reason as
+    `identifies_llm_call`.
     """
     if not getattr(sem, "provider_inferred", False):
         return None
@@ -181,7 +184,8 @@ def build_gen_ai(sem: Any) -> GenAIAttributes:
     encodings = tuple(sem.encoding_formats) if sem.encoding_formats else None
     return GenAIAttributes(
         operation=_OPERATION_MAP.get(sem.operation, sem.operation),
-        provider=_PROVIDER_MAP.get(sem.provider, sem.provider),
+        # Empty means no host named the provider: the key is left off rather than sent empty.
+        provider=_PROVIDER_MAP.get(sem.provider, sem.provider or None),
         stop_sequences=stops,
         finish_reasons=finishes,
         encoding_formats=encodings,

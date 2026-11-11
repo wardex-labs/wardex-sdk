@@ -218,9 +218,9 @@ def test_responses_compact_is_a_billable_llm_call_under_agent_mode():
             assert sp.gen_ai.response_id == "resp_cmp1"
             assert not sp.gen_ai.finish_reasons
             assert sp.gen_ai.response_status is None
-            # provider from the body shape: the host here is 127.0.0.1, so the
-            # label is a guess and the span says so, once, with one count
-            assert sp.gen_ai.provider == ProviderName.OPENAI
+            # the host here is 127.0.0.1, which names no provider: the label is
+            # left off rather than guessed, and the span says so, once, with one count
+            assert sp.gen_ai.provider is None
             assert Limitation.PROVIDER_INFERRED in sp.capture_integrity.limitations
             assert counters.get("protocol.semantic.provider_inferred") == 1
             extra = dict(sp.extra)
@@ -263,3 +263,43 @@ def test_an_inferred_provider_label_is_marked_and_counted():
 
     assert provider_limitation(_Sem("openai", True)) is Limitation.PROVIDER_INFERRED
     assert counters.get("protocol.semantic.provider_inferred") == 1
+
+
+def test_a_host_that_names_no_provider_ships_no_provider_name():
+    """An OpenAI-shaped call to a host no known provider operates keeps its
+    gen_ai block but carries no `gen_ai.provider.name`, and a known vendor's
+    host is named by its registry name rather than by the API shape."""
+    from wardex_sdk._protocol import parse_llm_semantics
+    from wardex_sdk._semantics import build_gen_ai
+
+    req = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).encode()
+    resp = json.dumps(
+        {
+            "id": "c",
+            "object": "chat.completion",
+            "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    ).encode()
+    gateway = parse_llm_semantics("llm-gw.corp.internal", "/v1/chat/completions", req, resp)
+    assert build_gen_ai(gateway).provider is None
+    groq = parse_llm_semantics("api.groq.com", "/openai/v1/chat/completions", req, resp)
+    assert build_gen_ai(groq).provider == ProviderName.GROQ
+    azure = parse_llm_semantics(
+        "res.openai.azure.com", "/openai/deployments/d/chat/completions", req, resp
+    )
+    assert build_gen_ai(azure).provider == ProviderName.AZURE_AI_OPENAI
+
+
+def test_an_unanswered_call_to_an_unnamed_host_is_still_identified():
+    """A refused call keeps its identity when the host names no provider: the
+    request still named a model at a recognized LLM endpoint."""
+    from wardex_sdk._semantics import identifies_llm_call
+
+    class _Unanswered(_Sem):
+        operation = "chat"
+        request_model = "m"
+
+    assert identifies_llm_call(_Unanswered("", True))
+    assert not identifies_llm_call(_Unanswered("", False))

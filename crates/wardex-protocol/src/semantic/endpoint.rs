@@ -25,8 +25,9 @@ pub(crate) enum Api {
 }
 
 impl Api {
-    /// The provider label this API shape implies (used when the host says
-    /// nothing — the shapes are provider-specific).
+    /// The provider whose own hosts make a WebSocket on this API shape a
+    /// known provider's (`ws_upgrade`). Never a span label: other vendors
+    /// serve the same shapes (`provider_for_host` is the label).
     pub(super) fn provider(self) -> &'static str {
         match self {
             Api::OpenAiChatCompletions | Api::OpenAiResponses | Api::OpenAiEmbeddings => "openai",
@@ -220,15 +221,12 @@ pub enum WsUpgrade {
 }
 
 /// The provider's own API hosts: the apex API host or any subdomain of the
-/// provider's domain. Deliberately not the substring test the provider
-/// label uses (`provider_from_host`): a label is a hint on a span, but this
-/// answer makes a bare WebSocket ship under the default mode with payload
-/// samples, and `openai-mock.corp` speaking its own protocol on
-/// `/v1/responses` must not earn that on the strength of its hostname. The
-/// HTTP path refuses the same claim (the seam wants parsed semantics, not a
-/// hostname) and this keeps the two transports honest to the same degree.
-/// The provider label asks it too, afterwards: a label this does not confirm
-/// ships with `provider_inferred` set, so the hint is marked as one.
+/// provider's domain. Deliberately not a substring test: this answer makes a
+/// bare WebSocket ship under the default mode with payload samples, and
+/// `openai-mock.corp` speaking its own protocol on `/v1/responses` must not
+/// earn that on the strength of its hostname. The HTTP path refuses the same
+/// claim (the seam wants parsed semantics, not a hostname) and this keeps the
+/// two transports honest to the same degree.
 pub(super) fn is_official_host(provider: &str, host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let domain = match provider {
@@ -240,6 +238,113 @@ pub(super) fn is_official_host(provider: &str, host: &str) -> bool {
         || host
             .strip_suffix(domain)
             .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// How a row of `PROVIDER_HOSTS` matches a host name.
+#[derive(Clone, Copy, Debug)]
+enum HostRule {
+    /// The domain itself or any subdomain of it (`api.groq.com` under
+    /// `groq.com`), never a host that merely ends in the same letters
+    /// (`notgroq.com`).
+    Domain(&'static str),
+    /// A host whose first label is the given one, or it with `-fips`, under
+    /// the domain: Bedrock's per-region runtime hosts
+    /// (`bedrock-runtime.us-east-1.amazonaws.com`). The whole label, because
+    /// other `amazonaws.com` hosts (an S3 bucket's) take a name anyone picks.
+    FirstLabel(&'static str, &'static str),
+    /// A host ending in `-` or `.` plus the domain: Vertex AI's per-region
+    /// hosts (`us-central1-aiplatform.googleapis.com`) beside its global one.
+    RegionalDomain(&'static str),
+}
+
+/// Hosts a gen_ai provider operates, and the OpenTelemetry
+/// `gen_ai.provider.name` each one proves. A path's API shape does not name a
+/// provider: Groq, DeepSeek, xAI, Mistral, Gemini, Azure OpenAI, gateways and
+/// local servers all serve the OpenAI-shaped paths. So the label comes only
+/// from this table, and only names the OpenTelemetry registry defines are
+/// used; a host that is not here (OpenRouter, Together, Fireworks, a gateway,
+/// a local server) gets no label.
+const PROVIDER_HOSTS: &[(HostRule, &str)] = &[
+    (HostRule::Domain("openai.azure.com"), "azure.ai.openai"),
+    (HostRule::Domain("openai.com"), "openai"),
+    (HostRule::Domain("anthropic.com"), "anthropic"),
+    (HostRule::Domain("groq.com"), "groq"),
+    (HostRule::Domain("deepseek.com"), "deepseek"),
+    (HostRule::Domain("mistral.ai"), "mistral_ai"),
+    (HostRule::Domain("x.ai"), "x_ai"),
+    (HostRule::Domain("perplexity.ai"), "perplexity"),
+    (HostRule::Domain("cohere.ai"), "cohere"),
+    (HostRule::Domain("cohere.com"), "cohere"),
+    (
+        HostRule::Domain("generativelanguage.googleapis.com"),
+        "gcp.gemini",
+    ),
+    (
+        HostRule::RegionalDomain("aiplatform.googleapis.com"),
+        "gcp.vertex_ai",
+    ),
+    (
+        HostRule::FirstLabel("bedrock-runtime", "amazonaws.com"),
+        "aws.bedrock",
+    ),
+];
+
+/// `host` as a bare lowercase DNS name: a `:port` suffix and a trailing root
+/// dot removed. An IPv6 literal (bracketed or not) is returned unchanged
+/// apart from case; it matches no row.
+fn bare_host(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    let name = match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host.as_str(),
+    };
+    name.trim_end_matches('.').to_string()
+}
+
+/// Is `host` the domain itself or one of its subdomains?
+fn under_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+impl HostRule {
+    fn matches(self, host: &str) -> bool {
+        match self {
+            HostRule::Domain(domain) => under_domain(host, domain),
+            HostRule::FirstLabel(label, domain) => {
+                let first = host.split('.').next().unwrap_or_default();
+                let named = first
+                    .strip_prefix(label)
+                    .is_some_and(|rest| rest.is_empty() || rest == "-fips");
+                named && under_domain(host, domain)
+            }
+            HostRule::RegionalDomain(domain) => {
+                under_domain(host, domain)
+                    || host
+                        .strip_suffix(domain)
+                        .is_some_and(|prefix| prefix.ends_with('-') && prefix.len() > 1)
+            }
+        }
+    }
+}
+
+/// The `gen_ai.provider.name` the host proves, or None when the host is not
+/// one a known provider operates (an IP, `localhost`, a gateway, a mock
+/// whose name merely contains a provider's).
+pub(super) fn provider_for_host(host: &str) -> Option<&'static str> {
+    let host = bare_host(host);
+    PROVIDER_HOSTS
+        .iter()
+        .find(|(rule, _)| rule.matches(&host))
+        .map(|(_, name)| *name)
 }
 
 /// None unless the upgrade path matches a `ws_transport` row (the one
@@ -447,6 +552,60 @@ mod tests {
             ("x", "/realtime"),
         ] {
             assert_eq!(ws_upgrade(host, path), None, "{host}{path}");
+        }
+    }
+
+    /// A provider's own hosts name it by its OpenTelemetry provider name; a
+    /// host that merely contains a provider's name, a gateway, a local
+    /// server or an address names nobody.
+    #[test]
+    fn provider_hosts_name_the_registry_provider() {
+        let named = [
+            ("api.openai.com", "openai"),
+            ("eu.api.openai.com", "openai"),
+            ("API.OpenAI.com:443", "openai"),
+            ("api.openai.com.", "openai"),
+            ("api.anthropic.com", "anthropic"),
+            ("my-resource.openai.azure.com", "azure.ai.openai"),
+            ("api.groq.com", "groq"),
+            ("api.deepseek.com", "deepseek"),
+            ("api.mistral.ai", "mistral_ai"),
+            ("api.x.ai", "x_ai"),
+            ("api.perplexity.ai", "perplexity"),
+            ("api.cohere.ai", "cohere"),
+            ("api.cohere.com", "cohere"),
+            ("generativelanguage.googleapis.com", "gcp.gemini"),
+            ("aiplatform.googleapis.com", "gcp.vertex_ai"),
+            ("us-central1-aiplatform.googleapis.com", "gcp.vertex_ai"),
+            ("bedrock-runtime.us-east-1.amazonaws.com", "aws.bedrock"),
+            (
+                "bedrock-runtime-fips.us-east-1.amazonaws.com",
+                "aws.bedrock",
+            ),
+        ];
+        for (host, want) in named {
+            assert_eq!(provider_for_host(host), Some(want), "{host}");
+        }
+        for host in [
+            "openrouter.ai",
+            "api.together.xyz",
+            "api.fireworks.ai",
+            "localhost",
+            "localhost:8000",
+            "127.0.0.1",
+            "127.0.0.1:11434",
+            "10.0.0.5",
+            "[::1]:8080",
+            "llm-gw.corp.internal",
+            "openai-mock.corp",
+            "myopenai-proxy.internal",
+            "api.openai.com.evil.example",
+            "notopenai.com",
+            "notx.ai",
+            "bedrock-runtime-bucket.s3.amazonaws.com",
+            "",
+        ] {
+            assert_eq!(provider_for_host(host), None, "{host}");
         }
     }
 

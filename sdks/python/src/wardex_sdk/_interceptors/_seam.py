@@ -149,9 +149,9 @@ def _is_llm_traffic(txn: Any, sem: Any) -> bool:
     The request half (`identifies_llm_call`) is admitted only for a reply that is not an answer: a
     4xx/5xx; a stream whose provider declared a failure before any chunk named the model (an
     `error` event first: `declared_error_type`); a body the connection cut before its framing ended
-    (`response_cut`). On a plain 2xx a request-only match is ambiguous — the parser's provider gates
-    are SUBSTRING matches, so `anthropic-proxy.corp/v1/messages` with a `model` in its body parses
-    as an Anthropic call — and stays dropped. A reply that refused, failed or never finished is not:
+    (`response_cut`). On a plain 2xx a request-only match is ambiguous — the parser's call gate
+    takes a host-name SUBSTRING, so `anthropic-proxy.corp/v1/messages` with a `model` in its body is
+    an LLM call to it — and stays dropped. A reply that refused, failed or never finished is not:
     the request named a model at a chat endpoint, and the reply names none because it never became
     an answer. `getattr`: the capture-policy tests drive doubles; an absent status reads as success.
     """

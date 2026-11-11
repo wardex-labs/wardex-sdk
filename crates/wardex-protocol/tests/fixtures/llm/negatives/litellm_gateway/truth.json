@@ -1,7 +1,7 @@
 {
  "host": "llm-gw.corp.internal",
  "path": "/v1/chat/completions",
- "provider": "openai",
+ "provider": "",
  "inferred": true,
- "why": "A gateway host that names no provider. The label comes from the OpenAI-shaped response body; the upstream model vendor behind the gateway is not visible on the wire, so the label is a guess and must carry the inference marker."
+ "why": "A gateway host that names no provider. The OpenAI-shaped response body makes it an LLM call, but the vendor behind the gateway is not on the wire, so no provider label ships and the inference marker says the label is missing."
 }
