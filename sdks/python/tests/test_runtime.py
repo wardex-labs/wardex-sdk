@@ -213,6 +213,7 @@ def test_init_then_close_puts_every_patched_attribute_back():
     before = _process_seams()
 
     wardex.init(
+        transport=wardex.NoOpTransport(),
         intercept=True,
         propagation=PropagationConfig(enabled=True),
     )
@@ -275,6 +276,7 @@ def test_the_atexit_teardown_drops_the_propagation_patches_too():
 
     original = httpx.Client.send
     wardex.init(
+        transport=wardex.NoOpTransport(),
         intercept=False,
         propagation=PropagationConfig(enabled=True),
     )
@@ -551,20 +553,21 @@ def test_an_ambient_otel_endpoint_losing_to_a_project_key_is_not_announced(monke
     wardex.close()
 
 
-def test_a_wardex_endpoint_variable_losing_to_a_transport_is_still_announced(monkeypatch):
+def test_a_wardex_endpoint_variable_losing_to_a_transport_is_still_announced(monkeypatch, capsys):
     """`WARDEX_ENDPOINT` is wardex's own variable: a host that set it told
     wardex where to send, and that losing in silence would look exactly like
-    it being honoured."""
+    it being honoured. Said on stderr, because a side of the conflict came
+    from the environment, which never raises -- not even under `-W error`."""
     monkeypatch.setenv("WARDEX_ENDPOINT", "http://collector.invalid:4318")
-    with pytest.warns(wardex.WardexConfigWarning, match="endpoint ignored"):
-        wardex.init(transport=_Recording(), intercept=False)
+    wardex.init(transport=_Recording(), intercept=False)
+    assert "WARDEX_ENDPOINT ignored" in capsys.readouterr().err
     wardex.close()
 
 
-def test_a_wardex_endpoint_variable_losing_to_a_project_key_is_still_announced(monkeypatch):
+def test_a_wardex_endpoint_variable_losing_to_a_project_key_is_still_announced(monkeypatch, capsys):
     monkeypatch.setenv("WARDEX_ENDPOINT", "http://collector.invalid:4318")
-    with pytest.warns(wardex.WardexConfigWarning, match="api_key routes to the wardex receiver"):
-        wardex.init(intercept=False, backend=BackendConfig(api_key=project_key()))
+    wardex.init(intercept=False, backend=BackendConfig(api_key=project_key()))
+    assert "api_key routes to the wardex receiver" in capsys.readouterr().err
     wardex.close()
 
 
@@ -582,21 +585,15 @@ def test_pii_exemptions_under_mode_off_are_announced():
     wardex.close()
 
 
-def test_no_transport_and_no_endpoint_still_installs_the_noop_default(capsys):
-    from wardex_sdk.transport._noop import NoOpTransport
-
+@pytest.mark.no_destination
+def test_no_transport_and_no_endpoint_installs_nothing_and_says_so(capsys):
+    """Capturing into nothing cost the host every patch and worker for no
+    output, so with no destination nothing is installed. Unconditional, not
+    debug-gated: a wardex that exports nothing looks exactly like a backend
+    receiving no traffic, so it says so once, naming the fix."""
     wardex.init(intercept=False)
-    client = _hub.get_client()
-    try:
-        assert isinstance(client._transport, NoOpTransport)
-        # Unconditional, not debug-gated: a wardex capturing into nothing looks
-        # exactly like a backend receiving no traffic, so it says so once.
-        assert (
-            "no transport, backend.api_key or backend.endpoint configured: "
-            "capturing, exporting nothing" in capsys.readouterr().err
-        )
-    finally:
-        wardex.close()
+    assert wardex.diagnostics().initialized is False
+    assert "no destination is configured. Set WARDEX_ENDPOINT" in capsys.readouterr().err
 
 
 def test_debug_prints_the_resolved_config_once(capsys):
@@ -663,7 +660,7 @@ def test_close_after_a_teardown_is_a_no_op():
 
 
 def test_reset_twice_is_a_no_op():
-    wardex.init(intercept=False)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=False)
     _hub.reset_for_test()
     _hub.reset_for_test()  # must not raise on an already-empty runtime
     assert _runtime.runtime().client is None

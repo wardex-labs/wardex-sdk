@@ -81,8 +81,12 @@ class Diagnostics:
     reads it; before the first `init()` it is empty. `losses` counts every
     kind of loss since the process started, one entry per reason and unit
     that has happened at least once; a forked child starts its own from zero.
+    `config_problems` is every line the most recent `init()` said about its
+    configuration on stderr -- a variable it could not use, a kill switch, no
+    destination -- so a check made later reads why `initialized` is False.
     """
 
     initialized: bool
     adapters: tuple[AdapterStatus, ...] = ()
     losses: tuple[Loss, ...] = ()
+    config_problems: tuple[str, ...] = ()

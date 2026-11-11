@@ -33,7 +33,7 @@ def _client_span():
 
 
 def test_sse_stream_extracts_gen_ai_and_synthetic_body(sse_tls_server):
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     resp = httpx.post(
         f"{sse_tls_server}/v1/chat/completions",
         json={"model": "gpt-4o-mini", "stream": True},
@@ -55,7 +55,7 @@ def test_sse_stream_extracts_gen_ai_and_synthetic_body(sse_tls_server):
 
 
 def test_sse_stream_measures_ttft(sse_tls_server):
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     httpx.post(
         f"{sse_tls_server}/v1/chat/completions",
         json={"model": "gpt-4o-mini", "stream": True},

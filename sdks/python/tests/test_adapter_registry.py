@@ -503,6 +503,7 @@ def test_options_for_an_adapter_excluded_by_enabled_warn_unconditionally():
     try:
         with pytest.warns(WardexConfigWarning, match="excluded by adapters.enabled"):
             wardex_sdk.init(
+                transport=wardex_sdk.NoOpTransport(),
                 intercept=False,
                 adapters=AdaptersConfig(
                     enabled=(),
@@ -525,7 +526,11 @@ def test_default_options_under_an_excluding_enabled_are_not_a_contradiction():
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            wardex_sdk.init(intercept=False, adapters=AdaptersConfig(enabled=()))
+            wardex_sdk.init(
+                transport=wardex_sdk.NoOpTransport(),
+                intercept=False,
+                adapters=AdaptersConfig(enabled=()),
+            )
         assert not [w for w in caught if issubclass(w.category, WardexConfigWarning)]
     finally:
         wardex_sdk.close()

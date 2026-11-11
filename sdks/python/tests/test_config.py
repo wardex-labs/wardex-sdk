@@ -532,16 +532,15 @@ def test_the_api_key_never_appears_in_a_repr():
     assert secret not in repr(WardexConfig(backend=BackendConfig(api_key=secret)))
 
 
-def test_resolve_config_reads_base_url_and_otel_headers(monkeypatch):
-    """The two fields added with the wardex receiver: `WARDEX_BASE_URL` fills
-    `base_url`, and `OTEL_EXPORTER_OTLP_HEADERS` fills `headers` parsed the way
-    the OTel specification says (comma-separated pairs, percent-encoded
-    values, whitespace around pairs ignored)."""
+def test_resolve_config_reads_base_url(monkeypatch):
+    """`WARDEX_BASE_URL` fills `base_url`. `OTEL_EXPORTER_OTLP_HEADERS` is not
+    read here: only the destination `init()` picks says whether it matters
+    (see `test_init_environment.py`)."""
     monkeypatch.setenv("WARDEX_BASE_URL", "http://127.0.0.1:8080")
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", " a=1 , b=x%20y ,,")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "a=1")
     c = _resolve_config()
     assert c.backend.base_url == "http://127.0.0.1:8080"
-    assert dict(c.backend.headers) == {"a": "1", "b": "x y"}
+    assert c.backend.headers is None
 
 
 def test_resolve_config_headers_absent_reads_as_none_and_explicit_wins(monkeypatch):
@@ -550,12 +549,6 @@ def test_resolve_config_headers_absent_reads_as_none_and_explicit_wins(monkeypat
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "a=env")
     c = _resolve_config(backend=BackendConfig(headers={"a": "explicit"}))
     assert dict(c.backend.headers) == {"a": "explicit"}
-
-
-def test_malformed_otel_headers_are_refused_not_dropped(monkeypatch):
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "no-equals-sign")
-    with pytest.raises(ValueError, match="not key=value"):
-        _resolve_config()
 
 
 def test_backend_headers_read_back_immutable_and_equal():
@@ -666,15 +659,17 @@ def test_a_refused_endpoint_is_not_quoted_back():
     assert "t0k" not in str(excinfo.value)
 
 
-def test_a_scheme_less_wardex_endpoint_variable_is_refused_when_it_is_the_destination(
-    monkeypatch,
+def test_a_scheme_less_wardex_endpoint_variable_is_said_when_it_is_the_destination(
+    monkeypatch, capsys
 ):
-    """With nothing else naming a destination, wardex would export nothing:
-    refused at configuration time, like the same value passed as the argument."""
+    """With nothing else naming a destination, wardex would export nothing: it
+    says so and installs nothing. A variable never raises -- the same value
+    passed as the argument does."""
     monkeypatch.setenv("WARDEX_ENDPOINT", "collector:4318")
     assert _resolve_config().backend.endpoint is None
-    with pytest.raises(ValueError, match="WARDEX_ENDPOINT"):
-        wardex_sdk.init(intercept=False)
+    wardex_sdk.init(intercept=False)
+    assert "WARDEX_ENDPOINT is set but is not an http://" in capsys.readouterr().err
+    assert wardex_sdk.diagnostics().initialized is False
 
 
 @pytest.mark.parametrize(
@@ -685,8 +680,8 @@ def test_a_scheme_less_wardex_endpoint_variable_is_refused_when_it_is_the_destin
     ],
     ids=["transport", "api_key"],
 )
-def test_a_scheme_less_wardex_endpoint_variable_that_lost_anyway_only_warns(
-    monkeypatch, given, says
+def test_a_scheme_less_wardex_endpoint_variable_that_lost_anyway_is_only_said(
+    monkeypatch, capsys, given, says
 ):
     """Under a `transport=` or a project key the variable was never going to be
     the destination. A stray value left in the environment must not stop the
@@ -694,8 +689,10 @@ def test_a_scheme_less_wardex_endpoint_variable_that_lost_anyway_only_warns(
     monkeypatch.setenv("WARDEX_ENDPOINT", "collector:4318")
     if given.get("transport") == "noop":
         given = {"transport": wardex_sdk.NoOpTransport()}
-    with pytest.warns(wardex_sdk.WardexConfigWarning, match=says):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         wardex_sdk.init(intercept=False, **given)
+    assert f"WARDEX_ENDPOINT ignored: {says}" in capsys.readouterr().err
     wardex_sdk.close()
 
 
@@ -722,11 +719,11 @@ def test_an_unusable_specific_otel_endpoint_does_not_fall_through_to_the_generic
 
 
 def test_an_unusable_otel_endpoint_is_named_when_it_would_have_been_the_destination(
-    monkeypatch,
+    monkeypatch, capsys
 ):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")
-    with pytest.warns(wardex_sdk.WardexConfigWarning, match="OTEL_EXPORTER_OTLP_ENDPOINT"):
-        wardex_sdk.init(intercept=False)
+    wardex_sdk.init(intercept=False)
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT is set but" in capsys.readouterr().err
     wardex_sdk.close()
 
 
@@ -757,21 +754,25 @@ if sys.platform != "win32":  # Windows folds variable names to upper case
 
 
 @pytest.mark.parametrize(("typo", "meant"), _TYPOS)
-def test_a_misspelled_wardex_variable_is_named_with_its_correct_spelling(monkeypatch, typo, meant):
-    """A variable wardex does not read used to be ignored by everyone, and the
-    symptom -- no spans -- looked exactly like a healthy backend receiving
-    nothing. A warning, not an error: a stray variable left in a deployment's
-    environment must not stop a process from starting."""
+def test_a_misspelled_wardex_variable_is_named_with_its_correct_spelling(
+    monkeypatch, capsys, typo, meant
+):
+    """A variable nobody reads has the symptom of a healthy backend receiving
+    nothing, so it is named. On stderr, not as a warning: under `-W error` a
+    warning about a stray variable would stop the process from starting."""
     _without_wardex_variables(monkeypatch)
     monkeypatch.setenv(typo, "x")
-    with pytest.warns(wardex_sdk.WardexConfigWarning) as record:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         wardex_sdk.init(intercept=False, transport=wardex_sdk.NoOpTransport())
     wardex_sdk.close()
-    [message] = [str(w.message) for w in record if typo in str(w.message)]
+    [message] = [ln for ln in capsys.readouterr().err.splitlines() if f"{typo} is set" in ln]
     assert f"Did you mean {meant}?" in message
 
 
-def test_known_variables_and_the_repository_tooling_ones_pass_without_a_warning(monkeypatch):
+def test_known_variables_and_the_repository_tooling_ones_pass_without_a_warning(
+    monkeypatch, capsys
+):
     _without_wardex_variables(monkeypatch)
     for name in (
         "WARDEX_SERVICE_NAME",
@@ -787,6 +788,7 @@ def test_known_variables_and_the_repository_tooling_ones_pass_without_a_warning(
         warnings.simplefilter("error", wardex_sdk.WardexConfigWarning)
         wardex_sdk.init(intercept=False, transport=wardex_sdk.NoOpTransport())
     wardex_sdk.close()
+    assert "is set, but wardex reads no environment variable" not in capsys.readouterr().err
 
 
 def test_the_known_variable_names_are_exactly_the_ones_the_sdk_reads():

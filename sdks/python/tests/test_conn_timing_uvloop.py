@@ -29,7 +29,7 @@ def _verify_ctx() -> ssl.SSLContext:
 def test_uvloop_async_capture_populates_handshake(tls_server):
     # capture_mode=ALL: this test targets connect/handshake timing, not the
     # AGENT-mode policy gate, and the server response has no LLM semantics.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
 
     async def call() -> int:
         async with httpx.AsyncClient(verify=_verify_ctx()) as client:

@@ -1025,6 +1025,7 @@ def _observe(limits: LimitsConfig) -> dict[str, list[tuple[str, int]]]:
     from wardex_sdk._config import AdaptersConfig, AnthropicAgentSdkConfig
 
     wardex_sdk.init(
+        transport=wardex_sdk.NoOpTransport(),
         intercept=True,
         limits=limits,
         adapters=AdaptersConfig(anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True)),

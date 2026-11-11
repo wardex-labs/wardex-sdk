@@ -8,6 +8,7 @@ from collections.abc import Iterator as _Iterator
 from collections.abc import Sequence as _Sequence
 from contextlib import AbstractContextManager as _AbstractContextManager
 from contextlib import contextmanager as _contextmanager
+from dataclasses import replace as _replace
 from typing import Any as _Any
 from urllib.parse import urlsplit as _urlsplit
 from urllib.parse import urlunsplit as _urlunsplit
@@ -19,9 +20,8 @@ from ._assembly import diag_warning as _diag_warning
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT
 from ._client import Client as _Client
 from ._config import (
-    WARDEX_INGEST_HOSTS as _WARDEX_INGEST_HOSTS,
-)
-from ._config import (
+    _MOVED,
+    _REMOVED,
     AdaptersConfig,
     AnthropicAgentSdkConfig,
     BackendConfig,
@@ -32,11 +32,22 @@ from ._config import (
     WardexConfigWarning,
     _non_default_adapter_options,
 )
+from ._config import (
+    WARDEX_INGEST_HOSTS as _WARDEX_INGEST_HOSTS,
+)
+from ._config import WardexConfig as _WardexConfig
 from ._config import _resolve_config as _resolve_config_from_env
 from ._config import region_of_key as _region_of_key
+from ._config_checks import disabled_by as _disabled_by
 from ._config_checks import endpoint_named_for_wardex as _endpoint_named_for_wardex
+from ._config_checks import env_base_url_problem as _env_base_url_problem
 from ._config_checks import env_typo_messages as _env_typo_messages
 from ._config_checks import pii_off_from_env as _pii_off_from_env
+from ._config_checks import grpc_protocol_variable as _grpc_protocol_variable
+from ._config_checks import otel_pairs as _otel_pairs
+from ._config_checks import refuses_unknown_init_keywords as _refuses_unknown_init_keywords
+from ._config_checks import require_instance as _require_instance
+from ._config_checks import require_optional_str as _require_optional_str
 from ._config_checks import unusable_env_endpoint as _unusable_env_endpoint
 from ._decorators import agent, step, tool, workflow
 from ._diagnostics import AdapterStatus, Diagnostics, Loss
@@ -224,6 +235,143 @@ def _traces_endpoint(endpoint: str, *, argument: str | None = None) -> str:
     return _urlunsplit(parts._replace(path=path + "/v1/traces"))
 
 
+#: Every line the most recent `init()` said about its configuration, in order:
+#: what `diagnostics().config_problems` answers with. Replaced, never appended
+#: to across calls, so it describes the configuration in force.
+_said: list[str] = []
+
+
+def _say(message: str, *, problem: bool = True) -> None:
+    """One line about the configuration on stderr, kept for `diagnostics()`."""
+    _said.append(message)
+    (_diag_warning if problem else _diag_info)(message)
+
+
+def _install_nothing() -> None:
+    """End `init()` with nothing installed, so every public call stays the no-op
+    it is before `init()`; a previous `init()`'s client is closed."""
+    if _runtime.runtime().client is not None:
+        _runtime.runtime().teardown()
+
+
+def _default_transport(
+    config: _WardexConfig, given: BackendConfig
+) -> tuple[Transport | None, _WardexConfig]:
+    """The transport `init()` builds when handed none, and the config with what
+    that choice read written in; `(None, config)`, after saying why, when
+    nothing usable names a destination. An unusable ARGUMENT raises; an
+    unusable VARIABLE exports nothing rather than export somewhere else."""
+    backend = config.backend
+    if given.base_url is None:
+        said, veto = _env_base_url_problem(bool(backend.api_key), bool(backend.endpoint))
+        if said is not None:
+            _say(said)
+            if veto:
+                return None, config
+    if backend.api_key:
+        problem = _receiver_config_problem(backend.api_key, backend.base_url)
+        if problem is not None:
+            message, setting = problem
+            if getattr(given, setting):
+                raise ValueError(message)
+            variable = "WARDEX_API_KEY" if setting == "api_key" else "WARDEX_BASE_URL"
+            _say(f"{message} The value came from {variable}, so wardex exports nothing.")
+            return None, config
+        # The project key names a wardex project, and it rides only in the
+        # wardex receiver's Authorization header, never in a line or a repr.
+        # `base_url` wins over the region table: a self-hosted receiver issues
+        # keys in the same form, and its operator names it. Without one the
+        # key's region tag is the whole of the routing, and an unknown tag
+        # never falls back -- a batch sent to the wrong receiver is a 401.
+        base_url = backend.base_url
+        if base_url is None:
+            try:
+                region = _region_of_key(backend.api_key)
+            except ValueError:
+                if given.api_key:
+                    raise
+                _say(
+                    "WARDEX_API_KEY is not a wardex project key (expected the form "
+                    "wdx_<region>_<secret>), so wardex exports nothing. Set WARDEX_API_KEY to "
+                    "the key your project's settings show."
+                )
+                return None, config
+            base_url = _WARDEX_INGEST_HOSTS.get(region)
+            if base_url is None:
+                unknown = (
+                    f"names region {region!r}, which this SDK version has no receiver for "
+                    f"(known: {sorted(_WARDEX_INGEST_HOSTS)})"
+                )
+                fix = "Set WARDEX_BASE_URL to the receiver's address, or upgrade wardex-sdk."
+                if given.api_key:
+                    raise ValueError(f"api_key {unknown}. {fix}")
+                _say(f"WARDEX_API_KEY {unknown}, so wardex exports nothing. {fix}")
+                return None, config
+        return WardexTransport(base_url, backend.api_key, debug=config.debug), config
+    if backend.endpoint:
+        grpc = None if _endpoint_named_for_wardex(given.endpoint) else _grpc_protocol_variable()
+        if grpc is not None:
+            _say(
+                f"{grpc} is grpc, and wardex exports OTLP over HTTP only, so it does not send "
+                "to the OTel endpoint (a gRPC port answers every HTTP request with an error) and "
+                "exports nothing. Set WARDEX_ENDPOINT to the collector's OTLP/HTTP address, such "
+                "as http://collector:4318."
+            )
+            return None, config
+        headers = backend.headers
+        raw = _os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
+        if headers is None and raw.strip():
+            headers = _otel_pairs(raw)
+            if headers is None:
+                # The value is not quoted: headers are where collectors keep
+                # their credentials, and this line reaches logs.
+                _say(
+                    "OTEL_EXPORTER_OTLP_HEADERS has an entry that is not key=value, so wardex "
+                    "exports nothing rather than send requests without the collector's "
+                    "credentials. Write it as key=value,key2=value2 with percent-encoded values."
+                )
+                return None, config
+            config = _replace(config, backend=_replace(backend, headers=headers))
+        # A third-party collector: the project key is never among its headers.
+        transport = OtlpHttpTransport(
+            _traces_endpoint(backend.endpoint, argument=given.endpoint),
+            headers=dict(headers) if headers else None,
+            debug=config.debug,
+        )
+        return transport, config
+    unusable = _unusable_env_endpoint()
+    if unusable is not None:
+        _say(
+            f"{unusable} is set but is not an http:// or https:// URL with a host, so wardex "
+            "exports nothing (a scheme-less host:port is the form gRPC exporters take). Set "
+            "WARDEX_ENDPOINT to the collector's OTLP/HTTP address, such as "
+            "http://collector:4318."
+        )
+        return None, config
+    # Unconditional, like the degraded-mode line: a wardex that exports nothing
+    # looks exactly like a backend that is up and receiving no traffic.
+    _say(
+        "wardex is not running: no destination is configured. Set WARDEX_ENDPOINT to your "
+        "collector's OTLP/HTTP URL (such as http://localhost:4318) or WARDEX_API_KEY to your "
+        "wardex project key. To capture without exporting (a test, or before_send_envelope as "
+        "the only consumer), pass transport=wardex_sdk.NoOpTransport().",
+        problem=False,
+    )
+    return None, config
+
+
+@_refuses_unknown_init_keywords(
+    moved=_MOVED,
+    removed=_REMOVED,
+    groups=(
+        ("backend", BackendConfig),
+        ("pii", PIIConfig),
+        ("batching", BatchingConfig),
+        ("limits", LimitsConfig),
+        ("propagation", PropagationConfig),
+        ("adapters", AdaptersConfig),
+    ),
+)
 def init(
     *,
     transport: Transport | None = None,
@@ -247,7 +395,9 @@ def init(
 
     The keyword parameters are `WardexConfig`'s fields plus `transport=` — a
     drift test holds the two signatures together — and `None` for a config
-    group means that group's defaults.
+    group means that group's defaults. A keyword that belongs to a group
+    (`endpoint=`, `api_key=`) is refused with the spelling that works:
+    `backend=BackendConfig(endpoint=...)`.
 
     RESOLUTION ORDER, per field: an explicit argument wins; an unset one falls
     back to its environment variable; only then does the default apply. The
@@ -258,67 +408,81 @@ def init(
         backend.endpoint     WARDEX_ENDPOINT, else
                              OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, else
                              OTEL_EXPORTER_OTLP_ENDPOINT
-        backend.headers      OTEL_EXPORTER_OTLP_HEADERS
-        service_name         WARDEX_SERVICE_NAME
-        release              WARDEX_RELEASE
-        environment          WARDEX_ENVIRONMENT
-        debug                WARDEX_DEBUG=true (case-insensitive)
+        backend.headers      OTEL_EXPORTER_OTLP_HEADERS (OTLP destination only)
+        service_name         WARDEX_SERVICE_NAME, else OTEL_SERVICE_NAME, else
+                             service.name in OTEL_RESOURCE_ATTRIBUTES
+        release              WARDEX_RELEASE, else service.version in
+                             OTEL_RESOURCE_ATTRIBUTES
+        environment          WARDEX_ENVIRONMENT, else deployment.environment
+                             (.name) in OTEL_RESOURCE_ATTRIBUTES
+        debug                WARDEX_DEBUG
         pii.mode             WARDEX_PII=off (on, the default, masks)
+        (kill switch)        WARDEX_DISABLED, else OTEL_SDK_DISABLED
 
-    so `wardex.init()` with only `WARDEX_API_KEY` set is a working first run.
-    A set `WARDEX_*` variable outside this table is named in a
-    `WardexConfigWarning` together with the closest name in it -- a warning,
-    so a stray variable cannot stop a process from starting, unless the
-    process turns warnings into errors (`-W error`), which reaches it like any
-    other. An endpoint variable that is not an http(s) URL is left unused
-    rather than exported to; when nothing else names a destination, a
-    `WARDEX_ENDPOINT` like that raises `ValueError` and an OTel one warns.
-    What the environment resolved is written into the config the client
-    carries — `client.config` answers with the resolved values, not the bare
-    arguments. `WARDEX_DEBUG` can only turn `debug` ON: `debug=False` is this
-    signature's default and therefore cannot veto the variable.
+    Booleans accept 1/true/yes/on and 0/false/no/off, case ignored.
+    `WARDEX_DEBUG` can only turn `debug` ON (`debug=False` is the default, so
+    it cannot veto). The client's config carries what the environment resolved.
+
+    THE ENVIRONMENT NEVER RAISES. A variable wardex cannot use is said in one
+    stderr line naming it and the fix, and kept in
+    `diagnostics().config_problems`; when it was the destination, wardex
+    installs nothing. The same value as an ARGUMENT raises
+    `TypeError`/`ValueError`. THE KILL SWITCH, `WARDEX_DISABLED=1` (or
+    `OTEL_SDK_DISABLED=true`), installs nothing and says so once.
 
     TRANSPORT RESOLUTION, in precedence order, decided by what was configured
     and nothing else:
 
-      1. an explicit `transport=` carries its own address and wins outright;
+      1. an explicit `transport=` instance carries its own address and wins
+         outright (`ConsoleTransport()` prints to stdout, for a first look);
       2. `backend.api_key` names a wardex project, so `WardexTransport` is
          built against the receiver the key's region names — or against
-         `backend.base_url` for a self-hosted receiver; a `base_url` with no
-         key is refused with `ValueError`, and a key whose region this build
-         does not know is refused the same way rather than sent anywhere. A
-         key that fails its checksum, or a `base_url` that is not an http(s)
-         URL, raises when passed as an argument and, read from the
-         environment, warns and exports nothing;
+         `backend.base_url` for a self-hosted receiver. A key that fails its
+         checksum, or a `base_url` that is not an http(s) URL, raises as an
+         argument and, read from the environment, is said on stderr and
+         exports nothing;
       3. `backend.endpoint` builds the OTLP/HTTP exporter against a
          third-party collector (`/v1/traces` is appended unless the path
          already ends with it; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is used as
          written — see `BackendConfig.endpoint`), with `backend.headers` as
          its request headers;
-      4. with none of those, wardex installs `NoOpTransport`, captures into
-         nothing, and says so once on stderr.
+      4. with none of those, wardex installs nothing and says so once on
+         stderr, naming `WARDEX_ENDPOINT` and `WARDEX_API_KEY`.
 
     When a setting loses a precedence fight — the endpoint under an explicit
     `transport=` or under a project key, PII exemptions under `PIIMode.OFF`,
-    an `interceptors=` selection under `intercept=False` — a
-    `WardexConfigWarning` is emitted, because a config value that loses in
-    silence is indistinguishable from one that was honoured. The endpoint
-    counts only when it was given to wardex, as the argument or as
-    `WARDEX_ENDPOINT`: one inherited from the OTel variables, which every OTel
-    SDK in the process shares, was never set for wardex and is not announced.
+    an `interceptors=` selection under `intercept=False` — it is announced,
+    because a config value that loses in silence is indistinguishable from one
+    that was honoured: as a `WardexConfigWarning` when every side of it is an
+    argument, on stderr when a side came from the environment. An endpoint
+    inherited from the OTel variables, which every OTel SDK in the process
+    shares, was never set for wardex and is not announced.
 
     `intercept=True` is the default: `init()` is the consent and
     zero-instrumentation capture is the product. Mutation of outbound traffic
     (`propagation`) stays opt-in; PII masking stays on.
 
-    EXCEPTIONS: this call — configuration time — raises `TypeError`/`ValueError`
-    on a bad argument like any Python constructor; every other public call is a
-    safe no-op before `init()` and never raises into host code afterwards.
-
     DIAGNOSTICS go to the stdlib logger `wardex_sdk` (default: one-line stderr
-    messages prefixed `[wardex] `); configuration conflicts are
-    `warnings.warn(..., WardexConfigWarning)`.
+    messages prefixed `[wardex] `).
     """
+    for name, value, cls in (
+        ("backend", backend, BackendConfig),
+        ("pii", pii, PIIConfig),
+        ("batching", batching, BatchingConfig),
+        ("limits", limits, LimitsConfig),
+        ("propagation", propagation, PropagationConfig),
+    ):
+        # `adapters` is judged by `WardexConfig`, whose refusal names the
+        # selection-tuple spelling it replaced.
+        _require_instance(name, value, cls)
+    _require_instance("transport", transport, Transport, example="ConsoleTransport()")
+    for name, value in (
+        ("service_name", service_name),
+        ("release", release),
+        ("environment", environment),
+    ):
+        _require_optional_str(name, value)
+    problems: list[str] = []
     config = _resolve_config_from_env(
         backend=backend,
         pii=pii,
@@ -335,18 +499,29 @@ def init(
         environment=environment,
         before_send_envelope=before_send_envelope,
         debug=debug,
+        problems=problems,
     )
-    # A `WARDEX_*` variable wardex does not read -- `WARDEX_ENDPONT` -- was read
-    # by nobody and mentioned by nobody, and its symptom (no spans) looked
-    # exactly like a healthy backend receiving nothing. Named here with the
-    # closest real name. A warning rather than a raise, unlike a bad argument:
-    # a stray variable left in a deployment's environment must not be able to
-    # stop a process from starting.
-    for message in _env_typo_messages():
-        _warnings.warn(message, WardexConfigWarning, stacklevel=2)
-    # The config is built FIRST so that a caller's bad argument still raises
-    # the same TypeError/ValueError it raises with a working wheel. Degraded
-    # mode must not turn a programming error into a shrug.
+    # Every argument has been judged: from here on nothing raises for a value
+    # the environment supplied, and what is said replaces the last call's.
+    _said.clear()
+    before_switch = len(problems)
+    switch = _disabled_by(problems)
+    if switch is not None:
+        # A bad value of the switch variables themselves is still said: it is
+        # why the other one decided. The rest is moot with nothing installed.
+        for message in problems[before_switch:]:
+            _say(message)
+        _say(
+            f"{switch} is set, so wardex installed nothing and captures and exports nothing. "
+            "To turn wardex on, unset it or set WARDEX_DISABLED=0.",
+            problem=False,
+        )
+        _install_nothing()
+        return
+    # A stray `WARDEX_ENDPONT` reads as "no spans", like a healthy backend
+    # receiving nothing. Said, not warned: `-W error` would stop the host.
+    for message in (*_env_typo_messages(), *problems):
+        _say(message)
     if not _NATIVE_OK:
         # Without the core there is nothing to capture WITH, and the failure is
         # one nobody can fix from Python. Returning here is what makes degraded
@@ -354,23 +529,15 @@ def init(
         # interceptor, adapter, propagation patch, atexit hook or signal handler
         # is ever installed, and every one of those modules -- each of which
         # still reaches the extension -- stays unreachable by construction.
-        #
-        # The diagnostic line is not optional. Silently doing nothing is the
-        # other failure mode and it is the worse one: it looks exactly like a
-        # backend that is up and receiving no traffic, so nobody goes looking.
-        _diag_warning(
+        _say(
             f"native extension unavailable, wardex is disabled: "
             f"nothing will be captured or exported ({_unavailable_reason()})"
         )
         return
-    # The three known conflict cases, announced UNCONDITIONALLY as warnings —
-    # they used to hide behind `debug`, which printed them in exactly the
-    # configuration nobody runs. Each is a setting another setting disables:
-    # legal, but never to be confused with a setting that was honoured.
-    if config.backend.base_url and not config.backend.api_key:
-        # A receiver address with nothing to authenticate with. Not a warning:
-        # every POST would be a 401 the transport is fail-silent about, which
-        # is the silent-ignore outcome a config change may not have.
+    given = backend if backend is not None else BackendConfig()
+    if given.base_url and not config.backend.api_key:
+        # A receiver address with nothing to authenticate with, written in
+        # code: every POST would be a 401 the transport is fail-silent about.
         raise ValueError(
             "backend.base_url names a wardex receiver but backend.api_key is unset; "
             "a receiver rejects unauthenticated requests. Set WARDEX_API_KEY or "
@@ -378,30 +545,19 @@ def init(
         )
     # Judged on the endpoint the host gave WARDEX -- the argument, else
     # `WARDEX_ENDPOINT` -- not on the resolved one: an endpoint inherited from
-    # the process-wide OTel variables was never passed to wardex, and the
-    # warning used to name it to a host that had set it for other tooling.
-    named_endpoint = _endpoint_named_for_wardex(backend.endpoint if backend is not None else None)
-    if transport is not None and named_endpoint:
-        _warnings.warn(
-            "backend endpoint ignored: transport= carries its own address",
-            WardexConfigWarning,
-            stacklevel=2,
-        )
-    elif config.backend.api_key and named_endpoint:
-        # Two destinations named, and they do not mix: the project key routes
-        # to the wardex receiver and is never sent to a third-party collector.
-        # Said once, here, rather than letting the OTLP address sit inert.
-        _warnings.warn(
-            "backend endpoint ignored: api_key routes to the wardex receiver "
-            "(drop api_key to export OTLP to that collector instead)",
-            WardexConfigWarning,
-            stacklevel=2,
-        )
+    # the process-wide OTel variables was never passed to wardex.
+    endpoint_loser = "backend endpoint" if given.endpoint else "WARDEX_ENDPOINT"
+    if transport is not None and _endpoint_named_for_wardex(given.endpoint):
+        reason = "transport= carries its own address"
+        if given.endpoint:
+            _warnings.warn(f"backend endpoint ignored: {reason}", WardexConfigWarning, stacklevel=3)
+        else:
+            _say(f"WARDEX_ENDPOINT ignored: {reason}")
     if config.pii.mode is PIIMode.OFF and config.pii.disabled_categories:
         _warnings.warn(
             "pii disabled_categories has no effect when pii mode is OFF",
             WardexConfigWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
     if config.pii.mode is PIIMode.OFF and (
         config.pii.extra_secret_names or config.pii.reveal_names
@@ -409,7 +565,7 @@ def init(
         _warnings.warn(
             "pii extra_secret_names and reveal_names have no effect when pii mode is OFF",
             WardexConfigWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
     if config.interceptors is not None and not config.intercept:
         # Detected here rather than at install time: `_interceptors/` keeps the
@@ -418,7 +574,7 @@ def init(
         _warnings.warn(
             "interceptors=... has no effect without intercept=True",
             WardexConfigWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
     if config.adapters.enabled is not None:
         # Adapter options set while the SAME config object's `enabled=`
@@ -434,7 +590,7 @@ def init(
                     f"adapters.{name.value} options set but {name.value} is "
                     "excluded by adapters.enabled",
                     WardexConfigWarning,
-                    stacklevel=2,
+                    stacklevel=3,
                 )
     if pii is None:
         _announce_pii_env(config.pii.mode)
@@ -445,92 +601,28 @@ def init(
         _diag_info(f"resolved config: {config!r}")
     if transport is not None:
         resolved_transport = transport
-    elif config.backend.api_key and (
-        problem := _receiver_config_problem(config.backend.api_key, config.backend.base_url)
-    ):
-        # A key that fails its checksum, or a receiver address no POST can reach. Written as an
-        # argument, it is a programming error and raises; read from the environment, it must
-        # not stop a process from starting, so wardex warns and exports nothing.
-        message, setting = problem
-        if getattr(backend, setting, None):
-            raise ValueError(message)
-        variable = "WARDEX_API_KEY" if setting == "api_key" else "WARDEX_BASE_URL"
-        _warnings.warn(
-            f"{message} The value came from {variable}, so wardex starts without exporting.",
-            WardexConfigWarning,
-            stacklevel=2,
-        )
-        resolved_transport = NoOpTransport()
-    elif config.backend.api_key:
-        # `backend.api_key` is WIRED here: the project key names a wardex
-        # project, so the default exporter is the wardex receiver's, and the
-        # key rides only in that request's Authorization header — never in
-        # any stderr line or repr (`api_key` is `repr=False` on the config,
-        # and the transport never echoes it).
-        #
-        # `base_url` wins over the region table on purpose: a self-hosted
-        # receiver issues keys in the same form, and its operator names it.
-        # Without one, the key's region tag is the whole of the routing —
-        # an unknown tag raises rather than falls back, because a batch sent
-        # to the wrong receiver is a 401 the transport is silent about.
-        base_url = config.backend.base_url
-        if base_url is None:
-            region = _region_of_key(config.backend.api_key)
-            try:
-                base_url = _WARDEX_INGEST_HOSTS[region]
-            except KeyError:
-                raise ValueError(
-                    f"api_key names region {region!r}, which this SDK version has no "
-                    f"receiver for (known: {sorted(_WARDEX_INGEST_HOSTS)}). Set "
-                    f"WARDEX_BASE_URL to the receiver's address, or upgrade wardex-sdk."
-                ) from None
-        resolved_transport = WardexTransport(
-            base_url,
-            config.backend.api_key,
-            debug=config.debug,
-        )
-    elif config.backend.endpoint:
-        # A third-party collector: the OTLP exporter, with whatever headers
-        # that collector wants. The project key is NOT among them.
-        resolved_transport = OtlpHttpTransport(
-            _traces_endpoint(
-                config.backend.endpoint, argument=backend.endpoint if backend is not None else None
-            ),
-            headers=dict(config.backend.headers) if config.backend.headers else None,
-            debug=config.debug,
-        )
     else:
-        resolved_transport = NoOpTransport()
-        unusable = _unusable_env_endpoint()
-        # Judged only here, where that value would have been the destination;
-        # under a `transport=` or a key it lost anyway, and the "endpoint
-        # ignored" warning above already named a `WARDEX_ENDPOINT` that did.
-        if unusable == "WARDEX_ENDPOINT":
-            # wardex's own variable, and nothing else names a destination: a
-            # process that would export nothing, refused at configuration time
-            # like the same value passed as the argument.
-            raise ValueError(
-                "WARDEX_ENDPOINT must be an absolute http:// or https:// URL with a host, such "
-                "as 'http://collector:4318'; the value set has no such scheme or no host, and "
-                "with no transport= or api_key it would be wardex's only destination, so every "
-                "export would fail. Write the scheme and the host."
+        default, config = _default_transport(config, given)
+        if default is None:
+            _install_nothing()
+            return
+        if config.backend.api_key and _endpoint_named_for_wardex(given.endpoint):
+            # Announced only now that the key produced a transport: a key that
+            # did not would make this line contradict the one it said. The key
+            # routes to the wardex receiver and is never sent to a collector.
+            key = "api_key" if given.api_key else "WARDEX_API_KEY"
+            fix = "drop api_key" if given.api_key else "unset WARDEX_API_KEY"
+            reason = (
+                f"{key} routes to the wardex receiver "
+                f"({fix} to export OTLP to that collector instead)"
             )
-        if unusable is not None:
-            _warnings.warn(
-                f"{unusable} is set but is not an http:// or https:// URL, so wardex does not "
-                "export to it (wardex exports OTLP over HTTP; a scheme-less host:port is the "
-                "form gRPC exporters take). Set WARDEX_ENDPOINT or backend.endpoint to the "
-                "collector's OTLP/HTTP address.",
-                WardexConfigWarning,
-                stacklevel=2,
-            )
-        # Unconditional, like the degraded-mode line and for the same reason: a
-        # wardex that captures into nothing looks exactly like a backend that
-        # is up and receiving no traffic, so nobody goes looking.
-        _diag_info(
-            "no transport, backend.api_key or backend.endpoint configured: "
-            "capturing, exporting nothing"
-        )
+            if given.endpoint and given.api_key:
+                _warnings.warn(
+                    f"backend endpoint ignored: {reason}", WardexConfigWarning, stacklevel=3
+                )
+            else:
+                _say(f"{endpoint_loser} ignored: {reason}")
+        resolved_transport = default
     # Plumbing, not subclass hooks: the private setters install what
     # `Transport.encode()` — the sanctioned, masked path to wire bytes — reads.
     resolved_transport._set_pii_policy(config.pii)
@@ -704,9 +796,15 @@ def diagnostics() -> Diagnostics:
     when the native extension is unavailable. After `close()` the adapters are
     still described as the last `init()` left them, so a check made once the
     run is over reads what happened; before the first `init()` there are none.
+
+    `config_problems` is every line the most recent `init()` said about its
+    configuration -- a variable it could not use, the kill switch, no
+    destination -- which is where to look when `initialized` is False.
     """
     live, adapters = _runtime.runtime().describe()
-    return Diagnostics(initialized=live, adapters=adapters, losses=_losses())
+    return Diagnostics(
+        initialized=live, adapters=adapters, losses=_losses(), config_problems=tuple(_said)
+    )
 
 
 def _losses() -> tuple[Loss, ...]:

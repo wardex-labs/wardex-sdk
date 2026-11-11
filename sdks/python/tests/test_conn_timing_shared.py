@@ -42,13 +42,21 @@ def test_a_second_init_reapplies_max_connections():
 
     ct.reset_shared_timing()
     try:
-        wardex_sdk.init(intercept=True, limits=LimitsConfig(max_connections=64))
+        wardex_sdk.init(
+            transport=wardex_sdk.NoOpTransport(),
+            intercept=True,
+            limits=LimitsConfig(max_connections=64),
+        )
         try:
             assert ct.shared_timing_store()._cap == 64
         finally:
             wardex_sdk.close()
 
-        wardex_sdk.init(intercept=True, limits=LimitsConfig(max_connections=128))
+        wardex_sdk.init(
+            transport=wardex_sdk.NoOpTransport(),
+            intercept=True,
+            limits=LimitsConfig(max_connections=128),
+        )
         try:
             assert ct.shared_timing_store()._cap == 128
         finally:

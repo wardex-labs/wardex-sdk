@@ -72,7 +72,7 @@ def test_classify_path_table(path: str, want: str | None):
 def test_traces_ingest_is_excluded_under_agent_mode():
     with queued_server([(200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
             assert _request(host, port, "POST", "/v1/traces/ingest", _INGEST) == 200
             assert client_spans() == []
             assert counters.get("interceptors.seam.path_excluded") == 1
@@ -85,7 +85,9 @@ def test_traces_ingest_is_excluded_under_all_mode():
     with the whole run record as `input_data`; the exclusion beats ALL."""
     with queued_server([(200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+            wardex.init(
+                transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL
+            )
             assert _request(host, port, "POST", "/v1/traces/ingest", _INGEST) == 200
             assert client_spans() == []
             assert counters.get("interceptors.seam.path_excluded") == 1
@@ -98,7 +100,9 @@ def test_traces_ingest_is_excluded_above_intercept_hosts():
     still captures every other request to the named host."""
     with queued_server([(200, b"{}"), (200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True, intercept_hosts=[f"{host}:{port}"])
+            wardex.init(
+                transport=wardex.NoOpTransport(), intercept=True, intercept_hosts=[f"{host}:{port}"]
+            )
             assert _request(host, port, "POST", "/v1/traces/ingest", _INGEST) == 200
             assert client_spans() == []
             assert counters.get("interceptors.seam.path_excluded") == 1
@@ -114,7 +118,7 @@ def test_traces_ingest_inside_workflow_is_still_excluded():
     exclusion is the one exception, so the run record never rides along."""
     with queued_server([(200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
 
             @wardex.workflow(name="run")
             def run() -> None:
@@ -134,7 +138,7 @@ def test_conversation_create_is_dropped_and_counted_under_agent_mode():
     and outside a local span it is still dropped — but now counted."""
     with queued_server([(200, _CONVERSATION), (200, _ITEMS)]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
             assert _request(host, port, "POST", "/v1/conversations", b"{}") == 200
             assert _request(host, port, "GET", "/v1/conversations/conv_1/items") == 200
             assert client_spans() == []
@@ -147,7 +151,9 @@ def test_conversation_create_is_dropped_and_counted_under_agent_mode():
 def test_conversation_items_are_plain_http_under_all_mode():
     with queued_server([(200, _ITEMS)]) as (host, port):
         try:
-            wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+            wardex.init(
+                transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL
+            )
             body = b'{"items":[{"role":"user","content":"hello"}]}'
             assert _request(host, port, "POST", "/v1/conversations/conv_1/items", body) == 200
             spans = client_spans()
@@ -164,7 +170,7 @@ def test_conversation_items_are_plain_http_under_all_mode():
 def test_conversation_call_inside_workflow_is_a_child_http_span():
     with queued_server([(200, _DELETED)]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
 
             @wardex.workflow(name="run")
             def run() -> None:
@@ -188,7 +194,7 @@ def test_root_level_conversations_path_is_not_provider_state():
     (Intercom, Front) out of the count."""
     with queued_server([(200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
             assert _request(host, port, "POST", "/conversations", b"{}") == 200
             assert client_spans() == []
             assert counters.get("interceptors.seam.provider_state_dropped") == 0
@@ -205,7 +211,7 @@ def test_responses_compact_is_a_billable_llm_call_under_agent_mode():
         port,
     ):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
             req = llm_fixture("openai_responses_compact", "request.json")
             assert _request(host, port, "POST", "/v1/responses/compact", req) == 200
             spans = client_spans()

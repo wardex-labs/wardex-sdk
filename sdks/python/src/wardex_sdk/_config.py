@@ -61,10 +61,18 @@ from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from urllib.parse import unquote
 
 from . import _config_checks
 from ._config_checks import endpoint_from_env, refuses_unknown_keywords, require_http_url
+from ._config_checks import (
+    endpoint_from_env,
+    env_flag,
+    env_http_url,
+    otel_resource,
+    refuses_unknown_keywords,
+    require_exact_hosts,
+    require_http_url,
+)
 from ._enums import (
     AdapterName,
     CaptureMode,
@@ -84,10 +92,9 @@ class WardexConfigWarning(UserWarning):
     an explicit `transport=` next to a `backend.endpoint`, PII category exemptions under
     `PIIMode.OFF`, or an `interceptors=` selection with `intercept=False`. Each is a valid program —
     the warning exists because the losing setting would otherwise be indistinguishable from one that
-    was honoured. The same category names a `WARDEX_*` environment variable wardex does not read
-    (most likely a misspelling of one it does), and an OTel endpoint variable it had to leave
-    unused. Filter it like any warning category (`warnings.simplefilter("ignore",
-    WardexConfigWarning)`).
+    was honoured. Only arguments raise it: a problem with an environment variable is said on stderr
+    instead, so `-W error` cannot turn a deployment's environment into a crash. Filter it like any
+    warning category (`warnings.simplefilter("ignore", WardexConfigWarning)`).
     """
 
 
@@ -211,9 +218,11 @@ class BackendConfig:
     """A wardex receiver's address, for a self-hosted receiver or a proxy in
     front of ours -- `http://127.0.0.1:8080`; a trailing `/v1/envelope` is not appended twice.
     Unset, the receiver is the one the key's region names (`WARDEX_INGEST_HOSTS`). Only meaningful
-    with `api_key`: a receiver address with no key cannot authenticate, and `init()` refuses the
-    pair with a `ValueError`, as it does a value that is not an http(s) URL with a host (from
-    `WARDEX_BASE_URL`, that one warns and exports nothing).
+    with `api_key`: a receiver address with no key cannot authenticate: `init()` refuses that
+    argument with a `ValueError`. When the address came from `WARDEX_BASE_URL` it says so on stderr
+    and exports nothing, unless an endpoint is configured, which then stays the destination. A
+    value with no `http://` or `https://` scheme, or no host, is refused here; from the variable
+    it is said, and with a key nothing is exported rather than fall back to the region's receiver.
 
     Unset, `init()` reads `WARDEX_BASE_URL` from the environment.
     """
@@ -221,7 +230,7 @@ class BackendConfig:
     endpoint: str | None = None
     """A third-party OTLP/HTTP collector to send to instead. `init()` without
     a `transport=` and without an `api_key` builds the OTLP exporter against this address; with none
-    of the three, it installs `NoOpTransport`, captures into nothing, and says so once on stderr.
+    of the three, it installs nothing and says so once on stderr.
 
     Unset, `init()` reads `WARDEX_ENDPOINT`, then
     `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT`.
@@ -233,13 +242,14 @@ class BackendConfig:
 
     An explicit `transport=` wins over this field, and so does `api_key` (the
     project key routes to the wardex receiver); the losing endpoint is
-    announced with a `WardexConfigWarning` rather than ignored in silence.
+    announced rather than ignored in silence: with a `WardexConfigWarning` when
+    both sides are arguments, on stderr when one came from the environment.
 
     A value with no `http://` or `https://` scheme, or no host, is refused
     with `ValueError` here: `collector:4318` parses with `collector` as its
     scheme, and every export to it would fail. A variable holding one is left
-    unused; `init()` refuses `WARDEX_ENDPOINT` only when it would have been
-    the destination, and warns about an OTel spelling in that case.
+    unused; when it would have been the destination, `init()` says so on
+    stderr and exports nothing.
     """
 
     headers: Mapping[str, str] | None = None
@@ -248,39 +258,20 @@ class BackendConfig:
     "Basic ..."}`). Read only when `endpoint` builds the OTLP transport; the wardex receiver
     authenticates with `api_key` and ignores this field. Reads back as an immutable mapping.
 
-    Unset, `init()` reads `OTEL_EXPORTER_OTLP_HEADERS` from the environment,
-    in the OpenTelemetry form `key=value,key2=value2` with percent-encoded
+    Unset, `init()` reads `OTEL_EXPORTER_OTLP_HEADERS` from the environment when the OTLP exporter
+    is the destination, in the OpenTelemetry form `key=value,key2=value2` with percent-encoded
     values -- the variable a host already exporting OTLP elsewhere has set.
     """
 
     def __post_init__(self) -> None:
         require_http_url(self.endpoint)
+        require_http_url(self.base_url, field="backend.base_url")
         if self.headers is not None:
             # Canonicalize to an immutable mapping (lossless, like the tuple
             # and frozenset canonicalizations elsewhere): a config that reads
             # back as written must not be editable through a dict it handed
             # out, and a plain `dict` would be.
             object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
-
-
-def _otlp_headers_from_env() -> Mapping[str, str] | None:
-    """`OTEL_EXPORTER_OTLP_HEADERS`, parsed the way the OTel specification
-    says: comma-separated `key=value` pairs, values percent-encoded, whitespace
-    around each pair ignored. `None` when the variable is absent or empty, so
-    the config reads "nothing configured" rather than an empty mapping."""
-    raw = os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
-    if not raw.strip():
-        return None
-    headers: dict[str, str] = {}
-    for pair in raw.split(","):
-        pair = pair.strip()
-        if not pair:
-            continue
-        key, sep, value = pair.partition("=")
-        if not sep or not key.strip():
-            raise ValueError(f"OTEL_EXPORTER_OTLP_HEADERS entry {pair!r} is not key=value")
-        headers[key.strip()] = unquote(value.strip())
-    return headers
 
 
 @refuses_unknown_keywords
@@ -645,7 +636,7 @@ class WardexConfig:
     globs, unlike `propagation.targets`: that one scopes a header wardex
     WRITES, where a user has to be able to name a whole domain, while this one
     widens what wardex READS off the wire — the direction in which a pattern
-    that matched more than its author meant is expensive.
+    that matched more than its author meant is expensive. A pattern is refused.
     """
 
     capture_mode: CaptureMode = CaptureMode.AGENT
@@ -653,17 +644,21 @@ class WardexConfig:
     service_name: str | None = None
     """Maps to the OTLP resource's `service.name` — the app's identity in any
     OTel backend, the axis every one of them groups by. Unset, `init()` reads
-    `WARDEX_SERVICE_NAME`; still unset, the wire falls back to semconv's
+    `WARDEX_SERVICE_NAME`, then `OTEL_SERVICE_NAME`, then `service.name` in
+    `OTEL_RESOURCE_ATTRIBUTES`; still unset, the wire falls back to semconv's
     `unknown_service:python` (never the SDK's own name — the SDK travels in
     `telemetry.sdk.*`)."""
 
     release: str | None = None
     """Maps to the OTLP resource's `service.version`. Unset, `init()` reads
-    `WARDEX_RELEASE`; still unset, no key is emitted."""
+    `WARDEX_RELEASE`, then `service.version` in `OTEL_RESOURCE_ATTRIBUTES`;
+    still unset, no key is emitted."""
 
     environment: str | None = None
     """Maps to the OTLP resource's `deployment.environment.name`. Unset,
-    `init()` reads `WARDEX_ENVIRONMENT`; still unset, no key is emitted."""
+    `init()` reads `WARDEX_ENVIRONMENT`, then `deployment.environment.name`
+    (or `deployment.environment`) in `OTEL_RESOURCE_ATTRIBUTES`; still unset,
+    no key is emitted."""
 
     def __new__(cls, *args: object, **kwargs: object) -> WardexConfig:
         moved = [name for name in _MOVED if name in kwargs]
@@ -717,16 +712,7 @@ class WardexConfig:
                         f"interceptors entries must be InterceptorName members, got {name!r}"
                     )
             object.__setattr__(self, "interceptors", interceptors)
-        if self.intercept_hosts is not None:
-            # Same bare-string hazard as `PropagationConfig.targets`: a lone
-            # host name would canonicalize into its characters and match no
-            # peer at all, in silence.
-            if isinstance(self.intercept_hosts, str):
-                raise ValueError(
-                    f"intercept_hosts must be an iterable of host names, got the "
-                    f"bare string {self.intercept_hosts!r} — write ({self.intercept_hosts!r},)"
-                )
-            object.__setattr__(self, "intercept_hosts", tuple(self.intercept_hosts))
+        object.__setattr__(self, "intercept_hosts", require_exact_hosts(self.intercept_hosts))
 
 
 def _resolve_config(
@@ -746,12 +732,17 @@ def _resolve_config(
     environment: str | None = None,
     before_send_envelope: BeforeSendEnvelopeCallback | None = None,
     debug: bool = False,
+    problems: list[str] | None = None,
 ) -> WardexConfig:
     """Fold the environment into `init()`'s arguments and build the config.
 
     THE RESOLUTION ORDER, PER FIELD: an explicit argument wins; an unset one
-    falls back to its `WARDEX_*` variable; `backend.endpoint` additionally
-    falls through to the OTel spellings. The result IS the resolved config —
+    falls back to its `WARDEX_*` variable; `backend.endpoint`, `service_name`,
+    `release` and `environment` additionally fall through to the OTel
+    spellings. `backend.headers` is `init()`'s to resolve, because only the
+    destination it picks says whether they are read. A bad argument raises; a
+    bad variable never does, and adds its sentence to `problems` instead (see
+    `_config_checks`). The result IS the resolved config —
     what `init()` installs and what `client.config` answers with — so an env
     value that won is readable there rather than applied invisibly.
 
@@ -763,7 +754,7 @@ def _resolve_config(
 
     `debug` is the one field the environment can only turn ON: `debug=False`
     is the parameter's default, so it cannot be read as a veto, and
-    `WARDEX_DEBUG=true` (case-insensitive) must be able to switch diagnostics
+    `WARDEX_DEBUG=1` (any spelling `env_flag` accepts) must switch diagnostics
     on for a program nobody can edit. Same shape as Sentry's.
 
     `None` for a whole group means that group's defaults. `intercept_hosts`
@@ -771,13 +762,15 @@ def _resolve_config(
     absence of one.
     """
     off = _config_checks.pii_off_from_env()
+    problems = [] if problems is None else problems
     given = backend if backend is not None else BackendConfig()
     resolved_backend = BackendConfig(
         api_key=given.api_key or os.environ.get("WARDEX_API_KEY"),
-        base_url=given.base_url or os.environ.get("WARDEX_BASE_URL"),
+        base_url=given.base_url or env_http_url("WARDEX_BASE_URL"),
         endpoint=given.endpoint or endpoint_from_env(),
-        headers=given.headers if given.headers is not None else _otlp_headers_from_env(),
+        headers=given.headers,
     )
+    otel_service, otel_version, otel_environment = otel_resource(problems)
     return WardexConfig(
         backend=resolved_backend,
         pii=pii if pii is not None else PIIConfig(mode=PIIMode.OFF if off else PIIMode.MASK),
@@ -793,13 +786,16 @@ def _resolve_config(
         # the check can see the string.
         intercept_hosts=intercept_hosts,
         capture_mode=capture_mode,
-        service_name=(
-            service_name if service_name is not None else os.environ.get("WARDEX_SERVICE_NAME")
-        ),
-        release=release if release is not None else os.environ.get("WARDEX_RELEASE"),
-        environment=(
-            environment if environment is not None else os.environ.get("WARDEX_ENVIRONMENT")
-        ),
+        service_name=service_name
+        if service_name is not None
+        else os.environ.get("WARDEX_SERVICE_NAME") or otel_service,
+        release=release
+        if release is not None
+        else os.environ.get("WARDEX_RELEASE") or otel_version,
+        environment=environment
+        if environment is not None
+        else os.environ.get("WARDEX_ENVIRONMENT") or otel_environment,
         before_send_envelope=before_send_envelope,
-        debug=bool(debug) or os.environ.get("WARDEX_DEBUG", "").lower() == "true",
+        debug=bool(debug)
+        or bool(env_flag("WARDEX_DEBUG", os.environ.get("WARDEX_DEBUG"), problems)),
     )

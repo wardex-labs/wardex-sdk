@@ -73,6 +73,18 @@ def test_nothing_to_do_with_wardex():
     assert True
 """
 
+# A test that calls `init()` in an environment that names no destination, as a
+# CI job usually does: wardex installs nothing, so there is nothing to check.
+_INIT_WITHOUT_A_DESTINATION_TEST = """
+import wardex_sdk as wardex
+
+def test_app():
+    wardex.init()
+    with wardex.span("a"):
+        pass
+    wardex.close()
+"""
+
 # Inner tests that lose something on purpose, through the ledger itself.
 _LOSE = """
 import pytest
@@ -249,6 +261,19 @@ def test_a_session_that_never_initialized_wardex_fails(run):
     assert "wardex was never initialized in this test session" in result.stdout.str()
 
 
+def test_a_session_whose_init_installed_nothing_fails_with_what_init_said(run):
+    """`init()` ran, so "never initialized" would name a fix the user already
+    applied. The failure quotes why it installed nothing, which names the fix."""
+    result = run(_INIT_WITHOUT_A_DESTINATION_TEST, "--wardex-strict")
+    result.assert_outcomes(passed=1)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    out = result.stdout.str()
+    assert "never initialized" not in out
+    assert "wardex.init() ran but installed nothing in this test session" in out
+    assert "no destination is configured" in out
+    assert "transport=wardex_sdk.NoOpTransport()" in out
+
+
 def test_the_entry_point_names_the_plugin_module_and_the_wheel_ships_it():
     """The flag is the whole setup only if the package registers the plugin,
     and an entry point whose module is not in the wheel breaks every pytest
@@ -401,6 +426,14 @@ def test_under_xdist_a_session_that_never_initialized_wardex_fails(run_xdist):
     assert "wardex was never initialized in this test session" in result.stdout.str()
 
 
+def test_under_xdist_a_session_whose_init_installed_nothing_says_why(run_xdist):
+    result = run_xdist(_INIT_WITHOUT_A_DESTINATION_TEST, "--wardex-strict")
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    out = result.stdout.str()
+    assert "never initialized" not in out
+    assert "no destination is configured" in out
+
+
 def test_under_xdist_collecting_only_checks_nothing_and_passes(run_xdist):
     result = run_xdist(_NO_WARDEX_TEST, "--wardex-strict", "--collect-only")
     assert result.ret == 0, result.stdout.str()
@@ -529,9 +562,25 @@ def test_the_assertion_lists_every_gap_and_how_to_accept_one(reading, monkeypatc
 
 
 def test_the_assertion_fails_when_wardex_was_never_initialized(monkeypatch):
-    monkeypatch.setattr("wardex_sdk._runtime.runtime", lambda: type("R", (), {"client": None})())
+    stub = type("R", (), {"client": None, "describe": lambda self: (False, ())})
+    monkeypatch.setattr("wardex_sdk._runtime.runtime", lambda: stub())
     with pytest.raises(CaptureGapError, match="never initialized"):
         assert_no_capture_gaps()
+
+
+@pytest.mark.no_destination
+def test_the_assertion_quotes_why_init_installed_nothing(capsys):
+    from wardex_sdk import _hub
+
+    _hub.reset_for_test()
+    wardex.init()
+    capsys.readouterr()
+    with pytest.raises(CaptureGapError) as raised:
+        assert_no_capture_gaps()
+    text = str(raised.value)
+    assert "never initialized" not in text
+    assert "wardex.init() ran but installed nothing" in text
+    assert "no destination is configured" in text
 
 
 def test_the_assertion_passes_on_a_clean_initialized_process():

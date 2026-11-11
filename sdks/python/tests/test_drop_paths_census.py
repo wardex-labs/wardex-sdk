@@ -740,7 +740,12 @@ async def test_an_mcp_parser_latching_off_is_counted_and_said_once(capsys):
     )
     from wardex_sdk import _hub
 
-    wardex.init(intercept=True, debug=False, limits=LimitsConfig(max_stream_buffer_bytes=64))
+    wardex.init(
+        transport=wardex.NoOpTransport(),
+        intercept=True,
+        debug=False,
+        limits=LimitsConfig(max_stream_buffer_bytes=64),
+    )
     try:
         capsys.readouterr()
         proc = await anyio.open_process([sys.executable, "-c", junk])

@@ -121,9 +121,14 @@ def assert_no_capture_gaps(*, since: Diagnostics | None = None, allow: Iterable[
     `wardex.close()`: the loss counts and the last `init()`'s adapter states
     both survive it. It also fails when wardex was never initialized in this
     process, because then there was nothing to check, and a pass would say that
-    wardex saw everything when it saw nothing.
+    wardex saw everything when it saw nothing; when `init()` ran and installed
+    nothing, the error quotes what it said about why.
     """
     if _runtime.runtime().client is None:
+        said = diagnostics().config_problems
+        if said:
+            header = "wardex.init() ran but installed nothing, so there was nothing to check"
+            raise CaptureGapError((), header=said_why(header, said))
         raise CaptureGapError(
             (),
             header=(
@@ -135,6 +140,13 @@ def assert_no_capture_gaps(*, since: Diagnostics | None = None, allow: Iterable[
     gaps = capture_gaps(since=since, allow=allow)
     if gaps:
         raise CaptureGapError(gaps, header="wardex could not say it recorded everything")
+
+
+def said_why(header: str, said: tuple[str, ...]) -> str:
+    """`header`, then what `init()` said when it installed nothing. Those lines
+    name the cause and the fix; "never initialized" would name a call the
+    caller already made."""
+    return "\n".join([f"{header}. wardex.init() said:", *(f"  - {line}" for line in said)])
 
 
 def render(gaps: tuple[CaptureGap, ...], *, header: str) -> str:

@@ -133,7 +133,9 @@ def test_body_cap_reaches_the_parser_end_to_end():
     import wardex_sdk
     from wardex_sdk import _hub
 
-    wardex_sdk.init(intercept=False, limits=LimitsConfig(max_headers=1))
+    wardex_sdk.init(
+        transport=wardex_sdk.NoOpTransport(), intercept=False, limits=LimitsConfig(max_headers=1)
+    )
     try:
         from wardex_sdk._interceptors._trackers import _Http1Tracker
 
@@ -277,7 +279,11 @@ def test_max_buffer_bytes_reaches_the_client():
             output_data=payload,
         )
 
-    wardex_sdk.init(intercept=False, limits=LimitsConfig(max_buffer_bytes=32 * 1024))
+    wardex_sdk.init(
+        transport=wardex_sdk.NoOpTransport(),
+        intercept=False,
+        limits=LimitsConfig(max_buffer_bytes=32 * 1024),
+    )
     try:
         client = _hub.get_client()
         assert client is not None
@@ -304,7 +310,11 @@ def test_max_connections_reaches_the_seam():
     from wardex_sdk import _hub
     from wardex_sdk._interceptors._ssl import SSLInterceptor
 
-    wardex_sdk.init(intercept=False, limits=LimitsConfig(max_connections=1))
+    wardex_sdk.init(
+        transport=wardex_sdk.NoOpTransport(),
+        intercept=False,
+        limits=LimitsConfig(max_connections=1),
+    )
     try:
         client = _hub.get_client()
         assert client is not None
@@ -1224,7 +1234,7 @@ def _dropped_under(limits: LimitsConfig) -> int:
     from wardex_sdk._enums import SpanKind
     from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
 
-    wardex_sdk.init(intercept=False, limits=limits)
+    wardex_sdk.init(transport=wardex_sdk.NoOpTransport(), intercept=False, limits=limits)
     try:
         client = _hub.get_client()
         assert client is not None

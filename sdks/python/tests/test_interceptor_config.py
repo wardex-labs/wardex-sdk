@@ -114,7 +114,11 @@ def test_a_refinement_of_a_switch_that_is_off_is_announced():
     _hub.reset_for_test()
     try:
         with pytest.warns(WardexConfigWarning, match="no effect without intercept=True"):
-            wardex_sdk.init(intercept=False, interceptors=(InterceptorName.SSL,))
+            wardex_sdk.init(
+                transport=wardex_sdk.NoOpTransport(),
+                intercept=False,
+                interceptors=(InterceptorName.SSL,),
+            )
         assert _installed() == []
     finally:
         wardex_sdk.close()

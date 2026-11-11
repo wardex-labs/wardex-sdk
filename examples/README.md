@@ -263,10 +263,10 @@ python examples/openai_agents_quickstart.py
 
 The `unset` is not decoration: if you ran the Phoenix path in this same
 shell, `WARDEX_ENDPOINT` is still exported, and an explicit `transport=`
-next to it makes `wardex.init()` warn `WardexConfigWarning: backend
-endpoint ignored: transport= carries its own address`. The export still
-goes to Langfuse — the transport wins — but the warning is telling you a
-setting was dropped, and the leftover variable is the whole reason.
+next to it makes `wardex.init()` print `[wardex] WARDEX_ENDPOINT ignored:
+transport= carries its own address` on stderr. The export still goes to
+Langfuse — the transport wins — but the line is telling you a setting was
+dropped, and the leftover variable is the whole reason.
 
 What the script does with them, if you want the same thing in your own
 `wardex.init()`:
