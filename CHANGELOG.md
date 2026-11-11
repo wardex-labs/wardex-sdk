@@ -99,7 +99,8 @@ All notable changes to this project are documented here. The format follows
 - **`WARDEX_PII=off` turns masking off from the environment.** It prints one
   stderr line. An explicit `pii=` argument still wins.
 - **`wardex.set_account(id)` names your own customer.** Spans carry it as
-  `wardex.account.id`. It is scoped like `set_user`.
+  `wardex.account.id`. It is scoped like `set_user`, and takes a string, an
+  integer or a `uuid.UUID`; `None` or an empty string clears it.
 - **`wardex.current_span()`, `Span.set_input()`, `Span.set_output()` and
   `Span.add_event()`.** On a tool span the input and output export as
   `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`, masked and
@@ -583,9 +584,17 @@ All notable changes to this project are documented here. The format follows
 - **Requests no longer share tags, users or accounts.** A value set inside
   an asyncio task, a `wardex.bind_context` thread or a scope block stays
   there. A loop that sets each request's user and then starts that request
-  gives each request its own user.
-- **`set_user` takes a string id, an integer id, keyword fields, a
-  `UserInfo` or `None`.** Any other type raises `TypeError` at the call. A
+  gives each request its own user. A function run through
+  `asyncio.to_thread()`, such as a FastAPI `def` dependency, works on a copy
+  of the request's context, so identity it sets stays in that function: set
+  it in `async def` code. A pool thread keeps what earlier jobs set on it;
+  submit through `wardex.bind_context(fn)` or open `isolation_scope()` per job.
+- **One `wardex.bind_context(fn)` wrapper can be reused.** Each call runs in
+  its own copy of the captured context, so `executor.map(bound, items)` no
+  longer raises `RuntimeError: cannot enter context`, and one call's
+  `set_user()` does not reach the next.
+- **`set_user` takes a string id, an integer id, a `uuid.UUID`, keyword
+  fields, a `UserInfo` or `None`.** Any other type raises `TypeError` at the call. A
   call whose fields are all empty clears the user. The `Scope` that
   `isolation_scope()` and `new_scope()` yield reads and writes the block.
 - **A span started on an unbound thread while another span is open is

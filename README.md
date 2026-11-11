@@ -297,7 +297,11 @@ carry `user.id` and `wardex.account.id`. `set_input()` on a tool span
 exports as `gen_ai.tool.call.arguments`. An exception that leaves a span is
 recorded on it, and your code still receives the same exception.
 Hand-started threads need `wardex.bind_context(fn)` to carry the context;
-`asyncio` tasks inherit it.
+`asyncio` tasks inherit it. A pool thread keeps what earlier jobs set on it,
+so submit through `wardex.bind_context(fn)` or open `wardex.isolation_scope()`
+per job. A function run through `asyncio.to_thread()` (FastAPI runs a plain
+`def` dependency that way) works on a copy of the request's context: identity
+it sets does not reach the request, so set it in `async def` code.
 
 ## Data safety
 

@@ -6,6 +6,7 @@ import warnings as _warnings
 from collections.abc import Sequence as _Sequence
 from contextlib import AbstractContextManager as _AbstractContextManager
 from typing import Any as _Any
+from uuid import UUID as _UUID
 
 from . import _hub, _runtime
 from ._assembly import _ledger
@@ -488,10 +489,18 @@ def set_tag(key: str, value: _AttributeValue | list | tuple | dict | None) -> No
       request's user and then starts that request gives each its own.
     * A tag set inside a task, a bound thread, or an `isolation_scope()` /
       `new_scope()` block stays there: siblings, the code that started the
-      task and the code after the block never see it.
-    * A plain `threading.Thread` or executor thread starts with NO tags,
-      because Python gives a new thread an empty context. Wrap its target in
+      task and the code after the block never see it. That includes a
+      function run through `asyncio.to_thread()`, which is how FastAPI and
+      Starlette run a plain `def` dependency: a `set_user()` there does not
+      reach the request. Set identity in the `async def` code, or return the
+      value and set it there.
+    * A new `threading.Thread` starts with NO tags, because Python gives a
+      new thread an empty context. Wrap its target in
       `wardex.bind_context(fn)` to carry tags set at startup into it.
+    * A pool thread (a `ThreadPoolExecutor` worker, `loop.run_in_executor`)
+      is not new for the jobs after its first: it keeps what earlier jobs
+      set on it. Submit through `wardex.bind_context(fn)`, or open
+      `wardex.isolation_scope()` in each job.
 
     A span-local attribute with the same key wins over the scope tag.
     """
@@ -529,7 +538,7 @@ def set_user(
     _hub.write_scope(_hub._isolation_scope, Scope.set_user, resolved)
 
 
-def set_account(id: str) -> None:
+def set_account(id: str | int | _UUID | None) -> None:
     """Attribute the work in this scope to one of YOUR customers: `wardex.account.id`.
 
     An account is the customer's customer: the company or workspace your
@@ -542,13 +551,20 @@ def set_account(id: str) -> None:
                 wardex.set_account(request.state.workspace_id)
                 await run_agent(request)
 
-    `id` must be a non-empty `str`; anything else raises here.
+    `id` is a `str`, an `int` or a `uuid.UUID` (sent as its text); None or
+    "" clears the account, so a request with no workspace goes on. Anything
+    else raises `TypeError` here. The id is masked like any value: one that
+    reads as an e-mail, an IP address or a phone number ships as a
+    placeholder, so use an opaque id.
     """
-    if not isinstance(id, str):
-        raise TypeError(f"set_account() takes the account id as a str, got {type(id).__name__}")
-    if not id:
-        raise ValueError("set_account() got an empty account id; pass a non-empty string")
-    _hub.write_scope(_hub._isolation_scope, Scope.set_tag, _ACCOUNT_KEY, id)
+    if isinstance(id, _UUID) or type(id) is int:
+        id = str(id)
+    elif id is not None and not isinstance(id, str):
+        raise TypeError(
+            "set_account() takes the account id as a str, an int or a uuid.UUID (None clears "
+            f"it), got {type(id).__name__}"
+        )
+    _hub.write_scope(_hub._isolation_scope, Scope.set_tag, _ACCOUNT_KEY, id or None)
 
 
 def set_context(key: str, value: dict[str, _Any]) -> None:

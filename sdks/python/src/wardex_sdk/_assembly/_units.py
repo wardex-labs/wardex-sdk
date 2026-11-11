@@ -527,13 +527,10 @@ class Unit:
     def bind(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap `fn` so each INVOCATION runs inside a fresh activation.
 
-        NOT `context.bind_context`, and the difference is load-bearing rather
-        than stylistic: that helper replays ONE captured `contextvars.Context`,
-        and entering the same Context twice concurrently raises
-        `RuntimeError: cannot enter context ... is already entered`. For a
-        framework callback invoked from two tasks — the ordinary case for a
-        thread-pool tool handler — that error surfaces INTO USER CODE. Entering
-        a fresh fork per call is re-entrant and concurrency-safe.
+        NOT `context.bind_context`: that helper runs each call in a copy of
+        the context captured when it was wrapped, while this activates the
+        unit around each call in the context the call runs in. Both are
+        re-entrant and concurrency-safe.
 
         A coroutine function gets an async wrapper so the activation spans the
         whole await rather than only the call that creates the coroutine.

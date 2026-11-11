@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any
+from uuid import UUID
 
 from ._types import ConversationContext, SpanContext
 from ._values import AttributeValue, attribute_value
@@ -74,7 +75,8 @@ def user_from_call(user: object, keywords: dict[str, object]) -> UserInfo | None
 
 #: What `set_user` accepts, for the TypeError a wrong call raises.
 USER_FORMS = (
-    "set_user() takes a UserInfo, a user id (str or int), None to clear the user, or keyword "
+    "set_user() takes a UserInfo, a user id (str, int or uuid.UUID), None to clear the user, "
+    "or keyword "
     "fields: set_user(id=..., email=..., username=..., ip_address=...)"
 )
 
@@ -85,6 +87,8 @@ def checked_user(user: object) -> UserInfo | None:
         return None if user == UserInfo() else user
     if isinstance(user, str) or type(user) is int:
         return None if user == "" else UserInfo(id=user)  # type: ignore[arg-type]
+    if isinstance(user, UUID):
+        return UserInfo(id=str(user))
     raise TypeError(f"{USER_FORMS}; got {type(user).__name__}")
 
 

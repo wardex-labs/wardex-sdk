@@ -475,7 +475,7 @@ _MODULE_CEILING = 800
 #: count, as `wc -l`). Each may only shrink; a module not listed here may not
 #: cross the ceiling; a module that drops below it is removed from this dict.
 _OVERSIZED_BUDGET = {
-    "_assembly/_units.py": 2100,
+    "_assembly/_units.py": 2097,
     "_adapters/_assembler.py": 1929,
     # Lowered from 1588 when the span pieces its later span kinds share with it
     # (`_open_child`, the start instant, the error sentences) moved out to

@@ -185,6 +185,54 @@ def test_a_dispatcher_that_sets_identity_then_submits_bound_work_gives_each_its_
         assert _extra(spans["req-" + uid]) == {"wardex.account.id": "acct-" + uid}
 
 
+def test_one_bound_function_reused_by_a_pool_gives_each_call_its_own_scope(rec):
+    """`bind_context` once, then `pool.map`/`submit` it many times: concurrent
+    calls must not fail in the host's code, and a write one call makes must
+    not reach the next."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    wardex.set_tag("startup", "1")
+
+    def job(i: int) -> int:
+        if i == 0:
+            wardex.set_user("first-item-user")
+        with wardex.span(f"item-{i}"):
+            pass
+        return i
+
+    bound = wardex.bind_context(job)
+    with ThreadPoolExecutor(4) as pool:
+        assert list(pool.map(bound, range(8))) == list(range(8))
+    for i in range(1, 4):
+        bound(i + 10)
+    spans = _spans(rec)
+    assert _extra(spans["item-0"]) == {"startup": "1", "user.id": "first-item-user"}
+    for name in [f"item-{i}" for i in range(1, 8)] + ["item-11", "item-12", "item-13"]:
+        assert _extra(spans[name]) == {"startup": "1"}, name
+
+
+def test_a_sync_function_run_through_to_thread_sets_identity_for_itself_only(rec):
+    """Documented, not hidden: `asyncio.to_thread` (and so a FastAPI `def`
+    dependency) runs in a copy of the request's context, and a write there
+    ends with that copy."""
+
+    def dependency() -> None:
+        wardex.set_user("dep-user")
+        with wardex.span("in-dependency"):
+            pass
+
+    async def request() -> None:
+        with wardex.continue_trace({}):
+            await asyncio.to_thread(dependency)
+            with wardex.span("handler"):
+                pass
+
+    asyncio.run(request())
+    spans = _spans(rec)
+    assert _extra(spans["in-dependency"]) == {"user.id": "dep-user"}
+    assert "user.id" not in _extra(spans["handler"])
+
+
 def test_each_continued_request_keeps_its_own_user(rec):
     async def request(uid: str) -> None:
         with wardex.continue_trace({}):
@@ -394,10 +442,37 @@ def test_set_account_is_scoped_like_set_user(rec):
     assert "wardex.account.id" not in _extra(spans["after"])
 
 
-@pytest.mark.parametrize(("bad", "error"), [(42, TypeError), (None, TypeError), ("", ValueError)])
-def test_set_account_rejects_a_non_string_or_empty_id(rec, bad, error):
-    with pytest.raises(error, match="set_account"):
+@pytest.mark.parametrize("bad", [4.2, True, ["acct"], {"id": 1}, object()])
+def test_set_account_rejects_a_value_that_is_no_id(rec, bad):
+    with pytest.raises(TypeError, match="set_account"):
         wardex.set_account(bad)
+
+
+def test_set_account_takes_the_ids_a_host_forwards_and_clears_on_none(rec):
+    """An integer primary key or a UUID is an id; a missing one (None or "")
+    clears the account, as it clears the user, instead of failing the request."""
+    import uuid
+
+    key = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    for value, name in [(42, "int"), (key, "uuid"), ("acct-1", "str")]:
+        wardex.set_account(value)
+        with wardex.span(name):
+            pass
+    for value, name in [(None, "none"), ("", "empty")]:
+        wardex.set_account("acct-1")
+        wardex.set_account(value)
+        with wardex.span(name):
+            pass
+    wardex.set_user(key)
+    with wardex.span("user-uuid"):
+        pass
+    spans = _spans(rec)
+    assert _extra(spans["int"])["wardex.account.id"] == "42"
+    assert _extra(spans["uuid"])["wardex.account.id"] == str(key)
+    assert _extra(spans["str"])["wardex.account.id"] == "acct-1"
+    assert "wardex.account.id" not in _extra(spans["none"])
+    assert "wardex.account.id" not in _extra(spans["empty"])
+    assert _extra(spans["user-uuid"])["user.id"] == str(key)
 
 
 def test_the_account_id_survives_masking_on_the_wire(rec):
