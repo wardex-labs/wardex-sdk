@@ -468,6 +468,7 @@ class Runtime:
                     self._interceptors._at_fork_reinit()
                 _fork_reinit_module("_interceptors._conn_timing")
                 _fork_reinit_module("_interceptors._close_hook")
+                _fork_reinit_module("_interceptors._socket")
                 _fork_reinit_module("context._inject")
             # step 4 — adapters: sessions/units dropped without emitting, the
             # inherited bridge receiver torn down the child-safe way. Then the

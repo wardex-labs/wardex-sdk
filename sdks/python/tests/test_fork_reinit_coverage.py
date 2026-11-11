@@ -110,6 +110,21 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_adapters/_registry.py", "_installed"): "install record, kept (I-fork-4)",
     ("_adapters/_registry.py", "_contexts"): "install record, kept (I-fork-4)",
     ("_adapters/_registry.py", "_statuses"): "install record, kept (I-fork-4)",
+    ("_adapters/_registry.py", "_waiting"): (
+        "installs armed on a framework import, kept: the import hook crossed the fork "
+        "in sys.meta_path and the child's import of the framework still installs"
+    ),
+    # -- a once-per-process notice: the child runs the same event loop kind
+    #    the parent said it about, so it has nothing new to say.
+    ("_interceptors/_socket.py", "_UVLOOP_SAID"): (
+        "once-per-process uvloop notice; the parent said and counted it, the child runs the "
+        "same loop kind"
+    ),
+    # -- the import hook's per-thread import stack: only the forking thread
+    #    survives a fork, and the import it is in the middle of, if any,
+    #    carries on in the child, so its depth count stays true.
+    ("_adapters/_on_import.py", "finding"): "per-thread import stack, carries on in the child",
+    ("_adapters/_on_import.py", "depths"): "per-thread import stack, carries on in the child",
     ("_interceptors/_registry.py", "_installed"): "install record, kept (I-fork-4)",
     ("context/_inject.py", "_installed"): "patch record, kept (I-fork-4)",
     ("_hub.py", "_said"): (
@@ -472,6 +487,7 @@ _WALK_ALLOWED_POPULATED: dict[str, str] = {
     "_installed": "install/patch records are kept (I-fork-4)",
     "_contexts": "install records are kept (I-fork-4)",
     "_statuses": "install records are kept (I-fork-4)",
+    "_waiting": "installs armed on a framework import; the hook crossed the fork (I-fork-4)",
     "_patches": "restore records are kept (I-fork-4)",
     "_prev_handlers": "signal dispositions survive fork by design (§3.8)",
     "_limits": "resolved config projection — immutable by convention",

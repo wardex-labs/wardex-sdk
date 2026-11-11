@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import threading
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -11,9 +13,12 @@ from .._diagnostics import AdapterStatus
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from ._base import AdapterInterface
 from ._context import AdapterContext
+from ._on_import import ImportTrigger
 from ._sink import _ClientSink
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .._client import Client
 
 
@@ -96,9 +101,88 @@ class AdapterRegistry:
         #: common place for one — still reads what happened; the next `init()`
         #: starts it over (`reset_statuses`).
         self._statuses: dict[str, AdapterStatus] = {}
+        #: Framework import name -> the install to run once the application
+        #: has imported it. Read without the lock on the import path (a miss
+        #: there is the common case), changed only under `_waiting_lock`.
+        self._waiting: dict[str, Callable[[], AdapterInterface | None]] = {}
+        #: Held only to arm, take or drop an entry, never while an install
+        #: runs: an install imports its framework's modules, and another
+        #: thread in the middle of importing one of them may be waiting here
+        #: to run its own framework's install. Never the runtime's lock either,
+        #: which a thread may hold while it waits on the very import that fires here.
+        self._waiting_lock = threading.RLock()
+        #: Bumped by `stop_waiting()`. An install taken before a bump and
+        #: finished after it raced `close()`, and is undone.
+        self._epoch = 0
+        self._trigger: ImportTrigger | None = None
+
+    def install_on_import(
+        self, module: str, install: Callable[[], AdapterInterface | None]
+    ) -> None:
+        """Run `install` once the application has imported `module`, on the
+        importing thread. `install` returns the adapter it installed, if any."""
+        with self._waiting_lock:
+            self._waiting[module] = install
+            if self._trigger is None:
+                self._trigger = ImportTrigger(self.framework_imported)
+            self._trigger.watch(self._waiting)
+            if self._trigger not in sys.meta_path:
+                sys.meta_path.insert(0, self._trigger)
+
+    def framework_imported(self, module: str, finished: str | None = None) -> None:
+        """Run the install waiting for `module`, if one is. `finished` is the
+        module whose execution just ended, when that is what calls."""
+        if module not in self._waiting:
+            return
+        if finished is not None and finished != module:
+            # A submodule ended while `module` itself is still executing: on
+            # another thread, or on this one in an import that began before
+            # the install was armed. Its next import, or the check at init(),
+            # installs it once it is whole.
+            spec = getattr(sys.modules.get(module), "__spec__", None)
+            if getattr(spec, "_initializing", False):
+                return
+        with self._waiting_lock:
+            install = self._waiting.pop(module, None)
+            if install is None:
+                return
+            self._stop_waiting_if_done()
+            epoch = self._epoch
+        adapter = install()
+        if adapter is None or epoch == self._epoch:
+            return
+        # `close()` ran while this installed, so its teardown may have missed
+        # it, or undone it before the install was done: undo it now.
+        name = adapter.name()
+        if self._installed.get(name) is adapter:
+            self._installed.pop(name, None)
+            self._contexts.pop(name, None)
+        self._sweep([(name, adapter)], lambda _, late: late.uninstall(), "uninstall")
+
+    def stop_waiting(self) -> None:
+        """Forget every install still waiting for its framework; unhook from `sys.meta_path`."""
+        with self._waiting_lock:
+            self._epoch += 1
+            self._waiting.clear()
+            self._stop_waiting_if_done()
+
+    def _stop_waiting_if_done(self) -> None:
+        trigger = self._trigger
+        if trigger is None:
+            return
+        trigger.watch(self._waiting)
+        if self._waiting or trigger not in sys.meta_path:
+            return
+        with guard("adapters.on_import.unhook"):
+            sys.meta_path.remove(trigger)
 
     def install(
-        self, adapter: AdapterInterface, client: Client | None, *, explicit: bool = False
+        self,
+        adapter: AdapterInterface,
+        client: Client | None,
+        *,
+        explicit: bool = False,
+        probed: bool = False,
     ) -> None:
         """Install one adapter. A failure here costs its spans and nothing else.
 
@@ -153,7 +237,10 @@ class AdapterRegistry:
         )
 
         debug = bool(getattr(getattr(client, "config", None), "debug", False))
-        absence = _framework_absence(name, explicit=explicit, debug=debug)
+        # `probed`: the caller already ran the probe for this very install
+        # (an install that waited for its framework's import), and running it
+        # again would count its findings twice.
+        absence = None if probed else _framework_absence(name, explicit=explicit, debug=debug)
         if absence is not None:
             self._statuses[name] = _status(name, absence, _framework_versions(name))
             return
@@ -214,7 +301,12 @@ class AdapterRegistry:
         — after which the later undo restores the earlier adapter's wrapper as
         though it were the host's original. Newest-first, each undo sees exactly
         what it installed.
+
+        Installs still waiting for their framework's import are dropped
+        first, and one already running on an importing thread undoes itself
+        when it finishes, so nothing stays installed after this returns.
         """
+        self.stop_waiting()
         self._drain(lambda name, adapter: adapter.uninstall(), "uninstall")
 
     def close_units_all(self, *, marker: Limitation) -> None:
@@ -278,6 +370,10 @@ class AdapterRegistry:
         every holder, present and future. Per-adapter `guard()` so one
         failing reset cannot abandon the rest.
         """
+        # What waits for an import keeps waiting in the child, the same
+        # program carrying on; only the lock, which a parent thread may have
+        # held across the fork, is replaced.
+        self._waiting_lock = threading.RLock()
         for name, adapter in list(self._installed.items()):
             reinit = getattr(adapter, "_at_fork_reinit", None)
             if reinit is None:

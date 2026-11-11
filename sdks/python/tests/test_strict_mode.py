@@ -13,6 +13,7 @@ installed package metadata already carries the entry point.
 
 from __future__ import annotations
 
+import importlib
 import re
 import subprocess
 import sys
@@ -51,6 +52,7 @@ def test_agent_runs(monkeypatch):
         adapters=AdaptersConfig(enabled=(AdapterName.OPENAI_AGENTS,)),
     )
     try:
+        import agents  # the code under test uses the framework; its adapter installs here
         assert 1 + 1 == 2
     finally:
         wardex.close()
@@ -639,6 +641,7 @@ def test_a_swallowed_internal_error_fails_the_check_and_says_where():
 
 def test_an_adapter_that_did_not_install_is_one_gap_under_its_own_name():
     """The ledger counts it too, twice over; the check says it once."""
+    importlib.import_module("agents")  # imported first, so the adapter is built at init()
     with mock.patch("wardex_sdk._adapters._make_adapter", side_effect=ImportError("x")):
         wardex.init(
             transport=wardex.NoOpTransport(),

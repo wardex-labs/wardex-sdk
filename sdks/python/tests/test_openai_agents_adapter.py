@@ -610,6 +610,8 @@ _DECLINE_SCRIPT = textwrap.dedent(
         "adapters": AdaptersConfig(enabled=(AdapterName.OPENAI_AGENTS,))
     }
     wardex.init(transport=RecordingTransport(), **kw)
+    if mode == "absent":
+        import agents  # the host's own import; the named adapter installs here
     wardex.close()
     print(json.dumps({
         "agents_imported": "agents" in sys.modules,
@@ -659,7 +661,7 @@ def test_a_named_adapter_installs_a_framework_that_has_no_package_metadata(tmp_p
     """`enabled=` names the adapter and `import agents` succeeds, but no
     distribution is installed — a PyInstaller bundle or a vendored checkout.
     The user's word wins, as it did before the probe existed: the adapter
-    installs on its own import. What the probe could not do (the shadow
+    installs once the host imports the framework. What the probe could not do (the shadow
     check needs a distribution to compare against) is said once as a
     warning; the empty `tracing` module of this stand-in then declines the
     surface, which is the second warning and the only counter. The third is

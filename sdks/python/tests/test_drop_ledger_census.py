@@ -141,6 +141,13 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/__init__.py", "report_once", "f'adapters.{name}.{key}'"): L(
         "INSTRUMENTATION_UNAVAILABLE", at="_adapters/__init__.py"
     ),
+    # -- adapters: what else shares the process
+    ("_adapters/_neighbors.py", "report_once", "f'environment.duplicate.{family}'"): NotADrop(
+        "a second record of the same model call by another instrumentation, not a loss"
+    ),
+    ("_adapters/_neighbors.py", "report_once", "'environment.gevent'"): NotADrop(
+        "an unsupported runtime said at init(); no loss was observed, so none is counted"
+    ),
     # -- adapters: Claude Agent SDK
     (
         "_adapters/_anthropic_agent_sdk.py",
@@ -742,6 +749,15 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.ws_llm_endpoint_unconfirmed'"): _SEAM,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.ws_llm_semantics_unread'"): Marker(
         "WS_LLM_SEMANTICS_UNREAD", at="_interceptors/_trackers.py"
+    ),
+    # Plaintext HTTP on a uvloop loop never passes the socket methods the seam patches;
+    # recorded once its first response is seen.
+    ("_interceptors/_socket.py", "record", "DropReason.INSTRUMENTATION_UNAVAILABLE"): L(
+        "INSTRUMENTATION_UNAVAILABLE"
+    ),
+    ("_interceptors/_socket.py", "report_once", "'interceptors.socket.uvloop'"): NotADrop(
+        "said when a uvloop loop is found; the loss is recorded apart, once a plaintext "
+        "HTTP response is seen on one"
     ),
     # An HTTP/2 body past its cap bumps nothing: the span ships with
     # `Limitation.BODY_CAP_EXCEEDED`, and the limitation census holds that site.

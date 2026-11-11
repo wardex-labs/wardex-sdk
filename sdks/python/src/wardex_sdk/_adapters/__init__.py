@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+import sys
+from functools import partial
 from operator import attrgetter
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -12,6 +14,7 @@ from .._config import AdaptersConfig, _non_default_adapter_options
 from .._diagnostics import AdapterStatus
 from .._enums import AdapterName, AdapterState
 from ._measured import MEASURED, Measured, installed_version, is_measured, spelled
+from ._neighbors import say_what_shares_the_process
 from ._probe import probe
 from ._registry import get_registry
 
@@ -368,12 +371,38 @@ def _options_for(name: str, adapters: AdaptersConfig) -> object | None:
     return None
 
 
+def _install(
+    name: AdapterName, client: Client | None, *, explicit: bool, debug: bool, probed: bool = False
+) -> AdapterInterface | None:
+    """Build and install one adapter; return it once handed to the registry.
+    Never raises: a broken adapter must not break init(), nor the
+    application's import that it may run inside. Guarded rather than caught,
+    so the failure is counted under `adapters.<name>.load`, its traceback
+    prints under debug, and it is said once as that adapter's failure line."""
+    registry = get_registry()
+    loaded = False
+    adapter = None
+    with guard(f"adapters.{name.value}.load", debug=debug):
+        built = _make_adapter(name)
+        if built is not None:
+            registry.install(built, client, explicit=explicit, probed=probed)
+        adapter, loaded = built, True
+    if not loaded:
+        registry.record(_failed_status(name.value))
+    return adapter
+
+
 def install_configured_adapters(client: Client | None, config: WardexConfig) -> None:
     """Install what `config.adapters.enabled` selects.
 
     `None` auto-detects installed frameworks, `()` installs none, a tuple
     installs exactly what it names — the same three answers the flat
     `config.adapters` tuple gave before the group existed.
+
+    An adapter whose framework the application has not imported yet is not
+    installed here, because installing it means importing the framework: it
+    is filed `WAITING_FOR_IMPORT` and installs right after the application's
+    own import of the framework finishes.
     """
     if config.adapters.enabled is not None:
         wanted = list(config.adapters.enabled)
@@ -394,20 +423,36 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
                         f"{name.value} options set but the adapter is not installed (not detected)"
                     )
     explicit = config.adapters.enabled is not None
+    debug = bool(config.debug)
     registry = get_registry()
     registry.reset_statuses()
+    later = []
     for name in wanted:
-        # A broken adapter must not break init(). Guarded rather than caught, so
-        # the failure is counted under `adapters.<name>.load` and its traceback
-        # prints under debug, and said once as that adapter's failure line.
-        loaded = False
-        with guard(f"adapters.{name.value}.load", debug=bool(config.debug)):
-            adapter = _make_adapter(name)
-            if adapter is not None:
-                registry.install(adapter, client, explicit=explicit)
-            loaded = True
-        if not loaded:
-            registry.record(_failed_status(name.value))
+        row = _ADAPTERS.get(name)
+        if row is None or row.detect is None or row.detect in sys.modules:
+            _install(name, client, explicit=explicit, debug=debug)
+        else:
+            later.append((name, row.detect))
+    # Armed only after every immediate install is done, so an install fired by
+    # another thread's import never runs beside one of those.
+    for name, module in later:
+        # The probe runs now, without importing anything, so a shadowed or
+        # missing framework is reported at init() and never waited for.
+        absence = _framework_absence(name.value, explicit=explicit, debug=debug)
+        found = _framework_versions(name.value)
+        if absence is not None:
+            registry.record(_status(name.value, absence, found))
+            continue
+        registry.record(_status(name.value, AdapterState.WAITING_FOR_IMPORT, found))
+        registry.install_on_import(
+            module, partial(_install, name, client, explicit=explicit, debug=debug, probed=True)
+        )
+        if debug:
+            diag_info(f"{name.value} adapter: installs when the application imports {module}")
+        # Another thread may have finished importing it since the check above,
+        # before the hook was there to see it.
+        if module in sys.modules:
+            registry.framework_imported(module)
     # Every adapter this release ships gets a status, so `wardex.diagnostics()`
     # answers for the ones that were never tried as well: left out by `enabled=`,
     # or not detected.
@@ -415,3 +460,4 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
         if member not in wanted:
             state = AdapterState.DISABLED if explicit else AdapterState.ABSENT
             registry.record(_status(member.value, state, _framework_versions(member.value)))
+    say_what_shares_the_process(config)
