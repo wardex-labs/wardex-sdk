@@ -21,3 +21,13 @@ class Http2Parser:
         """Why the connection latched off, if it did — a debug string, never a
         span marker: no transaction exists to carry it."""
         return self._native.disabled_reason()  # type: ignore[no-any-return]
+
+    def finish(self) -> list[Any]:
+        """The connection closed: every stream whose response status arrived and whose response
+        never ended, as native transactions with `response_ended` False."""
+        return self._native.finish()  # type: ignore[no-any-return]
+
+    def request_path(self, stream_id: int) -> str | None:
+        """The request path of `stream_id` while the native stream table holds its request half;
+        None when unknown, evicted, completed or reset."""
+        return self._native.request_path(stream_id)  # type: ignore[no-any-return]

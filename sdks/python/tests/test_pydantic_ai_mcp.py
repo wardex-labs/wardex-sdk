@@ -37,20 +37,24 @@ is the official SDK's low-level `Server`, as in `test_mcp_real_server.py`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
+from opentelemetry.metrics import NoOpMeterProvider
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.instrumented import InstrumentationSettings
 
 import wardex_sdk as wardex
-from _pydantic_ai_support import MODES, instrumentation_mode, is_bridge
+from _pydantic_ai_support import MODES, host_provider, instrumentation_mode, is_bridge
 from wardex_sdk._assembly import counters
 from wardex_sdk._config import AdaptersConfig
 from wardex_sdk._enums import AdapterName, CaptureSource
@@ -102,12 +106,16 @@ def _answer(messages: list[Any], info: Any) -> ModelResponse:
     return ModelResponse(parts=[TextPart(f"sum is {returned[-1].content}")])
 
 
-def _record(answer: Any, server: Path, *, entered: bool) -> list[Any]:
+def _record(answer: Any, server: Path, *, entered: bool, prefix: str | None = None) -> list[Any]:
     """Run one agent against the arithmetic server and return every shipped span."""
     transport = RecordingTransport()
     wardex.init(transport=transport, adapters=AdaptersConfig(enabled=(AdapterName.PYDANTIC_AI,)))
     try:
-        toolset = MCPToolset(StdioTransport(command=sys.executable, args=[str(server)]), id="arith")
+        toolset: Any = MCPToolset(
+            StdioTransport(command=sys.executable, args=[str(server)]), id="arith"
+        )
+        if prefix is not None:
+            toolset = toolset.prefixed(prefix)
         agent = Agent(FunctionModel(answer, model_name="fn"), toolsets=[toolset], name="mcp")
 
         async def run() -> Any:
@@ -155,6 +163,114 @@ def test_an_mcp_tool_call_nests_the_seam_span_under_the_framework_tool_unit(
     assert call.transport.mcp.rpc_method == "tools/call"
     assert b'"a": 2' in call.input_data, "the JSON-RPC arguments"
     assert b'"5"' in call.output_data, "the JSON-RPC result"
+
+
+def _answer_prefixed(messages: list[Any], info: Any) -> ModelResponse:
+    returned = [p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)]
+    if not returned:
+        return ModelResponse(
+            parts=[ToolCallPart("srv_add", {"a": 2, "b": 3}, tool_call_id="call_1")]
+        )
+    return ModelResponse(parts=[TextPart(f"sum is {returned[-1].content}")])
+
+
+def test_a_prefixed_toolsets_call_nests_under_the_framework_tool_unit_by_its_arguments(
+    instrumentation, server: Path
+):
+    """A prefixed toolset (`.prefixed("srv")`, which is what `MCP(tool_prefix="srv")` builds)
+    names the framework's tool `srv_add` while the JSON-RPC request names the server's `add`.
+    The arguments prove the unit, so the wire call still nests under it."""
+    counters.reset()
+    output, *spans = _record(_answer_prefixed, server, entered=False, prefix="srv")
+    assert output == "sum is 5"
+
+    bridge = [s for s in spans if is_bridge(s) and s.name.startswith("execute_tool")]
+    seam = [s for s in spans if CaptureSource.STDIO in s.capture_sources and s.tool is not None]
+    assert [s.name for s in bridge] == ["execute_tool srv_add"], sorted(s.name for s in spans)
+    assert [s.name for s in seam] == ["MCP tools/call"], "not promoted: the framework's is the call"
+    assert len([s for s in spans if s.name.startswith("execute_tool")]) == 1
+    unit, call = bridge[0], seam[0]
+    assert call.tool.name == "add", "the wire keeps the server's own name"
+    assert call.parent_span_id == unit.context.span_id
+    assert call.context.trace_id == unit.context.trace_id
+    assert counters.get("interceptors.mcp_stdio.nested_under_tool_unit") == 1
+    assert counters.get("adapters.pydantic_ai.tool_call_prefix_unproved") == 0
+
+
+#: The arithmetic server with a second tool whose own name looks prefixed: `srv_add`.
+_SELF_SIMILAR_SERVER = _SERVER.replace(
+    'types.Tool(name="mul", description="a * b"', 'types.Tool(name="srv_add", description="+1000"'
+).replace('a + b if params.name == "add" else a * b', 'a + b + (params.name != "add") * 1000')
+
+
+def _answer_self_similar(messages: list[Any], info: Any) -> ModelResponse:
+    """Under prefix `srv` the framework names the server's `add` `srv_add` and its `srv_add`
+    `srv_srv_add`; both called at once with the same arguments."""
+    returned = [p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)]
+    if not returned:
+        return ModelResponse(
+            parts=[
+                ToolCallPart("srv_add", {"a": 2, "b": 3}, tool_call_id="c_add"),
+                ToolCallPart("srv_srv_add", {"a": 2, "b": 3}, tool_call_id="c_srvadd"),
+            ]
+        )
+    return ModelResponse(parts=[TextPart(f"got {sorted(p.content for p in returned)}")])
+
+
+def test_an_exact_name_that_may_be_a_prefixed_one_is_ambiguous_not_a_match(
+    instrumentation, tmp_path: Path
+):
+    """The wire `srv_add` (the framework's `srv_srv_add`) matches the unit named `srv_add` by
+    exact name and arguments, but that unit is the framework's call of `add`. Neither wire call
+    can be proved to one unit, so neither is nested, and both are counted as ambiguous."""
+    server = tmp_path / "self_similar_server.py"
+    server.write_text(_SELF_SIMILAR_SERVER)
+    counters.reset()
+    output, *spans = _record(_answer_self_similar, server, entered=False, prefix="srv")
+    assert output == "got ['1005', '5']"
+
+    units = {s.context.span_id: s for s in spans if is_bridge(s) and s.tool is not None}
+    assert sorted(s.tool.call_id for s in units.values()) == ["c_add", "c_srvadd"]
+    seam = [s for s in spans if CaptureSource.STDIO in s.capture_sources and s.tool is not None]
+    assert sorted(s.tool.name for s in seam) == ["add", "srv_add"]
+    for call in seam:
+        assert call.parent_span_id not in units, (call.tool.name, units[call.parent_span_id].name)
+    assert counters.get("interceptors.mcp_stdio.nested_under_tool_unit") == 0
+    assert counters.get("adapters.pydantic_ai.tool_call_ambiguous") == 2
+
+
+@contextlib.contextmanager
+def _without_content() -> Iterator[None]:
+    """Instrumentation on with `include_content=False`: the tool span records no arguments."""
+    provider, _exporter = host_provider()
+    settings = InstrumentationSettings(
+        tracer_provider=provider, meter_provider=NoOpMeterProvider(), include_content=False
+    )
+    before = vars(Agent)["_instrument_default"]
+    Agent.instrument_all(settings)
+    try:
+        yield
+    finally:
+        Agent._instrument_default = before
+        provider.shutdown()
+
+
+def test_a_prefixed_toolsets_call_is_not_nested_by_the_suffix_of_its_name_alone(server: Path):
+    """Without content the framework's unit carries only `srv_add`. A name that merely ends in
+    `_add` is no proof, so the wire call keeps the seam's own placement and is counted."""
+    counters.reset()
+    with _without_content():
+        output, *spans = _record(_answer_prefixed, server, entered=False, prefix="srv")
+    assert output == "sum is 5"
+
+    run_unit = next(s for s in spans if s.name == "invoke_agent mcp")
+    unit = next(s for s in spans if is_bridge(s) and s.name == "execute_tool srv_add")
+    [call] = [s for s in spans if CaptureSource.STDIO in s.capture_sources and s.tool is not None]
+    assert call.name == "execute_tool add", "promoted, as for any client"
+    assert call.parent_span_id != unit.context.span_id
+    assert call.parent_span_id == run_unit.context.span_id, "the seam's own placement"
+    assert counters.get("interceptors.mcp_stdio.nested_under_tool_unit") == 0
+    assert counters.get("adapters.pydantic_ai.tool_call_prefix_unproved") == 1
 
 
 def _answer_twice(a: dict[str, int], b: dict[str, int]) -> Any:

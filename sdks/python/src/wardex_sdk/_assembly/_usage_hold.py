@@ -34,8 +34,15 @@ What follows from witnessing at the seal, stated so nobody mistakes it for a def
 
 * A request that got no complete response (timeout, cancellation, a stream the app abandoned) is
   not witnessed before the unit closes: the framework's numbers for that call are promoted with
-  `NO_WIRE_EVIDENCE`. An abandoned stream may still be sealed later, at connection close, as a
-  partial span; usage arrives in a stream's last chunk, so that span normally carries none.
+  `NO_WIRE_EVIDENCE`. Such a stream may still be sealed later, at connection close, as a partial
+  span, and it can carry usage: an HTTP/2 stream read to its last event whose END_STREAM never
+  came has all of it. That seal is answered `"promoted"` (the unit already shipped the numbers),
+  and the wire span ships with its usage moved out of the typed block (`demote_late_usage`), so
+  the call is still counted once. Only the FIRST late model-call seal under a promoted unit gets
+  that answer: a second one is a second call, whose usage nobody else carries, so it keeps it.
+  The memory of promoted units is the last `_PROMOTED_CAP` of them; a late seal under a unit
+  older than that is counted twice. It is bounded because most promoted units never see a late
+  seal (no interceptor reads their provider), so their entries are never consumed.
 * A 4xx/5xx from a model-call endpoint IS witnessed: the wire span exists and carries the failure.
 * A WebSocket session is one span, sealed at connection close, and never goes through `_seal`: a
   chat over a WebSocket transport is never witnessed and its framework numbers are promoted. The
@@ -55,8 +62,9 @@ Imported by `_units` (the close path calls `settle_usage`), so this module must 
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from ._builder import NULL_DRAFT
 from ._diag import counters, guard
@@ -64,7 +72,7 @@ from ._integrity import Limitation
 from ._vocab import SpanIntent
 
 if TYPE_CHECKING:
-    from .._types import SpanContext, SpanId
+    from .._types import GenAIAttributes, SpanContext, SpanId
     from ._builder import SpanDraft
 
 #: The usage keys a holder's demoted extras may be promoted from, after the holder's prefix, and
@@ -98,11 +106,33 @@ class _Holder:
 #: registry's fork reset, which is why this table has one of its own.
 _HOLDERS: dict[SpanId, _Holder] = {}
 
+#: Span ids of the holders `settle_usage` PROMOTED, oldest first, at most `_PROMOTED_CAP`: the
+#: memory a late seal under an already-shipped unit is answered from (`witness_request`). An
+#: `OrderedDict` because `pop` and `popitem(last=False)` are each one C call, so a seal thread and
+#: a closing thread never see it half-changed.
+_PROMOTED_RECENTLY: OrderedDict[SpanId, bool] = OrderedDict()
+_PROMOTED_CAP = 256
+
+#: Where a late wire span's typed usage goes (`demote_late_usage`): one key per typed field, plus
+#: the flag. Not under the provider-usage mirror's `wardex.usage.`, whose keys spell the
+#: provider's own usage paths: `late.input_tokens` there would read as a provider leaf.
+LATE_USAGE_PREFIX = "wardex.usage_late."
+LATE_USAGE_DEMOTED_KEY = LATE_USAGE_PREFIX + "demoted"
+_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "reasoning_output_tokens",
+)
+
 
 def _at_fork_reinit() -> None:
     """Fork-child reset: the child's registries drop their inherited units without emitting them,
-    so nothing would ever settle the parent's `_HOLDERS` entries in the child."""
+    so nothing would ever settle the parent's `_HOLDERS` entries in the child, and the parent's
+    promoted units are not the child's to answer for."""
     _HOLDERS.clear()
+    _PROMOTED_RECENTLY.clear()
 
 
 def hold_framework_usage(draft: SpanDraft, *, prefix: str) -> bool:
@@ -127,18 +157,30 @@ def hold_framework_usage(draft: SpanDraft, *, prefix: str) -> bool:
     return True
 
 
-def witness_request(parent: SpanContext | None) -> None:
+def witness_request(parent: SpanContext | None) -> Literal["held", "promoted"] | None:
     """A transaction to a model-call endpoint was sealed with `parent` as its latched parent.
 
     Called by the byte seam's seal (`_interceptors/_seam.py::_seal`), synchronously on the thread
     that completed the transaction, for a path the endpoint table classifies `llm_call` — never
-    from the parse, which is asynchronous. Two module-global reads and nothing else when no bridge
-    holds anything: this runs once per sealed model call on every seam.
+    from the parse, which is asynchronous. Three module-global reads and nothing else when no
+    bridge holds anything: this runs once per sealed model call on every seam.
+
+    The answer: `"held"` — `parent` is a live holder, now marked, so its numbers stay demoted and
+    the wire span carries the usage. `"promoted"` — `parent` already settled by PROMOTING its
+    numbers, so the wire span must not carry them again (the seam demotes them with
+    `demote_late_usage`); the memory is consumed, so only the first late seal gets this answer.
+    None — anything else: no holder, or one that settled without promoting.
     """
-    if _HOLDERS and parent is not None:
+    if parent is None:
+        return None
+    if _HOLDERS:
         holder = _HOLDERS.get(parent.span_id)
         if holder is not None:
             holder.issued = True
+            return "held"
+    if _PROMOTED_RECENTLY and _PROMOTED_RECENTLY.pop(parent.span_id, False):
+        return "promoted"
+    return None
 
 
 def settle_usage(draft: SpanDraft) -> SpanDraft:
@@ -161,7 +203,29 @@ def settle_usage(draft: SpanDraft) -> SpanDraft:
             _promote(draft, holder.prefix)
             draft.add_limitation(Limitation.NO_WIRE_EVIDENCE)
             counters.bump("assembly._usage_hold.usage_promoted")
+            _PROMOTED_RECENTLY[draft.context.span_id] = True
+            if len(_PROMOTED_RECENTLY) > _PROMOTED_CAP:
+                _PROMOTED_RECENTLY.popitem(last=False)
     return draft
+
+
+def demote_late_usage(draft: SpanDraft, block: GenAIAttributes) -> GenAIAttributes:
+    """`block` with its typed usage removed, the numbers kept on `draft` as `wardex.usage_late.*`.
+
+    For a wire span sealed under a unit that had already shipped the same call's usage (the seal's
+    `witness_request` answered `"promoted"`): the typed block is what every sum over a trace adds
+    up, so the second copy leaves it, and the flag says why the span has none. Returns `block`
+    itself when it carries no usage; nothing was counted twice then. `dataclasses.replace`, not a
+    construction site (the usage-construction census).
+    """
+    moved = {f: v for f in _USAGE_FIELDS if (v := getattr(block, f)) is not None}
+    if not moved:
+        return block
+    for field, value in moved.items():
+        draft.set_extra(LATE_USAGE_PREFIX + field, value)
+    draft.set_extra(LATE_USAGE_DEMOTED_KEY, True)
+    counters.bump("assembly._usage_hold.late_wire_usage_demoted")
+    return replace(block, **dict.fromkeys(moved))
 
 
 def _promote(draft: SpanDraft, prefix: str) -> None:
@@ -197,4 +261,4 @@ def _promote(draft: SpanDraft, prefix: str) -> None:
     draft._extra[:] = [pair for pair in draft._extra if pair[0] not in moved]
 
 
-__all__ = ["hold_framework_usage", "settle_usage", "witness_request"]
+__all__ = ["demote_late_usage", "hold_framework_usage", "settle_usage", "witness_request"]

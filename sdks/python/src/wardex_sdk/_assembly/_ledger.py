@@ -21,11 +21,12 @@ records it also folds the inbox into the tables, with a lock taken only by
 buffer lock, inside the export slot, from a signal handler that interrupted
 either, and from a finalizer: none of them can make it wait, so none of them
 can deadlock on it. It also calls no Python function, the fold included, which
-matters in `guard.__exit__` at the recursion limit: a swallowed `RecursionError`
+matters in `guard.__exit__` near the recursion limit: a failure swallowed there
 leaves only the frames it unwound, and the counter bump beside it already needs
-one. A fold that pushed a frame would let that error escape the guard on one
-swallow in `_FOLD_AT`, chosen by how full the inbox happened to be. (The one
-call it can make is a signal handler held for the fold, below.)
+one. A fold that pushed a frame would make whether the guard swallows depend on
+how full the inbox happened to be. (A `RecursionError` itself is never
+swallowed: the guard lets it through first.) The one call it can make is a
+signal handler held for the fold, below.
 Every reader folds before it reads, so a record waiting in the inbox is never
 missed. The read for the wire (`attach`) never waits either: a drain that
 cannot take the fold ships its envelope without a report, and the counts ride

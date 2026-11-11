@@ -278,6 +278,10 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "two live tool units share the name and the arguments; the wire call keeps the seam's own "
         "placement and ships"
     ),
+    ("_adapters/_context_bridge.py", "count", "'tool_call_prefix_unproved'"): NotADrop(
+        "a prefixed tool unit recorded no arguments to prove the wire call is its own; the wire "
+        "call keeps the seam's own placement and ships"
+    ),
     ("_adapters/_conversation.py", "count", "shadowed_counter"): NotADrop(
         "the host's conversation id wins over the framework's, which stays on the span"
     ),
@@ -767,6 +771,14 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.promote_skipped'"): NotADrop(
         "a demoted usage pair left where it was, still on the span as an extra"
     ),
+    (
+        "_assembly/_usage_hold.py",
+        "bump",
+        "'assembly._usage_hold.late_wire_usage_demoted'",
+    ): NotADrop(
+        "a wire span sealed after its unit promoted the same call's usage; its numbers move to "
+        "wardex.usage_late.* extras on the span, so the call is counted once"
+    ),
     ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.usage_kept_demoted'"): NotADrop(
         "the wire span under the unit carries the usage; the framework's copy stays demoted"
     ),
@@ -873,6 +885,13 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     # An HTTP/2 body past its cap bumps nothing: the span ships with
     # `Limitation.BODY_CAP_EXCEEDED`, and the limitation census holds that site.
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_parent_forgotten'"): _SEAM,
+    # A model call whose latch entry the cap evicted and whose answer the tracker never paired:
+    # the wire record is lost (the chat unit keeps its promoted usage, so the number is not).
+    ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_call_unanswered'"): _SEAM,
+    ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_witnessed'"): NotADrop(
+        "the answer to a model call whose latch entry the cap evicted reaches the seal with the "
+        "evicted parent as its witness, so the wire span's number is the only one counted"
+    ),
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.request_unobserved'"): _SEAM,
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.stream_evicted'"): Marker(
         "H2_REQUEST_EVICTED", at="_interceptors/_trackers.py"

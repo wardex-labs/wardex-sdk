@@ -12,7 +12,7 @@ into units. Two things it needs cannot be built from the verbs every adapter has
   tool never ran on: pydantic-ai's MCP client writes the server's stdin from a task it spawned
   when the toolset connected. `follow_tool_calls` lets the seam parent the wire `tools/call` to
   the one live tool unit this context holds for that tool name and those arguments
-  (`latch_tool_call`).
+  (`latch_tool_call`), or for that name under a framework prefix when the arguments prove it.
 * **Holding framework usage.** A bridge CHAT unit carries the framework's usage demoted, and the
   core promotes it at close only when no model-call transaction was sealed under the unit
   (`_assembly/_usage_hold.py`).
@@ -77,28 +77,53 @@ class BridgeVerbs:
         arguments equal the wire's (proved), else among those that recorded none (by name only).
         Two concurrent calls of one tool with the same arguments cannot be told apart, so the
         answer is None and the ambiguity is counted.
+
+        A framework may rename a server's tool: pydantic-ai's prefixed toolset (`.prefixed("srv")`,
+        or `MCP(tool_prefix="srv")`) calls the server's `add` as `srv_add`, and the wire still
+        says `add`. So a unit named `<prefix>_<wire name>` is a candidate too, but only by
+        arguments equal to the wire's: a suffix is weak evidence (a function tool the agent
+        defines itself may be called `fast_add`), so a prefixed unit that recorded no arguments
+        is refused and counted, never nested by name. An exact name does not win over a prefixed
+        one: with prefix `srv` over a server exposing `add` and `srv_add`, the unit named `srv_add`
+        is the framework's call of `add`, and a wire `srv_add` with the same arguments is just as
+        likely the call of the unit named `srv_srv_add`. Both kinds present is ambiguity.
         """
 
         def resolve(name: str, arguments: str | None) -> tuple[Unit, bool] | None:
             proved: list[Unit] = []
             named: list[Unit] = []
+            prefixed: list[Unit] = []
+            prefixed_unproved = False
+            suffix = f"_{name}"
             for entry in self.slots_snapshot():
                 handle = entry.get("handle")
                 if handle is None or handle.degraded or not handle._unit.is_live:
                     continue
                 call = call_of(entry)
-                if call is None or call[0] != name:
+                if call is None:
                     continue
-                if call[1] is None:
-                    named.append(handle._unit)
-                elif arguments is not None and call[1] == arguments:
-                    proved.append(handle._unit)
-            for found, by_arguments in ((proved, True), (named, False)):
+                matches = arguments is not None and call[1] == arguments
+                if call[0] == name:
+                    if call[1] is None:
+                        named.append(handle._unit)
+                    elif matches:
+                        proved.append(handle._unit)
+                elif len(call[0]) > len(suffix) and call[0].endswith(suffix):
+                    if call[1] is None:
+                        prefixed_unproved = True
+                    elif matches:
+                        prefixed.append(handle._unit)
+            if prefixed and (proved or named):  # an exact name may itself be a prefixed one
+                self.count("tool_call_ambiguous")
+                return None
+            for found, by_arguments in ((proved, True), (named, False), (prefixed, True)):
                 if len(found) > 1:
                     self.count("tool_call_ambiguous")
                     return None
                 if found:
                     return found[0], by_arguments
+            if prefixed_unproved:
+                self.count("tool_call_prefix_unproved")
             return None
 
         set_tool_call_resolver(self, resolve)

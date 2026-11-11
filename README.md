@@ -312,18 +312,25 @@ with no token usage, and the `chat` span carries pydantic-ai's numbers as its
 token usage, marked `no_wire_evidence`, so the call is still counted once. The
 same holds for a model call whose response never completed (a timeout, a
 cancellation) and for one sent over a WebSocket connection: its numbers are
-pydantic-ai's, marked `no_wire_evidence`.
+pydantic-ai's, marked `no_wire_evidence`. If the request's span still ships
+later, at connection close (an HTTP/2 stream whose end arrived after the
+client stopped reading), it carries no token usage: its numbers are kept under
+`wardex.usage_late.*` with `wardex.usage_late.demoted` set, so the call is
+counted once.
 An MCP tool call appears as the framework's `execute_tool` span under its run,
 and the stdio interceptor's span for the JSON-RPC `tools/call` (named
 `MCP tools/call`, carrying the request and response) nests under it, in either
 connect order and under a toolset several agents share. The two are matched by
-tool name and arguments, so two calls of one tool in flight at once each nest
-under their own span, and a call another MCP client makes with other arguments
-never lands under the agent's (one made with exactly the same arguments at the
-same moment does). The interceptor's span keeps its own placement (an
-`execute_tool` span under the run when the toolset connected inside the run, or
-a separate trace when the agent was entered with `async with agent` beforehand)
-when two calls with the same arguments are in flight at once, or when
+tool name and arguments (a prefixed toolset, `.prefixed("srv")` or
+`MCP(tool_prefix="srv")`, whose tools the framework names `<prefix>_<tool>`,
+nests too, matched by its arguments only), so two calls of one tool in flight at
+once each nest under their own span, and a call another MCP client makes with
+other arguments never lands under the agent's (one made with exactly the same
+arguments at the same moment does). The interceptor's span keeps its own
+placement (an `execute_tool` span under the run when the toolset connected
+inside the run, or a separate trace when the agent was entered with
+`async with agent` beforehand) when two calls with the same arguments are in
+flight at once, or when
 `include_content=False` leaves pydantic-ai's span without arguments and the
 call was written from outside the run. Retries of a
 `FallbackModel` appear as attempt spans under the model call on the releases
