@@ -33,7 +33,7 @@ jobs:
           - { runner: macos-14,       target: aarch64, manylinux: "" }
           - { runner: windows-latest, target: x64,     manylinux: "" }
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Run maturin from the package dir so it reads sdks/python/pyproject.toml
       # (which points at the real crate via [tool.maturin] manifest-path). maturin's
       # own --manifest-path expects a Cargo.toml, not pyproject.toml.
@@ -44,7 +44,7 @@ jobs:
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
           working-directory: sdks/python
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
           path: sdks/python/dist
@@ -92,7 +92,7 @@ jobs:
           - { runner: macos-14,       target: aarch64, how: native,  python: "3.12" }
           - { runner: windows-latest, target: x64,     how: native,  python: "3.12" }
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
           path: dist
@@ -107,7 +107,7 @@ jobs:
         if: matrix.platform.how == 'rosetta'
         run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: matrix.platform.how != 'qemu'
         with:
           python-version: ${{ matrix.platform.python }}
@@ -146,7 +146,7 @@ jobs:
           arch -x86_64 "$py" -m pip install --pre --no-index --find-links dist wardex-sdk
           arch -x86_64 "$py" -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
 
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         if: matrix.platform.how == 'qemu'
         with:
           platforms: arm64
@@ -185,10 +185,10 @@ jobs:
       matrix:
         python-version: ["3.10", "3.14"]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-deny@0.20.2,cargo-machete@0.9.2
       - run: scripts/check-rust.sh lint test deps msrv
@@ -197,7 +197,7 @@ jobs:
           # known advisory or a yanked crate blocks the publish; on a pull
           # request the same step only reports (see ci.yml).
           CHECK_RUST_ADVISORIES_BLOCKING: "1"
-      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "**/pyproject.toml"
@@ -224,7 +224,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: wheels-*
           merge-multiple: true
