@@ -43,22 +43,34 @@ const PRELUDE_LEN: usize = 12;
 /// One header value, in the type the header declared.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HeaderValue<'a> {
+    /// Header types 0 and 1: the value is the type itself, with no payload.
     Bool(bool),
+    /// Header type 2: one signed byte.
     Byte(i8),
+    /// Header type 3: a big-endian signed 16-bit integer.
     Short(i16),
+    /// Header type 4: a big-endian signed 32-bit integer.
     Int(i32),
+    /// Header type 5: a big-endian signed 64-bit integer.
     Long(i64),
+    /// Header type 6: a length-prefixed byte string, borrowed from the body.
     Bytes(&'a [u8]),
+    /// Header type 7: a length-prefixed UTF-8 string, borrowed from the body.
+    /// A value that is not UTF-8 fails the header parse instead.
     String(&'a str),
-    /// Milliseconds since the Unix epoch.
+    /// Header type 8: milliseconds since the Unix epoch.
     Timestamp(i64),
+    /// Header type 9: a 16-byte UUID, as laid out on the wire.
     Uuid([u8; 16]),
 }
 
 /// One decoded message: its headers in wire order and its raw payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message<'a> {
+    /// Every header in wire order, as `(name, value)`; duplicates kept.
     pub headers: Vec<(&'a str, HeaderValue<'a>)>,
+    /// The bytes between the header block and the message CRC, untouched:
+    /// for Bedrock an event's JSON, for an exception its error document.
     pub payload: &'a [u8],
 }
 
@@ -76,6 +88,7 @@ impl<'a> Message<'a> {
 /// could not be read.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Decoded<'a> {
+    /// Every message whose preludes and CRCs checked out, in wire order.
     pub messages: Vec<Message<'a>>,
     /// Messages skipped, plus one for an unreadable remainder. A message
     /// whose prelude checks out but whose message CRC or headers do not is
@@ -196,16 +209,19 @@ fn parse_headers(mut b: &[u8]) -> Option<Vec<(&str, HeaderValue<'_>)>> {
 pub(crate) fn encode_message(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
     let mut hb = Vec::new();
     for (name, value) in headers {
-        hb.push(name.len() as u8);
+        hb.push(u8::try_from(name.len()).expect("test header names are under 256 bytes"));
         hb.extend_from_slice(name.as_bytes());
         hb.push(7);
-        hb.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        let value_len = u16::try_from(value.len()).expect("test header values are under 64 KiB");
+        hb.extend_from_slice(&value_len.to_be_bytes());
         hb.extend_from_slice(value.as_bytes());
     }
-    let total = (FRAME_OVERHEAD + hb.len() + payload.len()) as u32;
+    let total = u32::try_from(FRAME_OVERHEAD + hb.len() + payload.len())
+        .expect("test messages are far below 4 GiB");
+    let headers_len = u32::try_from(hb.len()).expect("test header blocks are far below 4 GiB");
     let mut msg = Vec::new();
     msg.extend_from_slice(&total.to_be_bytes());
-    msg.extend_from_slice(&(hb.len() as u32).to_be_bytes());
+    msg.extend_from_slice(&headers_len.to_be_bytes());
     let prelude_crc = crc32(&msg);
     msg.extend_from_slice(&prelude_crc.to_be_bytes());
     msg.extend_from_slice(&hb);
@@ -336,7 +352,7 @@ mod tests {
     fn every_header_type_decodes() {
         let mut hb = Vec::new();
         let mut put = |name: &str, ty: u8, value: &[u8]| {
-            hb.push(name.len() as u8);
+            hb.push(u8::try_from(name.len()).expect("test header names are under 256 bytes"));
             hb.extend_from_slice(name.as_bytes());
             hb.push(ty);
             hb.extend_from_slice(value);
@@ -352,7 +368,7 @@ mod tests {
         put("ts", 8, &1i64.to_be_bytes());
         put("u", 9, &[3u8; 16]);
         let headers = parse_headers(&hb).expect("well formed");
-        let values: Vec<HeaderValue> = headers.into_iter().map(|(_, v)| v).collect();
+        let values: Vec<HeaderValue<'_>> = headers.into_iter().map(|(_, v)| v).collect();
         assert_eq!(
             values,
             vec![

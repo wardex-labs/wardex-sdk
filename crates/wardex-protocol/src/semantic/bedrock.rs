@@ -8,26 +8,34 @@
 //! its events into one synthetic Converse response, as the SSE reassemblers
 //! do for their providers.
 
+use serde::Deserialize;
+
 use super::event_json::parse_event;
-use super::parts::*;
+use super::parts::{
+    blob_part, build_input_messages, build_output_messages, build_system_instructions,
+    declared_error_type, generic_part, normalize_finish_reason, reasoning_part, text_part,
+    tool_call_part, tool_call_response_part, uri_part, InMsg, OutMsg, Reassembled, FINISH_ERROR,
+};
 use super::usage::{deep_merge, flatten_usage, UsageBounds, UsageView};
 use super::LlmSemantics;
 use crate::aws_eventstream;
 use crate::usage::{InputConvention, TokenUsage};
-use serde::Deserialize;
 
 /// The provider label, spelled as the semconv `gen_ai.provider.name` value.
 pub(super) const PROVIDER: &str = "aws.bedrock";
 
 // Normalization table, same contract as the other providers' (`anthropic.rs`):
-// the extraction reads THROUGH these constants. `inputTokens` EXCLUDES the
+// the extraction reads through these constants. `inputTokens` excludes the
 // cache tiers reported beside it, as on Anthropic's own API; Converse reports
 // no reasoning-token count, so the table has no row for one.
 const P_INPUT: &str = "inputTokens";
 const P_OUTPUT: &str = "outputTokens";
 const P_CACHE_READ: &str = "cacheReadInputTokens";
 const P_CACHE_CREATION: &str = "cacheWriteInputTokens";
-#[cfg_attr(not(test), allow(dead_code))]
+// Read only by the fixture test (`every_normalized_usage_path_is_extracted_
+// from_its_fixture`); the runtime reads the P_* consts the table is built
+// from, which makes the two one string.
+#[cfg(test)]
 pub(super) const NORMALIZED_USAGE_PATHS: &[(&str, &str)] = &[
     ("input_tokens", P_INPUT),
     ("output_tokens", P_OUTPUT),
@@ -96,9 +104,14 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            let hex = |c: u8| (c as char).to_digit(16);
+            // A hex digit is below 16, so two of them always fit one byte.
+            let hex = |c: u8| {
+                char::from(c)
+                    .to_digit(16)
+                    .and_then(|d| u8::try_from(d).ok())
+            };
             if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((h * 16 + l) as u8);
+                out.push(h * 16 + l);
                 i += 3;
                 continue;
             }
