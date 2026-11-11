@@ -730,6 +730,38 @@ def test_a_plain_thread_with_nothing_open_elsewhere_is_a_trace_root(rec, caplog)
     assert not _unbound_warnings(caplog)
 
 
+def test_roots_on_pool_threads_beside_each_other_are_trace_roots(rec, caplog):
+    """A thread-per-request program without middleware: each worker's root is
+    open while the others' are. A root on another unbound thread is no parent
+    this one could have lost, so none of them is marked."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    def handle(i: int) -> None:
+        with wardex.span(f"request-{i}"):
+            time.sleep(0.01)
+
+    with caplog.at_level("WARNING", logger="wardex_sdk"), ThreadPoolExecutor(8) as pool:
+        list(pool.map(handle, range(24)))
+    spans = _spans(rec)
+    assert len(spans) == 24
+    assert {s.correlation.strategy.value for s in spans.values()} == {"trace_root"}
+    assert not _unbound_warnings(caplog)
+
+
+def test_a_pool_thread_root_while_the_main_thread_holds_a_span_is_unresolved(rec):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def tool(i: int) -> None:
+        with wardex.span(f"tool-{i}"):
+            pass
+
+    with wardex.span("agent"), ThreadPoolExecutor(2) as pool:
+        list(pool.map(tool, range(2)))
+    spans = _spans(rec)
+    assert {spans[f"tool-{i}"].correlation.strategy.value for i in range(2)} == {"unresolved"}
+
+
 def test_a_plain_thread_that_opens_its_own_isolation_scope_is_a_trace_root(rec, caplog):
     def work() -> None:
         with wardex.isolation_scope(), wardex.span("job"):

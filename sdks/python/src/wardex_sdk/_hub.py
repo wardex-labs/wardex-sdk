@@ -125,19 +125,34 @@ def unseen_parent(scope: Scope) -> str | None:
     root an unresolved edge instead of a confident one (no parent is guessed):
     a `continue_trace` whose traceparent could not be parsed, and a thread
     Python started with an empty context (a plain `Thread`, an executor worker)
-    working while a span is open elsewhere in the process. A context that a
-    wardex block, a bound thread or a span reached is not the second: there a
-    root is what the code asked for.
+    working while a span is open elsewhere in the process that is not itself
+    such a thread's root. A context that a wardex block, a bound thread or a
+    span reached is not the second: there a root is what the code asked for.
+    Nor is a root beside other unbound threads' roots: a thread-per-request
+    program without middleware has one per worker, and none parents another.
     """
     if scope._parent_unreadable:
         return TRACEPARENT_UNREADABLE
+    if not on_unbound_thread(scope):
+        return None
+    # A root opened on an unbound thread marks its `Interrupt` so (`_tracing`).
+    # A snapshot: other threads open and close spans meanwhile.
+    open_now = list(runtime()._open_spans.values())
+    if any(not getattr(interrupt, "unbound_root", False) for interrupt in open_now):
+        return UNBOUND_THREAD
+    return None
+
+
+def on_unbound_thread(scope: Scope | None = None) -> bool:
+    """Whether `scope` (the current one by default) is what a thread Python
+    started with an empty context reads: no wardex block, no bound context, not
+    the main thread, not wardex's."""
+    scope = get_current_scope() if scope is None else scope
     iso = _isolation_scope.get()
     if not scope._implicit or (iso is not None and not iso._implicit):
-        return None
+        return False
     thread = threading.current_thread()
-    if thread is threading.main_thread() or thread.name.startswith("wardex-"):
-        return None
-    return UNBOUND_THREAD if runtime()._open_spans else None
+    return thread is not threading.main_thread() and not thread.name.startswith("wardex-")
 
 
 def explain_unseen_parent(reason: str) -> None:

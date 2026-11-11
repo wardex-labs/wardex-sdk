@@ -41,10 +41,8 @@ from .context._contextvar import fork_scope
 from .context._with_only import WithOnly
 
 if TYPE_CHECKING:
-    # Type-only: these three name the span machinery, which stays out of this
-    # module's runtime namespace — the `noqa: ANN201` escape these properties
-    # used to wear existed to dodge exactly this import, and a TYPE_CHECKING
-    # import states the same fact without leaving the properties untyped.
+    # Type-only: these name the span machinery, which stays out of this
+    # module's runtime namespace, without leaving the properties untyped.
     from ._assembly import Limitation
     from ._scope import Scope
     from ._types import CorrelationInfo, SpanContext, SpanId
@@ -54,10 +52,8 @@ class Span:
     """The object `wardex.span()` yields — a published surface over a `SpanDraft`.
 
     Every attribute below is a view onto the draft, so the manual path and the
-    observation paths build the same object through the same validation. That is
-    §6.4's point about the two `execute_tool` shapes: this path used to ship
-    spans with no `capture_sources`, no `capture_integrity` and no
-    `correlation`, purely because it was a second constructor.
+    observation paths build the same object through the same validation, with
+    the same `capture_sources`, `capture_integrity` and `correlation`.
 
     The draft is in MANUAL mode, which changes exactly two things and no more:
     the name is the host's (`wardex.span("anything")` is a published API), and
@@ -406,6 +402,7 @@ def _begin(
         # inherits the same hazard, so it asks it too rather than having a
         # second answer.
         ambient = latch_ambient()
+        unbound_root = ambient.span_context is None and _hub.on_unbound_thread()
         parentage = resolve_observed(
             ambient, parent_closed=parent_is_closed_unit(ambient.span_context)
         )
@@ -459,9 +456,9 @@ def _begin(
     current = None if stepped else _make_current(builder)
     tracked = None
     with guard("tracing.manual_track", debug=_debug_enabled()):
-        tracked = _runtime.runtime().track_open_span(
-            id(builder), functools.partial(_interrupt, builder)
-        )
+        interrupt = functools.partial(_interrupt, builder)
+        interrupt.unbound_root = unbound_root  # type: ignore[attr-defined]  # `unseen_parent`
+        tracked = _runtime.runtime().track_open_span(id(builder), interrupt)
     try:
         yield builder
     finally:
@@ -515,9 +512,8 @@ def _make_current(span: Span) -> Any:
 
 def _unmake_current(span: Span, token: Any) -> None:
     span._open = False
-    # A span that closed in another Context stays in the one it opened in, and
-    # the next span opened there links to it: each one cut to the open span it
-    # stands for keeps a long-lived task from holding every one it ever opened.
+    # Closed in another Context, it stays in the one it opened in: linking it on
+    # to closed spans would keep every span a long-lived task ever opened.
     span._outer = _open_from(span._outer)
     if token is None:
         return
@@ -596,9 +592,8 @@ def _debug_enabled() -> bool:
 class _WithOnly(WithOnly):
     """`WithOnly` for the two span openers, which also record the host's exception.
 
-    `@span("x")` on an `async def` used to compile, run, and silently close the
-    span before any awaited work started (see `WithOnly`). The refusal here
-    names the decorators that do it right.
+    `@span("x")` on an `async def` would close the span before any awaited
+    work started (see `WithOnly`); the refusal names the decorators that work.
     """
 
     __slots__ = ("_span",)
