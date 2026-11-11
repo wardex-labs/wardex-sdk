@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import os as _os
 import warnings as _warnings
-from collections.abc import Iterator as _Iterator
 from collections.abc import Sequence as _Sequence
 from contextlib import AbstractContextManager as _AbstractContextManager
-from contextlib import contextmanager as _contextmanager
 from dataclasses import replace as _replace
 from typing import Any as _Any
 from urllib.parse import urlsplit as _urlsplit
@@ -17,6 +15,7 @@ from . import _hub, _runtime
 from ._assembly import _ledger
 from ._assembly import diag_info as _diag_info
 from ._assembly import diag_warning as _diag_warning
+from ._assembly import report_once as _report_once
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT
 from ._client import Client as _Client
 from ._config import (
@@ -80,7 +79,10 @@ from ._limits import LimitsConfig
 # they are free to change shape there.
 from ._native import NATIVE_OK as _NATIVE_OK
 from ._native import unavailable_reason as _unavailable_reason
+from ._scope import ACCOUNT_KEY as _ACCOUNT_KEY
+from ._scope import NO_USER as _NO_USER
 from ._scope import Scope, UserInfo
+from ._scope import user_from_call as _user_from_call
 from ._snapshot_api import capture_state_snapshot
 from ._tracing import Span, conversation, span
 from ._types import (
@@ -125,6 +127,7 @@ __all__ = [
     "capture_state_snapshot",
     "set_tag",
     "set_user",
+    "set_account",
     "set_context",
     "isolation_scope",
     "new_scope",
@@ -641,74 +644,154 @@ def init(
 
 
 def set_tag(key: str, value: str) -> None:
-    """Set a tag on the ISOLATION scope; exported spans captured under it carry it.
+    """Set a tag that exported spans in this scope carry as an attribute.
 
-    The isolation scope, not the process-global one (Sentry 2.x semantics): a
-    tag set inside one request's `isolation_scope()` — one tenant, one job —
-    stays that unit's and cannot bleed onto every other thread's spans. A tag
-    set outside any `isolation_scope()` block lands on the ambient context's
-    own isolation scope and behaves like a process-wide tag in a simple script.
+    The tag lands on the running context's isolation scope (Sentry 2.x
+    semantics), and these rules decide which spans see it:
+
+    * Work started from this context afterwards (an asyncio task, a thread
+      started through `wardex.bind_context`) reads it. A later write here
+      does not reach work already started, so a loop that sets each
+      request's user and then starts that request gives each its own.
+    * A tag set inside a task, a bound thread, or an `isolation_scope()` /
+      `new_scope()` block stays there: siblings, the code that started the
+      task and the code after the block never see it.
+    * A plain `threading.Thread` or executor thread starts with NO tags,
+      because Python gives a new thread an empty context. Wrap its target in
+      `wardex.bind_context(fn)` to carry tags set at startup into it.
+
     A span-local attribute with the same key wins over the scope tag.
     """
-    _hub.get_isolation_scope().set_tag(key, value)
+    _hub.write_scope(_hub._isolation_scope, Scope.set_tag, key, value)
 
 
-def set_user(user: UserInfo | None) -> None:
-    """Attach `user` to the ISOLATION scope; exported spans carry `user.*`.
+def set_user(
+    user: UserInfo | str | int | None = _NO_USER,
+    /,
+    *,
+    id: str | int | None = None,
+    email: str | None = None,
+    username: str | None = None,
+    ip_address: str | None = None,
+) -> None:
+    """Attach the end user to the scope; exported spans carry `user.*`.
 
-    `UserInfo.id/email/username` map to the `user.id`/`user.email`/`user.name`
-    span attributes and `ip_address` to `client.address`; `None` fields are
-    skipped. `set_user(None)` clears the user again. Same scope targeting as
-    `set_tag` — see its docstring.
+    Accepted forms, anything else raises `TypeError` here::
+
+        wardex.set_user("user-42")                       # the user id
+        wardex.set_user(42)                              # an int id is sent as "42"
+        wardex.set_user(id="user-42", email="a@b.example")
+        wardex.set_user(wardex.UserInfo(id="user-42"))
+        wardex.set_user(None)                            # clear it again
+
+    `id`/`email`/`username` map to the `user.id`/`user.email`/`user.name`
+    span attributes and `ip_address` to `client.address`; None or empty
+    fields are skipped, and a call whose fields are all None or empty (an
+    anonymous user) clears the user. Scoped exactly like `set_tag`: see its
+    docstring.
     """
-    _hub.get_isolation_scope().set_user(user)
+    resolved = _user_from_call(
+        user, {"id": id, "email": email, "username": username, "ip_address": ip_address}
+    )
+    _hub.write_scope(_hub._isolation_scope, Scope.set_user, resolved)
+
+
+def set_account(id: str) -> None:
+    """Attribute the work in this scope to one of YOUR customers: `wardex.account.id`.
+
+    An account is the customer's customer: the company or workspace your
+    agent serves, the unit you compare behaviour across. It is not your
+    wardex login or project. Scoped exactly like `set_user`, so set it per
+    request::
+
+        async def handle(request):
+            with wardex.continue_trace(request.headers):
+                wardex.set_account(request.state.workspace_id)
+                await run_agent(request)
+
+    `id` must be a non-empty `str`; anything else raises here.
+    """
+    if not isinstance(id, str):
+        raise TypeError(f"set_account() takes the account id as a str, got {type(id).__name__}")
+    if not id:
+        raise ValueError("set_account() got an empty account id; pass a non-empty string")
+    _hub.write_scope(_hub._isolation_scope, Scope.set_tag, _ACCOUNT_KEY, id)
 
 
 def set_context(key: str, value: dict[str, _Any]) -> None:
-    """Store a named context payload on the ISOLATION scope.
+    """Attach a named payload to the scope; its scalars reach exported spans.
 
-    Same scope targeting as `set_tag`. Contexts hold arbitrary host objects and
-    are NOT stamped onto exported spans; they are readable back off the scope.
+    Each `str`/`int`/`float`/`bool` value is stamped as the attribute
+    `wardex.context.<key>.<name>` (masked like every attribute), at most 32
+    keys per payload. Other values stay on the scope and are
+    not exported; that is said once on the `wardex_sdk` logger. A second call
+    with the same `key` replaces the first payload. Scoped exactly like
+    `set_tag`. A non-str `key` or a non-mapping `value` raises `TypeError`.
     """
-    _hub.get_isolation_scope().set_context(key, value)
+    skipped, over = _hub.write_scope(_hub._isolation_scope, Scope.set_context, key, value)
+    if skipped:
+        _report_once(
+            f"wardex.set_context({key!r}): {sorted(skipped)[:5]} hold values that are not "
+            "str, int, float or bool, so they are kept on the scope and not recorded on "
+            "spans. Pass scalar values (for example str(value)) to record them.",
+            key="wardex.set_context.non_scalar",
+        )
+    if over:
+        _report_once(
+            f"wardex.set_context({key!r}): {over} keys past the first 32 are kept on the "
+            "scope and not recorded on spans. Split the payload into several named contexts.",
+            key="wardex.set_context.too_many_keys",
+        )
 
 
 def isolation_scope() -> _AbstractContextManager[Scope]:
-    """Fork the current isolation scope for the block, then restore it.
+    """A request or job boundary: identity set inside stays inside.
 
-    The new isolation scope is a CLONE of the current one — ambient context
-    (tags, user, contexts) is inherited, and mutations made inside the block
-    are isolated to it (Sentry 2.x fork semantics). The current scope is
-    replaced with a fresh one for the block's duration, which is also how to
-    step out of a `wardex.conversation(...)`: spans inside carry none.
-    (`continue_trace` keeps the conversation instead.) As a decorator it serves
-    a plain function only (see `WithOrSyncDecorator`).
+    Use it around one unit of work that has its own user, account or tags,
+    when nothing has opened one for you (`continue_trace`, the ASGI/WSGI
+    middleware and the framework adapters already do)::
+
+        for job in queue:
+            with wardex.isolation_scope():
+                wardex.set_account(job.account_id)
+                process(job)
+
+    The block starts from a copy of the enclosing tags, user and contexts;
+    whatever is set inside is discarded at exit. The yielded `Scope` reads and
+    writes the block, as the module-level setters inside it do. The trace is
+    untouched: spans inside keep the parent and conversation they would have
+    had. As a decorator it serves a plain function only (see
+    `WithOrSyncDecorator`).
     """
     return _WithOrSyncDecorator(
         "isolation_scope",
-        _isolation_scope(),
+        _hub.public_isolation_scope(),
         "Open it inside the function: `with wardex.isolation_scope():`.",
     )
 
 
-@_contextmanager
-def _isolation_scope() -> _Iterator[Scope]:
-    with _hub.isolation_scope() as s:
-        yield s
-
-
 def new_scope() -> _AbstractContextManager[Scope]:
-    """Fork the current scope for the block, then restore it. As a decorator it
-    serves a plain function only (see `WithOrSyncDecorator`)."""
+    """A temporary override inside a request: everything set in it ends with it.
+
+    Use it to label a few calls differently without changing the request's
+    identity::
+
+        wardex.set_user("user-42")            # the whole request
+        with wardex.new_scope():
+            wardex.set_tag("phase", "retry")  # only the calls in here
+            call_model()
+
+    `set_tag`/`set_user`/`set_account`/`set_context` inside the block write to
+    the block and are gone at exit; nested blocks compose; a task started
+    inside reads the block and keeps its own writes. The yielded `Scope` reads
+    and writes the block too. As a decorator it serves a plain function only
+    (see `WithOrSyncDecorator`).
+    """
     return _WithOrSyncDecorator(
-        "new_scope", _new_scope(), "Open it inside the function: `with wardex.new_scope():`."
+        "new_scope",
+        _hub.public_new_scope(),
+        "Open it inside the function: `with wardex.new_scope():`.",
     )
-
-
-@_contextmanager
-def _new_scope() -> _Iterator[Scope]:
-    with _hub.new_scope() as s:
-        yield s
 
 
 def flush(timeout: float | None = None) -> None:

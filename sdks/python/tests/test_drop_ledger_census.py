@@ -639,6 +639,14 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_assembly/_units.py", "bump", "'assembly._units.stale_pin_foreign_registry'"): _UNITS,
     ("_assembly/_units.py", "bump", "f'assembly._units.{where}_table_full'"): _UNITS,
     # -- the client
+    ("__init__.py", "report_once", "'wardex.set_context.non_scalar'"): NotADrop(
+        "a value an attribute cannot hold stays on the scope; the line, said at the "
+        "developer's own call, names the keys and how to record them"
+    ),
+    ("__init__.py", "report_once", "'wardex.set_context.too_many_keys'"): NotADrop(
+        "the per-payload attribute bound is the documented contract; the keys stay on the "
+        "scope and the line says how to record them"
+    ),
     ("_client.py", "bump", "'client.finalize.rejected_closed'"): L("AFTER_CLOSE"),
     ("_client.py", "record", "DropReason.AFTER_CLOSE"): L("AFTER_CLOSE"),
     ("_client.py", "record", "DropReason.BEFORE_SEND"): L("BEFORE_SEND"),

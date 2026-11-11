@@ -112,6 +112,10 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_adapters/_registry.py", "_statuses"): "install record, kept (I-fork-4)",
     ("_interceptors/_registry.py", "_installed"): "install record, kept (I-fork-4)",
     ("context/_inject.py", "_installed"): "patch record, kept (I-fork-4)",
+    ("_hub.py", "_said"): (
+        "said-once keys of advisory log lines; a child inheriting them stays quiet about "
+        "a line the parent process already wrote, and names no connection, span or pid"
+    ),
     ("_assembly/_patchset.py", "_patches"): "restore records, kept (I-fork-4)",
     # -- a memo of a pure function, keyed by every input it reads: what the
     #    child finds in it is exactly what it would have computed itself.

@@ -572,8 +572,8 @@ def conversation(
     what it does after the block ends.
 
     A task or callback started inside the block keeps the id after the block
-    ends, however it ends; `wardex.isolation_scope()` steps out of the
-    conversation, `wardex.continue_trace()` does not. A block held across a
+    ends, however it ends; neither `wardex.isolation_scope()` nor
+    `wardex.continue_trace()` clears it. A block held across a
     `yield` in a generator the consumer abandons is closed elsewhere, and the
     consumer gets its own scope back: at once when the block is closed on the
     consumer task's own event loop on Python 3.12+ (the usual case: an abandoned

@@ -615,46 +615,46 @@ class Client:
 
         Precedence: a key the span already carries wins over the scope (a
         span-local `set_attribute` is more specific than ambient state), and
-        within the scope the usual Global → Isolation → Current layering
-        applies (`_scope.merged_tags_and_user`). The user maps to `user.id` /
+        within the scope the Global → Isolation → Current layering applies
+        (`_scope.merged_tags_and_user`). The user maps to `user.id` /
         `user.email` / `user.name` / `client.address` (from
         `UserInfo.id/email/username/ip_address`), skipping `None` fields.
         Snapshots are NOT stamped — spans only.
 
-        The whole read-and-merge is inside `guard()` (I6): scope state is
-        host-adjacent (another thread can be mutating the tag dict under us),
-        and a failure here may cost the stamping but never the span — the
-        caller buffers the original untouched.
+        The read, the tags and the user each sit in their own `guard()` (I6): another thread
+        can be mutating the scope under us, and a failure costs only its own part, never the
+        span and never the other part: a user that cannot be read keeps the tags.
         """
-        stamped = span
-        with guard("client.scope_stamp", debug=self._config.debug):
-            if merged is None:
-                # Deferred import: `_hub` imports this module for the `Client`
-                # type, so the edge cannot exist at import time in this
-                # direction.
-                from . import _hub  # noqa: PLC0415
+        if merged is None:
+            merged = ({}, None)
+            with guard("client.scope_stamp", debug=self._config.debug):
+                from . import _hub  # noqa: PLC0415 - deferred: `_hub` imports this module
 
                 merged = _hub.get_merged_tags_and_user()
-            tags, user = merged
-            if tags or user is not None:
-                taken = {key for key, _ in span.extra}
-                additions: list[tuple[str, str | int | float | bool]] = []
-                for key, value in tags.items():
-                    if key not in taken:
-                        additions.append((key, value))
-                        taken.add(key)
-                if user is not None:
+        tags, user = merged
+        taken = {key for key, _ in span.extra}
+        additions: list[tuple[str, str | int | float | bool]] = []
+        with guard("client.scope_stamp", debug=self._config.debug):
+            for key, value in tags.items():
+                if key not in taken:
+                    additions.append((key, value))
+                    taken.add(key)
+        if user is not None:
+            with guard("client.scope_stamp", debug=self._config.debug):
+                additions += [
+                    (key, value)
                     for key, value in (
                         ("user.id", user.id),
                         ("user.email", user.email),
                         ("user.name", user.username),
                         ("client.address", user.ip_address),
-                    ):
-                        if value is not None and key not in taken:
-                            additions.append((key, value))
-                            taken.add(key)
-                if additions:
-                    stamped = replace(span, extra=span.extra + tuple(additions))
+                    )
+                    if value is not None and key not in taken
+                ]
+        stamped = span
+        with guard("client.scope_stamp", debug=self._config.debug):
+            if additions:
+                stamped = replace(span, extra=span.extra + tuple(additions))
         return stamped
 
     def capture_span(self, span: InternalSpan, *, scope: Any = _AMBIENT) -> None:
