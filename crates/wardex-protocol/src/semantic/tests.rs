@@ -1314,7 +1314,7 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
             path: "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse",
             req: fixture!("bedrock_converse", "request.json"),
             resp: fixture!("bedrock_converse", "response.json"),
-            table: super::bedrock::NORMALIZED_USAGE_PATHS,
+            table: bedrock::NORMALIZED_USAGE_PATHS,
             input_excludes_cache: true,
         },
     ];
