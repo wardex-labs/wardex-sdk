@@ -61,7 +61,7 @@ from .._types import (
     TransportTiming,
 )
 from ._admission import _accepted_prefix as _accepted_prefix
-from ._admission import keeps_bodies, named_in, report_unread_model_api
+from ._admission import could_be_model_call, keeps_bodies, named_in, report_unread_model_api
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
@@ -559,8 +559,8 @@ class ByteSeamInterceptor(InterceptorInterface):
         O(1)). The parse, the gate and the draft belong to the worker.
 
         `None` means the prefilter DENIED the connection, the path is one the endpoint table
-        EXCLUDES (`classify_path`), or the two heads leave the policy nothing to admit
-        — each cheaper than a parse, which is what a refusal used to cost.
+        EXCLUDES (`classify_path`), or the policy refuses an exchange no parse could make a model
+        call (`could_be_model_call`) — each cheaper than a parse, which a refusal used to cost.
 
         The fork latch is consumed here rather than at assembly: `st` must not travel with the job
         (I-F1), so the first transaction SEALED on a fork-crossing connection carries the marker in
@@ -603,11 +603,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             return None
         config = getattr(client, "config", None)
         mode = capture_mode_of(client)
-        if not (
-            treatment == "llm_call"
-            or txn.event_stream
-            or _should_capture(pre, txn, None, mode=mode)
-        ):
+        if not (_should_capture(pre, txn, None, mode=mode) or could_be_model_call(treatment, txn)):
             # Nothing a parse could find would admit it: no job competes with a model call's.
             _count_refusal(treatment, url_host, txn.path, bool(getattr(config, "debug", False)))
             return None
@@ -918,10 +914,10 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         if not parsed:
             parse_failed = True
     unparsed = ((not parse) or parse_failed) and not p.is_grpc
-    # A skipped parse leaves the claim unanswered only where a head made a model call possible: an
-    # eviction fallback must not turn ordinary traffic into exported spans.
-    possible = p.treatment == "llm_call" or txn.event_stream
-    if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=unparsed and possible):
+    # A skipped parse leaves the claim unanswered only where the exchange could be a model call: an
+    # eviction fallback must not turn ordinary traffic into exported spans, or count it as lost.
+    possible = unparsed and could_be_model_call(p.treatment, txn)
+    if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=possible):
         _count_refusal(p.treatment, p.url_host, txn.path, p.debug)
         return None
     withhold_bodies = unparsed and not _should_capture(
@@ -1135,7 +1131,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         )
     draft.integrity.truncated(txn.truncated)
     span = draft.finish(txn.end_ns)  # the two losses below are parts of a span that ships
-    if Limitation.PARSE_BACKLOG_FULL in extra:
+    if possible and Limitation.PARSE_BACKLOG_FULL in extra:
         record(DropReason.BACKPRESSURE, where="interceptors.seam.parse_backlog_full")
     if Limitation.BODY_CAP_EXCEEDED in txn.limitations:
         record(DropReason.BODY_CAP, where="interceptors.seam.body_cap_exceeded")

@@ -37,7 +37,7 @@ use wardex_core::protocol::grpc::{
     grpc_status_name as core_grpc_status_name, parse_grpc_frames as core_parse_grpc_frames,
     GrpcFrames as CoreGrpcFrames, GrpcMessage as CoreGrpcMessage,
 };
-use wardex_core::protocol::http1::{BodyPolicy, Http1Stream, ParsedHttp};
+use wardex_core::protocol::http1::{BodyPolicy, BodyUse, Http1Stream, ParsedHttp};
 use wardex_core::protocol::http2::{Http2Connection, Http2Transaction as CoreHttp2Txn};
 use wardex_core::protocol::json_rpc::{JsonRpcKind, JsonRpcMessage as CoreJsonRpc, JsonRpcStream};
 use wardex_core::protocol::semantic::{
@@ -107,11 +107,18 @@ impl RawHttpMessage {
     fn limitations(&self) -> Vec<&'static str> {
         self.inner.limitations.clone()
     }
-    /// The stream's body policy left this message's body unstored: `body` is
-    /// empty and is not the body's size. See `Http1Parser.set_body_policy`.
+    /// What the stream's body policy stored this body for
+    /// (`Http1Parser.set_body_policy`): "kept", "model_call", "provisional",
+    /// "stream", or "skipped" (`body` is empty and is not the body's size).
     #[getter]
-    fn body_skipped(&self) -> bool {
-        self.inner.body_skipped
+    fn body_use(&self) -> &'static str {
+        match self.inner.body_use {
+            BodyUse::Kept => "kept",
+            BodyUse::ModelCall => "model_call",
+            BodyUse::Provisional => "provisional",
+            BodyUse::Stream => "stream",
+            BodyUse::Skipped => "skipped",
+        }
     }
 }
 
@@ -264,16 +271,17 @@ impl Http1Parser {
         })
     }
 
-    /// Which bodies to store from the next header block on. `keep_all` True
-    /// stores every body; False stores only a body that can still prove a
-    /// model call (a request to an LLM endpoint path, a response that declares
-    /// an event stream) and marks the others `body_skipped`.
-    fn set_body_policy(&mut self, keep_all: bool) -> PyResult<()> {
+    /// Which bodies to store from the next header block on: "keep" every
+    /// body; "model_call" every body, as a model call's (a response whose
+    /// request went to an LLM endpoint); "model_calls_only" only a body that
+    /// can still prove a model call (see `RawHttpMessage.body_use`). Any other
+    /// value keeps every body: storing too much is the safe direction.
+    fn set_body_policy(&mut self, policy: &str) -> PyResult<()> {
         shielded(|| {
-            self.inner.set_body_policy(if keep_all {
-                BodyPolicy::Keep
-            } else {
-                BodyPolicy::ModelCallsOnly
+            self.inner.set_body_policy(match policy {
+                "model_call" => BodyPolicy::ModelCall,
+                "model_calls_only" => BodyPolicy::ModelCallsOnly,
+                _ => BodyPolicy::Keep,
             });
             Ok(())
         })
@@ -1126,6 +1134,14 @@ fn classify_path(path: &str) -> PyResult<Option<&'static str>> {
     })
 }
 
+/// Do a body's first bytes open an event stream (`sse::opens_event_stream`
+/// says so)? The question a "model_calls_only" HTTP/1 parser asked of a
+/// reply it kept without its declaring one, asked again over the same bytes.
+#[pyfunction]
+fn opens_event_stream(body: &[u8]) -> PyResult<bool> {
+    shielded(|| Ok(wardex_core::protocol::sse::opens_event_stream(body) == Some(true)))
+}
+
 /// Body bytes the HTTP parsers in this process hold for messages still
 /// arriving: what `max_in_flight_body_bytes` bounds.
 #[pyfunction]
@@ -1164,6 +1180,7 @@ fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     protocol.add_function(wrap_pyfunction!(classify_path, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(classify_ws_upgrade, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(in_flight_body_bytes, &protocol)?)?;
+    protocol.add_function(wrap_pyfunction!(opens_event_stream, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(normalize_finish_reason, &protocol)?)?;
     protocol.add_class::<WsParser>()?;
     protocol.add_class::<WsFeedResult>()?;

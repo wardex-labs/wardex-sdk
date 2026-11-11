@@ -121,7 +121,8 @@ class _Http1Tracker:
     def keep_bodies(self, keep_all: bool) -> None:
         """The seam's answer, for the request bytes it feeds next, to "could the capture policy use
         this exchange whatever its response says?". False stores a request body only for an LLM
-        endpoint path, and the reply's only when it declares an event stream (`_admitted`)."""
+        endpoint path, or until its reply decides for a JSON POST elsewhere; and the reply's only
+        when it is an event stream (`_reply_policy`)."""
         self._requests.keep_bodies(keep_all)
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
@@ -129,12 +130,16 @@ class _Http1Tracker:
         self._expect_ws = self._upgrade_requested()
         return []
 
-    def _admitted(self) -> bool:
-        """Did the request a reply is about to open answer get its body stored? Then the reply's is
-        stored too. No complete request waiting (one still arriving, or none seen) keeps it too:
-        nothing says the policy can do without it."""
+    def _reply_policy(self) -> str:
+        """The body policy for the reply about to open, from what its request's body was stored for:
+        a model call's makes the reply one too (first claim on the in-flight budget); a body kept
+        under "keep" keeps the reply's; a provisional or skipped one stores the reply's only if it
+        is an event stream. No complete request waiting (one still arriving, or none seen) keeps
+        it: nothing says the policy can do without it."""
         request = self._requests.request
-        return request is None or not request.body_skipped
+        if request is None or request.body_use == "kept":
+            return "keep"
+        return "model_call" if request.body_use == "model_call" else "model_calls_only"
 
     def pass_unseen(self, n: int) -> bool:
         """Take `n` response bytes without seeing them, when they can only be a body this tracker
@@ -149,7 +154,7 @@ class _Http1Tracker:
             # These bytes open a response, so its request is settled: HEAD and CONNECT frame their
             # answers, and only the request side knows which one this reply answers.
             self._resp.expect_response_to(self._requests.method)
-            self._resp.set_body_policy(self._admitted())
+            self._resp.set_body_policy(self._reply_policy())
         now = time.time_ns()
         if self._resp_first_ns == 0:
             self._resp_first_ns = now
@@ -250,14 +255,15 @@ class _Http1Tracker:
             else None
         )
         # Reads inside a body left unstored may have gone by unseen (`pass_unseen`): not measured.
+        response_kept = msg.body_use != "skipped"
         ttft = (
-            None
-            if msg.body_skipped
-            else _ttft_from_marks(self._resp_marks, msg.header_len, issue.start_ns)
+            _ttft_from_marks(self._resp_marks, msg.header_len, issue.start_ns)
+            if response_kept
+            else None
         )
         path = (request.url if request is not None else None) or "/"
         cut = (Limitation.FRAME_PARSE_FAILED,) if msg.incomplete else ()
-        request_kept = request is None or not request.body_skipped
+        request_kept = request is None or request.body_use != "skipped"
         return _Txn(
             method=(request.method if request is not None else None) or "?",
             path=_name_path(path),
@@ -274,9 +280,9 @@ class _Http1Tracker:
             ttfb_ms=ttfb,
             truncated=(request is not None and request.truncated) or msg.truncated,
             request_counted=request is not None and not request.truncated and request_kept,
-            response_counted=not msg.truncated and not msg.body_skipped,
+            response_counted=not msg.truncated and response_kept,
             request_body_kept=request_kept,
-            response_body_kept=not msg.body_skipped,
+            response_body_kept=response_kept,
             response_cut=msg.incomplete,
             limitations=_merge_markers(
                 request.limitations if request is not None else (), msg.limitations, cut

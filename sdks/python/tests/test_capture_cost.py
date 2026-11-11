@@ -9,6 +9,7 @@ request head, the budget across bodies, and the account a refusal leaves.
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import http.server
 import json
@@ -46,12 +47,13 @@ def _losses() -> dict[str, int]:
 
 
 class _Server:
-    """A loopback HTTP/1.1 server. GET answers `body` as JSON; when `hold` is set, it sends all but
-    the last byte and waits for `hold` before the rest, so a client that has read all but the last
-    byte is looking mid-transfer. POST answers with `post_reply` under `post_type`."""
+    """A loopback HTTP/1.1 server. GET answers `body` under `get_type`; when `hold` is set, it sends
+    all but the last byte and waits for `hold` before the rest, so a client that has read all but
+    the last byte is looking mid-transfer. POST answers with `post_reply` under `post_type`."""
 
     def __init__(self, body: bytes = b"{}") -> None:
         self.body = body
+        self.get_type = "application/json"
         self.post_reply = b"{}"
         self.post_type = "application/json"
         self.hold: threading.Event | None = None
@@ -62,7 +64,7 @@ class _Server:
 
             def do_GET(self) -> None:
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", server.get_type)
                 self.send_header("Content-Length", str(len(server.body)))
                 self.end_headers()
                 if server.hold is None:
@@ -199,33 +201,55 @@ def test_a_model_call_outside_any_span_keeps_both_bodies(server):
     assert span.transport.request_size == len(_CHAT_REQUEST)
 
 
-def test_a_stream_on_an_unrecognised_path_is_still_read_and_says_its_request_was_not_kept(server):
-    """A reply declaring an event stream can still name its API by its grammar, so its body is
-    kept even on a path the endpoint table does not know. The request went out before anyone could
-    know that, unkept; the span says the request body was not captured instead of shipping an
-    empty one."""
-    chunk = {
-        "id": "c1",
-        "object": "chat.completion.chunk",
-        "model": "gpt-4o",
-        "choices": [{"index": 0, "delta": {"content": "hey"}, "finish_reason": "stop"}],
-    }
-    server.post_type = "text/event-stream"
-    server.post_reply = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
+_STREAM_REPLY = (
+    "data: "
+    + json.dumps(
+        {
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": "hey"}, "finish_reason": "stop"}],
+        }
+    )
+    + "\n\ndata: [DONE]\n\n"
+).encode()
+
+
+@pytest.mark.parametrize("reply_type", ["text/event-stream", "application/octet-stream"])
+def test_a_streamed_model_call_on_an_unrecognised_path_keeps_both_bodies(server, reply_type):
+    """A gateway path the endpoint table does not know. The reply's event grammar names the API
+    whether or not its Content-Type declares a stream, and the JSON request is held until the
+    reply says so, so the span has the model and the prompt."""
+    server.post_type = reply_type
+    server.post_reply = _STREAM_REPLY
     wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
-    _post(server.port, "/gateway/stream", _CHAT_REQUEST)
+    _post(server.port, "/corp/llm/stream", _CHAT_REQUEST)
     (span,) = client_spans()
     assert span.gen_ai is not None
+    assert span.gen_ai.request_model == "gpt-4o"
     assert span.gen_ai.response_model == "gpt-4o"
-    assert not span.capture_integrity.request_body_captured
-    assert span.transport.request_size is None
+    assert span.capture_integrity.request_body_captured
+    assert span.transport.request_size == len(_CHAT_REQUEST)
     assert span.capture_integrity.response_body_captured
+
+
+def test_a_json_post_whose_reply_is_no_stream_queues_no_parse_and_holds_nothing(
+    server, monkeypatch
+):
+    server.post_reply = _ROWS
+    jobs = _count_parse_jobs(monkeypatch)
+    wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
+    before = _held()
+    assert _post(server.port, "/internal/search", _CHAT_REQUEST) == _ROWS
+    assert jobs == []
+    assert client_spans() == []
+    assert _held() == before
 
 
 # --- one budget for every body in flight ----------------------------------------------------
 
 
-def test_bodies_in_flight_share_one_budget_and_the_newest_is_cut(server):
+def test_bodies_in_flight_share_one_budget_and_one_arriving_into_a_full_budget_is_cut(server):
     big = json.dumps({"rows": ["y" * 100] * 3000}).encode()  # ~310 KB
     server.body = big
     server.hold = threading.Event()
@@ -233,7 +257,8 @@ def test_bodies_in_flight_share_one_budget_and_the_newest_is_cut(server):
     wardex.init(
         adapters=wardex.AdaptersConfig(enabled=()),
         capture_mode=CaptureMode.ALL,
-        limits=LimitsConfig(max_in_flight_body_bytes=before + len(big) + 1000),
+        # Twice the room: a body that is no model call's may take half of the budget.
+        limits=LimitsConfig(max_in_flight_body_bytes=2 * (before + len(big) + 1000)),
     )
     first = http.client.HTTPConnection("127.0.0.1", server.port)
     first.request("GET", "/first")
@@ -257,6 +282,39 @@ def test_bodies_in_flight_share_one_budget_and_the_newest_is_cut(server):
     assert cut.capture_integrity.truncated
     assert cut.transport.response_size is None
     assert _losses().get("body_cap") == 1
+
+
+@pytest.mark.parametrize("where", ["download inside a span", "event stream outside any span"])
+def test_bodies_that_are_no_model_call_leave_room_for_one(server, where):
+    """Traffic that cannot be a model call by its target fills its half of the budget, and a model
+    call arriving meanwhile is still stored whole: the span keeps its model and is not cut."""
+    server.body = (b"data: " + b"y" * 1000 + b"\n\n") * 400  # ~400 KB
+    server.get_type = "text/event-stream" if "event stream" in where else "application/json"
+    server.hold = threading.Event()
+    server.post_reply = _CHAT_REPLY
+    before = _held()
+    budget = 2 * (before + 150_000)  # the download alone could fill all of it
+    wardex.init(
+        adapters=wardex.AdaptersConfig(enabled=()),
+        limits=LimitsConfig(max_in_flight_body_bytes=budget),
+    )
+    conn = http.client.HTTPConnection("127.0.0.1", server.port)
+    try:
+        with wardex.span("tools") if "inside" in where else contextlib.nullcontext():
+            conn.request("GET", "/feed")
+            resp = conn.getresponse()
+            resp.read(len(server.body) - 1)
+        assert _held() <= budget // 2, "the download took more than its half"
+        with wardex.span("agent"):
+            _post(server.port, "/v1/chat/completions", _CHAT_REQUEST)
+        server.hold.set()
+        resp.read()
+    finally:
+        conn.close()  # its parser's share of the budget goes with it, whatever failed
+
+    (call,) = [s for s in client_spans() if s.name == "HTTP POST /v1/chat/completions"]
+    assert call.gen_ai is not None and call.gen_ai.request_model == "gpt-4o"
+    assert Limitation.BODY_CAP_EXCEEDED not in call.capture_integrity.limitations
 
 
 # --- an overloaded parse queue -------------------------------------------------------------
@@ -287,6 +345,25 @@ def test_an_overloaded_parse_queue_ships_no_ordinary_traffic_and_counts_every_mo
     assert len(lines) == 1
     assert "1 transaction" not in lines[0]
     assert "backpressure" in lines[0]
+
+
+def test_an_overloaded_parse_queue_does_not_count_ordinary_traffic_as_lost(server, capsys):
+    """Inside a span every exchange ships, parsed or not; one that could never be a model call
+    loses nothing when its parse is skipped, so it is marked but not counted under backpressure."""
+    wardex.init(
+        adapters=wardex.AdaptersConfig(enabled=()),
+        limits=LimitsConfig(max_parse_backlog_bytes=1),
+    )
+    with wardex.span("tools"):
+        for _ in range(3):
+            _get(server.port)
+    spans = [s for s in client_spans() if s.name == "HTTP GET /internal/rows"]
+    assert len(spans) == 3
+    for span in spans:
+        assert Limitation.PARSE_BACKLOG_FULL in span.capture_integrity.limitations
+    assert "backpressure" not in _losses()
+    line = next(x for x in capsys.readouterr().err.splitlines() if "deferred-parse" in x)
+    assert "A model call among them" in line, line
 
 
 # --- a model API wardex does not read -------------------------------------------------------

@@ -9,7 +9,8 @@ use fluke_hpack::Decoder;
 
 use wardex_limits::Limits;
 
-use crate::budget::{process_pool, Reservation};
+use crate::budget::{self, process_pool, Reservation};
+use crate::semantic::{treatment, Treatment};
 
 /// A carved raw HTTP/2 frame.
 #[derive(Clone)]
@@ -317,6 +318,9 @@ struct StreamState {
     /// evicted, or cleared with the connection.
     req_held: Reservation,
     resp_held: Reservation,
+    /// The request's `:path` is an LLM endpoint (`semantic::treatment`): both
+    /// bodies have first claim on the budget (`budget::ceiling`).
+    model_call: bool,
     /// A client header block was decoded into this entry. Only such an entry
     /// has a request half to lose, so only evicting one of these may raise
     /// the eviction mark — an entry built from DATA alone (a stream opened
@@ -740,7 +744,11 @@ impl Http2Connection {
         for (name, value) in headers {
             match name.as_slice() {
                 b":method" => st.method = Some(String::from_utf8_lossy(&value).into_owned()),
-                b":path" => st.path = Some(String::from_utf8_lossy(&value).into_owned()),
+                b":path" => {
+                    let path = String::from_utf8_lossy(&value).into_owned();
+                    st.model_call = treatment(&path) == Some(Treatment::LlmCall);
+                    st.path = Some(path);
+                }
                 b":status" => {
                     st.status = String::from_utf8_lossy(&value).trim().parse().ok();
                 }
@@ -816,7 +824,8 @@ impl Http2Connection {
             // regains later must not splice a later part onto the prefix.
             if !*truncated {
                 let room = cap.saturating_sub(target.len());
-                let take = held.grow(room.min(body.len()), limits.max_in_flight_body_bytes);
+                let ceiling = budget::ceiling(limits.max_in_flight_body_bytes, st.model_call);
+                let take = held.grow(room.min(body.len()), ceiling);
                 target.extend_from_slice(&body[..take]);
                 if take < body.len() {
                     *truncated = true;
@@ -2054,19 +2063,19 @@ mod tests {
     }
 
     #[test]
-    fn the_in_flight_budget_cuts_the_newest_body_and_frees_it_with_the_stream() {
+    fn the_in_flight_budget_cuts_a_body_where_it_fills_and_frees_it_with_the_stream() {
         let limits = Limits {
             max_in_flight_body_bytes: 10,
             ..Default::default()
         };
-        let pool = crate::budget::private_pool();
+        let pool = budget::private_pool();
         let mut c = Http2Connection::new(limits);
         c.pool = pool;
 
         let block = |path: &'static [u8]| hpack(&[(b":method", b"POST"), (b":path", path)]);
-        let mut req = frame(0x1, FH, 1, &block(b"/a"));
+        let mut req = frame(0x1, FH, 1, &block(b"/v1/messages"));
         req.extend_from_slice(&frame(0x0, 0, 1, b"012345"));
-        req.extend_from_slice(&frame(0x1, FH, 3, &block(b"/b")));
+        req.extend_from_slice(&frame(0x1, FH, 3, &block(b"/v1/chat/completions")));
         req.extend_from_slice(&frame(0x0, FS, 3, b"abcdefgh"));
         feed_setup(&mut c, true, &req);
         assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 10);
@@ -2088,5 +2097,29 @@ mod tests {
         );
         drop(c);
         assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn other_streams_leave_half_the_in_flight_budget_to_model_calls() {
+        let limits = Limits {
+            max_in_flight_body_bytes: 10,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut c = Http2Connection::new(limits);
+        c.pool = pool;
+        let block = |path: &'static [u8]| hpack(&[(b":method", b"POST"), (b":path", path)]);
+        let mut req = frame(0x1, FH, 1, &block(b"/upload"));
+        req.extend_from_slice(&frame(0x0, 0, 1, b"0123456789"));
+        req.extend_from_slice(&frame(0x1, FH, 3, &block(b"/v1/messages")));
+        req.extend_from_slice(&frame(0x0, FS, 3, b"abcde"));
+        feed_setup(&mut c, true, &req);
+        let r = c.feed(
+            false,
+            &frame(0x1, FH | FS, 3, &hpack(&[(b":status", b"200")])),
+        );
+        let txn = r.transactions.first().expect("the model call completes");
+        assert_eq!(txn.request_body, b"abcde", "the upload took only its half");
+        assert!(!txn.request_truncated);
     }
 }

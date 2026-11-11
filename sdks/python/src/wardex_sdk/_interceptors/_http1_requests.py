@@ -61,6 +61,10 @@ def _opens_like_a_request(data: bytes) -> bool:
     return data.startswith(REQUEST_METHODS) or any(m.startswith(data) for m in REQUEST_METHODS)
 
 
+def _policy(keep_all: bool) -> str:
+    return "keep" if keep_all else "model_calls_only"
+
+
 def _sent_by_a_client(method: str | None) -> bool:
     return method is not None and f"{method} ".encode() in REQUEST_METHODS
 
@@ -175,16 +179,16 @@ class RequestSide:
         `Http1Parser.set_body_policy`): the seam's answer for a request issued right now."""
         if keep_all != self._keep_all:
             self._keep_all = keep_all
-            self._reading.parser.set_body_policy(keep_all)
+            self._reading.parser.set_body_policy(_policy(keep_all))
             if self._fresh is not None:
-                self._fresh.parser.set_body_policy(keep_all)
+                self._fresh.parser.set_body_policy(_policy(keep_all))
 
     def feed(self, data: bytes) -> None:
         if self._just_orphaned:
             self._just_orphaned = False
             if _opens_like_a_request(data):
                 self._fresh = _Reading(self._limits)
-                self._fresh.parser.set_body_policy(self._keep_all)
+                self._fresh.parser.set_body_policy(_policy(self._keep_all))
         fresh = self._fresh
         if fresh is not None:
             fresh.feed(data)

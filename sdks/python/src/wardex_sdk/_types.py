@@ -746,9 +746,10 @@ class ParsedMessage:
     # parser's close flush produces it; a fact, not a marker — the tracker
     # decides what the span says about it.
     incomplete: bool = False
-    # The parser's body policy left this body unstored (the capture policy
-    # could not use it): `body` is empty and is not the body's size.
-    body_skipped: bool = False
+    # What the parser's body policy stored the body for (`RawHttpMessage.body_use`):
+    # "kept", "model_call", "provisional", "stream", or "skipped" (the capture policy could
+    # not use it: `body` is empty and is not the body's size).
+    body_use: str = "kept"
 
 
 # --- Callback protocols (concrete signatures instead of Callable) ---

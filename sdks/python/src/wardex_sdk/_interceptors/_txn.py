@@ -63,7 +63,7 @@ class _Txn:
     request_counted: bool = True
     response_counted: bool = True
     #: Was this half's body stored at all? False when the parser's body policy left it unstored
-    #: because the capture policy could not use it (`ParsedMessage.body_skipped`): the body field is
+    #: because the capture policy could not use it (`ParsedMessage.body_use`): the body field is
     #: empty, which is not a captured empty body, and the half has no size.
     request_body_kept: bool = True
     response_body_kept: bool = True

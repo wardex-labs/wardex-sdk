@@ -90,7 +90,13 @@ pub struct Limits {
     /// message leaves the parser (completed, ended, or dropped with the
     /// connection). Over it, the body that needs the next byte stops being
     /// stored where it stands, as at its own cap: the message is marked
-    /// `body_cap_exceeded` and its framing keeps advancing.
+    /// `body_cap_exceeded` and its framing keeps advancing. Bodies grow side
+    /// by side, so several large ones arriving together are each cut where
+    /// the budget filled.
+    ///
+    /// A body of an exchange with an LLM endpoint may use all of it; any other
+    /// body only half, so downloads, uploads and long-lived feeds leave the
+    /// other half to model calls however many of them are in flight.
     ///
     /// A completed message is the host SDK's to bound once handed over (in the
     /// Python SDK, the deferred-parse queue's `max_parse_backlog_bytes`).

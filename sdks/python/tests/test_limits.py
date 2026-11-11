@@ -553,12 +553,14 @@ def _probe_max_opaque_body_bytes() -> bool:
 def _probe_max_in_flight_body_bytes() -> bool:
     """Two bodies in flight at once on two parsers: the second gets only what the first left of
     the budget. Offset by what other parsers in this process already hold, which the budget
-    counts too."""
+    counts too. Both are a model call's, which may use the whole budget rather than half."""
     head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n"
 
     def second_body(limits) -> bytes:
         first = _wardex_native.protocol.Http1Parser(False, limits)
         second = _wardex_native.protocol.Http1Parser(False, limits)
+        for parser in (first, second):
+            parser.set_body_policy("model_call")
         first.feed(head + b"012345")  # six bytes held, four still to come
         return second.feed(head + b"abcdefghij")[0].body
 

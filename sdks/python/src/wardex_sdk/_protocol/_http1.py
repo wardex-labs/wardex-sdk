@@ -130,7 +130,7 @@ def _to_parsed(raw: object) -> ParsedMessage:
         truncated=raw.truncated,  # type: ignore[attr-defined]
         limitations=_resolve_markers(raw),
         incomplete=raw.incomplete,  # type: ignore[attr-defined]
-        body_skipped=raw.body_skipped,  # type: ignore[attr-defined]
+        body_use=raw.body_use,  # type: ignore[attr-defined]
     )
 
 
@@ -149,10 +149,11 @@ class _Http1Parser(ProtocolParserInterface):
         end the message in flight. False means nothing changed and the bytes must be fed."""
         return self._native.pass_unseen_body(n)  # type: ignore[no-any-return]
 
-    def set_body_policy(self, keep_all: bool) -> None:
-        """Which bodies to store from the next header block on: all of them, or (`False`) only
-        one that can still prove a model call. A body left unstored is marked `body_skipped`."""
-        self._native.set_body_policy(keep_all)
+    def set_body_policy(self, policy: str) -> None:
+        """Which bodies to store from the next header block on: "keep" all of them, "model_call"
+        all of them as a model call's, "model_calls_only" only one that can still prove a model
+        call. Each message says what its body was stored for (`ParsedMessage.body_use`)."""
+        self._native.set_body_policy(policy)
 
     def expect_response_to(self, method: str) -> None:
         """The request the next final response answers used `method`: a response to HEAD has no

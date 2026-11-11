@@ -5,8 +5,9 @@ why). This module holds what a request head alone can answer, and the account a 
 
 * `keeps_bodies`: could the policy use a request issued right now on this connection, whatever its
   response says? Everything `_should_capture` reads except the LLM-semantic claim. When the answer
-  is no, the HTTP/1 parser stores a body only if a head still makes a model call possible.
+  is no, the HTTP/1 parser stores a body only while the exchange can still be a model call.
 * `named_in`: is this peer one the user named in `intercept_hosts`?
+* `could_be_model_call`: could a parse find a model call in an exchange, whatever the policy?
 * `report_unread_model_api`: a refused call to a model API wardex does not parse yet is counted
   and said, never silent.
 * `_accepted_prefix`: the part of a send buffer the kernel took, without copying the rest.
@@ -17,7 +18,7 @@ from __future__ import annotations
 import functools
 from typing import Any
 
-from .. import _hub
+from .. import _hub, _wardex_native
 from .._assembly import (
     DropReason,
     Prefilter,
@@ -66,12 +67,13 @@ from .._enums import CaptureMode
 # executes.
 #
 # And a FOURTH, first in time: everything the gate reads but the LLM-semantic claim is known when
-# the request goes out, and a parse needs bodies only where a head makes a model call possible (a
-# request to an LLM endpoint path, a reply declaring an event stream). So `keeps_bodies` asks the
-# rest per request, before its bytes reach the parser, and an exchange it cannot use has its bodies
-# framed but never stored (`Http1Parser.set_body_policy`); `_seam._seal` asks again on both heads
-# and refuses there, before a parse is queued. Per request, never per connection, for the reason
-# above.
+# the request goes out, and a parse needs bodies only where the exchange can still be a model call
+# (a request to an LLM endpoint path; a reply that declares an event stream or whose first bytes
+# open one, with the JSON request it answers held until its reply says which). So `keeps_bodies`
+# asks the rest per request, before its bytes reach the parser, and an exchange it cannot use has
+# its bodies framed but never stored (`Http1Parser.set_body_policy`); `_seam._seal` asks again
+# (`could_be_model_call`) and refuses there, before a parse is queued. Per request, never per
+# connection, for the reason above.
 #
 # NOT here, deliberately: "the transport is a NoOpTransport". `init()` resolves a missing
 # `transport=` argument to exactly that, so it is the out-of-the-box configuration rather than a
@@ -126,6 +128,19 @@ def keeps_bodies(prefilter: Prefilter, client: Any) -> bool:
         degraded=in_degraded_run(),
         parent_closed=parent is not None and parent_is_closed_unit(parent),
     )
+
+
+def could_be_model_call(treatment: str | None, txn: Any) -> bool:
+    """Could a parse find a model call in this exchange? Its target is an LLM endpoint (`treatment`,
+    from `classify_path`), or its reply declares an event stream or its stored first bytes open one:
+    a stream's grammar names its API on any path. The last is the question an HTTP/1 parser under
+    "model_calls_only" answered to keep the reply, asked again over the same bytes; an HTTP/2
+    reply is stored whole, so it is first asked here. Reads at most the first KiB of the reply,
+    and nothing of one whose body was not stored."""
+    if treatment == "llm_call" or txn.event_stream:
+        return True
+    body = txn.response_body
+    return bool(body) and _wardex_native.protocol.opens_event_stream(body)
 
 
 def named_in(allow: set[str], hostname: str | None, address: str, port: int) -> bool:

@@ -5,8 +5,14 @@
 //! it. This module sums it: a byte a parser stores for a message in flight is reserved here first,
 //! against `Limits::max_in_flight_body_bytes`, and given back when the message leaves the parser
 //! (completed and handed to the caller, ended by `finish`, or dropped with the parser). A body
-//! the budget cannot grow stops being stored where it stands, exactly as at its own cap, so the
-//! newest body is the one cut and the message says so (`body_cap_exceeded`).
+//! the budget has no room for stops being stored where it stands, exactly as at its own cap, and
+//! the message says so (`body_cap_exceeded`). Bodies grow side by side as their bytes arrive, so
+//! with many large ones in flight each is cut wherever the budget filled, not only the last to
+//! start.
+//!
+//! The budget is not first come, first served for every body: one that cannot be a model call's
+//! by its exchange's target (`ceiling`) may take only half of it, so downloads, uploads and
+//! long-lived feeds can never take the room a model call needs.
 //!
 //! A completed message is the caller's to bound: once handed back, its body is no longer held
 //! here.
@@ -19,6 +25,18 @@ static HELD: AtomicUsize = AtomicUsize::new(0);
 /// Body bytes the parsers in this process hold for messages still arriving.
 pub fn held() -> usize {
     HELD.load(Ordering::Relaxed)
+}
+
+/// The level up to which a body may take from the budget (`Reservation::grow`'s `ceiling`): all of
+/// `max_in_flight_body_bytes` for a body of an exchange with an LLM endpoint (`model_call`), half
+/// of it for any other. The other half is therefore always there for model calls, however many
+/// other bodies are arriving.
+pub(crate) fn ceiling(max_in_flight_body_bytes: usize, model_call: bool) -> usize {
+    if model_call {
+        max_in_flight_body_bytes
+    } else {
+        max_in_flight_body_bytes / 2
+    }
 }
 
 /// One message's share of the budget. Dropping it gives the share back.
@@ -110,6 +128,16 @@ mod tests {
         );
         assert_eq!(second.grow(1, 10), 0, "the pool is at the ceiling");
         assert_eq!(pool.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn other_bodies_leave_half_the_budget_to_model_calls() {
+        let pool = private_pool();
+        let mut download = Reservation::in_pool(pool);
+        let mut model_call = Reservation::in_pool(pool);
+        assert_eq!(download.grow(100, ceiling(100, false)), 50);
+        assert_eq!(download.grow(1, ceiling(100, false)), 0);
+        assert_eq!(model_call.grow(60, ceiling(100, true)), 50);
     }
 
     #[test]

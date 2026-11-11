@@ -216,11 +216,11 @@ class FinalizeQueue:
         # No count in the line: it is said once, at the first eviction, and a number there would
         # stay the first one's however many follow. The running count is the ledger's.
         report_once(
-            "deferred-parse backlog full: model calls are shipping without their gen_ai "
-            "fields (model, tokens, messages) and marked parse_backlog_full; "
-            "wardex.diagnostics() counts every one under backpressure. Raise "
-            "LimitsConfig(max_parse_backlog=..., max_parse_backlog_bytes=...) or spread the "
-            "burst of model calls.",
+            "deferred-parse backlog full: HTTP spans are shipping unparsed and marked "
+            "parse_backlog_full. A model call among them ships without its gen_ai fields "
+            "(model, tokens, messages), and wardex.diagnostics() counts each such call under "
+            "backpressure. Raise LimitsConfig(max_parse_backlog=..., "
+            "max_parse_backlog_bytes=...) or spread the burst of traffic.",
             key="wardex.finalize.backlog",
         )
 
