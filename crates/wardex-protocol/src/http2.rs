@@ -921,12 +921,20 @@ fn hpack_decode(decoder: &mut Decoder<'static>, block: &[u8]) -> Result<Vec<Head
 }
 
 #[cfg(test)]
-#[expect(
-    unused_must_use,
-    reason = "many tests feed one half of an exchange only to set up state, and assert on the call that completes it"
-)]
 mod tests {
     use super::*;
+
+    /// A feed whose result the test does not read: it sets up one half of an
+    /// exchange, and the test asserts on the call that completes it. Every
+    /// other `feed` in this module reads its result, so a dropped one is
+    /// visible by name at the call site.
+    #[expect(
+        unused_must_use,
+        reason = "setup feeds are asserted through the call that completes the exchange"
+    )]
+    fn feed_setup(c: &mut Http2Connection, from_client: bool, data: &[u8]) {
+        c.feed(from_client, data);
+    }
 
     fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
         let len = u32::try_from(payload.len()).expect("test payloads are far below 4 GiB");
@@ -1060,7 +1068,7 @@ mod tests {
             (b":path", b"/v1/chat/completions"),
             (b"content-encoding", b"gzip"),
         ]);
-        c.feed(true, &frame(0x1, FH | FS, 1, &req_block));
+        feed_setup(&mut c, true, &frame(0x1, FH | FS, 1, &req_block));
         let resp_block = hpack(&[(b":status", b"200"), (b"content-encoding", b"br")]);
         let mut resp = frame(0x1, FH, 1, &resp_block);
         resp.extend_from_slice(&frame(0x0, FS, 1, b"\x5b\x35\xab"));
@@ -1070,7 +1078,7 @@ mod tests {
 
         // A response that names no coding has none, whatever the request declared.
         let mut c = Http2Connection::new(Limits::default());
-        c.feed(true, &frame(0x1, FH | FS, 1, &req_block));
+        feed_setup(&mut c, true, &frame(0x1, FH | FS, 1, &req_block));
         let plain = hpack(&[(b":status", b"200")]);
         let r = c.feed(false, &frame(0x1, FH | FS, 1, &plain));
         assert_eq!(r.transactions.len(), 1);
@@ -1214,7 +1222,7 @@ mod tests {
     fn padded_data_strips_padding() {
         let mut c = Http2Connection::new(Limits::default());
         let req_block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
-        c.feed(true, &frame(0x1, FH | FS, 1, &req_block));
+        feed_setup(&mut c, true, &frame(0x1, FH | FS, 1, &req_block));
         let s = hpack(&[(b":status", b"200")]);
         // PADDED DATA: [pad_len=3]["body"][3 pad bytes], END_STREAM+PADDED
         let mut payload = vec![3u8];
@@ -1249,7 +1257,7 @@ mod tests {
                 None,
                 "a fresh connection is not disabled"
             );
-            c.feed(from_client, &bytes);
+            feed_setup(&mut c, from_client, &bytes);
             c.disabled_reason()
         };
 
@@ -1306,7 +1314,7 @@ mod tests {
 
         // A latched connection keeps its first reason and stays a no-op.
         let mut c = Http2Connection::new(Limits::default());
-        c.feed(false, &frame(FRAME_HEADERS, FH, 1, &[0xff]));
+        feed_setup(&mut c, false, &frame(FRAME_HEADERS, FH, 1, &[0xff]));
         let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
         let r = c.feed(true, &frame(FRAME_CONTINUATION, FH, 3, &block));
         assert!(r.opened_request_streams.is_empty());
@@ -1314,7 +1322,7 @@ mod tests {
 
         // Healthy traffic never sets a reason.
         let mut c = Http2Connection::new(Limits::default());
-        c.feed(true, &frame(FRAME_HEADERS, FH | FS, 1, &block));
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, 1, &block));
         assert_eq!(c.disabled_reason(), None);
     }
 
@@ -1330,8 +1338,8 @@ mod tests {
         let mut c = Http2Connection::new(limits);
         for i in 0..1000u32 {
             let sid = 1 + 2 * i;
-            c.feed(true, &frame(FRAME_DATA, 0, sid, b"x"));
-            c.feed(false, &frame(FRAME_DATA, 0, sid, b"y"));
+            feed_setup(&mut c, true, &frame(FRAME_DATA, 0, sid, b"x"));
+            feed_setup(&mut c, false, &frame(FRAME_DATA, 0, sid, b"y"));
             assert!(
                 c.streams.len() <= 4,
                 "{} streams resident after DATA on stream {sid}",
@@ -1357,7 +1365,7 @@ mod tests {
             let block = hpack(&[(b":method", b"POST"), (b":path", b"/s")]);
             req.extend_from_slice(&frame(FRAME_HEADERS, FH, sid, &block));
         }
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
         let kept: Vec<u32> = c.streams.keys().copied().collect();
         assert_eq!(
             kept,
@@ -1406,7 +1414,7 @@ mod tests {
         for i in 0..8u32 {
             req.extend_from_slice(&frame(FRAME_HEADERS, FH | FS, 1 + 2 * i, &block));
         }
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
         c
     }
 
@@ -1458,7 +1466,7 @@ mod tests {
         for i in 0..8u32 {
             heads.extend_from_slice(&frame(FRAME_HEADERS, FH, 1 + 2 * i, &s));
         }
-        c.feed(false, &heads);
+        feed_setup(&mut c, false, &heads);
         assert_eq!(c.streams.keys().copied().collect::<Vec<_>>(), vec![13, 15]);
         assert_eq!(c.orphans.keys().copied().collect::<Vec<_>>(), vec![9, 11]);
 
@@ -1489,7 +1497,7 @@ mod tests {
         let mut c = Http2Connection::new(limits);
         let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
         for sid in [1u32, 3, 5, 7] {
-            c.feed(true, &frame(FRAME_HEADERS, FH | FS, sid, &block));
+            feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, sid, &block));
         }
         assert!(
             c.evicted_through >= 3,
@@ -1497,7 +1505,7 @@ mod tests {
         );
         let mut promise = vec![0, 0, 0, 2];
         promise.extend_from_slice(&hpack(&[(b":method", b"GET"), (b":path", b"/pushed")]));
-        c.feed(false, &frame(FRAME_PUSH_PROMISE, FH, 7, &promise));
+        feed_setup(&mut c, false, &frame(FRAME_PUSH_PROMISE, FH, 7, &promise));
         let s = hpack(&[(b":status", b"200")]);
         let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 2, &s));
         assert_eq!(r.transactions.len(), 1);
@@ -1518,7 +1526,7 @@ mod tests {
         let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
         let mut req = frame(FRAME_HEADERS, FH, 3, &block);
         req.extend_from_slice(&frame(FRAME_HEADERS, FH, 5, &block));
-        c.feed(true, &req); // evicts 3
+        feed_setup(&mut c, true, &req); // evicts 3
         let s = hpack(&[(b":status", b"200")]);
         let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 1, &s));
         assert_eq!(r.transactions.len(), 1);
@@ -1572,8 +1580,8 @@ mod tests {
         let rst = frame(FRAME_RST_STREAM, 0, 1, &[0, 0, 0, 8]);
 
         let mut c = Http2Connection::new(Limits::default());
-        c.feed(true, &frame(FRAME_HEADERS, FH | FS, 1, &block));
-        c.feed(true, &rst);
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, 1, &block));
+        feed_setup(&mut c, true, &rst);
         let mut late = frame(FRAME_HEADERS, FH, 1, &s);
         late.extend_from_slice(&frame(FRAME_DATA, FS, 1, b"late"));
         let r = c.feed(false, &late);
@@ -1587,10 +1595,10 @@ mod tests {
             ..Default::default()
         };
         let mut c = Http2Connection::new(limits);
-        c.feed(true, &frame(FRAME_HEADERS, FH, 1, &block));
-        c.feed(true, &rst);
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH, 1, &block));
+        feed_setup(&mut c, true, &rst);
         for sid in [3u32, 5, 7] {
-            c.feed(true, &frame(FRAME_HEADERS, FH, sid, &block));
+            feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH, sid, &block));
         }
         assert!(c.evicted_through >= 3, "precondition: stream 3 was evicted");
         let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 1, &s));
@@ -1601,7 +1609,8 @@ mod tests {
 
         // The memory of resets is held to the same bound as the table.
         for i in 0..100u32 {
-            c.feed(
+            feed_setup(
+                &mut c,
                 true,
                 &frame(FRAME_RST_STREAM, 0, 101 + 2 * i, &[0, 0, 0, 8]),
             );
@@ -1643,10 +1652,10 @@ mod tests {
         let mut c = Http2Connection::new(limits);
         let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
         for (i, sid) in [1u32, 3, 5, 7].iter().enumerate() {
-            c.feed(true, &frame(FRAME_HEADERS, FS, *sid, &block));
+            feed_setup(&mut c, true, &frame(FRAME_HEADERS, FS, *sid, &block));
             assert_eq!(c.disabled_reason(), None, "{} open blocks fit", i + 1);
         }
-        c.feed(true, &frame(FRAME_HEADERS, FS, 9, &block));
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FS, 9, &block));
         assert_eq!(c.disabled_reason(), Some("stream_buffer_exceeded"));
         assert!(
             c.pending.is_empty() && c.pending_bytes == 0,
@@ -1670,19 +1679,23 @@ mod tests {
 
         // A chain that never sets END_HEADERS must not grow without bound.
         let mut c = Http2Connection::new(limits);
-        c.feed(true, &frame(FRAME_HEADERS, FS, 1, &[0x82; 100]));
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FS, 1, &[0x82; 100]));
         for i in 0..9 {
-            c.feed(true, &frame(FRAME_CONTINUATION, 0, 1, &[0x82; 100]));
+            feed_setup(&mut c, true, &frame(FRAME_CONTINUATION, 0, 1, &[0x82; 100]));
             assert_eq!(c.disabled_reason(), None, "{} bytes held", 200 + 100 * i);
         }
-        c.feed(true, &frame(FRAME_CONTINUATION, 0, 1, &[0x82; 100]));
+        feed_setup(&mut c, true, &frame(FRAME_CONTINUATION, 0, 1, &[0x82; 100]));
         assert_eq!(c.disabled_reason(), Some("stream_buffer_exceeded"));
 
         // The bound holds on the frame that would complete the block, too: a
         // block past it is never handed to HPACK.
         let mut c = Http2Connection::new(limits);
-        c.feed(true, &frame(FRAME_HEADERS, FS, 1, &[0x82; 1000]));
-        c.feed(true, &frame(FRAME_CONTINUATION, FH, 1, &[0x82; 100]));
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FS, 1, &[0x82; 1000]));
+        feed_setup(
+            &mut c,
+            true,
+            &frame(FRAME_CONTINUATION, FH, 1, &[0x82; 100]),
+        );
         assert_eq!(c.disabled_reason(), Some("stream_buffer_exceeded"));
     }
 
@@ -1694,10 +1707,10 @@ mod tests {
         };
         let mut c = Http2Connection::new(limits);
         let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
-        c.feed(true, &frame(FRAME_HEADERS, FS, 1, &block));
-        c.feed(true, &frame(FRAME_RST_STREAM, 0, 1, &[0, 0, 0, 8]));
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FS, 1, &block));
+        feed_setup(&mut c, true, &frame(FRAME_RST_STREAM, 0, 1, &[0, 0, 0, 8]));
         assert_eq!(c.pending_bytes, 0);
-        c.feed(true, &frame(FRAME_HEADERS, FS, 3, &block));
+        feed_setup(&mut c, true, &frame(FRAME_HEADERS, FS, 3, &block));
         assert_eq!(c.disabled_reason(), None);
     }
 
@@ -1711,7 +1724,11 @@ mod tests {
         let past_cap = [0x3f, 0xe2, 0xff, 0x03, 0x82]; // 65537
         for from_client in [true, false] {
             let mut c = Http2Connection::new(Limits::default());
-            c.feed(from_client, &frame(FRAME_HEADERS, FH | FS, 1, &at_cap));
+            feed_setup(
+                &mut c,
+                from_client,
+                &frame(FRAME_HEADERS, FH | FS, 1, &at_cap),
+            );
             assert_eq!(
                 c.disabled_reason(),
                 None,
@@ -1719,12 +1736,17 @@ mod tests {
             );
 
             let mut c = Http2Connection::new(Limits::default());
-            c.feed(from_client, &frame(FRAME_HEADERS, FH | FS, 1, &past_cap));
+            feed_setup(
+                &mut c,
+                from_client,
+                &frame(FRAME_HEADERS, FH | FS, 1, &past_cap),
+            );
             assert_eq!(c.disabled_reason(), Some("hpack_table_size_exceeded"));
         }
         // The largest update the decoder's integer reaches, about 256 MiB.
         let mut c = Http2Connection::new(Limits::default());
-        c.feed(
+        feed_setup(
+            &mut c,
             false,
             &frame(FRAME_HEADERS, FH, 1, &[0x3f, 0xff, 0xff, 0xff, 0x7f, 0x82]),
         );
@@ -1738,7 +1760,7 @@ mod tests {
         // frame, about 3.8 GB of memmove for this input.
         let raw = frame(0x6, 0, 0, b"").repeat(256 * 1024 / 9);
         let mut c = Http2Connection::new(Limits::default());
-        c.feed(false, &raw);
+        feed_setup(&mut c, false, &raw);
         assert_eq!(c.disabled_reason(), None);
         assert!(
             c.bytes_moved() <= 2 * raw.len() as u64,
@@ -1752,7 +1774,7 @@ mod tests {
         stream.extend_from_slice(&raw);
         let mut c = Http2Connection::new(Limits::default());
         for part in stream.chunks(1000) {
-            c.feed(true, part);
+            feed_setup(&mut c, true, part);
         }
         assert!(c.bytes_moved() <= 2 * stream.len() as u64);
     }
@@ -1769,7 +1791,7 @@ mod tests {
         let req_block = hpack(&[(b":method", b"POST"), (b":path", b"/p")]);
         let mut req = frame(0x1, FH, 1, &req_block);
         req.extend_from_slice(&frame(0x0, FS, 1, b"hello world"));
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
 
         let resp_block = hpack(&[(b":status", b"200")]);
         let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
@@ -1796,7 +1818,7 @@ mod tests {
         ]);
         let mut req = frame(0x1, FH, 1, &req_block);
         req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
 
         let resp_block = hpack(&[(b":status", b"200")]);
         let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
@@ -1822,7 +1844,7 @@ mod tests {
         ]);
         let mut req = frame(0x1, FH, 1, &req_block);
         req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
 
         let resp_block = hpack(&[(b":status", b"200")]);
         let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
@@ -1844,7 +1866,7 @@ mod tests {
         let req_block = hpack(&[(b":method", b"POST"), (b":path", b"/p")]);
         let mut req = frame(0x1, FH, 1, &req_block);
         req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
 
         let resp_block = hpack(&[(b":status", b"200")]);
         let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
@@ -1870,7 +1892,7 @@ mod tests {
         ]);
         let mut req = frame(0x1, FH, 1, &req_block);
         req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
 
         let resp_block = hpack(&[(b":status", b"200")]);
         let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
@@ -1900,7 +1922,7 @@ mod tests {
             ]);
             let mut req = frame(0x1, FH, 1, &req_block);
             req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
-            c.feed(true, &req);
+            feed_setup(&mut c, true, &req);
 
             let resp_block = hpack(&[(b":status", b"200")]);
             let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
@@ -1931,7 +1953,7 @@ mod tests {
         ]);
         let mut req = frame(0x1, FH, 1, &req_block);
         req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
 
         // Response HEADERS carry no content-type at all.
         let resp_block = hpack(&[(b":status", b"200")]);
@@ -1966,7 +1988,7 @@ mod tests {
         ]);
         let mut req = frame(0x1, FH, 1, &req_block);
         req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
-        c.feed(true, &req);
+        feed_setup(&mut c, true, &req);
 
         let resp_block = hpack(&[
             (b":status", b"200"),

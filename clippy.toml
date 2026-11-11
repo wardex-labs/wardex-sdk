@@ -8,6 +8,15 @@ allow-expect-in-tests = true
 allow-panic-in-tests  = true
 allow-print-in-tests  = true
 
+# `large_types_passed_by_value`: clippy's own default, written down because
+# `Limits` (`Copy`, 208 bytes today) travels by value through every parser
+# constructor and codec entry point and sits 48 bytes under it. When `Limits`
+# crosses this line, switch those signatures to `&Limits` in one change rather
+# than raising the number: a 256-byte copy per call is already the most the
+# capture path should pay for configuration. `wardex-limits` has a test that
+# names the day this happens.
+pass-by-value-size-limit = 256
+
 # `large_stack_frames`: a stack overflow is a SIGSEGV in the host process and
 # cannot be caught by the FFI shield. 128 KiB is the smallest default thread
 # stack among common libc targets (musl); no single frame may claim a

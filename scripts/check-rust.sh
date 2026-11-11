@@ -44,7 +44,7 @@ for step in "${steps[@]}"; do
       run cargo deny --locked --all-features check licenses bans sources
       # Advisory data changes independently of the code; a new entry should
       # not block an unrelated change. CI makes this step blocking only on the
-      # scheduled run.
+      # scheduled run and on the release gate, where the graph ships.
       if [ "${CHECK_RUST_ADVISORIES_BLOCKING:-0}" = "1" ]; then
         run cargo deny --locked --all-features check advisories
       else

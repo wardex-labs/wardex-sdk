@@ -165,7 +165,32 @@ def end_of_cfg_test_item(code, start, col):
 CFG_TEST_MOD_DECL_RE = re.compile(
     r"#\[\s*cfg\(test\)\s*\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;"
 )
-EXPECT_PANIC_LINT_RE = re.compile(r"#\[\s*expect\(\s*clippy::(?:unwrap_used|expect_used)\b")
+EXPECT_ATTR_OPEN_RE = re.compile(r"#\[\s*expect\s*\(")
+PANIC_LINTS_RE = re.compile(r"\bclippy::(?:unwrap_used|expect_used)\b")
+
+
+def expect_panic_marker(code, i):
+    """(line, col) just past the `]` of an `#[expect(..)]` attribute starting on
+    line i that names unwrap_used or expect_used, else None. Read to its own
+    `]` across lines: rustfmt wraps a long `reason` onto lines of its own."""
+    m = EXPECT_ATTR_OPEN_RE.search(code[i])
+    if m is None:
+        return None
+    depth = 0
+    parts = []
+    for j in range(i, len(code)):
+        line = code[j]
+        start = m.start() if j == i else 0
+        for k in range(start, len(line)):
+            if line[k] == "[":
+                depth += 1
+            elif line[k] == "]":
+                depth -= 1
+                if depth == 0:
+                    parts.append(line[start : k + 1])
+                    return (j, k + 1) if PANIC_LINTS_RE.search("\n".join(parts)) else None
+        parts.append(line[start:])
+    return None
 
 
 def test_only_files(root):
@@ -206,9 +231,13 @@ for root in sys.argv[1:]:
             code = code_lines(text)
             i = 0
             while i < len(raw):
-                marker = CFG_TEST_RE.search(code[i]) or EXPECT_PANIC_LINT_RE.search(code[i])
+                marker = CFG_TEST_RE.search(code[i])
                 if marker:
                     i = end_of_cfg_test_item(code, i, marker.end())
+                    continue
+                sanctioned = expect_panic_marker(code, i)
+                if sanctioned is not None:
+                    i = end_of_cfg_test_item(code, sanctioned[0], sanctioned[1])
                     continue
                 if UNWRAP_RE.search(raw[i]):
                     total += 1

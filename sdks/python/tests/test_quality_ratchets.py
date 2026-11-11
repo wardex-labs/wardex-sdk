@@ -220,7 +220,37 @@ _CFG_TEST_MOD_DECL_RE = re.compile(
 #: one sanctioned shape of a production `expect`: the attribute states the
 #: invariant for review, and the compiler reports it the day the site is gone.
 #: The item it decorates is skipped the way a `#[cfg(test)]` item is.
-_EXPECT_PANIC_LINT_RE = re.compile(r"#\[\s*expect\(\s*clippy::(?:unwrap_used|expect_used)\b")
+_EXPECT_ATTR_OPEN_RE = re.compile(r"#\[\s*expect\s*\(")
+_PANIC_LINTS_RE = re.compile(r"\bclippy::(?:unwrap_used|expect_used)\b")
+
+
+def _expect_panic_marker(code: list[str], i: int) -> tuple[int, int] | None:
+    """`(line, col)` just past the closing `]` of an `#[expect(..)]` attribute
+    that starts on line `i` of the blanked code and names `unwrap_used` or
+    `expect_used`; `None` when line `i` starts no such attribute.
+
+    The attribute is read to its own `]` first, across lines, because rustfmt
+    wraps any `reason` past the line width onto lines of its own: judging the
+    first line alone would reject the exact shape the error message asks for.
+    """
+    m = _EXPECT_ATTR_OPEN_RE.search(code[i])
+    if m is None:
+        return None
+    depth = 0
+    parts: list[str] = []
+    for j in range(i, len(code)):
+        line = code[j]
+        start = m.start() if j == i else 0
+        for k in range(start, len(line)):
+            if line[k] == "[":
+                depth += 1
+            elif line[k] == "]":
+                depth -= 1
+                if depth == 0:
+                    parts.append(line[start : k + 1])
+                    return (j, k + 1) if _PANIC_LINTS_RE.search("\n".join(parts)) else None
+        parts.append(line[start:])
+    return None
 
 
 def _test_only_files(root: pathlib.Path) -> set[pathlib.Path]:
@@ -267,9 +297,13 @@ def _count_unwrap_lines(*roots: pathlib.Path) -> int:
             code = _rust_code_lines(text)
             i = 0
             while i < len(raw):
-                marker = _CFG_TEST_RE.search(code[i]) or _EXPECT_PANIC_LINT_RE.search(code[i])
+                marker = _CFG_TEST_RE.search(code[i])
                 if marker:
                     i = _end_of_cfg_test_item(code, i, marker.end())
+                    continue
+                sanctioned = _expect_panic_marker(code, i)
+                if sanctioned is not None:
+                    i = _end_of_cfg_test_item(code, *sanctioned)
                     continue
                 if _UNWRAP_RE.search(raw[i]):
                     total += 1
@@ -297,6 +331,36 @@ def test_core_crates_have_no_unwrap_or_expect():
         "is reviewable. The compiler enforces the same rule through "
         "clippy::unwrap_used / expect_used; this scan keeps the snapshot honest."
     )
+
+
+def test_a_wrapped_expect_attribute_still_sanctions_its_item(tmp_path: pathlib.Path):
+    """The sanctioned shape is whatever rustfmt makes of it: a `reason` past the
+    line width puts `clippy::expect_used` on its own line, and the item under
+    it is still exempt. Judging only the attribute's first line counted the
+    `.expect(` below and failed the hard rule while clippy itself passed."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "lib.rs").write_text(
+        "#[expect(clippy::expect_used, reason = \"length was just checked\")]\n"
+        "fn short(v: &[u8]) -> u8 {\n"
+        "    *v.first().expect(\"length was just checked\")\n"
+        "}\n"
+        "\n"
+        "#[expect(\n"
+        "    clippy::expect_used,\n"
+        "    reason = \"the slice was checked non-empty two lines above, so first() cannot fail\"\n"
+        ")]\n"
+        "fn long(v: &[u8]) -> u8 {\n"
+        "    *v.first().expect(\"checked non-empty above\")\n"
+        "}\n"
+        "\n"
+        "#[expect(clippy::string_slice, reason = \"not a panic lint\")]\n"
+        "fn other(v: &[u8]) -> u8 {\n"
+        "    *v.first().expect(\"this one is counted\")\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    assert _count_unwrap_lines(src) == 1
 
 
 def test_cfg_test_mod_declaration_marks_the_file_test_only():

@@ -1,8 +1,9 @@
 # cargo-deny: the wheel statically links every dependency into a binary that is
 # shipped to customers, so every dependency's license, source and advisories are
 # checked before it can ship. CI runs `check licenses bans sources` on every
-# push and `check advisories` on a weekly schedule (advisory data changes
-# independently of the code, so a new entry must not turn an unrelated PR red).
+# push and `check advisories` blocking on a weekly schedule and on the release
+# gate (advisory data changes independently of the code, so a new entry must
+# not turn an unrelated PR red, but must stop a wheel that links it).
 # Every `ignore` entry below carries a reason.
 
 [graph]
