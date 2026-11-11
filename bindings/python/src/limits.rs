@@ -1,16 +1,4 @@
 //! Python-visible resource limits: the `Limits` pyclass and `limits_defaults()`.
-//!
-//! Kept in its own module (rather than `lib.rs`) so the `useless_conversion`
-//! workaround below stays scoped to the one function that needs it instead of
-//! silencing the lint for the whole crate — mirrors the `codec` module's use
-//! of the same attribute for the same reason.
-
-// Module-wide because the flagged code is the sibling items the macro
-// generates, which an attribute on the function itself does not reach.
-#![expect(
-    clippy::useless_conversion,
-    reason = "the pyfunction and pymethods macros of PyO3 0.22 expand to a conversion of PyErr into PyErr; remove after upgrading PyO3"
-)]
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;

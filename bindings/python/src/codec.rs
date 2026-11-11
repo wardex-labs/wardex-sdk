@@ -11,13 +11,6 @@
 //! decisions and re-deriving them from prose is how two SDKs end up shaping the
 //! same trace two ways.
 
-// Module-wide because the flagged code is the sibling items the macro
-// generates, which an attribute on the function itself does not reach.
-#![expect(
-    clippy::useless_conversion,
-    reason = "the pyfunction and pymethods macros of PyO3 0.22 expand to a conversion of PyErr into PyErr; remove after upgrading PyO3"
-)]
-
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};

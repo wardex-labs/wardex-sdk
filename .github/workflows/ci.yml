@@ -76,7 +76,8 @@ jobs:
       - run: scripts/check-rust.sh deps
         env:
           # Advisory data changes independently of the code, so a new entry
-          # fails only the scheduled run, never an unrelated pull request.
+          # fails only the scheduled run and the release gate, never an
+          # unrelated pull request.
           CHECK_RUST_ADVISORIES_BLOCKING: ${{ github.event_name == 'schedule' && '1' || '0' }}
 
   # Early warning for the next toolchain bump: the lints the current stable

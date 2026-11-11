@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use crate::codex_exec_json::{i64_field, str_field};
+use crate::json::{i64_field, str_field};
 use crate::usage::{InputConvention, TokenUsage};
 
 /// Which line of the stream an event came from; it decides which of the
@@ -45,10 +45,10 @@ pub struct ToolUse {
 }
 
 /// Flat event struct: one shape for all kinds keeps the FFI surface trivial.
-#[derive(Debug, Clone)]
 ///
 /// Every `Option` field is `None` when the line did not carry that key (or
 /// carried it with another JSON type); nothing is filled in by inference.
+#[derive(Debug, Clone)]
 pub struct ClaudeStreamEvent {
     /// Which line this was, and so which fields below can be set.
     pub kind: EventKind,

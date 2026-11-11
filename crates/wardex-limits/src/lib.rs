@@ -435,4 +435,19 @@ mod tests {
         let b = a; // moves only if !Copy
         assert_eq!(a, b);
     }
+
+    /// `Limits` travels by value through every parser constructor and codec
+    /// entry point, and `pass-by-value-size-limit` in `clippy.toml` is the
+    /// line past which `large_types_passed_by_value` flags each of them. This
+    /// names that day here, next to the fields, instead of in twenty
+    /// signatures: when it fails, change the signatures to `&Limits` rather
+    /// than the number.
+    #[test]
+    fn stays_under_the_by_value_lint_threshold() {
+        let size = size_of::<Limits>();
+        assert!(
+            size <= 256,
+            "Limits is {size} bytes; pass it by reference now"
+        );
+    }
 }

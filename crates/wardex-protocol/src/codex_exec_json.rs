@@ -13,6 +13,7 @@
 
 use serde_json::Value;
 
+use crate::json::{i64_field, str_field};
 use crate::usage::{InputConvention, TokenUsage};
 
 /// The line's `type`, one variant per event type this parser names.
@@ -80,18 +81,6 @@ impl CodexExecEvent {
             item_json: None,
         }
     }
-}
-
-/// The string at `key`, owned; `None` when the key is absent or not a string.
-/// Shared with the Claude stream-json parser, which reads lines the same way.
-pub(crate) fn str_field(v: &Value, key: &str) -> Option<String> {
-    v.get(key).and_then(Value::as_str).map(str::to_owned)
-}
-
-/// The integer at `key`; `None` when the key is absent or not an integer that
-/// fits in `i64`.
-pub(crate) fn i64_field(v: &Value, key: &str) -> Option<i64> {
-    v.get(key).and_then(Value::as_i64)
 }
 
 fn parse_usage(v: &Value) -> Option<TokenUsage> {

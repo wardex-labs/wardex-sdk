@@ -10,6 +10,7 @@ pub mod codex_exec_json;
 pub mod grpc;
 pub mod http1;
 pub mod http2;
+mod json;
 pub mod json_rpc;
 pub mod semantic;
 pub mod sse;
