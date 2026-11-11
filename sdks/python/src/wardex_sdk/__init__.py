@@ -83,6 +83,7 @@ from ._types import (
     ToolDefinition,
     ToolDefinitionSet,
 )
+from ._values import AttributeValue as _AttributeValue
 from ._version import __version__
 from .context._asgi import WardexAsgiMiddleware
 from .context._contextvar import bind_context
@@ -471,8 +472,12 @@ def init(
     _runtime.runtime().install(client, config)
 
 
-def set_tag(key: str, value: str) -> None:
+def set_tag(key: str, value: _AttributeValue | list | tuple | dict | None) -> None:
     """Set a tag that exported spans in this scope carry as an attribute.
+
+    The value follows `Span.set_attribute`'s rule: a list, tuple or dict is
+    sent as its JSON text, None removes the tag, and a non-str key or a value
+    the wire cannot hold raises here (`ValueError` for an int past 64 bits).
 
     The tag lands on the running context's isolation scope (Sentry 2.x
     semantics), and these rules decide which spans see it:

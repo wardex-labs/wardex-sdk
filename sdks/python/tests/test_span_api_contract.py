@@ -376,6 +376,53 @@ def test_a_number_the_wire_cannot_hold_raises_at_the_call(wire, value, error, na
     assert "wardex.codec.unmarshalled" not in attributes
 
 
+# -- set_tag shares the attribute rule -----------------------------------------
+
+
+def _tag_writer(scope, write: str):
+    return wardex.set_tag if write == "module" else scope.set_tag
+
+
+@pytest.mark.parametrize("write", ["module", "scope"])
+def test_a_tag_value_follows_the_attribute_rule(wire, write):
+    with wardex.isolation_scope() as scope:
+        set_tag = _tag_writer(scope, write)
+        set_tag("count", 3)
+        set_tag("ids", [3, 1, 2])
+        set_tag("draft", "x")
+        set_tag("draft", None)
+        set_tag("never", None)
+        with wardex.span("tagged"):
+            pass
+    attributes = _shipped(wire)["tagged"]["attributes"]
+    assert attributes["count"] == 3
+    assert attributes["ids"] == "[3,1,2]"
+    assert "draft" not in attributes
+    assert "never" not in attributes
+    assert "wardex.codec.unmarshalled" not in attributes
+
+
+@pytest.mark.parametrize("write", ["module", "scope"])
+@pytest.mark.parametrize(
+    ("key", "value", "error", "names"),
+    [
+        (5, "v", TypeError, "key must be a str"),
+        ("n", 2**63, ValueError, "as text with str"),
+        ("k", object(), TypeError, "list, tuple or dict"),
+    ],
+    ids=["int-key", "past-int64", "object"],
+)
+def test_a_tag_the_wire_cannot_hold_raises_at_the_call(wire, write, key, value, error, names):
+    with wardex.isolation_scope() as scope:
+        with pytest.raises(error, match=names):
+            _tag_writer(scope, write)(key, value)
+        with wardex.span("after"):
+            pass
+    attributes = _shipped(wire)["after"]["attributes"]
+    assert "n" not in attributes and "k" not in attributes
+    assert "wardex.codec.unmarshalled" not in attributes
+
+
 # -- reaching the span from inside it ----------------------------------------
 
 

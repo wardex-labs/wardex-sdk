@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 
 from ._types import ConversationContext, SpanContext
+from ._values import AttributeValue, attribute_value
 
 #: The tag key `wardex.set_account()` writes: the customer's own customer, the
 #: unit a dashboard compares behaviour across.
@@ -118,7 +119,7 @@ def context_entries(name: object, value: object) -> tuple[dict[str, Any], list[s
 
 @dataclass
 class Scope:
-    tags: dict[str, str] = field(default_factory=dict)
+    tags: dict[str, AttributeValue] = field(default_factory=dict)
     user: UserInfo | None = None
     contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
     active_span_context: SpanContext | None = None
@@ -142,8 +143,14 @@ class Scope:
     #: parsed: a root started under it had a caller wardex could not read.
     _parent_unreadable: bool = field(default=False, init=False, repr=False, compare=False)
 
-    def set_tag(self, key: str, value: str) -> None:
-        self.tags[key] = value
+    def set_tag(self, key: str, value: AttributeValue | list | tuple | dict | None) -> None:
+        """Set `key` under `Span.set_attribute`'s rule: None removes it, and a key or
+        value the wire cannot hold raises here, at the caller's line."""
+        stored = attribute_value("set_tag", key, value)
+        if stored is None:
+            self.tags.pop(key, None)
+        else:
+            self.tags[key] = stored
 
     def set_user(self, user: UserInfo | str | int | None) -> None:
         """Attach `user` (a `UserInfo` or a user id) to this scope; `None` clears it again.
