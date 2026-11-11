@@ -18,6 +18,7 @@ import warnings
 import pytest
 
 import wardex_sdk as wardex
+from conftest import project_key
 from wardex_sdk import BackendConfig, ConsoleTransport, NoOpTransport, _hub
 
 
@@ -47,7 +48,7 @@ def _not_running(capsys) -> str:
         ({"WARDEX_ENDPOINT": "collector:4318"}, "WARDEX_ENDPOINT"),
         ({"OTEL_EXPORTER_OTLP_ENDPOINT": "collector:4317"}, "OTEL_EXPORTER_OTLP_ENDPOINT"),
         ({"WARDEX_API_KEY": "sk-not-a-wardex-key"}, "WARDEX_API_KEY"),
-        ({"WARDEX_API_KEY": "wdx_mars_secret123"}, "WARDEX_API_KEY"),
+        ({"WARDEX_API_KEY": project_key("mars")}, "WARDEX_API_KEY"),
         ({"WARDEX_BASE_URL": "http://127.0.0.1:1"}, "WARDEX_BASE_URL"),
         (
             {
@@ -97,7 +98,7 @@ def test_malformed_otel_headers_matter_only_when_otlp_is_the_destination(monkeyp
     wardex.init(intercept=False, transport=NoOpTransport())
     assert wardex.diagnostics().initialized is True
     wardex.close()
-    wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_us_secret123"))
+    wardex.init(intercept=False, backend=BackendConfig(api_key=project_key()))
     assert wardex.diagnostics().initialized is True
     wardex.close()
     assert "OTEL_EXPORTER_OTLP_HEADERS" not in capsys.readouterr().err
@@ -116,7 +117,7 @@ def test_otel_headers_reach_the_resolved_config_when_otlp_is_the_destination(mon
     "backend",
     [
         BackendConfig(api_key="sk-not-a-wardex-key"),
-        BackendConfig(api_key="wdx_mars_secret123"),
+        BackendConfig(api_key=project_key("mars")),
         BackendConfig(base_url="http://127.0.0.1:1"),
     ],
     ids=["key-of-the-wrong-form", "key-of-an-unknown-region", "base-url-without-a-key"],
@@ -168,7 +169,7 @@ def test_a_wardex_endpoint_variable_losing_to_a_transport_is_said_not_warned(mon
 def test_an_endpoint_argument_losing_to_a_key_from_the_environment_is_said_not_warned(
     monkeypatch, capsys
 ):
-    monkeypatch.setenv("WARDEX_API_KEY", "wdx_us_secret123")
+    monkeypatch.setenv("WARDEX_API_KEY", project_key())
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         wardex.init(intercept=False, backend=BackendConfig(endpoint="http://c.invalid:4318"))
@@ -211,17 +212,18 @@ def test_a_stale_base_url_variable_without_a_key_does_not_veto_an_endpoint(
 
 
 def test_a_base_url_variable_without_a_scheme_installs_nothing(monkeypatch, capsys):
+    key = project_key()
     monkeypatch.setenv("WARDEX_BASE_URL", "collector:8080")
-    monkeypatch.setenv("WARDEX_API_KEY", "wdx_us_secret123")
+    monkeypatch.setenv("WARDEX_API_KEY", key)
     wardex.init(intercept=False)
     err = _not_running(capsys)
     assert "WARDEX_BASE_URL is set but is not an http://" in err
-    assert "secret123" not in err
+    assert key not in err
 
 
 def test_a_base_url_argument_without_a_scheme_raises():
     with pytest.raises(ValueError, match="base_url must be an absolute http"):
-        BackendConfig(base_url="collector:8080", api_key="wdx_us_secret123")
+        BackendConfig(base_url="collector:8080", api_key=project_key())
 
 
 # --------------------------------------------------------------------------

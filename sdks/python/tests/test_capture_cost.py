@@ -154,7 +154,7 @@ def test_a_download_outside_agent_work_holds_no_body_and_queues_no_parse(server,
     server.body = _ROWS
     server.hold = threading.Event()
     jobs = _count_parse_jobs(monkeypatch)
-    wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
     before = _held()
 
     conn = http.client.HTTPConnection("127.0.0.1", server.port)
@@ -174,7 +174,7 @@ def test_a_download_outside_agent_work_holds_no_body_and_queues_no_parse(server,
 
 def test_the_same_download_inside_a_span_keeps_its_body(server):
     server.body = _ROWS
-    wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
     with wardex.span("run"):
         assert _get(server.port) == _ROWS
     (span,) = client_spans()
@@ -184,7 +184,11 @@ def test_the_same_download_inside_a_span_keeps_its_body(server):
 
 def test_capture_mode_all_keeps_a_download_outside_any_span(server):
     server.body = _ROWS
-    wardex.init(adapters=wardex.AdaptersConfig(enabled=()), capture_mode=CaptureMode.ALL)
+    wardex.init(
+        transport=wardex.NoOpTransport(),
+        adapters=wardex.AdaptersConfig(enabled=()),
+        capture_mode=CaptureMode.ALL,
+    )
     assert _get(server.port) == _ROWS
     (span,) = client_spans()
     assert span.transport.response_size == len(_ROWS)
@@ -192,7 +196,7 @@ def test_capture_mode_all_keeps_a_download_outside_any_span(server):
 
 def test_a_model_call_outside_any_span_keeps_both_bodies(server):
     server.post_reply = _CHAT_REPLY
-    wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
     _post(server.port, "/v1/chat/completions", _CHAT_REQUEST)
     (span,) = client_spans()
     assert span.gen_ai is not None
@@ -222,7 +226,7 @@ def test_a_streamed_model_call_on_an_unrecognised_path_keeps_both_bodies(server,
     reply says so, so the span has the model and the prompt."""
     server.post_type = reply_type
     server.post_reply = _STREAM_REPLY
-    wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
     _post(server.port, "/corp/llm/stream", _CHAT_REQUEST)
     (span,) = client_spans()
     assert span.gen_ai is not None
@@ -238,7 +242,7 @@ def test_a_json_post_whose_reply_is_no_stream_queues_no_parse_and_holds_nothing(
 ):
     server.post_reply = _ROWS
     jobs = _count_parse_jobs(monkeypatch)
-    wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
     before = _held()
     assert _post(server.port, "/internal/search", _CHAT_REQUEST) == _ROWS
     assert jobs == []
@@ -255,6 +259,7 @@ def test_bodies_in_flight_share_one_budget_and_one_arriving_into_a_full_budget_i
     server.hold = threading.Event()
     before = _held()
     wardex.init(
+        transport=wardex.NoOpTransport(),
         adapters=wardex.AdaptersConfig(enabled=()),
         capture_mode=CaptureMode.ALL,
         # Twice the room: a body that is no model call's may take half of the budget.
@@ -295,6 +300,7 @@ def test_bodies_that_are_no_model_call_leave_room_for_one(server, where):
     before = _held()
     budget = 2 * (before + 150_000)  # the download alone could fill all of it
     wardex.init(
+        transport=wardex.NoOpTransport(),
         adapters=wardex.AdaptersConfig(enabled=()),
         limits=LimitsConfig(max_in_flight_body_bytes=budget),
     )
@@ -328,6 +334,7 @@ def test_an_overloaded_parse_queue_ships_no_ordinary_traffic_and_counts_every_mo
     server.body = _ROWS
     server.post_reply = _CHAT_REPLY
     wardex.init(
+        transport=wardex.NoOpTransport(),
         adapters=wardex.AdaptersConfig(enabled=()),
         limits=LimitsConfig(max_parse_backlog_bytes=1),
     )
@@ -351,6 +358,7 @@ def test_an_overloaded_parse_queue_does_not_count_ordinary_traffic_as_lost(serve
     """Inside a span every exchange ships, parsed or not; one that could never be a model call
     loses nothing when its parse is skipped, so it is marked but not counted under backpressure."""
     wardex.init(
+        transport=wardex.NoOpTransport(),
         adapters=wardex.AdaptersConfig(enabled=()),
         limits=LimitsConfig(max_parse_backlog_bytes=1),
     )
@@ -378,7 +386,7 @@ def test_an_overloaded_parse_queue_does_not_count_ordinary_traffic_as_lost(serve
     ],
 )
 def test_a_refused_call_to_an_unread_model_api_is_counted_and_said_once(server, capsys, path, api):
-    wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
     _post(server.port, path, b'{"contents":[]}')
     _post(server.port, path, b'{"contents":[]}')
     assert client_spans() == []
@@ -389,7 +397,7 @@ def test_a_refused_call_to_an_unread_model_api_is_counted_and_said_once(server, 
 
 
 def test_ordinary_refusals_are_not_counted_as_model_calls(server, capsys):
-    wardex.init(adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
     _post(server.port, "/internal/search", b"{}")
     _get(server.port)
     assert "mode_refused" not in _losses()

@@ -952,12 +952,16 @@ def test_the_cut_short_report_is_bounded_to_one_line_per_process(monkeypatch, ca
     reset_reports_for_test()
 
 
-def test_a_delivered_export_under_a_short_budget_reports_nothing(monkeypatch, capsys):
+def test_a_delivered_export_under_a_short_budget_reports_nothing_but_the_first_delivery(
+    monkeypatch, capsys
+):
     """The control: the report is scoped to a FAILED attempt. A short budget the
-    backend answered inside of is an ordinary success."""
+    backend answered inside of is an ordinary success, so the only line is the
+    once-per-process news that exports arrive."""
     import urllib.request
 
     from wardex_sdk._assembly._diag import reset_reports_for_test
+    from wardex_sdk.transport import _delivery
 
     class _Resp:
         def __enter__(self):
@@ -967,11 +971,15 @@ def test_a_delivered_export_under_a_short_budget_reports_nothing(monkeypatch, ca
             return False
 
     reset_reports_for_test()
+    monkeypatch.setattr(_delivery, "_FIRST_SUCCESS_PID", [])
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
     capsys.readouterr()
     t.export(_envelope_with_span(), timeout=NAMED_1S)
-    assert capsys.readouterr().err == "", "a successful export reported a delivery it made"
+    t.export(_envelope_with_span(), timeout=NAMED_1S)
+    assert capsys.readouterr().err.splitlines() == [
+        "[wardex] first export delivered: 1 span(s) accepted by http://127.0.0.1:1/v1/traces"
+    ]
     reset_reports_for_test()
 
 

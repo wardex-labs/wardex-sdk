@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -758,20 +759,42 @@ def _left_out(stacktrace: str) -> list[int]:
     return [int(n) for n in found]
 
 
-def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording):
+_CHAINED = re.compile(
+    r"^(?:During handling of the above exception, another exception occurred"
+    r"|The above exception was the direct cause of the following exception):$",
+    re.M,
+)
+
+
+def _tracebacks(stacktrace: str) -> list[str]:
+    """Each traceback of a chained trace, the exception that left the span last."""
+    return _CHAINED.split(stacktrace)
+
+
+def _from_depth(extra: int, fn: Callable[[int], object]) -> object:
+    return _from_depth(extra - 1, fn) if extra else fn(0)
+
+
+@pytest.mark.parametrize("extra", [0, 1], ids=["even-start", "odd-start"])
+def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording, extra):
     """Every span an exception leaves records it, and each used to format the whole
     traceback below it. A recursion through a decorated function, N spans deep,
     formatted N traces of up to 2N frames while the host unwound: about 10 s and
     20 MB of text for one RecursionError that unwinds in 10 ms without recording.
     Each traceback now keeps its frames nearest the raise and says how many came
-    before."""
+    before.
+
+    Where the recursion limit is hit depends on how deep the runner's stack starts:
+    on one parity it is inside the span-open path, where a guarded read fails and
+    the guard's own bookkeeping raises again, so the trace is a chain of two
+    tracebacks. Both starts run, so the bound is held on both shapes."""
 
     @wardex.tool
     def descend(n):
         return descend(n + 1)
 
     with pytest.raises(RecursionError) as caught:
-        descend(0)
+        _from_depth(extra, descend)
 
     _hub.get_client().flush()
     spans = [sp for env in recording.envelopes for sp in env.spans]
@@ -783,15 +806,16 @@ def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording)
     }
     assert len(traces) > _source_paths._MAX_FRAMES  # deep enough for the cut to bite
     for trace in traces.values():
-        assert _frame_count(trace) <= _source_paths._MAX_FRAMES
+        for part in _tracebacks(trace):
+            assert _frame_count(part) <= _source_paths._MAX_FRAMES
         assert trace.splitlines()[-1].startswith("RecursionError: maximum recursion depth")
 
     (outermost,) = [sp for sp in spans if sp.parent_span_id is None]
-    trace = traces[outermost.context.span_id]
-    # The test's own frame is the one frame of the caught traceback above the span.
-    depth = sum(1 for _ in traceback.walk_tb(caught.tb)) - 1
-    assert _frame_count(trace) == _source_paths._MAX_FRAMES
-    assert _left_out(trace) == [depth - _source_paths._MAX_FRAMES]
+    left_the_span = _tracebacks(traces[outermost.context.span_id])[-1]
+    # Above the span: the test's own frame and the `_from_depth` frames.
+    depth = sum(1 for _ in traceback.walk_tb(caught.tb)) - (2 + extra)
+    assert _frame_count(left_the_span) == _source_paths._MAX_FRAMES
+    assert _left_out(left_the_span) == [depth - _source_paths._MAX_FRAMES]
 
 
 def _sink(n: int) -> None:

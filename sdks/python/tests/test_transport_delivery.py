@@ -14,13 +14,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import warnings
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 from conftest import project_key
-from wardex_sdk import BackendConfig, BatchingConfig, WardexConfigWarning, _hub, _runtime
+from wardex_sdk import BackendConfig, BatchingConfig, _hub, _runtime, diagnostics
 from wardex_sdk import init as wardex_init
 from wardex_sdk._assembly import _ledger
 from wardex_sdk._assembly._diag import reset_reports_for_test
@@ -404,14 +405,27 @@ def test_a_base_url_without_a_scheme_is_refused_as_an_argument():
         wardex_init(intercept=False, backend=BackendConfig(api_key=project_key(), base_url="r:80"))
 
 
-def test_a_base_url_without_a_scheme_from_the_environment_warns_and_exports_nothing(monkeypatch):
-    monkeypatch.setenv("WARDEX_BASE_URL", "receiver:8080")
-    with pytest.warns(WardexConfigWarning, match="WARDEX_BASE_URL"):
+def _installed_nothing_and_said(err: str, needle: str) -> str:
+    """A bad value from the environment is one stderr line, kept in
+    `config_problems`, and nothing is installed: no host is ever stopped."""
+    state = diagnostics()
+    assert state.initialized is False
+    (line,) = _lines(err, needle)
+    (kept,) = [p for p in state.config_problems if needle in p]
+    assert kept in line
+    assert "exports nothing" in line
+    return line
+
+
+def test_a_base_url_without_a_scheme_from_the_environment_is_said_once_and_exports_nothing(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("WARDEX_BASE_URL", "unquoted.invalid:8080")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         wardex_init(intercept=False, backend=BackendConfig(api_key=project_key()))
-    try:
-        assert isinstance(_hub.get_client()._transport, NoOpTransport)
-    finally:
-        _runtime.runtime()._at_exit()
+    line = _installed_nothing_and_said(capsys.readouterr().err, "WARDEX_BASE_URL")
+    assert "unquoted.invalid" not in line
 
 
 def test_a_base_url_that_names_the_route_is_not_given_it_twice():
@@ -434,15 +448,15 @@ def test_a_mistyped_key_argument_raises():
         wardex_init(intercept=False, backend=BackendConfig(api_key=project_key()[:-1]))
 
 
-def test_a_mistyped_key_in_the_environment_warns_and_exports_nothing(monkeypatch):
+def test_a_mistyped_key_in_the_environment_is_said_and_exports_nothing(monkeypatch, capsys):
     monkeypatch.setenv("WARDEX_API_KEY", _mistyped())
-    with pytest.warns(WardexConfigWarning, match="looks mistyped") as caught:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         wardex_init(intercept=False)
-    try:
-        assert isinstance(_hub.get_client()._transport, NoOpTransport)
-        assert _mistyped() not in str(caught[0].message)
-    finally:
-        _runtime.runtime()._at_exit()
+    err = capsys.readouterr().err
+    line = _installed_nothing_and_said(err, "looks mistyped")
+    assert "WARDEX_API_KEY" in line
+    assert _mistyped() not in err
 
 
 def test_a_well_formed_key_passes_and_a_foreign_one_is_left_to_a_self_hosted_receiver():

@@ -25,9 +25,6 @@ from wardex_sdk._assembly._ledger import DropReason
 _NOT_YET_RECORDED: dict[str, str] = {
     "PARTIAL_SUCCESS": "the OTLP exporter does not read a partial-success answer's rejected count",
     "TRANSPORT_UNSUPPORTED": "the OTLP exporter skips state snapshots without counting them",
-    "CACHE_OVERFLOW": "there is no retry queue whose overflow could be counted",
-    "BACKPRESSURE": "the parse-backlog eviction marks its span but does not count it",
-    "MODE_REFUSED": "the capture gate's refusal is not counted per exchange",
     "EXCLUDED_BY_POLICY": "the byte seam's path exclusion is a counter only",
     "RESPONSE_UNOBSERVED": "no seam counts a request whose response never came",
     "REQUEST_UNOBSERVED": "the HTTP/1 and HTTP/2 trackers count this as a counter only",
@@ -38,10 +35,6 @@ _NOT_YET_RECORDED: dict[str, str] = {
     "LINK_LOST": "the adapter surface counts an unresolved link target as a counter only",
     "PATCH_SUPERSEDED": "a superseded patch is found only at restore, and counted there only",
     "CHILD_UNINITIALIZED": "a spawned child that never initializes cannot be seen from the parent",
-    "BODY_CAP": (
-        "a body cut at max_body_bytes is marked body_cap_exceeded on its span, but the byte "
-        "trackers that cut it do not count it"
-    ),
     "WS_SAMPLE_CAP": "the WebSocket sample cap marks its span but does not count it",
     "WS_FRAME_CAP": "an over-cap WebSocket frame marks its span but does not count it",
     "DECODED_CAP": "the decoded-size cap is enforced in the native parser, which reports no count",

@@ -209,8 +209,8 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             "loss",
             "The queue holding batches for a retry was full, so a held batch was dropped "
             "(counted in spans, or in requests for part of a split batch).",
-            "The retry queue's size has no setting: restore the receiver, or check that its "
-            "address is the right one.",
+            "Restore the receiver, or check that its address is the right one; the retry "
+            "queue's size has no setting.",
         ),
         _R.BEFORE_SEND: ReasonInfo(
             _U.SPAN,

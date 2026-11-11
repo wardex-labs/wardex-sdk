@@ -497,7 +497,7 @@ def test_a_span_inside_isolation_scope_keeps_its_parent_and_conversation(rec):
     with wardex.conversation("chat", id="conv-1"):
         handle()
     spans = _spans(rec)
-    inside, wf = spans["inside-iso"], spans["handle"]
+    inside, wf = spans["inside-iso"], spans["invoke_workflow handle"]
     assert inside.parent_span_id == wf.context.span_id
     assert inside.context.trace_id == wf.context.trace_id
     assert inside.conversation is not None and inside.conversation.conversation_id == "conv-1"
