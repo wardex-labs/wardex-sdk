@@ -307,7 +307,7 @@ def test_a_span_sent_without_its_payload_names_the_request_cap_and_is_counted_on
         assert counters.get("transport.otlp.span_payload_dropped") == 0
         lines = _report_lines(lambda: t.export(env))
         assert counters.get("transport.otlp.span_payload_dropped") == 1
-        (report,) = [line for line in lines if "span_payload_dropped" in line]
+        (report,) = [line for line in lines if "without their payload" in line]
         assert "max_otlp_request_bytes" in report
         by_name = {
             sp["name"]: sp["attributes"]
@@ -1160,7 +1160,7 @@ def test_a_host_value_under_a_reserved_transport_name_is_replaced_and_counted_on
         assert counters.get("transport.otlp.reserved_attribute_overwritten") == 0
         lines = _report_lines(lambda: t.export(env))
         assert counters.get("transport.otlp.reserved_attribute_overwritten") == 3
-        assert any("reserved_attribute_overwritten" in line for line in lines)
+        assert any("under attribute_dropped" in line for line in lines)
         (request,) = _Handler.requests
         assert _transport_attributes(request) == {
             "host-step": {},

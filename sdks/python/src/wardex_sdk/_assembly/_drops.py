@@ -107,8 +107,8 @@ def report_export_failed(
     """
     report_once(
         f"{what} failed ({reason}); its {spans} span(s) were not confirmed delivered and are "
-        f"not resent.{hint} Every failed export is counted under {counter}; re-run with "
-        "debug=True to see each failure.",
+        f"not resent.{hint} wardex.diagnostics().losses counts every failed export by its "
+        "reason; re-run with debug=True to see each failure.",
         key=f"{counter}:credentials" if credentials else counter,
     )
 

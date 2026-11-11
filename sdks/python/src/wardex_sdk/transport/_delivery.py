@@ -467,9 +467,9 @@ class Delivery:
                 f"the retry queue for {self._label} exports to {self.destination} was full "
                 f"({RETRY_MAX_BATCHES} requests or {RETRY_MAX_BYTES // (1024 * 1024)} MiB), so "
                 "the oldest held request was dropped, and every one after it while "
-                f"exports keep failing ({self._last_error}; counted under "
-                f"transport.{self._wire}.retry_queue_full). Restore the receiver, or check "
-                "that this address is the right one.",
+                f"exports keep failing ({self._last_error}); wardex.diagnostics().losses counts "
+                "them under cache_overflow. Restore the receiver, or check that this address is "
+                "the right one.",
                 key=f"transport.{self._wire}.retry_queue_full",
             )
 
@@ -552,8 +552,8 @@ class Delivery:
             counters.bump(f"transport.{self._wire}.retry_abandoned")
             report_once(
                 f"{dropped} {self._label} request(s) to {self.destination} held for a retry "
-                f"after a failed attempt ({self._last_error}) were dropped {why} (counted "
-                f"under transport.{self._wire}.retry_abandoned)",
+                f"after a failed attempt ({self._last_error}) were dropped {why} "
+                "wardex.diagnostics().losses counts them by the reason each one failed for.",
                 key=f"transport.{self._wire}.retry_abandoned",
             )
 
@@ -661,7 +661,7 @@ class Delivery:
                 f"({self._last_error}); "
                 f"wardex holds {what} and retries after {delay:.0f}s, backing off up to "
                 f"{BACKOFF_MAX_S:.0f}s (at most {RETRY_MAX_BATCHES} requests are held). "
-                f"Every failed attempt is counted under transport.{self._wire}.export_failed."
+                "What it drops is counted in wardex.diagnostics().losses."
             )
         else:
             message = (

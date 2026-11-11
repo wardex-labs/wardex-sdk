@@ -123,17 +123,12 @@ _NOT_SAID = frozenset({"key", "where", "reason", "subject", "unprintable", "coun
 #: A private counter's name (dotted, or filled in at run time as `{}`), or a
 #: setting spelled the way no host writes it. A loss reason (`queue_overflow`)
 #: is public and passes.
-_PRIVATE = re.compile(r"[Cc]ounted under `?(?:\{\}|\w+\.\w)|\bthe counter \b|\blimits\.max_")
+_PRIVATE = re.compile(r"[Cc]ounted under `?(?:\{\}|\w+\.[\w{])|\bthe counter \b|\blimits\.max_")
 
 #: Lines that still name a private counter, per module, owned by changes to
 #: those modules in flight. The list only shrinks: a module whose lines are
 #: fixed fails here until its entry is lowered or deleted.
-_STILL_PRIVATE: dict[str, int] = {
-    "_assembly/_drops.py": 1,
-    "_client.py": 1,
-    "transport/_base.py": 4,
-    "transport/_wardex.py": 1,
-}
+_STILL_PRIVATE: dict[str, int] = {}
 
 
 def _module_strings(tree: ast.Module) -> dict[str, list[ast.expr]]:
@@ -198,9 +193,10 @@ def test_the_printed_line_scan_sees_a_counter_and_ignores_a_key():
         "report_once('lost; counted under client.buffer.evicted', key='client.buffer.evicted')\n"
         "report_once(MSG, key='k')\n"
         "report_once(f'lost (counted under {counter})', key='k')\n"
+        "report_once(f'lost (counted under transport.{wire}.full)', key='k')\n"
         "report_once('lost', key='counted under x.y')\n"
         "report_once('lost; diagnostics() has it counted under queue_overflow.', key='k')\n"
     )
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     said = [bool(_PRIVATE.search(_said_text(c, _module_strings(tree)))) for c in calls]
-    assert said == [True, True, True, False, False]
+    assert said == [True, True, True, True, False, False]

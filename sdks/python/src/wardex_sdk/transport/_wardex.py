@@ -281,7 +281,7 @@ class WardexTransport(Transport):
             report_once(
                 f"{len(unmarshalled)} span(s) could not be marshalled for export and "
                 "were left out; the other spans in their batch were not affected "
-                "(counted under transport.wardex.span_unmarshalled; re-run with "
+                "(wardex.diagnostics().losses counts them under unmarshallable; re-run with "
                 "debug=True to see which)",
                 key="transport.wardex.span_unmarshalled",
             )

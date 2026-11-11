@@ -185,7 +185,7 @@ def _report_unmarshalled(unmarshalled: list[str], *, debug: bool) -> None:
     report_once(
         f"{len(unmarshalled)} span(s) could not be marshalled for export and "
         "were left out; the other spans in their batch were not affected "
-        "(counted under transport.otlp.span_unmarshalled; re-run with "
+        "(wardex.diagnostics().losses counts them under unmarshallable; re-run with "
         "debug=True to see which)",
         key="transport.otlp.span_unmarshalled",
     )
@@ -212,8 +212,8 @@ def _report_reserved_overwritten(overwritten: int) -> None:
         f"{overwritten} span attribute(s) set under a reserved wardex.transport.* name "
         "were not exported as set: those names carry the transport values the SDK "
         "observed, so the SDK's value replaced yours, or the attribute was left out "
-        "where it observed none. Rename the attribute to keep it (counted under "
-        "transport.otlp.reserved_attribute_overwritten)",
+        "where it observed none. Rename the attribute to keep it "
+        "(wardex.diagnostics().losses counts them under attribute_dropped)",
         key="transport.otlp.reserved_attribute_overwritten",
     )
 
@@ -260,8 +260,7 @@ def _report_payload_dropped(dropped: int) -> None:
         f"{dropped} span(s) exceeded max_otlp_request_bytes on their own and were "
         "exported without their payload (input, output, tool arguments and "
         "results), marked with wardex.payload_dropped.reason. Raise "
-        "max_otlp_request_bytes if your collector accepts more (counted under "
-        "transport.otlp.span_payload_dropped)",
+        "max_otlp_request_bytes if your collector accepts more.",
         key="transport.otlp.span_payload_dropped",
     )
 
@@ -303,7 +302,8 @@ def _report_pii_scrubbed(scrubbed: int, *, wire: str) -> None:
     report_once(
         f"PII masking failed on {scrubbed} record(s), which were exported without "
         "their content (ids, kind and times only, marked pii_filter_failed) rather "
-        f"than unmasked. This is a wardex bug; please report it (counted under {key})",
+        "than unmasked. This is a wardex bug; please report it (wardex.diagnostics().losses "
+        "counts them under internal_sdk_error)",
         key=key,
     )
 

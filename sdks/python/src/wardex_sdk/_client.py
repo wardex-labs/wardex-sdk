@@ -1111,9 +1111,9 @@ class Client:
                 ledger.unsent(envelope, definite=False, last=True)
                 report_once(
                     f"transport export raised; a batch of {what} was dropped and is not "
-                    "retried, because the transport may have sent part of it (every such drop "
-                    "is counted under client.drain.span_dropped.export_raised; re-run with "
-                    "debug=True for the traceback)",
+                    "retried, because the transport may have sent part of it "
+                    "(wardex.diagnostics().losses counts each such drop under send_error; "
+                    "re-run with debug=True for the traceback)",
                     key="client.drain.span_dropped.export_raised",
                 )
                 if self._config.debug:

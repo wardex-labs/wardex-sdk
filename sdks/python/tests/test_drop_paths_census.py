@@ -166,7 +166,7 @@ def test_a_wardex_receiver_that_is_down_is_counted_and_said_once(capsys):
     [line] = _lines(err, "wardex export to")
     assert "ConnectionRefusedError" in line
     assert "3 span(s)" in line
-    assert "transport.wardex.export_failed" in line
+    assert "wardex.diagnostics().losses" in line and "transport.wardex." not in line
     assert f"{CLOSED}/v1/envelope" in line, "the line does not say where it posted"
     assert KEY not in err
 
@@ -279,7 +279,7 @@ def test_an_otlp_backend_that_is_down_is_counted_and_said_once(capsys):
     [line] = _lines(err, "OTLP export to")
     assert "ConnectionRefusedError" in line
     assert "4 span(s)" in line
-    assert "transport.otlp.export_failed" in line
+    assert "wardex.diagnostics().losses" in line and "transport.otlp." not in line
     assert f"{CLOSED}/v1/traces" in line, "the line does not say where it posted"
 
 
