@@ -8,6 +8,8 @@ stderr, `export_state`, and the drop ledger's counts.
 
 from __future__ import annotations
 
+import dataclasses
+import gzip
 import signal
 import socket
 import threading
@@ -236,6 +238,46 @@ def test_reading_the_answer_stays_inside_the_export_budget(monkeypatch):
     finally:
         stop.set()
         sock.close()
+
+
+# -- one span whose core field cannot be encoded costs that span alone -----------------
+
+
+def _posted_span_names(body: bytes, wire: str) -> list[str]:
+    from wardex_sdk import _wardex_native
+
+    if wire == "wardex":
+        decoded = _wardex_native.codec.decode_envelope(body)
+        return [item["span"]["name"] for item in decoded["items"] if "span" in item]
+    decoded = _wardex_native.codec.decode_otlp_traces(gzip.decompress(body))
+    return [
+        sp["name"]
+        for resource in decoded["resource_spans"]
+        for scope in resource["scope_spans"]
+        for sp in scope["spans"]
+    ]
+
+
+@pytest.mark.parametrize("wire", ["otlp", "wardex"])
+def test_a_span_whose_timestamp_overflows_is_skipped_and_its_batch_ships(receiver, capsys, wire):
+    """A span built outside the span API (an adapter, a hand-built envelope) with a start
+    time the wire's unsigned 64 bits cannot hold."""
+    spans = [_span("before"), _span("overflows"), _span("after")]
+    spans[1] = dataclasses.replace(spans[1], start_time_ns=2**64)
+    envelope = dataclasses.replace(_envelope(0), spans=tuple(spans))
+    transport = (
+        OtlpHttpTransport(f"{receiver.base}/v1/traces")
+        if wire == "otlp"
+        else WardexTransport(receiver.base, project_key())
+    )
+    transport.export(envelope)
+    err = capsys.readouterr().err
+
+    [(_, body)] = receiver.posts
+    assert _posted_span_names(body, wire) == ["before", "after"]
+    assert _lost(DropReason.UNMARSHALLABLE) == 1
+    [line] = _lines(err, "could not be marshalled")
+    assert line.startswith("[wardex] 1 span(s)")
 
 
 def test_a_credential_in_the_address_never_reaches_stderr(capsys):

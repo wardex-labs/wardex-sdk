@@ -999,17 +999,18 @@ fn state_to_proto(s: &Bound<'_, PyAny>) -> PyResult<pb::StateSnapshot> {
 
 /// One span is three steps — this head, `flatten_typed_blocks`, then
 /// `span_tail_to_proto` — run in that order by `envelope_to_proto`, and
-/// split so the export path can skip exactly one of them: the core fields
-/// and the wardex-owned blocks (head and tail) are the encoder's own and a
-/// failure there is an encoder bug that must raise; the host-facing typed
-/// blocks in the middle hold values the host wrote, and a value the
-/// marshaller cannot read there is that one span's loss and nothing else's.
+/// split so the export path can skip the first two: the core fields and the
+/// host-facing typed blocks hold values a host or an adapter wrote (a span
+/// built outside the span API is checked by nothing before this), so a value
+/// the marshaller cannot read there is that one span's loss and nothing
+/// else's; the wardex-owned blocks in the tail are the encoder's own, and a
+/// failure there is an encoder bug that must raise.
 ///
 /// The head is the core fields and the caller's `extra`, in wire order
 /// ahead of the typed blocks so the attribute sequence is unchanged by the
 /// split. An `extra` key or value the wire cannot hold as given is named
-/// onto `unmarshalled` rather than raised, so the head stays the encoder's
-/// own: nothing a host can set fails it.
+/// onto `unmarshalled` rather than raised: one attribute costs itself, not
+/// its span.
 fn span_head_to_proto(sp: &Bound<'_, PyAny>, unmarshalled: &mut Vec<String>) -> PyResult<pb::Span> {
     let ctx = sp.getattr("context")?;
     let mut span = pb::Span {
@@ -1290,17 +1291,17 @@ where
 /// malformed one fail an export whose spans were fine.
 /// Envelope → proto, plus the spans it could not marshal, when asked to go on.
 ///
-/// `skip_unmarshallable` is the export path's setting. A span whose typed
-/// block holds a value of the wrong Python type fails `flatten_typed_blocks`
-/// for that one span; raising here would make the client's drain drop the
-/// whole batch (its `except` is fail-closed and silent off-debug), so one bad
-/// value would delete every good span around it. With the flag set the bad span
-/// is skipped and named — `"{span name}: {reason}"`, host text, for the
-/// caller to count and to show only under debug; the fidelity encoders keep
-/// raising, because a round-trip tool that hides a span is lying about what
-/// it round-tripped. Only the typed-block step is skippable: a failure in
-/// the core fields or the wardex-owned blocks is an encoder bug, and the
-/// flag does not turn that into a quiet per-span loss.
+/// `skip_unmarshallable` is the export path's setting. A span whose core
+/// fields or typed blocks hold a value the wire cannot take (the wrong Python
+/// type, a timestamp past 64 bits) fails `span_head_to_proto` or
+/// `flatten_typed_blocks` for that one span; raising here would fail the
+/// whole batch, so one bad value would delete every good span around it. With
+/// the flag set the bad span is skipped and named — `"{span name}: {reason}"`,
+/// host text, for the caller to count and to show only under debug; the
+/// fidelity encoders keep raising, because a round-trip tool that hides a span
+/// is lying about what it round-tripped. The wardex-owned tail is not
+/// skippable: a failure there is an encoder bug, and the flag does not turn
+/// that into a quiet per-span loss.
 fn envelope_to_proto(
     env: &Bound<'_, PyAny>,
     non_span_items: bool,
@@ -1318,19 +1319,24 @@ fn envelope_to_proto(
         // the census reads every such declaration as one; these are attribute
         // names, not markers.
         let mut not_as_given: Vec<String> = Vec::new();
-        let mut span = span_head_to_proto(&sp, &mut not_as_given)?;
-        if let Err(e) = flatten_typed_blocks(&sp, &mut span, &mut not_as_given) {
+        let marshalled = span_head_to_proto(&sp, &mut not_as_given).and_then(|mut span| {
+            flatten_typed_blocks(&sp, &mut span, &mut not_as_given).map(|()| span)
+        });
+        let mut span = match marshalled {
+            Ok(span) => span,
             // Only an `Exception` is a value the marshaller could not read. A
             // `BaseException` that is not one — `KeyboardInterrupt` from a
             // host `__str__`, `SystemExit` — is the host's control flow and
             // must reach the host untouched, not become one more skipped span.
-            if !skip_unmarshallable || !e.is_instance_of::<pyo3::exceptions::PyException>(env.py())
+            Err(e)
+                if skip_unmarshallable
+                    && e.is_instance_of::<pyo3::exceptions::PyException>(env.py()) =>
             {
-                return Err(e);
+                unmarshalled.push(skip_reason(&sp, &e)?);
+                continue;
             }
-            unmarshalled.push(skip_reason(&sp, &e)?);
-            continue;
-        }
+            Err(e) => return Err(e),
+        };
         // After the typed blocks' attributes and before the tail's.
         set_unmarshalled_note(&mut span.extra, &not_as_given);
         span_tail_to_proto(&sp, &mut span)?;
