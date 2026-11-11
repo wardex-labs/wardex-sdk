@@ -173,7 +173,6 @@ def refuse_version() -> None:
     counters.bump("interceptors.mcp_stdio.protocol_version_unreadable")
     report_once(
         "an MCP peer named a protocol version that does not read as a revision identifier (not "
-        "a string, too long, or free text), so spans do not carry it. Counted under "
-        "interceptors.mcp_stdio.protocol_version_unreadable.",
+        "a string, too long, or free text), so spans do not carry it.",
         key="interceptors.mcp_stdio.protocol_version_unreadable",
     )

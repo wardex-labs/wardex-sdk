@@ -90,12 +90,6 @@ _SEAM = Pending("byte-seam capture loss")
 _MODE = Pending("default-mode refusal")
 _POLICY = Pending("policy exclusion, to be counted as not a loss")
 _MCP = Pending("MCP stdio capture loss")
-_MCP_PENDING_TABLE = Pending(
-    "MCP stdio requests evicted from the bounded pending table, meant for table_full:request"
-)
-_MCP_LINE_CAP = Pending(
-    "MCP stdio lines skipped unparsed past the size cap, meant for body_cap:message"
-)
 _USAGE = Pending("usage totals withheld")
 _UNITS = Pending("assembly-core unit tables and patches")
 _SIGNAL = Pending("signal-path shutdown tail")
@@ -163,7 +157,10 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "_adapters/_anthropic_agent_sdk.py",
         "bump",
         "'adapters.anthropic.tool_input_unserializable'",
-    ): _CLAUDE,
+    ): L("PAYLOAD_UNSERIALIZABLE"),
+    ("_adapters/_anthropic_agent_sdk.py", "record", "DropReason.PAYLOAD_UNSERIALIZABLE"): L(
+        "PAYLOAD_UNSERIALIZABLE"
+    ),
     (
         "_adapters/_anthropic_agent_sdk.py",
         "report_once",
@@ -200,9 +197,16 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.hook_session_unresolved'"): _CLAUDE,
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.otel_bridge_pending_overflow'"): (
-        _BRIDGE
+        L("BRIDGE_MERGE_SKIPPED")
     ),
-    ("_adapters/_assembler.py", "bump", "'adapters.assembler.otel_bridge_retired'"): _BRIDGE,
+    ("_adapters/_assembler.py", "bump", "'adapters.assembler.otel_bridge_retired'"): L(
+        "BRIDGE_RETIRED"
+    ),
+    ("_adapters/_assembler.py", "record", "DropReason.BRIDGE_MERGE_SKIPPED"): L(
+        "BRIDGE_MERGE_SKIPPED"
+    ),
+    ("_adapters/_assembler.py", "record", "DropReason.BRIDGE_RETIRED"): L("BRIDGE_RETIRED"),
+    ("_adapters/_assembler.py", "record", "DropReason.USAGE_WITHHELD"): L("USAGE_WITHHELD"),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.otel_bridge_unconfirmed_no_data'"): (
         _BRIDGE
     ),
@@ -211,9 +215,11 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "CORRELATION_CONFLICT"
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.session_unit_evicted'"): _CLAUDE,
-    ("_adapters/_assembler.py", "bump", "'adapters.assembler.stream_usage_overflowed'"): _USAGE,
+    ("_adapters/_assembler.py", "bump", "'adapters.assembler.stream_usage_overflowed'"): L(
+        "USAGE_WITHHELD"
+    ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.stream_usage_totals_unpaired'"): (
-        _USAGE
+        L("USAGE_WITHHELD")
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.subagent_stop_after_evict'"): (
         Marker("SESSION_ENTRY_TABLE_FULL", at="_adapters/_assembler.py")
@@ -235,16 +241,22 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ),
     ("_adapters/_assembler.py", "bump", "f'adapters.assembler.{where}_table_full'"): _CLAUDE,
     ("_adapters/_hook_reach.py", "bump", "'adapters.anthropic.handshake_unreadable'"): _CLAUDE,
-    ("_adapters/_hook_reach.py", "bump", "'adapters.anthropic.hooks_absent'"): _CLAUDE,
-    ("_adapters/_hook_reach.py", "bump", "'adapters.anthropic.hooks_absent_unmarked'"): _CLAUDE,
+    ("_adapters/_hook_reach.py", "bump", "'adapters.anthropic.hooks_absent'"): L("HOOKS_ABSENT"),
+    ("_adapters/_hook_reach.py", "bump", "'adapters.anthropic.hooks_absent_unmarked'"): L(
+        "HOOKS_ABSENT"
+    ),
+    ("_adapters/_hook_reach.py", "record", "DropReason.HOOKS_ABSENT"): L("HOOKS_ABSENT"),
     ("_adapters/_hook_reach.py", "report_once", "'adapters.anthropic_agent_sdk.hooks_absent'"): (
-        _CLAUDE
+        L("HOOKS_ABSENT")
     ),
     ("_adapters/_session_end.py", "bump", "'adapters.anthropic.otel_bridge.session_ended_late'"): (
         _BRIDGE
     ),
     ("_adapters/_session_outcome.py", "bump", "'adapters.assembler.stream_line_unrecognized'"): (
-        _CLAUDE
+        L("STREAM_LINE_UNRECOGNIZED")
+    ),
+    ("_adapters/_session_outcome.py", "record", "DropReason.STREAM_LINE_UNRECOGNIZED"): L(
+        "STREAM_LINE_UNRECOGNIZED"
     ),
     # -- adapters: Codex CLI
     ("_adapters/_codex_exec.py", "bump", "'adapters.codex_exec.argv_iterator_unread'"): _CODEX,
@@ -262,7 +274,10 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "_adapters/_codex_exec.py",
         "report_once",
         "'adapters.codex_exec.otel_bridge.receiver_failed'",
-    ): _BRIDGE,
+    ): L("BRIDGE_UNAVAILABLE"),
+    ("_adapters/_codex_exec.py", "record", "DropReason.BRIDGE_UNAVAILABLE"): L(
+        "BRIDGE_UNAVAILABLE"
+    ),
     ("_adapters/_codex_exec.py", "report_once", "'adapters.codex_exec.otel_bridge.stood_down'"): (
         Marker("SUBPROCESS_MODEL_CALLS_UNOBSERVED", at="_adapters/_codex_exec.py")
     ),
@@ -426,9 +441,14 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ),
     ("_adapters/_openai_agents_entry.py", "count", "'run_raised_after_root_ok'"): _OPENAI,
     ("_adapters/_openai_agents_entry.py", "count", "'streamed_outcome_unreadable'"): _OPENAI,
-    ("_adapters/_openai_agents_entry.py", "count", "'tracing_disabled_run'"): _OPENAI,
+    ("_adapters/_openai_agents_entry.py", "count", "'tracing_disabled_run'"): L(
+        "FRAMEWORK_TRACING_DISABLED"
+    ),
     ("_adapters/_openai_agents_entry.py", "count", "'unsupported_entry_surface'"): _OPENAI,
-    ("_adapters/_openai_agents_entry.py", "count", "counter"): _OPENAI,
+    ("_adapters/_openai_agents_entry.py", "count", "counter"): L("FRAMEWORK_TRACING_DISABLED"),
+    ("_adapters/_openai_agents_entry.py", "record", "DropReason.FRAMEWORK_TRACING_DISABLED"): L(
+        "FRAMEWORK_TRACING_DISABLED"
+    ),
     (
         "_adapters/_openai_agents_entry.py",
         "report_once",
@@ -443,7 +463,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "_adapters/_openai_agents_entry.py",
         "report_once",
         "f'adapters.openai_agents.tracing_off.{reason}'",
-    ): _OPENAI,
+    ): L("FRAMEWORK_TRACING_DISABLED"),
     ("_adapters/_openai_agents_kinds.py", "count", "'error_message_unmapped'"): NotADrop(
         "the error ships under the generic error type"
     ),
@@ -458,12 +478,17 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "the span ships with the time wardex observed instead"
     ),
     ("_adapters/_openai_agents_kinds.py", "count", "'step_end_unmatched'"): _OPENAI,
-    ("_adapters/_openai_agents_kinds.py", "count", "reason"): _OPENAI,
+    ("_adapters/_openai_agents_kinds.py", "count", "reason"): L(
+        "FRAMEWORK_SPAN_KIND_UNMAPPED", "FRAMEWORK_EVENT_UNMATCHED"
+    ),
+    ("_adapters/_openai_agents_kinds.py", "record", "lost"): L(
+        "FRAMEWORK_SPAN_KIND_UNMAPPED", "FRAMEWORK_EVENT_UNMATCHED"
+    ),
     ("_adapters/_openai_agents_kinds.py", "report_once", "'adapters.openai_agents.unmapped'"): (
         NotADrop("the error ships under the generic error type")
     ),
     ("_adapters/_openai_agents_kinds.py", "report_once", "f'adapters.openai_agents.{reason}'"): (
-        _OPENAI
+        L("FRAMEWORK_SPAN_KIND_UNMAPPED", "FRAMEWORK_EVENT_UNMATCHED")
     ),
     # -- adapters: the OTel bridge
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.attr_dropped'"): (
@@ -473,10 +498,13 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         Marker("CORRELATION_CONFLICT", at="_adapters/_assembler.py")
     ),
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.span_unrecognized'"): (
-        _BRIDGE
+        L("BRIDGE_UNRECOGNIZED")
     ),
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.tool_without_id'"): (
-        _BRIDGE
+        L("BRIDGE_UNRECOGNIZED")
+    ),
+    ("_adapters/_otel_merge.py", "record", "DropReason.BRIDGE_UNRECOGNIZED"): L(
+        "BRIDGE_UNRECOGNIZED"
     ),
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.usage_demoted'"): (
         NotADrop("the value is kept under a lesser name")
@@ -490,13 +518,20 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "_adapters/_otel_receiver.py",
         "bump",
         "f'adapters.{self._owner}.otel_bridge.body_rejected'",
-    ): (_BRIDGE),
+    ): L("BRIDGE_REQUEST_REJECTED"),
     ("_adapters/_otel_receiver.py", "bump", "f'adapters.{self._owner}.otel_bridge.decode_error'"): (
-        _BRIDGE
+        L("BRIDGE_REQUEST_REJECTED")
     ),
     ("_adapters/_otel_receiver.py", "bump", "f'adapters.{self._owner}.otel_bridge.gzip_error'"): (
-        _BRIDGE
+        L("BRIDGE_REQUEST_REJECTED", at="_adapters/_otel_receiver.py")
     ),
+    ("_adapters/_otel_receiver.py", "record", "DropReason.BRIDGE_REQUEST_REJECTED"): L(
+        "BRIDGE_REQUEST_REJECTED"
+    ),
+    ("_adapters/_otel_receiver.py", "record", "DropReason.BRIDGE_UNROUTABLE"): L(
+        "BRIDGE_UNROUTABLE"
+    ),
+    ("_adapters/_otel_receiver.py", "record", "DropReason.TABLE_FULL"): L("TABLE_FULL"),
     (
         "_adapters/_otel_receiver.py",
         "bump",
@@ -508,13 +543,13 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "f'adapters.{self._owner}.otel_bridge.span_after_close'",
     ): _BRIDGE,
     ("_adapters/_otel_receiver.py", "bump", "f'adapters.{self._owner}.otel_bridge.span_dropped'"): (
-        _BRIDGE
+        L("TABLE_FULL")
     ),
     (
         "_adapters/_otel_receiver.py",
         "bump",
         "f'adapters.{self._owner}.otel_bridge.span_unroutable'",
-    ): _BRIDGE,
+    ): L("BRIDGE_UNROUTABLE"),
     ("_adapters/_otel_receiver.py", "bump", "f'adapters.{self._owner}.otel_bridge.tick_failed'"): (
         _BRIDGE
     ),
@@ -524,13 +559,13 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "f'adapters.{self._owner}.otel_bridge.token_rejected'",
     ): NotADrop("a POST without this run's token is not this run's data, and is refused"),
     ("_adapters/_otel_receiver.py", "bump", "f'adapters.{self._owner}.otel_bridge.undecodable'"): (
-        _BRIDGE
+        L("BRIDGE_REQUEST_REJECTED")
     ),
     (
         "_adapters/_otel_receiver.py",
         "report_once",
         "f'adapters.{label}.otel_bridge.undecodable'",
-    ): _BRIDGE,
+    ): L("BRIDGE_REQUEST_REJECTED"),
     # -- assembly core
     ("_assembly/_builder.py", "bump", "'assembly.builder.gen_ai_usage_not_inclusive'"): NotADrop(
         "an observation about upstream usage numbers; the span ships whole"
@@ -714,11 +749,15 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         _TOOL_CEDED
     ),
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.line_over_cap'"): (
-        _MCP_LINE_CAP
+        L("STREAM_LINE_OVER_CAP")
     ),
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.pending_evicted'"): (
-        _MCP_PENDING_TABLE
+        L("TABLE_FULL")
     ),
+    ("_interceptors/_mcp_stdio.py", "record", "DropReason.STREAM_LINE_OVER_CAP"): L(
+        "STREAM_LINE_OVER_CAP"
+    ),
+    ("_interceptors/_mcp_stdio.py", "record", "DropReason.TABLE_FULL"): L("TABLE_FULL"),
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.stranded_requests'"): _MCP,
     (
         "_interceptors/_mcp_stdio.py",
@@ -726,11 +765,11 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "'interceptors.mcp_stdio.execute_tool_ceded'",
     ): _TOOL_CEDED,
     ("_interceptors/_mcp_stdio.py", "report_once", "'interceptors.mcp_stdio.line_over_cap'"): (
-        _MCP_LINE_CAP
+        L("STREAM_LINE_OVER_CAP")
     ),
     ("_interceptors/_mcp_stdio.py", "report_once", "'interceptors.mcp_stdio.no_anyio'"): _MCP,
     ("_interceptors/_mcp_stdio.py", "report_once", "'interceptors.mcp_stdio.pending_evicted'"): (
-        _MCP_PENDING_TABLE
+        L("TABLE_FULL")
     ),
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.path_excluded'"): _POLICY,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.peer_unresolved'"): Marker(
@@ -794,10 +833,12 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("transport/_base.py", "bump", "'transport.otlp.span_payload_dropped'"): _REQUEST_CAP,
     ("transport/_base.py", "bump", "'transport.otlp.span_unmarshalled'"): L("UNMARSHALLABLE"),
     ("transport/_base.py", "bump", "key"): L("INTERNAL_SDK_ERROR"),
+    ("transport/_base.py", "record", "DropReason.ATTRIBUTE_CAP"): L("ATTRIBUTE_CAP"),
     ("transport/_base.py", "record", "DropReason.INTERNAL_SDK_ERROR"): L("INTERNAL_SDK_ERROR"),
     ("transport/_base.py", "record", "DropReason.ATTRIBUTE_DROPPED"): L("ATTRIBUTE_DROPPED"),
     ("transport/_base.py", "record", "DropReason.REQUEST_TOO_LARGE"): L("REQUEST_TOO_LARGE"),
     ("transport/_base.py", "record", "DropReason.UNMARSHALLABLE"): L("UNMARSHALLABLE"),
+    ("transport/_base.py", "report_once", "'transport.otlp.attribute_capped'"): L("ATTRIBUTE_CAP"),
     ("transport/_base.py", "report_once", "'transport.otlp.reserved_attribute_overwritten'"): L(
         "ATTRIBUTE_DROPPED"
     ),

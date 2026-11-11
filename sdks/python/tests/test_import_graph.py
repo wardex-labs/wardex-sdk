@@ -915,10 +915,13 @@ _LAYER_RANK: dict[str, int] = {
     "_runtime.py": 10,
     # 11 — the public verbs.
     "_decorators.py": 11,
+    "_environment.py": 11,
     "_snapshot_api.py": 11,
     "_tracing.py": 11,
-    # 12 — the published surface, and the harness that exercises it.
+    # 12 — the published surface, the harness that exercises it, and the
+    #      command line that checks an install.
     "__init__.py": 12,
+    "__main__.py": 12,
     "testing/": 12,
 }
 

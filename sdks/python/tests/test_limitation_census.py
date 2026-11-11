@@ -1064,8 +1064,12 @@ def _shape(node: ast.expr) -> str:
 #: span to carry a marker; one of them counts markers that could not be
 #: attached (`marker_lost`, unit `marker`), so the scan reads its enum members
 #: as marker strings. Nothing in it reaches `CaptureIntegrity.limitations`; its
-#: own census is `test_drop_ledger_census.py`.
-_OTHER_VOCABULARIES: frozenset[str] = frozenset({"_assembly/_drop_reasons.py"})
+#: own census is `test_drop_ledger_census.py`. `_explain.py` keys each marker's
+#: user-facing sentences by member: prose about markers, never attached to a
+#: span; `test_diagnostic_vocabulary.py` holds it to the enum.
+_OTHER_VOCABULARIES: frozenset[str] = frozenset(
+    {"_assembly/_drop_reasons.py", "_assembly/_explain.py"}
+)
 #: That vocabulary's enums, as the modules that record into it spell them.
 _OTHER_VOCABULARY_ENUMS: frozenset[str] = frozenset({"DropReason", "DropUnit"})
 

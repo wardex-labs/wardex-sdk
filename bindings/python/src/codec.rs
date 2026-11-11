@@ -2035,15 +2035,17 @@ const PRODUCER: otlp::map::Producer<'static> = otlp::map::Producer {
 ///     `bytes_value` and this is the point of no return for the raw payload.
 ///
 /// Shared by both entry points below so the two cannot drift into applying a
-/// different policy to the same envelope. The two counts beside the request are
-/// the mapping's `reserved_overwritten` and the spans masking scrubbed
-/// fail-closed, for the export path to report.
+/// different policy to the same envelope. The three counts beside the request
+/// are the mapping's `reserved_overwritten`, the spans masking scrubbed
+/// fail-closed, and the spans the attribute cap cut, for the export path to
+/// report.
 fn otlp_request(
     proto: pb::Envelope,
     policy: &PiiPolicy<'_>,
     limits: wardex_limits::Limits,
 ) -> PyResult<(
     otlp_pb::trace_service::ExportTraceServiceRequest,
+    usize,
     usize,
     usize,
 )> {
@@ -2055,9 +2057,9 @@ fn otlp_request(
         reserved_overwritten,
     } = otlp::map::map_envelope(proto, PRODUCER);
     let scrubbed = pii_apply_otlp(&mut req, policy)?;
-    otlp::map::cap_attribute_values(&mut req, limits);
+    let attribute_capped = otlp::map::cap_attribute_values(&mut req, limits);
     otlp::map::strip_bytes_values(&mut req);
-    Ok((req, reserved_overwritten, scrubbed))
+    Ok((req, reserved_overwritten, scrubbed, attribute_capped))
 }
 
 #[pyfunction]
@@ -2101,7 +2103,7 @@ fn encode_otlp_traces(
         let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
             // Not an export, so nothing here is counted: the reserved-name
             // and scrub counts are the export encoder's to report.
-            let (req, _, _) = otlp_request(proto, &policy, limits)?;
+            let (req, _, _, _) = otlp_request(proto, &policy, limits)?;
             otlp::encode_traces(&req).map_err(value_error)
         })?;
         Ok(PyBytes::new_bound(py, &bytes).unbind())
@@ -2110,7 +2112,7 @@ fn encode_otlp_traces(
 
 /// What `encode_otlp_requests` hands the caller: the request bodies, then each
 /// count the export path reports, in the order that function's doc gives.
-type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize, usize);
+type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize, usize, usize);
 
 /// Envelope → `(request bodies, spans dropped)` — the export path's encoder.
 ///
@@ -2129,7 +2131,9 @@ type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize, usize);
 /// spans that shipped only because their payload was removed to fit
 /// `max_otlp_request_bytes` (`otlp::split::Requests::payload_dropped_spans`);
 /// the sixth counts the spans masking itself failed on, shipped emptied and
-/// marked `pii_filter_failed`. They exist because the core has no channel to a user: a loss reported
+/// marked `pii_filter_failed`; the seventh counts the spans with an attribute
+/// value cut at `max_otlp_attribute_bytes`, marked `otlp_attribute_truncated`
+/// (`otlp::map::cap_attribute_values`). They exist because the core has no channel to a user: a loss reported
 /// nowhere is the silent kind, and the caller is the only one who can say it
 /// out loud.
 #[pyfunction]
@@ -2157,13 +2161,15 @@ fn encode_otlp_requests(
         };
         let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
         let limits = limits.map(|p| p.inner).unwrap_or_default();
-        let (requests, overwritten, scrubbed) =
-            py.allow_threads(move || -> PyResult<(otlp::split::Requests, usize, usize)> {
-                let (req, overwritten, scrubbed) = otlp_request(proto, &policy, limits)?;
+        let (requests, overwritten, scrubbed, attribute_capped) = py.allow_threads(
+            move || -> PyResult<(otlp::split::Requests, usize, usize, usize)> {
+                let (req, overwritten, scrubbed, attribute_capped) =
+                    otlp_request(proto, &policy, limits)?;
                 let requests =
                     otlp::split::encode_requests(req, limits, compress).map_err(value_error)?;
-                Ok((requests, overwritten, scrubbed))
-            })?;
+                Ok((requests, overwritten, scrubbed, attribute_capped))
+            },
+        )?;
         let bodies = PyList::empty_bound(py);
         for body in &requests.bodies {
             bodies.append(PyBytes::new_bound(py, body))?;
@@ -2175,6 +2181,7 @@ fn encode_otlp_requests(
             overwritten,
             requests.payload_dropped_spans,
             scrubbed,
+            attribute_capped,
         ))
     })
 }

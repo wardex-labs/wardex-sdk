@@ -245,7 +245,7 @@ def test_spans_a_full_buffer_evicted_fail_the_test_that_made_them(run):
     result.assert_outcomes(failed=1)
     out = result.stdout.str()
     assert re.search(r"queue_overflow: \d+ span\(s\)\. The buffer was full", out), out
-    assert "Raise limits.max_buffer_spans" in out
+    assert "Raise LimitsConfig(max_buffer_spans=...)" in out
     assert "--wardex-strict-allow=queue_overflow" in out
 
 

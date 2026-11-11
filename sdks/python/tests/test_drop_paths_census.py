@@ -323,7 +323,7 @@ def test_a_full_span_buffer_is_counted_per_eviction_and_said_once(capsys):
     assert counters.get("client.buffer.evicted") == 6
     [line] = _lines(first, "evicted")
     assert "3 item(s)" in line
-    assert "client.buffer.evicted" in line
+    assert "LimitsConfig(max_buffer_spans=...)" in line and "under queue_overflow" in line
     assert not _lines(second, "evicted"), "the second overflow printed a second line"
 
 
@@ -464,7 +464,7 @@ def test_a_transport_flush_that_raises_is_counted_and_said_once(capsys):
 
     assert counters.get("client.transport.flush_failed") >= 2
     [line] = _lines(err, "flush() raised")
-    assert "client.transport.flush_failed" in line
+    assert "losses counts it under send_error" in line
     assert "flush blew up" not in err, "host exception text reached stderr off-debug"
 
 
@@ -625,7 +625,7 @@ def test_a_transport_close_that_raises_is_counted_and_said_once(capsys):
 
     assert counters.get("client.transport.close_failed") == 1
     [line] = _lines(err, "close() raised")
-    assert "client.transport.close_failed" in line
+    assert "losses counts it under send_error" in line
 
 
 def test_an_export_that_raises_is_counted_and_said_once(capsys):
@@ -666,7 +666,7 @@ def test_a_background_pass_that_raises_is_counted_and_said_once(capsys):
 
     assert counters.get("worker.drain_raised") >= 3
     [line] = _lines(err, "raised and was skipped")
-    assert "worker.drain_raised" in line
+    assert "losses counts it under internal_sdk_error" in line
     assert "drain blew up" not in err
 
 
@@ -690,7 +690,7 @@ def test_a_signal_flush_that_raises_is_counted_and_said_once(capsys, monkeypatch
 
     assert counters.get("_runtime.signal_flush_raised") == 2
     [line] = _lines(err, "signalled to stop")
-    assert "_runtime.signal_flush_raised" in line
+    assert "were not sent" in line
 
 
 # -- the parsers: a connection or stream wardex stopped reading ----------------

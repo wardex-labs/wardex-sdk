@@ -136,9 +136,9 @@ def report_buffer_evicted(evicted: int, *, debug: bool) -> None:
         counters.bump("client.buffer.evicted")
     report_once(
         f"the buffer was full, so {evicted} item(s) were evicted oldest-first before they "
-        "could be exported, and nothing will resend them. Raise limits.max_buffer_spans / "
-        "limits.max_buffer_bytes to keep more (every eviction is counted under "
-        "client.buffer.evicted)",
+        "could be exported, and nothing will resend them. Raise "
+        "LimitsConfig(max_buffer_spans=...) or LimitsConfig(max_buffer_bytes=...) to keep "
+        "more; wardex.diagnostics().losses counts every eviction under queue_overflow",
         key="client.buffer.evicted",
     )
     if debug:
@@ -158,8 +158,8 @@ def report_transport_raised(call: str, exc: BaseException, *, debug: bool) -> No
     record(DropReason.SEND_ERROR, unit=DropUnit.FAILURE)
     report_once(
         f"the transport's {call}() raised and was ignored; anything it was still holding "
-        f"may not have been sent (counted under {counter}; re-run with debug=True for the "
-        "error)",
+        "may not have been sent (wardex.diagnostics().losses counts it under send_error; "
+        "re-run with debug=True for the error)",
         key=counter,
     )
     if debug:
@@ -208,8 +208,8 @@ def report_worker_pass_raised(name: str) -> None:
     record(DropReason.INTERNAL_SDK_ERROR, where="worker.drain_raised")
     report_once(
         f"a background pass of {name} raised and was skipped; whatever it was handling "
-        "may be lost, and the worker keeps running (counted under worker.drain_raised; "
-        "re-run with debug=True for the error)",
+        "may be lost, and the worker keeps running (wardex.diagnostics().losses counts it "
+        "under internal_sdk_error; re-run with debug=True for the error)",
         key="worker.drain_raised",
     )
 
@@ -222,7 +222,7 @@ def report_signal_flush_raised() -> None:
     counters.bump("_runtime.signal_flush_raised")
     report_once(
         "the flush wardex runs when the process is signalled to stop raised; spans still "
-        "buffered were not sent (counted under _runtime.signal_flush_raised)",
+        "buffered were not sent",
         key="_runtime.signal_flush_raised",
     )
 
@@ -238,7 +238,7 @@ def report_open_spans_untracked() -> None:
     report_once(
         "more manual spans were open at once than wardex tracks for shutdown, so one "
         "opened past that bound is not shipped if the process stops while it is still "
-        "open (counted under _runtime.open_spans_full)",
+        "open",
         key="_runtime.open_spans_full",
     )
 
@@ -257,8 +257,8 @@ def report_open_spans_unshipped(lost: int) -> None:
     report_once(
         f"{lost} span(s) still open when the process was stopping did not fit in the "
         "buffer beside the finished spans already in it, and were not shipped. Raise "
-        "limits.max_buffer_spans, or give close() a larger budget (counted under "
-        "_runtime.open_spans_unshipped)",
+        "LimitsConfig(max_buffer_spans=...), or give close() a larger budget "
+        "(wardex.diagnostics().losses counts them under shutdown_tail)",
         key="_runtime.open_spans_unshipped",
     )
 

@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING, Any
 from .. import _hub, _wardex_native
 from .._assembly import (
     Ambient,
+    DropReason,
+    DropUnit,
     Limitation,
     PatchSet,
     SpanDraft,
@@ -51,6 +53,7 @@ from .._assembly import (
     guard,
     latch_ambient,
     parent_is_closed_unit,
+    record,
     report_once,
     report_stream_parser_disabled,
     resolve_observed,
@@ -218,10 +221,11 @@ class _ProcState:
             if len(self._latch) > MAX_PENDING_REQUESTS:
                 self._latch.pop(next(iter(self._latch)))
                 counters.bump("interceptors.mcp_stdio.pending_evicted")
+                record(DropReason.TABLE_FULL, unit=DropUnit.REQUEST, where="interceptors.mcp_stdio")
                 report_once(
                     f"an MCP subprocess had more than {MAX_PENDING_REQUESTS} requests awaiting a "
-                    "response; the oldest was dropped and its call will not become a span. Counted "
-                    "under interceptors.mcp_stdio.pending_evicted.",
+                    "response; the oldest was dropped and its call will not become a span. "
+                    "wardex.diagnostics().losses counts each one under table_full.",
                     key="interceptors.mcp_stdio.pending_evicted",
                 )
         self._count_lines_over_cap()
@@ -236,11 +240,18 @@ class _ProcState:
             return
         for _ in range(seen - self._lines_over_cap):
             counters.bump("interceptors.mcp_stdio.line_over_cap")
+        record(
+            DropReason.STREAM_LINE_OVER_CAP,
+            seen - self._lines_over_cap,
+            DropUnit.MESSAGE,
+            where="interceptors.mcp_stdio",
+        )
         self._lines_over_cap = seen
         report_once(
             "a line on an MCP subprocess's pipe was longer than max_stream_buffer_bytes and was "
-            "skipped unparsed; if it was a JSON-RPC message, its call is not captured. Counted "
-            "under interceptors.mcp_stdio.line_over_cap.",
+            "skipped unparsed; if it was a JSON-RPC message, its call is not captured. Raise "
+            "LimitsConfig(max_stream_buffer_bytes=...); wardex.diagnostics().losses counts "
+            "each one under stream_line_over_cap.",
             key="interceptors.mcp_stdio.line_over_cap",
         )
 
@@ -457,8 +468,7 @@ def _report_ceded(owners: frozenset[str]) -> None:
         f"{names} adapter(s) are installed, because those record a call made through their "
         "framework as their own execute_tool span. A raw `mcp` client's tool calls in this process "
         "are therefore not counted as execute_tool; leave the adapter(s) out with "
-        "AdaptersConfig(enabled=...) to have them counted. Counted under "
-        "interceptors.mcp_stdio.execute_tool_ceded.",
+        "AdaptersConfig(enabled=...) to have them counted.",
         key="interceptors.mcp_stdio.execute_tool_ceded",
     )
 

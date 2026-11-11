@@ -95,6 +95,7 @@ _STEPS = (
     "init_intercept",
     "close_again",
     "diagnostics",
+    "explain",
     # Last, and deliberately so: the two scope steps import internal packages,
     # and a package whose import fails half way leaves whatever it already
     # bound in `sys.modules`. Running them after the checklist means nothing
@@ -425,6 +426,7 @@ STEPS = [
     ("init_intercept", lambda: wardex_sdk.init(intercept=True)),
     ("close_again", lambda: wardex_sdk.close()),
     ("diagnostics", _diagnostics),
+    ("explain", lambda: wardex_sdk.explain("queue_overflow")),
     ("submodules_that_degrade", _submodules_that_degrade),
     ("submodules_that_still_raise", _submodules_that_still_raise),
 ]
@@ -546,6 +548,7 @@ def test_a_hand_driven_transport_says_why_it_dropped_the_batch(tmp_path, flavour
 _DRIVEN = frozenset(
     {
         "init",
+        "explain",
         "conversation",
         "span",
         "current_span",

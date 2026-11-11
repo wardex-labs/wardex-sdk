@@ -254,7 +254,7 @@ def test_with_no_way_to_drain_the_handler_keeps_finished_spans_and_counts_the_re
     _signal_with(signal.SIG_DFL, monkeypatch)
     release.set()
     assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before + 4
-    lines = [ln for ln in capsys.readouterr().err.splitlines() if "open_spans_unshipped" in ln]
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "under shutdown_tail" in ln]
     assert len(lines) == 1 and "4 span(s)" in lines[0]
     client.flush()
     names = [sp.name for sp in transport.spans()]
@@ -514,7 +514,7 @@ def test_a_full_table_turns_new_spans_away_and_counts_them(monkeypatch, capsys):
                 pass
             assert counters.snapshot().get("_runtime.open_spans_full", 0) == before + 2
             wardex.close()
-    lines = [ln for ln in capsys.readouterr().err.splitlines() if "open_spans_full" in ln]
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "tracks for shutdown" in ln]
     assert len(lines) == 1  # said once, counted every time
     # The tracked root is the one shipped; the overflow had no guarantee.
     (root,) = transport.named("root")

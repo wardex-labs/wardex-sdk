@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 import traceback
 from collections import deque
 from collections.abc import Callable
@@ -156,10 +157,22 @@ CONFIG are the one exception — they are `warnings.warn(...,
 WardexConfigWarning)`, because they belong to the line of code that set the
 value, not to a log stream.
 
-Zero-config behavior is unchanged: a default stderr handler is attached below,
-and what it prints is byte-identical to the `print(..., file=sys.stderr)`
-lines it replaced — the `[wardex] ` prefix lives in that handler's formatter,
-so a host's own handler receives the clean message without it.
+A LIBRARY'S MANNERS, decided per line rather than at import, because a host
+usually configures logging after its imports. When the host has configured
+logging (a handler on the root logger or on this one), the line goes through
+`logging` like any library's: the host's levels decide whether it is shown and
+its handlers decide where, and nothing else is written. When the host has
+configured nothing, the line goes to stderr as `[wardex] <message>`, INFO
+included, so a bare script still sees it; a level set on this logger still
+silences it. A handler on this logger with no level set on it gets INFO and
+up, wardex's own threshold. Importing wardex changes nothing in the logging
+tree. The `disabled` flag `logging.config.dictConfig` sets on existing loggers
+does not silence wardex (see `_deliver`); a level set on this logger does.
+
+Every line carries `wardex_reason`, `wardex_count` and `wardex_subject` in the
+record's `extra`, so a JSON log pipeline can filter on them: the reason is the
+condition's stable name, the count how many times it has happened (None when
+not counted), the subject what it is about (None when nothing narrower).
 
 Severity is two-valued by convention: WARNING for losses and failures (spans
 dropped, an export that failed, a parser disabled), INFO for announcements (the
@@ -173,7 +186,7 @@ _PREFIX = "[wardex] "
 
 
 class _StderrAtEmitTime(logging.StreamHandler):
-    """The default handler: today's stderr line, emitted through `logging`.
+    """The handler for a process with no logging configured: the stderr line.
 
     THE STREAM IS RESOLVED AT EMIT TIME, never stored. `logging.Handler.
     __init__` is called instead of `StreamHandler.__init__` precisely so no
@@ -211,64 +224,113 @@ class _StderrAtEmitTime(logging.StreamHandler):
             _ledger.record(DropReason.DIAGNOSTIC_UNWRITABLE)
 
 
-def _install_default_handler() -> None:
-    """Attach the stderr handler — UNLESS a host configured the logger first.
+#: Never attached to a logger: `_emit` hands it a line only when the host has
+#: configured no logging at all.
+_STDERR = _StderrAtEmitTime()
 
-    A `wardex_sdk` logger that already carries handlers belongs to the host:
-    whatever it routed diagnostics into wins, and wardex adds nothing (its
-    level and `propagate` are then also the host's business). Only the
-    zero-config logger gets the default handler, an INFO threshold (both
-    severities wardex uses pass; nothing is logged at DEBUG), and
-    `propagate = False` so the one line cannot print a second time through a
-    root logger the host configured with `logging.basicConfig()`.
-    """
-    if logger.handlers:
-        return
-    logger.addHandler(_StderrAtEmitTime())
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
+#: Handlers pytest attaches to the root logger to capture records for its
+#: report. They observe; they are not a pipeline a host configured, and with
+#: only them present the stderr line is still owed.
+_OBSERVERS = frozenset({"LogCaptureHandler", "_FileHandler", "_LiveLoggingNullHandler"})
 
 
-_install_default_handler()
+def _routing() -> tuple[bool, bool]:
+    """(the host configured logging, an observer is listening). Read per line:
+    a handful of attribute reads, on a path that runs when wardex has
+    something to say, not per captured call."""
+    hosted = bool(logger.handlers)
+    observed = False
+    for handler in logging.getLogger().handlers:
+        cls = type(handler)
+        if cls.__module__.startswith("_pytest") and cls.__name__ in _OBSERVERS:
+            observed = True
+        else:
+            hosted = True
+    return hosted, observed
 
 
-def _emit(level: int, message: str) -> None:
-    """Hand `message` to the logger, and never raise doing it.
+def _emit(
+    level: int,
+    message: str,
+    *,
+    reason: str | None = None,
+    count: int | None = None,
+    subject: str | None = None,
+) -> None:
+    """Hand `message` to the host's logging or to stderr, and never raise doing it.
 
     Two containments, both this function's job so no call site has to
     remember. SELF-CAPTURE SUPPRESSION: a host is free to attach a handler
     that POSTs log records over HTTP, and without the guard the byte seams
     would capture wardex's own diagnostic's traffic — the exporter
     self-exclusion (`_suppress`) covers the emission for the same reason it
-    covers the OTLP POST. FAIL-SAFETY: the default handler contains its own
+    covers the OTLP POST. FAIL-SAFETY: the stderr handler contains its own
     failures, but a HOST handler's `emit` can raise anything, and logging
     propagates that raise to the caller — which is wardex code inside the
     host's call stack (I6). A swallowed emission is counted under
     `LOG_FAILED`, like every other failure of the reporting path.
     """
+    extra = {"wardex_reason": reason, "wardex_count": count, "wardex_subject": subject}
     try:
         with suppress_capture():
-            logger.log(level, message)
+            hosted, observed = _routing()
+            if hosted and not (logger.handlers and logger.level == logging.NOTSET):
+                if not logger.disabled:
+                    logger.log(level, message, extra=extra)
+                    return
+                if level <= logging.root.manager.disable or level < logger.getEffectiveLevel():
+                    return
+            elif level <= logging.root.manager.disable or level < (logger.level or logging.INFO):
+                return
+            record = logger.makeRecord(logger.name, level, "", 0, message, (), None, extra=extra)
+            if hosted:
+                # A handler on this logger with its level left unset (the host
+                # took wardex's lines, at wardex's own INFO threshold), or a
+                # logger `dictConfig` disabled, past the level check above.
+                _deliver(record)
+                return
+            _STDERR.handle(record)
+            if observed:
+                _deliver(record)
     except Exception:  # noqa: BLE001 — the reporting path may not become a throw
         counters.bump(LOG_FAILED)
         _ledger.record(DropReason.DIAGNOSTIC_UNWRITABLE)
 
 
-def diag_info(message: str) -> None:
+def _deliver(record: logging.LogRecord) -> None:
+    """`logger.handle(record)`, except on a logger that `logging.config.dictConfig`
+    disabled. Its default `disable_existing_loggers=True` disables every logger
+    that exists when it runs, and a framework configures logging after its
+    imports, so a host that routed nothing away from wardex would lose every
+    loss line; a host that wants wardex quiet sets this logger's level, which
+    still applies. Disabled, the record goes to the handlers it would have
+    reached anyway: this logger's own, then up through propagation."""
+    if not logger.disabled:
+        logger.handle(record)
+    elif logger.filter(record):
+        logger.callHandlers(record)
+
+
+def diag_info(
+    message: str, *, reason: str | None = None, count: int | None = None, subject: str | None = None
+) -> None:
     """An announcement — wardex stating a mode, not reporting a loss.
 
-    `message` carries no `[wardex] ` prefix: the default handler's formatter
-    adds it, and a host's own handler gets the clean text.
+    `message` carries no `[wardex] ` prefix: the stderr handler's formatter
+    adds it, and a host's own handler gets the clean text. The keywords are
+    the record's structured fields (see `logger`).
     """
-    _emit(logging.INFO, message)
+    _emit(logging.INFO, message, reason=reason, count=count, subject=subject)
 
 
-def diag_warning(message: str) -> None:
+def diag_warning(
+    message: str, *, reason: str | None = None, count: int | None = None, subject: str | None = None
+) -> None:
     """A loss or a failure — something was dropped, skipped, or degraded.
 
-    Same prefix contract as `diag_info`.
+    Same prefix and field contract as `diag_info`.
     """
-    _emit(logging.WARNING, message)
+    _emit(logging.WARNING, message, reason=reason, count=count, subject=subject)
 
 
 def _log_with_traceback(where: str, exc: BaseException) -> None:
@@ -313,10 +375,19 @@ def _log_with_traceback(where: str, exc: BaseException) -> None:
     _emit(logging.WARNING, f"swallowed in {where}: {head}\n{text}".removesuffix("\n"))
 
 
-#: Keys already reported. A dict rather than a set for the reason `report_once`
-#: gives: `dict.setdefault` decides "was I the one who inserted this" inside a
-#: SINGLE C call, and a set has no operation that does. The values are inert.
-_REPORTED: dict[str, object] = {}
+#: Keys already reported, each with `[times seen, monotonic time last said]`.
+#: A dict rather than a set for the reason `report_once` gives:
+#: `dict.setdefault` decides "was I the one who inserted this" inside a SINGLE
+#: C call, and a set has no operation that does.
+_REPORTED: dict[str, list[float]] = {}
+
+#: How long a condition stays quiet after it was said before a repeat says it
+#: again, with how many times it has happened. A line said once and never again
+#: reads, an hour later, like a condition that stopped.
+RESURFACE_S = 300.0
+
+#: Read through the module, so tests can move the clock.
+_monotonic = time.monotonic
 
 #: An RLock, for the reason `Counters` gives: a signal handler that runs wardex
 #: code (`_runtime.py` installs one) can land on a thread that is already
@@ -334,8 +405,13 @@ _REPORTED: dict[str, object] = {}
 _REPORT_LOCK = threading.RLock()
 
 
-def report_once(message: str, *, key: str) -> None:
+def report_once(message: str, *, key: str, subject: str | None = None) -> None:
     """Emit `message` as a WARNING the FIRST time `key` is seen. Never fails.
+
+    A key seen again is counted, and said again, with the count, once
+    `RESURFACE_S` has passed since it was last said: a condition that keeps
+    happening keeps showing up, at most once per interval per key. The line's
+    `wardex_reason` field is `key`; `subject` is its `wardex_subject`.
 
     The channel a person actually reads. `counters` is not that channel and was
     never going to be: `Counters.snapshot/total/get/reset` has no caller under
@@ -351,11 +427,11 @@ def report_once(message: str, *, key: str) -> None:
     prefix; the default handler's formatter adds it (see `diag_warning`).
 
     BOUNDED BY CONSTRUCTION, which is what makes an unconditional line
-    acceptable on a per-call path: one line per key per process, so a site that
+    acceptable on a per-call path: one line per key per interval, so a site that
     fails a thousand times in a loop writes one line and not a thousand.
 
-    Honest about its reach: the `wardex_sdk` logger's default stderr handler is
-    the widest default-on channel this SDK has, not an infallible one — see
+    Honest about its reach: the stderr line is the widest default-on channel
+    this SDK has, not an infallible one — see
     `_log_with_traceback` for the four ways fd 2 can be unwritable. It is
     strictly better than a table with no readers.
 
@@ -376,11 +452,68 @@ def report_once(message: str, *, key: str) -> None:
     call that prints — in either delivery order, and whether the interruption
     lands before the call, inside the arguments, or after the return.
     """
-    mine = object()
-    with _REPORT_LOCK:
-        if _REPORTED.setdefault(key, mine) is not mine:
+    held = _REPORTED.get(key)
+    if held is None:
+        mine = [1, _monotonic()]
+        with _REPORT_LOCK:
+            held = _REPORTED.setdefault(key, mine)
+        if held is mine:
+            _emit(logging.WARNING, message, reason=key, count=1, subject=subject)
             return
-    _emit(logging.WARNING, message)
+    # A repeat. The two updates below are not atomic against a signal that
+    # re-enters on this thread: the worst it costs is a count off by one or
+    # the resurfacing line said twice, never the first line.
+    held[0] += 1
+    now = _monotonic()
+    if now - held[1] < RESURFACE_S:
+        return
+    held[1] = now
+    seen = int(held[0])
+    _emit(
+        logging.WARNING,
+        f"{message} (still happening: {seen} times in this process so far; said again at "
+        f"most every {int(RESURFACE_S // 60)} minutes)",
+        reason=key,
+        count=seen,
+        subject=subject,
+    )
+
+
+#: Refused-call lines under `debug=True`: at most this many per window across
+#: all calls, and one per host and path per window; the rest are counted into
+#: the next line said.
+_REFUSED_PER_WINDOW = 20
+_REFUSED_WINDOW_S = 60.0
+_refused: dict[str, Any] = {"window": 0.0, "said": 0, "held": 0, "seen": {}}
+
+
+def debug_refused_call(host: str, path: str, why: str) -> None:
+    """Under `init(debug=True)`: say that the capture policy refused one call,
+    by host and path only (never the query, a header or a body), rate-limited
+    so a busy process prints a sample rather than a flood. The caller checks
+    `debug` first; this never raises."""
+    try:
+        now = _monotonic()
+        state = _refused
+        if now - state["window"] >= _REFUSED_WINDOW_S:
+            state.update(window=now, said=0, seen={})
+        bare = path.split("?", 1)[0].split("#", 1)[0]
+        place = f"{host}{bare}"
+        if place in state["seen"] or state["said"] >= _REFUSED_PER_WINDOW:
+            state["held"] += 1
+            return
+        state["seen"][place] = None
+        state["said"] += 1
+        held, state["held"] = state["held"], 0
+        more = f" ({held} more refused since the last such line)" if held else ""
+        _emit(
+            logging.INFO,
+            f"debug: not recorded: {place} ({why}){more}",
+            reason="capture_refused",
+            subject=place,
+        )
+    except Exception:  # noqa: BLE001 — the reporting path may not become a throw
+        counters.bump(LOG_FAILED)
 
 
 def reset_reports_for_test() -> None:
@@ -398,6 +531,7 @@ def reset_reports_for_test() -> None:
     """
     with _REPORT_LOCK:
         _REPORTED.clear()
+    _refused.update(window=0.0, said=0, held=0, seen={})
 
 
 def diag_reset_for_new_process() -> None:
@@ -430,6 +564,7 @@ def diag_reset_for_new_process() -> None:
     counters._folding = False
     _REPORT_LOCK = threading.RLock()
     _REPORTED.clear()
+    _refused.update(window=0.0, said=0, held=0, seen={})
 
 
 class guard:  # noqa: N801 — a context manager reads as a verb at the call site

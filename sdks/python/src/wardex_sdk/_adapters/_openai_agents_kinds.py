@@ -49,10 +49,12 @@ from typing import Any
 
 from .._assembly import (
     ConversationContext,
+    DropReason,
     Limitation,
     SpanIntent,
     ToolAttributes,
     UnitKind,
+    record,
     report_once,
 )
 from .._enums import StatusCode, ToolExecutionType, ToolType
@@ -440,10 +442,16 @@ def _dropped(ctx: AdapterContext | None, reason: str, kind: str | None = None) -
     if ctx is None:
         return
     ctx.count(reason)
+    lost = (
+        DropReason.FRAMEWORK_SPAN_KIND_UNMAPPED
+        if reason == "span_kind_ignored"
+        else DropReason.FRAMEWORK_EVENT_UNMATCHED
+    )
+    record(lost, where=f"adapters.openai_agents.{reason}")
     seen = f" (first seen: {kind})" if kind is not None else ""
     report_once(
-        f"openai-agents adapter: {_DROPPED[reason]}{seen}; the counter "
-        f"adapters.openai_agents.{reason} counts every such span",
+        f"openai-agents adapter: {_DROPPED[reason]}{seen}; wardex.diagnostics().losses counts "
+        f"every such span under {lost.value}",
         key=f"adapters.openai_agents.{reason}",
     )
 
@@ -483,8 +491,7 @@ def _classify_error(adapter: Any, message: str) -> tuple[str, bool]:
     # the span carries the type.
     report_once(
         "openai-agents adapter: the framework reported an error message this adapter "
-        "does not map; the span carries error_type=openai_agents_error and the counter "
-        "adapters.openai_agents.error_message_unmapped counts every occurrence",
+        "does not map; the span carries error_type=openai_agents_error",
         key="adapters.openai_agents.unmapped",
     )
     return ("openai_agents_error", False)

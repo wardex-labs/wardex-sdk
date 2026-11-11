@@ -16,6 +16,7 @@ from ._assembly import _ledger
 from ._assembly import diag_info as _diag_info
 from ._assembly import diag_warning as _diag_warning
 from ._assembly import report_once as _report_once
+from ._assembly._explain import explain
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT
 from ._client import Client as _Client
 from ._config import (
@@ -135,6 +136,7 @@ __all__ = [
     "flush",
     "close",
     "diagnostics",
+    "explain",
     "bind_context",
     "continue_trace",
     "continue_from_otel",
@@ -884,10 +886,24 @@ def diagnostics() -> Diagnostics:
     `config_problems` is every line the most recent `init()` said about its
     configuration -- a variable it could not use, the kill switch, no
     destination -- which is where to look when `initialized` is False.
+
+    It also carries what a bug report needs (versions, the native module, the
+    resolved configuration with secrets masked, the exporter and where it
+    sends, what wardex patched, its threads); `.report()` renders all of it as
+    text safe to paste. `python -m wardex_sdk doctor` prints that report and
+    sends one test span to say whether the install works.
     """
+    # Imported here, not at the top: the package root's imports run through
+    # the cycle `_hub` settles, and this module's would enter it from the side.
+    from . import _environment
+
     live, adapters = _runtime.runtime().describe()
     return Diagnostics(
-        initialized=live, adapters=adapters, losses=_losses(), config_problems=tuple(_said)
+        initialized=live,
+        adapters=adapters,
+        losses=_losses(),
+        config_problems=tuple(_said),
+        **_environment.environment(),
     )
 
 

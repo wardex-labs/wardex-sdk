@@ -266,6 +266,24 @@ def _report_payload_dropped(dropped: int) -> None:
     )
 
 
+def _report_attribute_capped(capped: int) -> None:
+    """Record and say the spans exported with an attribute value cut short.
+
+    The span carries `otlp_attribute_truncated`, but only to whoever opens it;
+    recorded as a partial loss, so `wardex.diagnostics().losses` and strict
+    mode see degraded data as well as missing data.
+    """
+    if not capped:
+        return
+    record(DropReason.ATTRIBUTE_CAP, capped)
+    report_once(
+        f"{capped} span(s) had an attribute value longer than max_otlp_attribute_bytes and "
+        "were exported with it cut short, marked otlp_attribute_truncated. Raise "
+        "LimitsConfig(max_otlp_attribute_bytes=...) if your collector accepts more.",
+        key="transport.otlp.attribute_capped",
+    )
+
+
 def _report_pii_scrubbed(scrubbed: int, *, wire: str) -> None:
     """Count and say the records masking itself failed on.
 
@@ -308,6 +326,8 @@ class _EncodeReports(NamedTuple):
     """Spans masking itself failed on, exported emptied and marked `pii_filter_failed`."""
     over_cap: int = 0
     """Spans dropped whole, too large for a request even without their payload."""
+    attribute_capped: int = 0
+    """Spans with an attribute value cut at `max_otlp_attribute_bytes`."""
 
 
 def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
@@ -317,6 +337,7 @@ def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
     _report_payload_dropped(reports.payload_dropped)
     _report_pii_scrubbed(reports.pii_scrubbed, wire="otlp")
     _report_over_cap(reports.over_cap)
+    _report_attribute_capped(reports.attribute_capped)
 
 
 class Transport(abc.ABC):
@@ -484,7 +505,9 @@ class Transport(abc.ABC):
         # more -- it skips that one span and names it, for the caller to
         # count and report. A raise here is still a raise: a corrupt envelope
         # or an absent native module is not a per-span loss.
-        bodies, dropped, unmarshalled, overwritten, payload_dropped, scrubbed = (
+        # A seventh count, the spans the attribute cap cut, is read when the
+        # native module is new enough to return it.
+        bodies, dropped, unmarshalled, overwritten, payload_dropped, scrubbed, *capped = (
             native.codec.encode_otlp_requests(
                 envelope,
                 self._pii_mode,
@@ -497,7 +520,7 @@ class Transport(abc.ABC):
         # `dropped`, the spans too large for a request even without their
         # payload, rides back with the other reports (`_report_over_cap`).
         return tuple(bodies), _EncodeReports(
-            unmarshalled, overwritten, payload_dropped, scrubbed, dropped
+            unmarshalled, overwritten, payload_dropped, scrubbed, dropped, sum(capped[:1])
         )
 
     def _set_pii_policy(self, policy: PIIConfig) -> None:
