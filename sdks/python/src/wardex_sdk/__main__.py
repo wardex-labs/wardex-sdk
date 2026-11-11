@@ -95,6 +95,10 @@ def doctor(out: TextIO, *, environ: Mapping[str, str], deadline: float = 10.0) -
         wardex.flush(timeout=deadline)
     finally:
         restore()
+    if getattr(getattr(transport, "export_state", None), "retry_queued", 0):
+        # This process ends here, so a request held for a retry is never sent:
+        # close() drops it under the reason it failed for, which is the verdict.
+        wardex.close()
     code, line = _verdict(transport, outcomes, answers, before, started, where)
     say(line)
     wardex.close()

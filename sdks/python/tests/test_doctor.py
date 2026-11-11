@@ -231,3 +231,40 @@ def test_the_report_reads_the_delivery_state_a_transport_offers():
         _TrackingTransport(_ExportState(last_error="HTTP 503", retry_queued=2))
     ) == ("last export: last failure: HTTP 503; 2 request(s) held for a retry")
     assert _last_export_line(object()) == "last export: not tracked by this transport"
+
+
+def test_diagnostics_reads_a_real_exporters_delivery_state(collector):
+    import wardex_sdk as wardex
+
+    wardex.init(transport=wardex.OtlpHttpTransport(f"{collector}/v1/traces"), intercept=False)
+    try:
+        with wardex.span("delivered"):
+            pass
+        wardex.flush(5.0)
+        got = wardex.diagnostics()
+        assert got.export_tracked is True
+        assert got.destination == f"{collector}/v1/traces"
+        assert got.last_export_success is not None
+        assert got.last_export_error is None
+        assert got.retry_queued == 0
+    finally:
+        wardex.close()
+
+
+def test_diagnostics_reads_a_real_exporters_failure_and_what_it_holds():
+    import wardex_sdk as wardex
+
+    wardex.init(transport=wardex.OtlpHttpTransport("http://127.0.0.1:9/v1/traces"), intercept=False)
+    try:
+        with wardex.span("refused"):
+            pass
+        wardex.flush(5.0)
+        got = wardex.diagnostics()
+        assert got.export_tracked is True
+        assert got.destination == "http://127.0.0.1:9/v1/traces"
+        assert got.last_export_success is None
+        assert got.last_export_error == "ConnectionRefusedError"
+        assert got.retry_queued == 1
+        assert "1 request(s) held for a retry" in got.report()
+    finally:
+        wardex.close()
