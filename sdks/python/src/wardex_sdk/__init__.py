@@ -42,9 +42,9 @@ from ._config_checks import disabled_by as _disabled_by
 from ._config_checks import endpoint_named_for_wardex as _endpoint_named_for_wardex
 from ._config_checks import env_base_url_problem as _env_base_url_problem
 from ._config_checks import env_typo_messages as _env_typo_messages
-from ._config_checks import pii_off_from_env as _pii_off_from_env
 from ._config_checks import grpc_protocol_variable as _grpc_protocol_variable
 from ._config_checks import otel_pairs as _otel_pairs
+from ._config_checks import pii_off_from_env as _pii_off_from_env
 from ._config_checks import refuses_unknown_init_keywords as _refuses_unknown_init_keywords
 from ._config_checks import require_instance as _require_instance
 from ._config_checks import require_optional_str as _require_optional_str

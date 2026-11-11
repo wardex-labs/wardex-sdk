@@ -63,7 +63,6 @@ from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 
 from . import _config_checks
-from ._config_checks import endpoint_from_env, refuses_unknown_keywords, require_http_url
 from ._config_checks import (
     endpoint_from_env,
     env_flag,
