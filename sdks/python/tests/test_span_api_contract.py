@@ -497,6 +497,34 @@ def test_current_span_after_a_yield_is_the_block_left_open_across_it(wire):
     assert shipped["execute_step stream"]["attributes"]["closed"] == "fetch"
 
 
+def test_abandoned_streams_in_one_long_lived_task_do_not_pile_up_their_spans(wire):
+    """An async generator holding a span across a yield, abandoned after its
+    first item, is closed on another task: the span it leaves behind must not
+    hold the one before it, or a worker task keeps every one it ever opened."""
+    import gc
+    import weakref
+
+    async def stream():
+        with wardex.span("chunk") as s:
+            s.set_input("p" * 1000)
+            yield 1
+            yield 2
+
+    async def worker() -> list:
+        alive = []
+        for _ in range(30):
+            async for _ in stream():
+                alive.append(weakref.ref(wardex.current_span()))
+                break
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
+        gc.collect()
+        assert wardex.current_span() is None
+        return [ref for ref in alive if ref() is not None]
+
+    assert len(asyncio.run(worker())) <= 2
+
+
 def test_a_value_set_input_cannot_encode_raises_at_the_call(wire):
     with wardex.span("s") as s:
         with pytest.raises(TypeError, match="JSON-serialisable"):

@@ -332,7 +332,11 @@ def current_span() -> Span | None:
     write. Never raises. Before `init()` a block's span is returned as well; like
     the block, it records nothing.
     """
-    span = _CURRENT_SPAN.get()
+    return _open_from(_CURRENT_SPAN.get())
+
+
+def _open_from(span: Span | None) -> Span | None:
+    """`span`, or the first open span it was opened under."""
     while span is not None and not span._open:
         span = span._outer
     return span
@@ -505,12 +509,16 @@ def _interrupt(span: Span, marker: Limitation, end_ns: int) -> InternalSpan | No
 
 def _make_current(span: Span) -> Any:
     """Make `span` what `current_span()` answers here; the token to undo it with."""
-    span._outer = _CURRENT_SPAN.get()
+    span._outer = current_span()
     return _CURRENT_SPAN.set(span)
 
 
 def _unmake_current(span: Span, token: Any) -> None:
     span._open = False
+    # A span that closed in another Context stays in the one it opened in, and
+    # the next span opened there links to it: each one cut to the open span it
+    # stands for keeps a long-lived task from holding every one it ever opened.
+    span._outer = _open_from(span._outer)
     if token is None:
         return
     try:
