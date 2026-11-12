@@ -81,7 +81,10 @@ def doctor(out: TextIO, *, environ: Mapping[str, str], deadline: float = 10.0) -
         return 1
     transport = getattr(_runtime.runtime().client, "_transport", None)
     if transport is None or isinstance(transport, NoOpTransport):
-        say(f"FAIL: {_HOW_TO_CONFIGURE}")
+        # What init() said names the variable to fix; the how-to is for a
+        # process where nothing was set at all.
+        said = [p for p in wardex.diagnostics().config_problems if "not running" not in p]
+        say(f"FAIL: {' '.join(said)}" if said else f"FAIL: {_HOW_TO_CONFIGURE}")
         wardex.close()
         return 1
     where = transport_facts(transport).get("destination") or type(transport).__name__
@@ -197,6 +200,24 @@ def _judge_answer(status: int, answer: Answer, where: str) -> tuple[int, str] | 
     return None
 
 
+def _refused(error: object, where: str) -> tuple[int, str] | None:
+    """A receiver's HTTP refusal, said with the fix its status calls for: a
+    loss reason's own fix names a project key, which a collector has not."""
+    if not isinstance(error, str) or not error.startswith("HTTP "):
+        return None
+    status = error[len("HTTP ") :]
+    if status == "404":
+        fix = "Nothing answers at that path: OTLP/HTTP collectors take traces at /v1/traces."
+    elif status in ("401", "403"):
+        fix = (
+            "It refused the credentials: check OTEL_EXPORTER_OTLP_HEADERS (or "
+            "backend.headers) for a collector, WARDEX_API_KEY for a wardex receiver."
+        )
+    else:
+        fix = "Its own logs say why it refused the span."
+    return 1, f"FAIL: {where} answered {error} to the test span. {fix}"
+
+
 def _verdict(
     transport: Any,
     outcomes: list[object],
@@ -214,6 +235,9 @@ def _verdict(
         if judged is not None and judged[0]:
             return judged
         unconfirmed = unconfirmed or judged
+    refused = _refused(getattr(getattr(transport, "export_state", None), "last_error", None), where)
+    if refused is not None:
+        return refused
     new = [
         loss
         for loss in wardex.diagnostics().losses
@@ -221,7 +245,8 @@ def _verdict(
     ]
     if new:
         loss = new[0]
-        return 1, f"FAIL: {loss.reason}: {loss.meaning} {loss.next_step}"
+        here = " Here, run the doctor with a larger --timeout." * ("timeout" in loss.next_step)
+        return 1, f"FAIL: {loss.reason}: {loss.meaning} {loss.next_step}{here}"
     if unconfirmed is not None:
         return unconfirmed
     state = getattr(transport, "export_state", None)

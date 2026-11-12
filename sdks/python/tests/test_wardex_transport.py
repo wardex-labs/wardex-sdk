@@ -285,7 +285,8 @@ def test_an_unmarshallable_span_puts_no_host_text_on_stderr_off_debug(receiver):
         finally:
             logger.removeHandler(handler)
             logger.setLevel(level)
-        return handler.lines
+        # The first delivery in this process is announced once, whichever test it falls in.
+        return [line for line in handler.lines if "first export delivered" not in line]
 
     off = export(debug=False)
     assert len(off) == 1 and "could not be marshalled" in off[0]

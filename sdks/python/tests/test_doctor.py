@@ -144,6 +144,43 @@ def test_doctor_names_the_failure_and_its_fix_when_the_collector_is_down():
     assert "reachable" in last
 
 
+def _refusing(status: int) -> type[http.server.BaseHTTPRequestHandler]:
+    class _Refusing(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            self.send_response(status)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    return _Refusing
+
+
+@pytest.mark.parametrize(
+    ("status", "fix"),
+    [(404, "path"), (401, "OTEL_EXPORTER_OTLP_HEADERS"), (500, "logs")],
+)
+def test_doctor_names_the_fix_for_the_status_a_collector_refused_with(status, fix):
+    """A collector has no project key: the last line, which a script or a
+    coding agent reads, names the fix that status calls for."""
+    url, proc = _doctor_against(_refusing(status))
+    assert proc.returncode == 1, proc.stdout
+    last = proc.stdout.splitlines()[-1]
+    assert last.startswith(f"FAIL: {url}/v1/traces answered HTTP {status}"), last
+    assert fix in last
+    assert "project key" not in last
+
+
+def test_doctor_quotes_why_init_installed_nothing_when_a_variable_is_set():
+    proc = _run("doctor", env={"WARDEX_API_KEY": "wdx_us_made_up_key"})
+    assert proc.returncode == 1
+    last = proc.stdout.splitlines()[-1]
+    assert last.startswith("FAIL: ") and "WARDEX_API_KEY" in last, proc.stdout
+    assert "nowhere to send data" not in proc.stdout
+
+
 def test_doctor_says_how_to_configure_when_nothing_is():
     proc = _run("doctor")
     assert proc.returncode == 1

@@ -116,6 +116,8 @@ def _cut_short_by_the_caller(
     """
     if not isinstance(budget, CallerBudget) or effective >= configured:
         return None
+    if budget.requested >= configured:  # what ran out is this transport's own timeout
+        return None
     try:
         expired = isinstance(exc, TimeoutError) or isinstance(
             getattr(exc, "reason", None), TimeoutError
