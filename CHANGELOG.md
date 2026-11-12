@@ -506,12 +506,22 @@ All notable changes to this project are documented here. The format follows
   `RecursionError` from wardex's own frames could come chained onto yours. In
   those cases, and in a `wardex.span` block, wardex also counted the error as
   one of its own internal failures. Now nothing is chained onto it and wardex
-  no longer counts it as its own error, as long as the limit is the same when
-  the span closes as when it opened: code that lowers
-  `sys.setrecursionlimit` inside an adapter's span can still see one chained
-  on. If a `wardex.span` block closes with too little room left for wardex to
-  finish it (the limit was lowered inside it), its span is lost, but it no
-  longer stays the parent of the next span on the thread.
+  no longer counts it as its own error. That holds when the limit is lowered
+  inside the span too: if a `wardex.span` block or an adapter's span
+  (LangGraph, Pydantic AI and the other adapters built on the same unit)
+  closes with too little room left for wardex to finish it, its close is
+  dropped and counted (`tracing.close_at_limit`,
+  `adapters.context.close_at_limit`), the span is closed later by its parent's
+  teardown or lost, and it no longer stays the parent of the next span on that
+  thread or task, on Python 3.12 and later at every depth where the exit can
+  start at all; on 3.10 and 3.11, where C calls count against the limit too,
+  one frame of room is still needed. If such a span is closed on a different
+  thread or task from the one that opened it (a generator closed elsewhere),
+  wardex leaves that other thread's current span and context untouched, where
+  it used to overwrite them (`adapters.context.close_at_limit_not_restored`).
+  The open of such a span also no longer asks "is there a running event loop"
+  by catching an exception, which at the limit chained that exception onto
+  yours.
 - **A streamed model call over HTTP/2 is recorded even when your client stops
   reading at the last event.** The OpenAI SDK stops reading an HTTP/2 stream at
   `[DONE]` and leaves it open, so a server or proxy that sends the stream's end
@@ -528,16 +538,33 @@ All notable changes to this project are documented here. The format follows
   `max_streams` is no longer counted twice under a bridge adapter's chat
   span.** When the per-connection bound dropped a stream's parent, the chat
   span reported the framework's token usage as if no wire call had been seen,
-  and the wire span reported the same usage again. wardex now remembers a
-  model call's path from the moment its stream opens. Its answer ships under
-  that path even when the bound also dropped the request (named
-  `HTTP ? /v1/chat/completions` and marked `h2_request_evicted`, where it used
-  to be `HTTP ? /`). The chat span keeps the framework's numbers aside, as it
-  does for every other call. If the answer arrives after the chat span has
-  closed, the wire span's numbers move to `wardex.usage_late.*` instead.
-  `protocol.http2.evicted_witnessed` counts each such answer.
-  `protocol.http2.evicted_call_unanswered` counts a dropped model call whose
-  answer never arrived; its usage stays on the chat span.
+  and the wire span reported the same usage again. wardex now reads a model
+  call's path in the same parse that sees its request end, and keeps it when
+  the bound drops the request's header block before its body ends, so the path
+  survives both when two requests are sent in one write and when two tasks
+  interleave their frames on one connection with `max_streams=1` (each used to
+  lose it). Its answer ships under that path even when the bound also dropped
+  the request (named `HTTP ? /v1/chat/completions` and marked
+  `h2_request_evicted`, where it used to be `HTTP ? /`). The chat span keeps
+  the framework's numbers aside, as it does for every other call. If the
+  answer arrives after the chat span has closed, the wire span's numbers move
+  to `wardex.usage_late.*` instead. `protocol.http2.evicted_witnessed` counts
+  each such answer. `protocol.http2.evicted_call_unanswered` counts a dropped
+  model call whose answer never arrived; its usage stays on the chat span.
+  `protocol.http2.evicted_unanswered` counts any other request that the bound
+  dropped while it was issued under a span and whose answer never arrived.
+  Both counts leave out a stream that a `RST_STREAM` ended, whether your
+  client cancelled the request or the server refused it: no answer was due, so
+  nothing was lost. Such a stream also no longer takes a slot from the bound.
+- **When wardex's own capture work hits the interpreter's recursion limit, the
+  dropped record is now counted.** The socket and TLS wrappers, the MCP stdio
+  tees and the seam's parser-latch report let your call through untouched when
+  their own bookkeeping meets the limit, but they used to drop that chunk's
+  record with no trace. Each such drop is now counted under
+  `interceptors.<seam>.<call or call family>.recursion_limit`, without pushing
+  a frame. Your own call and exception are unchanged. One site is still
+  uncounted: the header injection in `context/_inject.py`, which sits below
+  the counters in the import order.
 - **A read made of many small HTTP/2, WebSocket or JSON-RPC frames no longer
   stalls your thread.** Each of those parsers removed every frame it parsed
   from the front of its buffer, moving the rest of the read once per frame, on

@@ -1,12 +1,11 @@
 """What a framework adapter is handed, and the whole of what it may do.
 
-An adapter's job is to know a framework. Deciding parentage is not part of that
-job and is not reachable from here: there is no `ambient=`, no `evidence=`, no
-`parent=`, no `parent_unit=`, and no value in this module's vocabulary that IS a
-parent. `enter()`, `open_run()` and `rejoin()` latch the live scope
-INTERNALLY, on the calling carrier, at the instant of the call — so the question
-"how did I know this was the parent" has one answer for every adapter that will
-ever exist, and an adapter author cannot get it wrong by trying harder.
+An adapter's job is to know a framework. Deciding parentage is not part of that job and is not
+reachable from here: there is no `ambient=`, no `evidence=`, no `parent=`, no `parent_unit=`, and no
+value in this module's vocabulary that IS a parent. `enter()`, `open_run()` and `rejoin()` latch the
+live scope INTERNALLY, on the calling carrier, at the instant of the call — so the question "how did
+I know this was the parent" has one answer for every adapter that will ever exist, and an adapter
+author cannot get it wrong by trying harder.
 
 That is the product claim expressed as a type rather than as a rule. wardex builds its causal tree
 from in-process context propagation; competitors rebuild it from the `run_id`/`parent_run_id` a
@@ -51,7 +50,6 @@ import threading
 import weakref
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
-from enum import Enum
 from itertools import count
 from typing import Any
 
@@ -72,6 +70,7 @@ from .._assembly import (
     UnitKey,
     UnitKind,
     UnitRegistry,
+    ambient_restore_point,
     cap_at_alias_tier,
     counters,
     degraded_run,
@@ -81,73 +80,7 @@ from .._assembly import (
 )
 from .._enums import StatusCode
 from ._context_bridge import BridgeVerbs
-
-
-class Placement(Enum):
-    """Whether a site may legitimately begin a trace. CLOSED, and never inferred.
-
-    Not a property of a call — a property of a PATCH SITE. The failure it
-    catches is "the adapter did not wrap the framework's run entry", which is a
-    bug in the adapter's shape rather than a condition of one invocation, and a
-    computed flag would let every site paper over it independently. An AST rule
-    requires the literal.
-    """
-
-    ROOT = "root"  # a framework run entry: nothing above it is expected
-    NESTED = "nested"  # always inside something this adapter already entered
-
-
-class Fallback(Enum):
-    """What a NESTED site may fall back to when the live scope did not reach it.
-
-    CLOSED, never inferred, and never a default — for the same reason
-    `Placement` is not: a heuristic that turns itself on is one nobody can find
-    later. Declaring it at the site is the adapter saying "this call is reached
-    through a carrier the framework may not have propagated to, and one live run
-    is a defensible guess there".
-
-    It is NOT a way to name a parent. The candidate comes from the registry's
-    own table, filtered to units this adapter owns, and only when there is
-    EXACTLY one — so no identifier, argument or adapter state can influence
-    which unit is picked. The edge it produces is `unit_sole` at 0.5 carrying
-    `UNIT_INFERRED_SOLE`, which is the vocabulary's word for "interpreted, not
-    read".
-
-    Reachable only where the site would otherwise become a trace root, which is
-    structural rather than a rule: a live scope or a host span always wins, so
-    the fallback can never displace something wardex actually read.
-    """
-
-    NONE = "none"  # orphan instead of guessing; the honest default
-    SOLE_LIVE_RUN = "sole_live_run"  # exactly one live SESSION this adapter owns
-
-
-class Observer(Enum):
-    """Which observer of one event this is, when a framework offers two.
-
-    A framework that announces a tool call through a callback AND lets wardex
-    wrap the executor produces two observations of one logical call. Ranks
-    arbitrate: the executor wrapped the real work, so it wins however late it
-    arrives — the callback usually fires first, and first-come would hand every
-    span to the observer that did not run the code.
-    """
-
-    EXECUTOR = 10
-    CALLBACK = 0
-
-
-class InstallOutcome(Enum):
-    """Why an adapter is or is not running, kept distinct from each other.
-
-    `DECLINED` and `UNSUPPORTED` are the pair today's adapters conflate into a
-    bare `return`: the framework being absent is nothing to look at, while the
-    framework being present with a surface wardex does not recognize is
-    something a human should see.
-    """
-
-    INSTALLED = "installed"
-    DECLINED = "declined"  # the framework is not present; nothing to do
-    UNSUPPORTED = "unsupported"  # present, but its surface is not one we know
+from ._context_vocab import Fallback, InstallOutcome, Observer, Placement
 
 
 class Scope:
@@ -595,32 +528,27 @@ class AdapterContext(BridgeVerbs):
         self.options = options
         self._units = units
         self._tripped = False
-        # The selector a site that names none gets. Built HERE, out of wardex's
-        # own counter, for two reasons. It is unique per call, where the shared
-        # empty key it replaces had every anonymous unit in the process rebinding
-        # one alias slot — `find()` on it answered "whichever was last", which is
-        # not an answer. And it costs the CALL SITE nothing to compute: an
-        # expression in a `with ctx.enter(...)` header runs before any failure
-        # boundary exists, so every one an adapter has to write there is a place
-        # a framework read can break the host.
+        # The selector a site that names none gets. Built HERE, out of wardex's own counter, for two
+        # reasons. It is unique per call, where the shared empty key it replaces had every anonymous
+        # unit in the process rebinding one alias slot — `find()` on it answered "whichever was
+        # last", which is not an answer. And it costs the CALL SITE nothing to compute: an
+        # expression in a `with ctx.enter(...)` header runs before any failure boundary exists, so
+        # every one an adapter has to write there is a place a framework read can break the host.
         self._anon_ns = f"adapters.{name}"
         self._anon_seq = count()
         self._slots: MutableMapping[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
-        # One lock over every slot read, write and copy. The table is walked
-        # by the uninstall sweep on the closing thread while a framework
-        # worker thread can still be ending spans -- `forget` pops a key --
-        # and a WeakKeyDictionary mutated under a copy raises RuntimeError
-        # on 3.10-3.13, which the registry's guard swallowed before the
-        # sweep reached `close_all`: every open unit stranded, unmarked.
-        # REENTRANT: a reattached trace's end arrives through a weakref
-        # finalizer, which runs wherever a reference count reaches zero --
-        # possibly on this very thread while a slot call holds the lock.
+        # One lock over every slot read, write and copy. The table is walked by the uninstall sweep
+        # on the closing thread while a framework worker thread can still be ending spans --
+        # `forget` pops a key -- and a WeakKeyDictionary mutated under a copy raises RuntimeError on
+        # 3.10-3.13, which the registry's guard swallowed before the sweep reached `close_all`:
+        # every open unit stranded, unmarked. REENTRANT: a reattached trace's end arrives through a
+        # weakref finalizer, which runs wherever a reference count reaches zero -- possibly on this
+        # very thread while a slot call holds the lock.
         self._slots_lock = threading.RLock()
-        # A READER, not a tuple. `AdapterRegistry.install` builds this context
-        # BEFORE it calls `adapter.install()`, and an adapter can only import its
-        # framework's error classes in there — so a tuple taken here is `()` for
-        # the life of the process. `_registry.context_for` is the only caller with
-        # an adapter to bind, and it binds a reader over the CLASS attribute;
+        # A READER, not a tuple. `AdapterRegistry.install` builds this context BEFORE it calls
+        # `adapter.install()`, and an adapter can only import its framework's error classes in there
+        # — so a tuple taken here is `()` for the life of the process. `_registry.context_for` is
+        # the only caller with an adapter to bind, and it binds a reader over the CLASS attribute;
         # nothing here can hold a snapshot.
         self._control_flow = control_flow
 
@@ -834,21 +762,19 @@ class AdapterContext(BridgeVerbs):
             evidence = self._evidence(placement, ambient)
         conflicted = False
         if holder is None and evidence is _ORPHAN and fallback is Fallback.SOLE_LIVE_RUN:
-            # `evidence is _ORPHAN` is the whole gate, and it is structural: only
-            # a NESTED site with nothing live above it and no host span reaches
-            # this line, so the fallback can never displace something wardex
-            # actually read. `owner` keeps the question about THIS adapter's
-            # runs — "exactly one session is live" is otherwise a question about
-            # the process, and answering it across a framework boundary is the
-            # guess `sole_live` refuses to make.
+            # `evidence is _ORPHAN` is the whole gate, and it is structural: only a NESTED site with
+            # nothing live above it and no host span reaches this line, so the fallback can never
+            # displace something wardex actually read. `owner` keeps the question about THIS
+            # adapter's runs — "exactly one session is live" is otherwise a question about the
+            # process, and answering it across a framework boundary is the guess `sole_live` refuses
+            # to make.
             sole = self._units.sole_live(UnitKind.SESSION, owner=self.name)
             if sole is not None:
-                # Asked BEFORE the fallback takes a parent, because taking one
-                # is what stops `open()` from seeing the poisoned ambient for
-                # itself. Without this the two reasons a guess happened are
-                # byte-identical on the wire — "nothing was pinned" and "what
-                # was pinned had died" — and the second is a tool call sitting
-                # in a run it has nothing to do with.
+                # Asked BEFORE the fallback takes a parent, because taking one is what stops
+                # `open()` from seeing the poisoned ambient for itself. Without this the two reasons
+                # a guess happened are byte-identical on the wire — "nothing was pinned" and "what
+                # was pinned had died" — and the second is a tool call sitting in a run it has
+                # nothing to do with.
                 conflicted = self._units.closed_unit_in_scope()
                 holder, evidence = sole, _SOLE
         lost = forgotten is not None and self._units.forgotten_owner(forgotten, holder=holder)
@@ -871,12 +797,11 @@ class AdapterContext(BridgeVerbs):
         if lost:
             unit.note(Limitation.ALIAS_FORGOTTEN)
         if conflicted:
-            # The WORD is the registry's to choose, exactly as it chooses it for
-            # the refusal `open()` performs itself: a strand left by the
-            # registry's own eviction reads as wardex's bound at work
-            # (`INSTRUMENTATION_DEGRADED`, repair: `max_units`), any other
-            # strand as a pin or lifetime bug (`CORRELATION_CONFLICT`).
-            # Spelling one member here would re-fuse what the registry split.
+            # The WORD is the registry's to choose, exactly as it chooses it for the refusal
+            # `open()` performs itself: a strand left by the registry's own eviction reads as
+            # wardex's bound at work (`INSTRUMENTATION_DEGRADED`, repair: `max_units`), any other
+            # strand as a pin or lifetime bug (`CORRELATION_CONFLICT`). Spelling one member here
+            # would re-fuse what the registry split.
             unit.note(self._units.refused_ambient_marker())
         return unit
 
@@ -946,21 +871,19 @@ class AdapterContext(BridgeVerbs):
                 unit.note(Limitation.INSTRUMENTATION_DEGRADED)
                 self._units.close(unit, status=StatusCode.UNSET)
                 closed = True
-        # PLACEMENT FIRST, and this is a correction. The flag below says the
-        # unit was CLOSED, not that it was described — it is True on the
-        # ordinary way of getting here (a `describe` that raised after the unit
-        # opened), so testing it first made the ROOT branch unreachable and
-        # every run entry reported as "one span". A ROOT site is the one place
-        # the loss is not one span: the description died before the intent's
-        # required block, so `finish()` refuses the draft and NOTHING ships for the whole run.
+        # PLACEMENT FIRST, and this is a correction. The flag below says the unit was CLOSED, not
+        # that it was described — it is True on the ordinary way of getting here (a `describe` that
+        # raised after the unit opened), so testing it first made the ROOT branch unreachable and
+        # every run entry reported as "one span". A ROOT site is the one place the loss is not one
+        # span: the description died before the intent's required block, so `finish()` refuses the
+        # draft and NOTHING ships for the whole run.
         if placement is Placement.ROOT:
-            # Measured rather than reasoned: 0 spans ship, and the body then
-            # runs inside `degraded_run()`. So traffic inside is still captured
-            # — that mechanism exists precisely so one failure here does not
-            # become total silence — but it arrives ORPHANED and marked instead
-            # of attached to a run. (The older wording claimed it would not be
-            # captured at all, which was true before `degraded_run` and is not
-            # now. An unreachable branch is also an unaudited one.)
+            # Measured rather than reasoned: 0 spans ship, and the body then runs inside
+            # `degraded_run()`. So traffic inside is still captured — that mechanism exists
+            # precisely so one failure here does not become total silence — but it arrives ORPHANED
+            # and marked instead of attached to a run. (The older wording claimed it would not be
+            # captured at all, which was true before `degraded_run` and is not now. An unreachable
+            # branch is also an unaudited one.)
             consequence = (
                 "this run will produce NO span of its own, and every request and "
                 "tool call inside it will arrive orphaned and marked rather than "
@@ -975,26 +898,39 @@ class AdapterContext(BridgeVerbs):
     def _run(self, unit: Unit, scope: Scope, *, intent: SpanIntent) -> Iterator[Scope]:
         """Activate, hand the scope to the caller's body, close. Shared, guarded.
 
-        `enter()` and `rejoin()` had this block twice, and a guard added to one
-        copy is a guard the other does not have.
+        `enter()` and `rejoin()` had this block twice, and a guard added to one copy is a guard the
+        other does not have.
+
+        AT THE RECURSION LIMIT the exit gives up its own work and nothing else. A host that lowers
+        `sys.setrecursionlimit` inside the body can leave too few frames for the close (about eleven
+        with a real client sink), and a `RecursionError` from wardex's close would reach the host
+        chained onto the host's own exception. So the exit catches it, writes back the restore point
+        taken before activation (`var.set`, C calls only) so the next sibling is not parented to a
+        dead unit, but only once a C-level Token reset has shown it runs on the unit's own task,
+        marks the carrier abandoned so the activation's late finalizer resets nothing, tallies the
+        drop with `counters.tally` (a `bump` would push a frame), and lets the host's exception, or
+        the host's return, go on as if wardex were absent. If the limit bit before `_units.close`
+        took the unit out of the registry, it stays registered and open, and the parent's
+        `close_all()` ends it; past that point the span is lost and the tally is its only record.
         """
         status, error_type = StatusCode.OK, None
-        activation = None
-        # A BARE FLAG, and it is the only valid test of a guarded step. `if
-        # activation is None:` is DEAD CODE here — `unit.activate()` binds the
-        # name before `__enter__` can raise — and the span it lets through reads
-        # byte-identical to a healthy one. Two authors wrote that bug an hour
-        # apart, which is why `test_import_graph.py` now checks the shape.
+        activation = carrier = None
+        restore: tuple[tuple[Any, Any], ...] = ()
+        # A BARE FLAG, and it is the only valid test of a guarded step. `if activation is None:` is
+        # DEAD CODE here — `unit.activate()` binds the name before `__enter__` can raise — and the
+        # span it lets through reads byte-identical to a healthy one. Two authors wrote that bug an
+        # hour apart, which is why `test_import_graph.py` now checks the shape.
         active = False
         with self.guard(f"enter_activate.{intent.value}"):
+            restore = ambient_restore_point()
             activation = unit.activate()
-            activation.__enter__()
+            carrier = activation.__enter__()
             active = True
         if not active:
             # Half-entered at worst, so it must not be exited. The unit itself is
             # live and its own edge is correct; what is lost is that work INSIDE
             # this span will find the enclosing unit instead.
-            activation = None
+            activation, carrier, restore = None, None, ()
             self._degrade(
                 f"enter_activate.{intent.value}",
                 holder=unit,
@@ -1003,47 +939,83 @@ class AdapterContext(BridgeVerbs):
         try:
             yield scope
         except BaseException as exc:
-            # A framework that implements pausing, handing off or draining by
-            # RAISING is not failing, and a span that says otherwise reports
-            # every human-in-the-loop pause as a crashed run. The adapter names
-            # those classes once, as a classvar; this is the one place that
-            # reads it, so no causal path can be the one nobody remembered.
-            if self._is_control_flow(exc):
-                status, error_type = StatusCode.UNSET, None
-            else:
-                status, error_type = StatusCode.ERROR, type(exc).__name__
+            # A framework that implements pausing, handing off or draining by RAISING is not
+            # failing, and a span that says otherwise reports every human-in-the-loop pause as a
+            # crashed run. The adapter names those classes once, as a classvar; this is the one
+            # place that reads it, so no causal path can be the one nobody remembered. ERROR first:
+            # a read that meets the recursion limit keeps it.
+            status, error_type = StatusCode.ERROR, type(exc).__name__
+            try:
+                if self._is_control_flow(exc):
+                    status, error_type = StatusCode.UNSET, None
+            except RecursionError:
+                counters.tally.append("adapters.context.control_flow_at_limit")
             raise
         finally:
-            if status is StatusCode.OK and scope._failure is not None:
-                # ONLY when nothing was raised. An exception is stronger
-                # evidence than a declaration and keeps its own type, so an
-                # adapter cannot relabel a crash — and control flow, which has
-                # already resolved to UNSET above, is not a failure to overwrite
-                # either. What this reaches is the one case neither can see: the
-                # host returned normally and told the adapter it had failed.
-                status, error_type = StatusCode.ERROR, scope._failure
-            if activation is not None:
-                # BEFORE the close, on every path including the ones where the
-                # close then fails. Deferring it until the close succeeds leaves
-                # a dead unit ambient, so the next sibling call in this task is
-                # parented to a corpse.
-                with self.guard(f"enter_activate_exit.{intent.value}"):
-                    activation.__exit__(None, None, None)
-            closed = False
-            with self.guard(f"enter_close.{intent.value}"):
-                self._units.close(unit, status=status, error_type=error_type)
-                closed = True
-            if not closed:
-                # NO SALVAGE. Hand-detaching the unit to rescue its own span
-                # ships one span of a subtree and makes the rest unreachable;
-                # leaving it where it is costs the same spans NOW and lets a
-                # later `close_all()` recover the whole subtree. Measured on a
-                # six-child subtree: salvage 1 of 7, no salvage 0 now and 7 then.
-                self._degrade(
-                    f"enter_close.{intent.value}",
-                    holder=None,
-                    consequence="this span and everything under it were lost",
-                )
+            try:
+                self._close_run(unit, scope, activation, status, error_type, intent)
+            except RecursionError:
+                if carrier is not None:
+                    carrier.abandoned = True
+                    # ASK THE CONTEXT FIRST: a generator-shaped host can close this unit on
+                    # another task, where `var.set` would overwrite THAT task's own unit.
+                    # Resetting the ambient Token answers in C: ValueError outside its
+                    # Context, writing nothing (3.10 may report it as RecursionError, its
+                    # message's repr meeting the limit too); RuntimeError where this task's
+                    # own exit reset it before the limit bit, leaving the scope to write.
+                    try:
+                        carrier._token.var.reset(carrier._token)
+                    except (ValueError, RecursionError):
+                        restore = ()
+                        # The scope fork's generator meets the same refusal; closed here
+                        # it is caught, where a later finalizer would print it on stderr.
+                        try:
+                            carrier._span_cm.gen.close()  # type: ignore[union-attr]
+                        except (ValueError, RecursionError):
+                            counters.tally.append("adapters.context.close_at_limit_not_restored")
+                    except RuntimeError:
+                        counters.tally.append("adapters.context.close_at_limit_half_exited")
+                for var, value in restore:
+                    var.set(value)
+                counters.tally.append("adapters.context.close_at_limit")
+
+    def _close_run(
+        self,
+        unit: Unit,
+        scope: Scope,
+        activation: Any,
+        status: StatusCode,
+        error_type: str | None,
+        intent: SpanIntent,
+    ) -> None:
+        """`_run`'s exit: take the activation down, then close the unit, each guarded."""
+        if status is StatusCode.OK and scope._failure is not None:
+            # ONLY when nothing was raised. An exception is stronger evidence than a declaration and
+            # keeps its own type, so an adapter cannot relabel a crash — and control flow, which has
+            # already resolved to UNSET above, is not a failure to overwrite either. What this
+            # reaches is the one case neither can see: the host returned normally and told the
+            # adapter it had failed.
+            status, error_type = StatusCode.ERROR, scope._failure
+        if activation is not None:
+            # BEFORE the close, on every path including the ones where the close then fails.
+            # Deferring it until the close succeeds leaves a dead unit ambient, so the next sibling
+            # call in this task is parented to a corpse.
+            with self.guard(f"enter_activate_exit.{intent.value}"):
+                activation.__exit__(None, None, None)
+        closed = False
+        with self.guard(f"enter_close.{intent.value}"):
+            self._units.close(unit, status=status, error_type=error_type)
+            closed = True
+        if not closed:
+            # NO SALVAGE. Hand-detaching the unit to rescue its own span ships one span of a subtree
+            # and makes the rest unreachable; leaving it where it is costs the same spans NOW and
+            # lets a later `close_all()` recover the whole subtree. Measured on a six-child subtree:
+            # salvage 1 of 7, no salvage 0 now and 7 then.
+            self._degrade(
+                f"enter_close.{intent.value}",
+                holder=None,
+                consequence="this span and everything under it were lost",
+            )
 
     # -- the causal methods ----------------------------------------------
 
@@ -1106,11 +1078,10 @@ class AdapterContext(BridgeVerbs):
         # `describe` is what raised. Same trap as `_run`'s activation.
         if not ok:
             self._abandon(unit, f"enter.{intent.value}", placement=placement)
-            # The host's block runs with nothing ambient, so under
-            # `capture_mode=AGENT` every request and every tool call inside it
-            # would be dropped at the byte seam — one wardex bug here turning
-            # into total silence underneath. The flag says the absence of a
-            # parent is wardex's doing, and the gate reads it.
+            # The host's block runs with nothing ambient, so under `capture_mode=AGENT` every
+            # request and every tool call inside it would be dropped at the byte seam — one wardex
+            # bug here turning into total silence underneath. The flag says the absence of a parent
+            # is wardex's doing, and the gate reads it.
             with degraded_run():
                 yield Scope(None, self)
             return
@@ -1248,11 +1219,10 @@ class AdapterContext(BridgeVerbs):
             ok = True
         if not ok:
             self._abandon(unit, f"rejoin.{intent.value}", placement=placement)
-            # The host's block runs with nothing ambient, so under
-            # `capture_mode=AGENT` every request and every tool call inside it
-            # would be dropped at the byte seam — one wardex bug here turning
-            # into total silence underneath. The flag says the absence of a
-            # parent is wardex's doing, and the gate reads it.
+            # The host's block runs with nothing ambient, so under `capture_mode=AGENT` every
+            # request and every tool call inside it would be dropped at the byte seam — one wardex
+            # bug here turning into total silence underneath. The flag says the absence of a parent
+            # is wardex's doing, and the gate reads it.
             with degraded_run():
                 yield Scope(None, self)
             return

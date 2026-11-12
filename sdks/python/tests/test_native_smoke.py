@@ -36,10 +36,11 @@ def test_protocol_http2_parser_roundtrip():
     from wardex_sdk import _wardex_native
 
     parser = _wardex_native.protocol.Http2Parser()
-    # check that Http2Parser exists and feed returns a (list, list) tuple (smoke test)
-    opened, txns = parser.feed(True, b"")  # empty input → both empty
+    # check that Http2Parser exists and feed returns a (list, list, list) tuple (smoke test)
+    opened, txns, reset = parser.feed(True, b"")  # empty input → all empty
     assert opened == []
     assert txns == []
+    assert reset == []
 
 
 def test_parse_llm_semantics_openai_chat():

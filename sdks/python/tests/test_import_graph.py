@@ -467,6 +467,16 @@ def _silent_swallow_node(node: ast.AST) -> bool:
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
             if name in _REPORTING_CALLS:
                 return False
+            # `counters.tally.append(label)` is `bump` for a handler at the recursion limit,
+            # where a Python call raises again (`Counters` in `_assembly/_diag.py`). Matched on
+            # the receiver too, so an ordinary `.append` is no evidence.
+            if (
+                name == "append"
+                and isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Attribute)
+                and func.value.attr == "tally"
+            ):
+                return False
     return True
 
 
@@ -1652,15 +1662,14 @@ _CS4_BUDGET = {
 # let a SECOND suppress land in a module already listed and change nothing that
 # any test can see, and that arrival is the entire reason this table exists.
 # It may only shrink.
-_ASSEMBLY_SUPPRESS: dict[str, tuple[str, ...]] = {
-    # `_current_task()` asks "is there a running event loop" and RETURNS the
-    # answer — the thread, when there is not. `asyncio.current_task()` is the
-    # only public spelling of that question and reports "no loop" by raising, so
-    # the RuntimeError is the answer rather than a failure, and nothing is being
-    # hidden from anyone. A counter here would fire on every synchronous
-    # `activate()` and be noise, not evidence.
-    "_assembly/_units.py": ("RuntimeError",),
-}
+#
+# Empty since the one entry it held left: `_current_task()` in `_assembly/_units.py`
+# suppressed the RuntimeError `asyncio.current_task()` raises for "no running
+# event loop", which was the ANSWER to its question, not a failure. It now asks
+# through `asyncio._get_running_loop()`, which answers None in C with no
+# exception in flight: handling that raise on the open path of every unit, at the
+# recursion limit, chained the host's own RecursionError onto wardex's RuntimeError.
+_ASSEMBLY_SUPPRESS: dict[str, tuple[str, ...]] = {}
 
 
 def _suppressed_exceptions(under: tuple[str, ...]) -> dict[str, tuple[str, ...]]:

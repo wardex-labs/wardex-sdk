@@ -3,9 +3,10 @@ from wardex_sdk._protocol._http2 import Http2Parser
 
 def test_http2_parser_feed_returns_tuple():
     p = Http2Parser()
-    opened, txns = p.feed(True, b"")
+    opened, txns, reset = p.feed(True, b"")
     assert opened == []
     assert txns == []
+    assert reset == []
 
 
 def test_truncated_hpack_size_update_latches_off_instead_of_raising():
@@ -20,11 +21,11 @@ def test_truncated_hpack_size_update_latches_off_instead_of_raising():
     # A well-formed request on stream 3 (`:method GET`, `:path /` from the
     # static table), END_HEADERS | END_STREAM. On a fresh parser it opens.
     request = bytes.fromhex("0000020105000000038284")
-    assert Http2Parser().feed(True, request)[0] == [3]
+    assert Http2Parser().feed(True, request)[0] == [(3, "/")]
 
     p = Http2Parser()
-    assert p.feed(False, poison) == ([], [])
-    assert p.feed(True, request) == ([], []), "the parser must stay latched off"
+    assert p.feed(False, poison) == ([], [], [])
+    assert p.feed(True, request) == ([], [], []), "the parser must stay latched off"
 
 
 # A HEADERS frame (END_HEADERS, stream 1) whose one-octet HPACK block is an

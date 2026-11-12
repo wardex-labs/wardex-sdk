@@ -13,9 +13,21 @@ class Http2Parser:
     def __init__(self, limits: object | None = None) -> None:
         self._native = _wardex_native.protocol.Http2Parser(limits)
 
-    def feed(self, from_client: bool, data: bytes) -> tuple[list[int], list[Any]]:
-        # returns: (opened_request_streams, [native Http2Transaction ...])
-        return self._native.feed(from_client, data)
+    def feed(
+        self, from_client: bool, data: bytes
+    ) -> tuple[list[tuple[int, str | None]], list[Any], list[int]]:
+        """Feed `data`, read in the direction `from_client` names.
+
+        Returns `(opened, transactions, reset)`. `opened` is one `(stream_id, path)` pair per stream
+        whose request ended in this call, in arrival order; `path` is the request `:path` read as
+        the request ended, kept across the stream table evicting the request's header block before
+        its end, and None when the request carried none or that memory dropped it under the same
+        bound. It is read there because the stream table evicts within the same call, so no later
+        question could answer it. `transactions` are the native transactions whose response ended
+        in this call. `reset` is the stream ids a RST_STREAM ended in this call, in arrival order,
+        whichever peer sent it: no transaction will ever complete for them.
+        """
+        return self._native.feed(from_client, data)  # type: ignore[no-any-return]
 
     def disabled_reason(self) -> str | None:
         """Why the connection latched off, if it did — a debug string, never a
@@ -26,8 +38,3 @@ class Http2Parser:
         """The connection closed: every stream whose response status arrived and whose response
         never ended, as native transactions with `response_ended` False."""
         return self._native.finish()  # type: ignore[no-any-return]
-
-    def request_path(self, stream_id: int) -> str | None:
-        """The request path of `stream_id` while the native stream table holds its request half;
-        None when unknown, evicted, completed or reset."""
-        return self._native.request_path(stream_id)  # type: ignore[no-any-return]

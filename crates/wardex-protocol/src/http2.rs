@@ -290,6 +290,21 @@ pub struct Http2FeedResult {
     /// Client stream ids whose END_STREAM arrived in this call, in arrival
     /// order: the request is fully sent and its response is now awaited.
     pub opened_request_streams: Vec<u32>,
+    /// The request `:path` of each stream in `opened_request_streams`, at the
+    /// same index, read the moment its END_STREAM arrived. A request whose
+    /// header block the bound evicted before its END_STREAM arrived still has
+    /// its path here, kept from the eviction (`Http2Connection::evicted_paths`).
+    /// None when the request carried no `:path`, or when that memory dropped
+    /// it under the same bound. Read here rather than asked for later because
+    /// the stream table evicts within the same call: a second request ending
+    /// in the same bytes can push the first out before the caller sees either.
+    pub opened_request_paths: Vec<Option<String>>,
+    /// Stream ids a RST_STREAM ended in this call, in arrival order, whichever
+    /// peer sent it: a host cancelling its own request and a server refusing
+    /// one end the stream alike. No transaction will ever complete for them,
+    /// so a caller holding state per stream can let it go here rather than
+    /// waiting for an answer that will not come.
+    pub reset_streams: Vec<u32>,
     /// Exchanges whose response ended in this call, in completion order,
     /// which need not be stream id order.
     pub transactions: Vec<Http2Transaction>,
@@ -428,6 +443,20 @@ pub struct Http2Connection {
     /// memory has forgotten falls back to the rules above; it is forgotten
     /// only because of that same bound.
     reset: BTreeSet<u32>,
+    /// The `:path` of each request whose header block the bound evicted
+    /// before its END_STREAM arrived, read back by `mark_ended` when that
+    /// END_STREAM does arrive. Two tasks writing to one connection interleave
+    /// their frames (HEADERS 1, HEADERS 3, DATA 1, DATA 3), so at a small
+    /// `max_streams` the second header block evicts the first before the
+    /// first request ends; without this the request was announced with no
+    /// path, and the caller could no longer tell a model call from any other.
+    ///
+    /// Held to `max_streams`, lowest id first: the same cap as the table, so
+    /// an id this memory drops is lost to the very bound that evicted it.
+    /// An entry leaves when its request ends, when a RST_STREAM ends the
+    /// stream, when its response ships or is handed back by `finish`, so it
+    /// cannot outlive its stream.
+    evicted_paths: BTreeMap<u32, String>,
     /// The first stream id whose request half this connection held — and so,
     /// with ids only increasing, the lowest. Zero until one is. The floor keeps the mark from claiming a stream
     /// opened before capture attached: that stream's id is below every id
@@ -451,6 +480,7 @@ impl std::fmt::Debug for Http2Connection {
             .field("preface_seen", &self.preface_seen)
             .field("evicted_through", &self.evicted_through)
             .field("reset", &self.reset.len())
+            .field("evicted_paths", &self.evicted_paths.len())
             .field("disabled", &self.disabled)
             .finish_non_exhaustive()
     }
@@ -482,6 +512,7 @@ impl Http2Connection {
             disabled: None,
             evicted_through: 0,
             reset: BTreeSet::new(),
+            evicted_paths: BTreeMap::new(),
             first_request: 0,
             limits,
         }
@@ -569,6 +600,7 @@ impl Http2Connection {
             if let Some(s) = held {
                 out.push(s.into_transaction(id, false));
                 self.reset.insert(id);
+                self.evicted_paths.remove(&id);
             }
         }
         let cap = self.limits.max_streams.max(1);
@@ -577,16 +609,6 @@ impl Http2Connection {
         }
         out.sort_by_key(|t| t.stream_id);
         out
-    }
-
-    /// The `:path` of the request on `stream_id`, while the stream table
-    /// holds its request half. None when the path is unknown: no client
-    /// header block for that id was seen, the table evicted the request half,
-    /// or the stream already completed or was reset. The host asks this of a
-    /// stream whose correlation entry it is about to drop, to decide what
-    /// that stream was, and must read None as "cannot say".
-    pub fn request_path(&self, stream_id: u32) -> Option<String> {
-        self.streams.get(&stream_id).and_then(|s| s.path.clone())
     }
 
     /// Bytes both frame decoders copied into their buffers or relocated
@@ -604,6 +626,7 @@ impl Http2Connection {
         self.pending_bytes = 0;
         self.streams = BTreeMap::new();
         self.orphans = BTreeMap::new();
+        self.evicted_paths = BTreeMap::new();
         self.preface_buf = Vec::new();
     }
 
@@ -650,7 +673,15 @@ impl Http2Connection {
             };
             if st.request_seen {
                 self.evicted_through = self.evicted_through.max(id);
+                if !st.req_ended {
+                    if let Some(path) = st.path {
+                        self.evicted_paths.insert(id, path);
+                    }
+                }
             }
+        }
+        while self.evicted_paths.len() > cap {
+            self.evicted_paths.pop_first();
         }
         while self.orphans.len() > cap {
             // Already under the mark, so the mark has nothing to learn.
@@ -697,8 +728,14 @@ impl Http2Connection {
             FRAME_RST_STREAM => {
                 self.streams.remove(&frame.stream_id);
                 self.orphans.remove(&frame.stream_id);
+                self.evicted_paths.remove(&frame.stream_id);
                 if let Some(p) = self.pending.remove(&frame.stream_id) {
                     self.pending_bytes -= p.buf.len();
+                }
+                // Stream 0 names the connection, which RST_STREAM cannot end
+                // (RFC 9113 section 6.4): no caller holds anything under it.
+                if frame.stream_id != 0 {
+                    result.reset_streams.push(frame.stream_id);
                 }
                 self.reset.insert(frame.stream_id);
                 let cap = self.limits.max_streams.max(1);
@@ -933,6 +970,13 @@ impl Http2Connection {
     }
 
     fn mark_ended(&mut self, from_client: bool, stream_id: u32, result: &mut Http2FeedResult) {
+        // Taken before the entry is borrowed: the path the bound kept when
+        // it evicted this request's header block before the request ended.
+        let kept_path = if from_client {
+            self.evicted_paths.remove(&stream_id)
+        } else {
+            None
+        };
         let st = self.stream(stream_id);
         if from_client {
             // Announced even when the request half was evicted before its
@@ -944,6 +988,9 @@ impl Http2Connection {
             if !st.req_ended {
                 st.req_ended = true;
                 result.opened_request_streams.push(stream_id);
+                result
+                    .opened_request_paths
+                    .push(st.path.clone().or(kept_path));
             }
         } else {
             st.resp_ended = true;
@@ -951,6 +998,7 @@ impl Http2Connection {
         if st.resp_ended {
             let s = self.streams.remove(&stream_id);
             if let Some(s) = s.or_else(|| self.orphans.remove(&stream_id)) {
+                self.evicted_paths.remove(&stream_id);
                 result
                     .transactions
                     .push(s.into_transaction(stream_id, true));
@@ -2180,37 +2228,96 @@ mod tests {
     }
 
     #[test]
-    fn request_path_answers_while_the_table_holds_the_request() {
+    fn opened_streams_carry_their_paths_even_when_evicted_in_the_same_feed() {
         let limits = Limits {
-            max_streams: 2,
+            max_streams: 1,
             ..Default::default()
         };
         let mut c = Http2Connection::new(limits);
         let block = |p: &[u8]| hpack(&[(b":method", b"POST"), (b":path", p)]);
-        assert_eq!(c.request_path(1), None, "never seen");
-        feed_setup(
-            &mut c,
-            true,
-            &frame(FRAME_HEADERS, FH | FS, 1, &block(b"/one")),
+        // Two whole requests in one write: the bound evicts stream 1 when
+        // stream 3 opens, before the caller can ask anything about stream 1.
+        let mut req = frame(FRAME_HEADERS, FH | FS, 1, &block(b"/one"));
+        req.extend_from_slice(&frame(FRAME_HEADERS, FH | FS, 3, &block(b"/three")));
+        let r = c.feed(true, &req);
+        assert_eq!(r.opened_request_streams, vec![1, 3]);
+        assert_eq!(
+            r.opened_request_paths,
+            vec![Some("/one".to_owned()), Some("/three".to_owned())]
         );
-        assert_eq!(c.request_path(1).as_deref(), Some("/one"));
 
-        // Completed: the entry left with its transaction.
-        let mut resp = frame(FRAME_HEADERS, FH, 1, &hpack(&[(b":status", b"200")]));
-        resp.extend_from_slice(&frame(FRAME_DATA, FS, 1, b""));
-        assert_eq!(c.feed(false, &resp).transactions.len(), 1);
-        assert_eq!(c.request_path(1), None);
+        // A request whose header block the bound evicted before its
+        // END_STREAM arrived is still announced with its path: the bound
+        // kept it when it evicted the block.
+        let mut c = Http2Connection::new(limits);
+        let mut req = frame(FRAME_HEADERS, FH, 5, &block(b"/five"));
+        req.extend_from_slice(&frame(FRAME_HEADERS, FH | FS, 7, &block(b"/seven")));
+        req.extend_from_slice(&frame(FRAME_DATA, FS, 5, b""));
+        let r = c.feed(true, &req);
+        assert_eq!(r.opened_request_streams, vec![7, 5]);
+        assert_eq!(
+            r.opened_request_paths,
+            vec![Some("/seven".to_owned()), Some("/five".to_owned())]
+        );
+        assert!(c.evicted_paths.is_empty(), "read back once, then let go");
+    }
 
-        // Evicted by the bound: the lowest id goes, and its path with it.
-        for (sid, p) in [(3u32, b"/three"), (5, b"/five_"), (7, b"/seven")] {
-            feed_setup(&mut c, true, &frame(FRAME_HEADERS, FH | FS, sid, &block(p)));
+    #[test]
+    fn interleaved_requests_keep_the_path_of_the_one_the_bound_evicted() {
+        // Two tasks on one connection interleave their frames: HEADERS 1,
+        // HEADERS 3, DATA 1 (END_STREAM), DATA 3 (END_STREAM). At a bound of
+        // one, stream 3's header block evicts stream 1's before stream 1's
+        // request ends. Its END_STREAM must still report the path it went to.
+        let limits = Limits {
+            max_streams: 1,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = hpack(&[(b":method", b"POST"), (b":path", b"/v1/chat/completions")]);
+        let mut req = frame(FRAME_HEADERS, FH, 1, &block);
+        req.extend_from_slice(&frame(FRAME_HEADERS, FH, 3, &block));
+        req.extend_from_slice(&frame(FRAME_DATA, FS, 1, b"{}"));
+        req.extend_from_slice(&frame(FRAME_DATA, FS, 3, b"{}"));
+        let r = c.feed(true, &req);
+        assert_eq!(r.opened_request_streams, vec![1, 3]);
+        let chat = Some("/v1/chat/completions".to_owned());
+        assert_eq!(r.opened_request_paths, vec![chat.clone(), chat]);
+        assert!(c.evicted_paths.len() <= 1, "held to max_streams");
+    }
+
+    #[test]
+    fn kept_paths_are_held_to_max_streams_and_let_go_on_reset() {
+        let limits = Limits {
+            max_streams: 1,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = |p: &[u8]| hpack(&[(b":method", b"POST"), (b":path", p)]);
+        let mut req = Vec::new();
+        for (sid, p) in [(1u32, &b"/a"[..]), (3, b"/b"), (5, b"/c")] {
+            req.extend_from_slice(&frame(FRAME_HEADERS, FH, sid, &block(p)));
         }
-        assert_eq!(c.request_path(3), None);
-        assert_eq!(c.request_path(5).as_deref(), Some("/five_"));
+        feed_setup(&mut c, true, &req);
+        // Streams 1 and 3 were evicted unended; the memory holds one, the
+        // highest, because the lowest id goes first.
+        assert_eq!(c.evicted_paths.keys().copied().collect::<Vec<_>>(), [3]);
+        feed_setup(&mut c, true, &frame(FRAME_RST_STREAM, 0, 3, &[0, 0, 0, 8]));
+        assert!(c.evicted_paths.is_empty(), "a reset stream keeps no path");
+    }
 
-        // Reset: forgotten too.
-        feed_setup(&mut c, true, &frame(FRAME_RST_STREAM, 0, 5, &[0, 0, 0, 8]));
-        assert_eq!(c.request_path(5), None);
-        assert_eq!(c.request_path(7).as_deref(), Some("/seven"));
+    #[test]
+    fn rst_stream_reports_the_stream_it_ended_from_either_peer() {
+        let mut c = Http2Connection::new(Limits::default());
+        let block = hpack(&[(b":method", b"POST"), (b":path", b"/s")]);
+        let mut req = frame(FRAME_HEADERS, FH, 1, &block);
+        req.extend_from_slice(&frame(FRAME_HEADERS, FH, 3, &block));
+        feed_setup(&mut c, true, &req);
+
+        let r = c.feed(true, &frame(FRAME_RST_STREAM, 0, 1, &[0, 0, 0, 8]));
+        assert_eq!(r.reset_streams, vec![1], "the host cancelled stream 1");
+        let r = c.feed(false, &frame(FRAME_RST_STREAM, 0, 3, &[0, 0, 0, 7]));
+        assert_eq!(r.reset_streams, vec![3], "the server refused stream 3");
+        let r = c.feed(true, &frame(FRAME_RST_STREAM, 0, 0, &[0, 0, 0, 8]));
+        assert!(r.reset_streams.is_empty(), "stream 0 is the connection");
     }
 }

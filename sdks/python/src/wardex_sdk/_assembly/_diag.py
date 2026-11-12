@@ -73,14 +73,30 @@ class Counters:
     behind it. A bump left in the inbox is not lost: every reader folds before
     it reads. The readers do take the lock and wait for it: they are
     diagnostics and tests, never the export or signal path.
+
+    `tally` is the count for a site that runs at the interpreter's recursion
+    limit, where `bump` cannot be called: it is a Python call, so it pushes the
+    frame the limit refuses and raises a second `RecursionError` from inside the
+    handler. `tally` IS the inbox (the same deque, never rebound, cleared in
+    place by `reset` and the fork child), so `counters.tally.append("<label>")`
+    is an attribute load and one C call, no frame, and the next fold (the
+    `_FOLD_AT`th bump, or any reader) counts the label exactly as a bump would
+    have. On 3.10 and 3.11 a C call counts against the limit too; an append that
+    still meets it raises out of the handler, as the host's next call would.
+    Rules: use it only in an `except RecursionError:` handler (everywhere else,
+    `bump`), and the label is a counter name `tests/test_drop_ledger_census.py`
+    classifies like any bump's. A tally still in the inbox when the process
+    exits is lost the way a bump still in it is: every reader folds first, and
+    nothing ships these counters, so there is no later reader to miss it.
     """
 
-    __slots__ = ("_counts", "_folding", "_inbox", "_lock")
+    __slots__ = ("_counts", "_folding", "_inbox", "_lock", "tally")
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._counts: dict[str, int] = {}
         self._inbox: deque[str] = deque()
+        self.tally = self._inbox  # see the class docstring: one object, two names
         self._folding = False
 
     def bump(self, where: str) -> None:

@@ -380,32 +380,34 @@ _JSON_ANSWER = (
 
 
 @pytest.mark.parametrize(
-    ("path", "reset_three", "answer", "witnessed"),
+    ("path", "answer", "witnessed"),
     [
-        ("/v1/chat/completions", True, "sse", True),
-        ("/v1/chat/completions", False, "sse", True),
-        ("/v1/chat/completions", False, "json", True),
-        ("/v1/chat/completions", False, None, False),
-        ("/v1/anything/else", True, None, False),
+        ("/v1/chat/completions", "sse", True),
+        ("/v1/chat/completions", "json", True),
+        ("/v1/chat/completions", None, False),
+        ("/v1/anything/else", None, False),
     ],
     ids=[
-        "parser-still-holds-it",
         "parser-evicted-it-too",
         "parser-evicted-it-too-json",
         "never-answered",
         "not-a-model-call",
     ],
 )
-def test_a_model_call_the_h2_latch_cap_evicts_is_counted_once(path, reset_three, answer, witnessed):
+def test_a_model_call_the_h2_latch_cap_evicts_is_counted_once(path, answer, witnessed):
     """`max_streams=2`, three streams under a held chat unit: the cap evicts stream 1's latch
     entry, so its answer reaches the seal parentless, and without a witness the unit would promote
     the framework's usage while the wire span ships its own: one call counted twice.
 
-    With stream 3 reset the parser still holds stream 1's request; without it the parser's table
-    evicts it in the same write, and the answer would ship `? /` with its usage read from the body
-    alone. The tracker kept the path from the stream's opening, so either way the answer ships under
-    its model-call path and the seal witnesses the evicted parent. A call never answered leaves the
-    unit's number promoted, and is counted."""
+    The parser's table evicts stream 1's request in the same write, and the answer would ship `? /`
+    with its usage read from the body alone. The tracker kept the path from the stream's opening,
+    so the answer ships under its model-call path and the seal witnesses the evicted parent. A call
+    never answered leaves the unit's number promoted, and is counted.
+
+    A case where the parser still held the request the latch had evicted used to be reachable by
+    resetting stream 3 (the parser let it go, the latch kept it). The parser now reports reset ids
+    and the latch lets them go too, so the two tables stay in step and that case no longer arises;
+    `test_h2_evicted_unanswered.py` covers the reset itself."""
     from hpack import Encoder
 
     from wardex_sdk._interceptors._trackers import _Http2Tracker
@@ -424,8 +426,6 @@ def test_a_model_call_the_h2_latch_cap_evicts_is_counted_once(path, reset_three,
 
     tracker.on_request_bytes(opened(1))
     tracker.on_request_bytes(opened(3))
-    if reset_three:
-        tracker.on_request_bytes(_h2_frame(0x3, 0x0, 3, b"\x00\x00\x00\x08"))  # RST_STREAM
     tracker.on_request_bytes(opened(5))
     assert 1 not in tracker._latch, "precondition: the cap evicted stream 1's latch entry"
     txns = []
@@ -456,9 +456,7 @@ def test_a_model_call_the_h2_latch_cap_evicts_is_counted_once(path, reset_three,
     unanswered = path == "/v1/chat/completions" and answer is None
     assert counters.get("protocol.http2.evicted_call_unanswered") == int(unanswered)
     if witnessed:
-        assert [s.name for s in wire] == [
-            "HTTP POST /v1/chat/completions" if reset_three else "HTTP ? /v1/chat/completions"
-        ]
+        assert [s.name for s in wire] == ["HTTP ? /v1/chat/completions"]
 
 
 def test_a_held_chat_unit_with_no_request_promotes_every_spelling_and_says_so():

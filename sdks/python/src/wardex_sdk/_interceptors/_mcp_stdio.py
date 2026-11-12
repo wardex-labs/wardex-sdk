@@ -87,18 +87,16 @@ from ._mcp_result import (
     span_tool_name,
 )
 
-# OPTIONAL, and it has to be: anyio is a third-party package, this wheel
-# declares no runtime dependencies, and `_backends._asyncio` is anyio's PRIVATE
-# layout on top of that. As a plain top-level import it made this module
-# unimportable in an environment without anyio, and `wardex.init(intercept=True)`
-# imports this module — so the interceptor whose promise is never to alter the
-# host took the host down at startup over a package the user never installed.
-# `except Exception` and not `except ImportError`: importing a third party runs
-# code wardex does not own, and I6 does not exempt the ways that code can fail.
-# Both halves are probed in a real interpreter — an absent anyio and an anyio
-# whose module body raises — because neither is visible to a monkeypatch.
-# Counted rather than silent (C-S4) — `install()` below turns it into one line
-# on stderr for a person, and the seam that needs it declines.
+# OPTIONAL, and it has to be: anyio is a third-party package, this wheel declares no runtime
+# dependencies, and `_backends._asyncio` is anyio's PRIVATE layout on top of that. As a plain
+# top-level import it made this module unimportable in an environment without anyio, and
+# `wardex.init(intercept=True)` imports this module — so the interceptor whose promise is never to
+# alter the host took the host down at startup over a package the user never installed.
+# `except Exception` and not `except ImportError`: importing a third party runs code wardex does not
+# own, and I6 does not exempt the ways that code can fail. Both halves are probed in a real
+# interpreter — an absent anyio and an anyio whose module body raises — because neither is visible
+# to a monkeypatch. Counted rather than silent (C-S4) — `install()` below turns it into one line on
+# stderr for a person, and the seam that needs it declines.
 try:
     import anyio._backends._asyncio as _aio_backend
 except Exception:  # noqa: BLE001 — an absent optional backend is not a crash
@@ -157,11 +155,10 @@ class _Pending:
 class _ProcState:
     """JSON-RPC correlation state for a single subprocess (stdin request <-> stdout response)."""
 
-    # Sourced from the core default (not a hardcoded literal), so it can never
-    # silently drift from crates/wardex-limits. Kept as a class attribute for
-    # direct-construction callers/tests; the interceptor overrides it per-instance
-    # via the sniff_limit constructor argument, sourced from the resolved config
-    # at install() time.
+    # Sourced from the core default (not a hardcoded literal), so it can never silently drift from
+    # crates/wardex-limits. Kept as a class attribute for direct-construction callers/tests; the
+    # interceptor overrides it per-instance via the sniff_limit constructor argument, sourced from
+    # the resolved config at install() time.
     SNIFF_LIMIT = _wardex_native.limits_defaults()["mcp_sniff_bytes"]
 
     def __init__(
@@ -172,12 +169,10 @@ class _ProcState:
         debug: bool = False,
     ) -> None:
         self._sniff_limit = sniff_limit if sniff_limit is not None else self.SNIFF_LIMIT
-        # The configured capture policy, resolved once at wrap time the way
-        # `_sniff_limit` and the native limits already are (config is frozen
-        # after init). `ALL` is the default for the same reason
-        # `assembly.capture_mode_of(None)` returns it: a state built without a
-        # client has no policy to apply, and an unconfigured wardex filters
-        # nothing.
+        # The configured capture policy, resolved once at wrap time the way `_sniff_limit` and the
+        # native limits already are (config is frozen after init). `ALL` is the default for the same
+        # reason `assembly.capture_mode_of(None)` returns it: a state built without a client has no
+        # policy to apply, and an unconfigured wardex filters nothing.
         self._mode = mode
         # Only reaches `guard()`: a swallowed span-assembly failure is always
         # counted, and under debug it is also logged with a traceback.
@@ -375,12 +370,10 @@ def _build_mcp_span(
     output_data = result_bytes
     tool: ToolAttributes | None = None
     status = StatusCode.ERROR if resp.error is not None else StatusCode.OK
-    # `SpanDraft.finish()` refuses `status=ERROR` without an `error_type`, and
-    # this span shipped exactly that pair until now — the same defect the
-    # adapter had. The JSON-RPC error object carries the answer
-    # (`{"code": -32601, ...}`), so the type is derived from it rather than
-    # invented; an unreadable error body degrades to the generic name instead of
-    # deleting the span.
+    # `SpanDraft.finish()` refuses `status=ERROR` without an `error_type`, and this span shipped
+    # exactly that pair until now — the same defect the adapter had. The JSON-RPC error object
+    # carries the answer (`{"code": -32601, ...}`), so the type is derived from it rather than
+    # invented; an unreadable error body degrades to the generic name instead of deleting the span.
     error_type: str | None = _json_rpc_error_type(resp.error) if resp.error is not None else None
     uninterpreted = False
     params = json_object(params_bytes)
@@ -535,6 +528,8 @@ def _maybe_log_disabled(client: Client | None, state: _ProcState, pid: int | Non
             return
         state.disabled_logged = True
         report_stream_parser_disabled(reason, pid, client)
+    except RecursionError:  # at the limit: C calls only; the host's call is outside
+        counters.tally.append("interceptors.mcp_stdio.disabled_report.recursion_limit")
     except Exception:  # noqa: BLE001 — off-span reporting must never break capture
         pass
 
@@ -694,6 +689,8 @@ class McpStdioInterceptor(InterceptorInterface):
                 _maybe_log_disabled(client, state, pid)
                 if state.should_detach():
                     detach()  # not an MCP server
+            except RecursionError:  # at the limit: C calls only; the host's call is outside
+                counters.tally.append("interceptors.mcp_stdio.send.recursion_limit")
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return await _osend(data)
@@ -727,6 +724,8 @@ class McpStdioInterceptor(InterceptorInterface):
                     # other spelling of EOF, and some anyio backends use it.
                     state.on_stream_end()
                     detach()
+            except RecursionError:  # at the limit: C calls only; the host's call is outside
+                counters.tally.append("interceptors.mcp_stdio.receive.recursion_limit")
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return data
@@ -770,6 +769,8 @@ class McpStdioInterceptor(InterceptorInterface):
                 _maybe_log_disabled(client, state, pid)
                 if state.should_detach():
                     detach()
+            except RecursionError:  # at the limit: C calls only; the host's call is outside
+                counters.tally.append("interceptors.mcp_stdio.write.recursion_limit")
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return _owrite(data)
@@ -788,6 +789,8 @@ class McpStdioInterceptor(InterceptorInterface):
                     detach()
                 elif state.should_detach():
                     detach()
+            except RecursionError:  # at the limit: C calls only; the host's call is outside
+                counters.tally.append("interceptors.mcp_stdio.readline.recursion_limit")
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return data

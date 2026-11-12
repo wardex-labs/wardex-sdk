@@ -35,6 +35,28 @@ from .._types import ConversationContext, ParsedMessage, SpanContext
 from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
 
 
+def header_get(headers: object, name: str) -> str | None:
+    """Looks up the value for name (case-insensitive) in ParsedMessage.headers
+    (a sequence of tuples)."""
+    target = name.lower()
+    for h in headers:  # type: ignore[union-attr]
+        if h[0].lower() == target:
+            return h[1]
+    return None
+
+
+def is_ws_upgrade_request(headers: object) -> bool:
+    """Does this request header block ask to upgrade the connection to a WebSocket?"""
+    up = header_get(headers, "upgrade")
+    conn = header_get(headers, "connection")
+    return (
+        up is not None
+        and "websocket" in up.lower()
+        and conn is not None
+        and "upgrade" in conn.lower()
+    )
+
+
 @dataclass(frozen=True)
 class Issue:
     """Where a request was issued, read where its first byte was seen."""
