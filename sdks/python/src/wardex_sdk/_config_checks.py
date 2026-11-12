@@ -187,14 +187,31 @@ def _unknown_keywords(owner: str, unknown: list[str], accepted: tuple[str, ...])
 def is_http_url(value: object) -> bool:
     """Whether `value` is an absolute `http://` or `https://` URL with a host:
     something a POST can actually be sent to."""
+    return url_flaw(value) is None
+
+
+def url_flaw(value: object) -> str | None:
+    """Why no POST can reach `value`: "address" (no http(s) scheme or host, or a
+    port out of range), "userinfo" (a `user:password@` the exporter cannot
+    send), or None."""
     try:
         parts = urlsplit(value)  # type: ignore[arg-type]
         scheme = parts.scheme
-        return (
-            isinstance(scheme, str) and scheme.lower() in ("http", "https") and bool(parts.hostname)
-        )
+        if not (isinstance(scheme, str) and scheme.lower() in ("http", "https")):
+            return "address"
+        if not parts.hostname:
+            return "address"
+        parts.port  # noqa: B018 - raises ValueError for a port out of range or not a number
     except (TypeError, ValueError, AttributeError):
-        return False
+        return "address"
+    return "userinfo" if "@" in parts.netloc else None
+
+
+#: Said after a refused endpoint that carried a credential before its host.
+USERINFO_FIX = (
+    "Write the URL without the user:password and send the credential as a header: "
+    "backend.headers (or OTEL_EXPORTER_OTLP_HEADERS) with Authorization: Basic <base64>."
+)
 
 
 def require_http_url(endpoint: str | None, *, field: str = "backend.endpoint") -> None:
@@ -207,6 +224,11 @@ def require_http_url(endpoint: str | None, *, field: str = "backend.endpoint") -
     query or its userinfo, and this message ends up in tracebacks and logs.
     An empty string is left alone, as unset: `init()` already reads it so.
     """
+    if endpoint and url_flaw(endpoint) == "userinfo":
+        raise ValueError(
+            f"{field} carries a user name or password before its host, which the exporter "
+            f"cannot send, so every export to it would fail. {USERINFO_FIX}"
+        )
     if endpoint and not is_http_url(endpoint):
         raise ValueError(
             f"{field} must be an absolute http:// or https:// URL with a host, such as "

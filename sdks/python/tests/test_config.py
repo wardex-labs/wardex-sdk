@@ -652,6 +652,32 @@ def test_an_absolute_http_endpoint_is_accepted_as_written(endpoint):
     assert BackendConfig(endpoint=endpoint).endpoint == endpoint
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "says"),
+    [
+        ("http://127.0.0.1:99999/", "absolute http:// or https:// URL"),
+        ("http://collector:port/", "absolute http:// or https:// URL"),
+        ("http://user:pAssW0rd@collector:4318/", "Authorization: Basic"),
+    ],
+    ids=["port-out-of-range", "port-not-a-number", "userinfo"],
+)
+def test_an_endpoint_whose_port_or_credential_no_export_can_use_is_refused(endpoint, says):
+    """Accepted, each failed every export as a name lookup error that no
+    retry could fix."""
+    with pytest.raises(ValueError, match=says) as excinfo:
+        BackendConfig(endpoint=endpoint)
+    assert "pAssW0rd" not in str(excinfo.value)
+
+
+def test_an_endpoint_variable_with_a_credential_is_said_and_installs_nothing(monkeypatch, capsys):
+    monkeypatch.setenv("WARDEX_ENDPOINT", "http://user:pAssW0rd@127.0.0.1:4318")
+    wardex_sdk.init(intercept=False)
+    err = capsys.readouterr().err
+    assert "WARDEX_ENDPOINT is set but" in err and "OTEL_EXPORTER_OTLP_HEADERS" in err
+    assert "pAssW0rd" not in err
+    assert wardex_sdk.diagnostics().initialized is False
+
+
 def test_a_refused_endpoint_is_not_quoted_back():
     """An endpoint can carry a credential, and this message reaches logs."""
     with pytest.raises(ValueError) as excinfo:

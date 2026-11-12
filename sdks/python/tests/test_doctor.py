@@ -166,6 +166,25 @@ def test_explain_all_is_the_markdown_list():
     assert "### `otlp_attribute_truncated`" in proc.stdout
 
 
+def test_the_debug_line_shows_the_config_with_its_secrets_masked(capsys):
+    import wardex_sdk as wardex
+
+    wardex.init(
+        backend=wardex.BackendConfig(
+            endpoint="http://127.0.0.1:9/v1/traces?api_key=SECRETQUERY#SECRETFRAG",
+            headers={"Authorization": "Bearer SECRETHEADER"},
+        ),
+        adapters=wardex.AdaptersConfig(enabled=()),
+        debug=True,
+    )
+    wardex.close()
+    err = capsys.readouterr().err
+    [line] = [ln for ln in err.splitlines() if "resolved config" in ln]
+    assert "backend.endpoint=http://127.0.0.1:9/v1/traces" in line
+    assert "Authorization: (masked)" in line
+    assert "SECRET" not in err
+
+
 def test_the_report_has_what_a_bug_report_needs_and_no_secret():
     import platform
 
@@ -173,7 +192,7 @@ def test_the_report_has_what_a_bug_report_needs_and_no_secret():
 
     wardex.init(
         backend=wardex.BackendConfig(
-            endpoint="http://user:pw@127.0.0.1:9/v1/traces?token=q", headers={"X-Key": _SECRET}
+            endpoint="http://127.0.0.1:9/v1/traces?token=q#frag", headers={"X-Key": _SECRET}
         ),
         adapters=wardex.AdaptersConfig(enabled=()),
     )
@@ -191,7 +210,7 @@ def test_the_report_has_what_a_bug_report_needs_and_no_secret():
     assert "ssl" in got.interceptors and "ssl.SSLSocket.recv" in got.patched
     assert "wardex-batch-worker" in got.worker_threads
     assert ("backend.headers", "{X-Key: (masked)}") in got.config
-    for leak in (_SECRET, "pw@", "token=q"):
+    for leak in (_SECRET, "token=q", "frag"):
         assert leak not in text
     assert text.startswith("wardex diagnostics\n")
     assert f"destination: {got.destination}\n" in text

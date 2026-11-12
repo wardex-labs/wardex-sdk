@@ -427,10 +427,12 @@ def init(
     if pii is None:
         _announce_pii_env(config.pii.mode)
     if config.debug:
-        # One line, at install time, with the RESOLVED config — the env
-        # fallbacks and canonicalized collections included. `api_key` is
-        # `repr=False`, so no credential can ride along.
-        _diag_info(f"resolved config: {config!r}")
+        # One line, at install time, with the RESOLVED config, masked as the
+        # report masks it: a URL's query and a header value can hold a secret.
+        from . import _environment
+
+        flat = ", ".join(f"{name}={value}" for name, value in _environment.flatten(config))
+        _diag_info(f"resolved config: {flat}")
     if transport is not None:
         resolved_transport = transport
     else:

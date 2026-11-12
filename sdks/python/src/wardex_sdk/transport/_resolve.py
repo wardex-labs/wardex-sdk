@@ -16,12 +16,14 @@ from urllib.parse import urlsplit, urlunsplit
 from .._assembly import diag_info, diag_warning
 from .._config import WARDEX_INGEST_HOSTS, BackendConfig, WardexConfig, region_of_key
 from .._config_checks import (
+    USERINFO_FIX,
     endpoint_named_for_wardex,
     env_base_url_problem,
     grpc_protocol_variable,
     otel_pairs,
     pii_off_from_env,
     unusable_env_endpoint,
+    url_flaw,
 )
 from .._enums import PIIMode
 from ._base import Transport
@@ -172,11 +174,17 @@ def default_transport(
         return transport, config
     unusable = unusable_env_endpoint()
     if unusable is not None:
+        if url_flaw(os.environ.get(unusable)) == "userinfo":
+            say(
+                f"{unusable} is set but carries a user name or password before its host, "
+                f"which the exporter cannot send, so wardex exports nothing. {USERINFO_FIX}"
+            )
+            return None, config
         say(
-            f"{unusable} is set but is not an http:// or https:// URL with a host, so wardex "
-            "exports nothing (a scheme-less host:port is the form gRPC exporters take). Set "
-            "WARDEX_ENDPOINT to the collector's OTLP/HTTP address, such as "
-            "http://collector:4318."
+            f"{unusable} is set but is not an http:// or https:// URL with a host and a valid "
+            "port, so wardex exports nothing (a scheme-less host:port is the form gRPC "
+            "exporters take). Set WARDEX_ENDPOINT to the collector's OTLP/HTTP address, such "
+            "as http://collector:4318."
         )
         return None, config
     # Unconditional, like the degraded-mode line: a wardex that exports nothing

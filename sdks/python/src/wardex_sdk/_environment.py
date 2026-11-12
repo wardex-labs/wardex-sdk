@@ -68,14 +68,14 @@ def _shown(name: str, value: Any) -> str:
     return type(value).__name__
 
 
-def _flatten(config: object, prefix: str = "") -> list[tuple[str, str]]:
+def flatten(config: object, prefix: str = "") -> list[tuple[str, str]]:
     """Every leaf setting of a config dataclass, dotted, with its shown value."""
     out: list[tuple[str, str]] = []
     for field in dataclasses.fields(config):  # type: ignore[arg-type]
         value = getattr(config, field.name, None)
         name = f"{prefix}{field.name}"
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
-            out += _flatten(value, f"{name}.")
+            out += flatten(value, f"{name}.")
         else:
             out.append((name, _shown(field.name, value)))
     return out
@@ -127,7 +127,7 @@ def environment() -> dict[str, Any]:
     if client is None:
         return facts
     with guard("diagnostics.config"):
-        facts["config"] = tuple(_flatten(client.config))
+        facts["config"] = tuple(flatten(client.config))
         facts["capture_policy"] = str(capture_mode_of(client).value)
     with guard("diagnostics.transport"):
         facts.update(transport_facts(getattr(client, "_transport", None)))
