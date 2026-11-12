@@ -598,7 +598,7 @@ def test_no_transport_and_no_endpoint_installs_nothing_and_says_so(capsys):
 
 def test_debug_prints_the_resolved_config_once(capsys):
     """`debug=True` prints the RESOLVED config at install time — the one the
-    client actually carries — and `api_key` is `repr=False`, so the line can
+    client actually carries — masked as the report masks it, so the line can
     never leak a credential."""
     wardex.init(
         intercept=False,
@@ -609,8 +609,8 @@ def test_debug_prints_the_resolved_config_once(capsys):
     try:
         err = capsys.readouterr().err
         assert err.count("[wardex] resolved config: ") == 1
-        assert "WardexConfig(" in err
-        assert "wkSecret123" not in err
+        assert "backend.api_key=set (masked)" in err
+        assert "wk-secret-123" not in err
     finally:
         wardex.close()
 

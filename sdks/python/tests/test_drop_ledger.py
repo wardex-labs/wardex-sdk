@@ -460,6 +460,7 @@ def test_a_report_whose_post_timed_out_is_resent_with_the_same_timestamp(receive
     client.capture_span(_span())
     client.capture_span(_span())  # one eviction, so the first POST carries a report
     client.flush(5.0)  # read timeout
+    client._transport._delivery._not_before = 0.0  # the silence's backoff has run out
     client.capture_span(_span())
     client.flush(5.0)
     client.close(1.0)

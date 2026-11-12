@@ -305,12 +305,12 @@ def test_the_fidelity_encoder_still_raises_on_an_unmarshallable_span():
 
 def test_a_failure_outside_the_typed_blocks_still_raises_on_the_export_path(receiver):
     """The skip is for HOST values the marshaller cannot read, not for the
-    encoder's own fields: a span whose wardex-owned `events` cannot be walked
+    encoder's own fields: a span whose wardex-owned `links` cannot be walked
     is an encoder bug, raised rather than counted as one more unmarshallable."""
     from dataclasses import replace
 
     before = _counter("transport.wardex.span_unmarshalled")
-    broken = replace(_span("broken"), events=object())  # type: ignore[arg-type]
+    broken = replace(_span("broken"), links=object())  # type: ignore[arg-type]
     with pytest.raises(Exception):  # noqa: B017 - the exact type is the encoder's
         WardexTransport(receiver, KEY).export(_envelope(broken))
     assert _Handler.received == {}

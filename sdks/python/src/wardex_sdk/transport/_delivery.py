@@ -370,6 +370,8 @@ class Delivery:
         self._failures = 0
         self._not_before = 0.0
         self._unreachable = False
+        #: The delay running was started by a request that got no answer.
+        self._silent = False
         self._last_success_at: float | None = None
         self._last_error: str | None = None
         self._last_error_at: float | None = None
@@ -418,7 +420,7 @@ class Delivery:
         self._held = deque()
         self._failures = 0
         self._not_before = 0.0
-        self._unreachable = False
+        self._unreachable = self._silent = False
         self._outage_since = self._outage_said_at = None
         self._outage_attempts = self._outage_dropped = 0
 
@@ -503,7 +505,14 @@ class Delivery:
         held bodies -- sent first, oldest first, so batches arrive in capture
         order -- did not fail again. False means the new batch waits behind
         them. Held bodies the time does not reach stay held."""
-        return time.monotonic() >= self._not_before and self.resend(headers, deadline)
+        # A signal's flush is the process's last: it does not wait out a delay
+        # that a silent receiver started, only one a failed connect or the
+        # receiver's own "later" did.
+        waiting = time.monotonic() < self._not_before
+        if waiting and self._silent and getattr(_INLINE, "depth", 0):
+            self._not_before = 0.0
+            waiting = False
+        return not waiting and self.resend(headers, deadline)
 
     def resend(self, headers: dict[str, str], deadline: float) -> bool:
         """Send the held bodies, oldest first, until the queue is empty or the
@@ -564,37 +573,36 @@ class Delivery:
                 key=f"transport.{self._wire}.retry_abandoned",
             )
 
-    def _claim_flights(self, when: str, fix: str, *, key: str) -> None:
+    def _claim_flights(self) -> str | None:
         """Close the transport to the exporters still running, and count what
         they had in flight as not confirmed delivered: nothing will wait for
-        their answers. `when` ends "were still waiting for an answer when ..."."""
+        their answers. What was claimed, as words, or None."""
         with self._lock:
             self._closed = True
             flights, self._flights = self._flights, []
         if not flights:
-            return
+            return None
         self._held = deque(h for h in self._held if all(h is not f for f in flights))
         totals: dict[DropUnit, int] = {}
         for flight in flights:
             self.lose(flight, DropReason.SEND_UNCONFIRMED)
             for unit, n in flight.units:
                 totals[unit] = totals.get(unit, 0) + n
-        report_once(
-            f"{units_text(tuple(totals.items()))} of {self._label} exports to "
-            f"{self.destination} were still waiting for an answer when {when}, so wardex "
-            f"cannot confirm they arrived and counts them as lost. {fix}",
-            key=key,
-        )
+        return units_text(tuple(totals.items()))
 
     def abandon(self, why: str) -> None:
         """The process is ending on a signal, without a close(): what is in
         flight on another thread dies unanswered, and what is held is never
         retried. Both are counted and said."""
-        self._claim_flights(
-            "the process ended on a signal",
-            "The receiver had not answered; check that it is reachable and answering.",
-            key=f"transport.{self._wire}.in_flight_at_signal",
-        )
+        claimed = self._claim_flights()
+        if claimed:
+            report_once(
+                f"{claimed} of {self._label} exports to {self.destination} were still waiting "
+                "for an answer when the process ended on a signal, so wardex cannot confirm "
+                "they arrived and counts them as lost. The receiver had not answered; check "
+                "that it is reachable and answering.",
+                key=f"transport.{self._wire}.in_flight_at_signal",
+            )
         self.give_up(why)
 
     def close(self, headers: dict[str, str], timeout: float) -> None:
@@ -604,15 +612,21 @@ class Delivery:
         the exit that much, and one that has come up since (a sidecar started a
         moment after the app) takes the rest. A request still in flight is
         claimed first and counted as not confirmed delivered."""
-        self._claim_flights(
-            "close() returned",
-            "The last attempt could not connect, so close() did not wait for this one; "
-            "check that the receiver is reachable."
-            if self._unreachable
-            else "close()'s budget ran out first; give close() a larger timeout "
-            "(batching.shutdown_timeout) to wait for the answer.",
-            key=f"transport.{self._wire}.in_flight_at_close",
-        )
+        claimed = self._claim_flights()
+        if claimed:
+            fix = (
+                "The last attempt could not connect, so close() did not wait for this one; "
+                "check that the receiver is reachable."
+                if self._unreachable
+                else "close()'s budget ran out first; give close() a larger timeout "
+                "(batching.shutdown_timeout) to wait for the answer."
+            )
+            report_once(
+                f"{claimed} of {self._label} exports to {self.destination} were still waiting "
+                f"for an answer when close() returned, so wardex cannot confirm they arrived "
+                f"and counts them as lost. {fix}",
+                key=f"transport.{self._wire}.in_flight_at_close",
+            )
         if not self._held:
             return
         self._not_before = 0.0  # one last try, whatever the receiver asked for
@@ -637,7 +651,7 @@ class Delivery:
         self._last_success_at = time.time()
         self._failures = 0
         self._not_before = 0.0
-        self._unreachable = False
+        self._unreachable = self._silent = False
         if self._outage_since is not None and self._outage_said_at is not None:
             diag_info(
                 f"{self._label} exports to {self.destination} are delivered again after "
@@ -669,6 +683,7 @@ class Delivery:
         if isinstance(exc, TimeoutError):  # a connect timeout is a URLError, retried instead
             self._failures += 1
             self._not_before = time.monotonic() + max(self._backoff(), waited)
+            self._silent = True
 
     def _backoff(self) -> float:
         """The next delay: doubling per failure up to the cap, half of it jitter."""
@@ -686,6 +701,7 @@ class Delivery:
         self._last_error = describe(exc)
         self._last_error_at = time.time()
         self._unreachable = http_status(exc) is None
+        self._silent = False
         self.last_reason = self._classify(exc)[0]
         self._failures += 1
         delay = retry_after(exc)

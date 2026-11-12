@@ -703,6 +703,9 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_client.py", "report_lost", "'client.closed.declined_after_close'"): L(
         "SHUTDOWN_TAIL", at="_client.py"
     ),
+    ("_client.py", "report_lost", "'client.signal.behind_an_export'"): L(
+        "SHUTDOWN_TAIL", at="_client.py"
+    ),
     ("_client.py", "report_lost", "'wardex.finalize.after_close'"): L(
         "SHUTDOWN_TAIL", at="_client.py"
     ),
@@ -875,7 +878,10 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "NETWORK_ERROR", "RATELIMIT_BACKOFF", "SEND_UNCONFIRMED", at="transport/_otlp_http.py"
     ),
     ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.in_flight_at_close'"): L(
-        "SEND_UNCONFIRMED"
+        "SEND_UNCONFIRMED", at="transport/_delivery.py"
+    ),
+    ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.in_flight_at_signal'"): L(
+        "SEND_UNCONFIRMED", at="transport/_delivery.py"
     ),
     ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.retry_abandoned'"): L(
         "NETWORK_ERROR", "RATELIMIT_BACKOFF", "SEND_UNCONFIRMED", at="transport/_otlp_http.py"
