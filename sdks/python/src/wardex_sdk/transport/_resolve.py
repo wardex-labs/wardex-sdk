@@ -45,7 +45,7 @@ def announce_pii_env(mode: PIIMode) -> None:
     a value that is neither on nor off and so left masking on."""
     raw = os.environ.get("WARDEX_PII", "")
     if mode is PIIMode.OFF:
-        diag_info(
+        diag_warning(
             f"PII masking is off (WARDEX_PII={raw.strip()}): captured text is exported as "
             "written, URL credentials excepted. Unset WARDEX_PII or set it to on to mask it."
         )
@@ -180,12 +180,12 @@ def default_transport(
         )
         return None, config
     # Unconditional, like the degraded-mode line: a wardex that exports nothing
-    # looks exactly like a backend that is up and receiving no traffic.
+    # looks exactly like a backend that is up and receiving no traffic. A
+    # warning, so a host logging at the stdlib's default level still sees it.
     say(
         "wardex is not running: no destination is configured. Set WARDEX_ENDPOINT to your "
         "collector's OTLP/HTTP URL (such as http://localhost:4318) or WARDEX_API_KEY to your "
         "wardex project key. To capture without exporting (a test, or before_send_envelope as "
-        "the only consumer), pass transport=wardex_sdk.NoOpTransport().",
-        problem=False,
+        "the only consumer), pass transport=wardex_sdk.NoOpTransport()."
     )
     return None, config

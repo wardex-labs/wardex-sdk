@@ -346,8 +346,7 @@ def init(
             _say(message)
         _say(
             f"{switch} is set, so wardex installed nothing and captures and exports nothing. "
-            "To turn wardex on, unset it or set WARDEX_DISABLED=0.",
-            problem=False,
+            "To turn wardex on, unset it or set WARDEX_DISABLED=0."
         )
         _install_nothing()
         return

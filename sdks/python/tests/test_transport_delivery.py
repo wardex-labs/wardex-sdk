@@ -163,6 +163,22 @@ def test_the_first_delivered_export_says_where_and_how_many(receiver, capsys):
     assert transport.export_state.last_success_at is not None
 
 
+def test_the_delivery_lines_carry_their_reason_for_a_log_pipeline(receiver, caplog, monkeypatch):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="wardex_sdk"):
+        OtlpHttpTransport(f"{receiver.base}/v1/traces").export(_envelope(2))
+
+        def refuse(request, timeout=None):
+            raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+        monkeypatch.setattr(urllib.request, "urlopen", refuse)
+        OtlpHttpTransport("http://collector.invalid/v1/traces").export(_envelope(1))
+    fields = {(r.wardex_reason, r.wardex_subject) for r in caplog.records if r.name == "wardex_sdk"}
+    assert ("transport.first_export_delivered", f"{receiver.base}/v1/traces") in fields
+    assert ("transport.otlp.export_failed", "http://collector.invalid/v1/traces") in fields
+
+
 #: `ExportTraceServiceResponse{partial_success{rejected_spans: 2, error_message: "too old\x07"}}`.
 _PARTIAL = b"\x0a\x0c\x08\x02\x12\x08too old\x07"
 

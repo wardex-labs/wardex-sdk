@@ -137,7 +137,11 @@ To check the install, run `python -m wardex_sdk doctor`. It reads the same
 environment as your app, sends one test span, and ends with
 `OK: <url> accepted the test span.` (exit code 0) or `FAIL:` and the fix
 (exit code 1). In your app, the first delivered export prints one line on
-stderr: `[wardex] first export delivered: N span(s) accepted by <url>`.
+stderr: `[wardex] first export delivered: N span(s) accepted by <url>`. If
+your app configures `logging`, the line goes there at INFO instead, so under
+the WARNING default of `logging.basicConfig()` set
+`logging.getLogger("wardex_sdk").setLevel(logging.INFO)` to see it; failures,
+and the line saying wardex is not running, are warnings and show either way.
 
 For Langfuse, use its OTLP base URL and its key pair as HTTP Basic auth:
 

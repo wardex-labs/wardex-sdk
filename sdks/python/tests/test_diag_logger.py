@@ -316,3 +316,43 @@ def test_a_refused_call_is_said_under_debug_by_host_and_path_only_and_rate_limit
     now[0] += _diag._REFUSED_WINDOW_S
     debug_refused_call("api.example.com", "/v1/items", "not a model call")
     assert "(6 more refused since the last such line)" in capsys.readouterr().err
+
+
+_WARNING_HOST_SCRIPT = """
+import logging, os, sys
+logging.basicConfig(stream=sys.stdout, format="HOST %(levelname)s %(message)s")  # WARNING
+for name in [k for k in os.environ if k.startswith(("WARDEX_", "OTEL_"))]:
+    del os.environ[name]
+case = sys.argv[1]
+if case == "disabled":
+    os.environ["WARDEX_DISABLED"] = "1"
+import wardex_sdk as wardex
+if case == "pii-off":
+    os.environ["WARDEX_PII"] = "off"
+    wardex.init(transport=wardex.NoOpTransport())
+else:
+    wardex.init()
+"""
+
+
+@pytest.mark.parametrize(
+    ("case", "said"),
+    [
+        ("no-destination", "wardex is not running"),
+        ("disabled", "WARDEX_DISABLED is set"),
+        ("pii-off", "PII masking is off"),
+    ],
+)
+def test_a_default_basicconfig_host_still_sees_that_wardex_is_not_doing_its_job(case, said):
+    """`logging.basicConfig()` leaves the root at WARNING. A line that changes
+    what the app gets (nothing installed, nothing masked) must pass it."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _WARNING_HOST_SCRIPT, case],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert any(
+        line.startswith("HOST WARNING") and said in line for line in proc.stdout.splitlines()
+    ), proc.stdout

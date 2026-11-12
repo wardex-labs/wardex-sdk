@@ -650,7 +650,12 @@ class Delivery:
         pid = os.getpid()
         if spans is not None and pid not in _FIRST_SUCCESS_PID:
             _FIRST_SUCCESS_PID[:] = [pid]
-            diag_info(f"first export delivered: {spans} span(s) accepted by {self.destination}")
+            diag_info(
+                f"first export delivered: {spans} span(s) accepted by {self.destination}",
+                reason="transport.first_export_delivered",
+                count=spans,
+                subject=self.destination,
+            )
 
     def refused(self, exc: BaseException, *, waited: float = 0.0) -> None:
         """A failure that is not retried. One that got no answer (the receiver
@@ -711,7 +716,12 @@ class Delivery:
                 f"for a retry, {self._outage_dropped} dropped because the queue was full."
             )
         self._outage_said_at = now
-        diag_warning(message)
+        diag_warning(
+            message,
+            reason=f"transport.{self._wire}.export_failed",
+            count=self._outage_attempts,
+            subject=self.destination,
+        )
 
 
 def hint_for(
