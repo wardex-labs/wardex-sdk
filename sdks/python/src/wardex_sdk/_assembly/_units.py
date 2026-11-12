@@ -207,45 +207,44 @@ def _current_task() -> object:
     ContextVar Token is scoped to. Used only for the pin's ownership check;
     nothing about parentage depends on it.
 
-    `suppress` and not an `except` block, and the distinction is not cosmetic:
-    C-S4 forbids a handler that leaves no trace of a swallowed FAILURE, and
-    there is no failure here. "There is no running event loop" is the ANSWER to
-    the question this function asks, and the answer is returned — the thread.
-    `asyncio.current_task()` is simply the only public spelling of the question,
-    and it reports "no loop" by raising. A counter here would fire on every
-    synchronous `activate()` and would be noise, not evidence.
+    Not `suppress`/`except`, and the distinction is not cosmetic. "There is no
+    running event loop" is the ANSWER to the question asked here, and the answer
+    is returned — the thread — so there is no failure to count (a counter would
+    fire on every synchronous `activate()`). It is asked with no exception in
+    flight: `asyncio.current_task()` reports "no loop" by raising, and handling
+    that raise at the recursion limit, on the open path of every unit, pushed
+    the frames that chained the host's own `RecursionError` onto wardex's
+    `RuntimeError`. `_get_running_loop` answers None instead, in C.
     """
-    task: object | None = None
-    with contextlib.suppress(RuntimeError):
-        task = asyncio.current_task()
+    loop = asyncio._get_running_loop()
+    task = asyncio.current_task(loop) if loop is not None else None
     return task if task is not None else threading.current_thread()
 
 
 class _Carrier:
     """One installed activation: the scope fork plus the ambient-unit entry.
 
-    Deliberately not a context manager. `activate()` is balanced and uses one of
-    these under a `try/finally`; `pin_driver()` installs one and never removes
-    it on that task, which is the whole point of a pin (design §5.6) — the
-    driver task's lifetime is bounded by the unit, so the unbalanced `set()`
-    cannot outlive it.
+    Deliberately not a context manager. `activate()` is balanced and uses one of these under a
+    `try/finally`; `pin_driver()` installs one and never removes it on that task, which is the whole
+    point of a pin (design §5.6) — the driver task's lifetime is bounded by the unit, so the
+    unbalanced `set()` cannot outlive it.
 
-    The two modes therefore use two different scope carriers, and that is
-    load-bearing rather than tidy. A pin's fork is installed by `install_span`,
-    which HAS NO FINALISER BY DESIGN — do not "simplify" it back into a context
-    manager. `activate_span` is a generator-backed CM, so its `finally` runs as
-    soon as nothing references the generator; the pin's only strong reference is
-    the `PinToken` the registry hands back, and a caller that reads `.installed`
-    off a temporary undoes the fork on the very statement that installed it,
-    silently, leaving the ambient UNIT installed and the ambient SPAN not. That
-    asymmetry ships a wrong parent at confidence 1.0 with no marker.
+    The two modes therefore use two different scope carriers, and that is load-bearing rather than
+    tidy. A pin's fork is installed by `install_span`, which HAS NO FINALISER BY DESIGN — do not
+    "simplify" it back into a context manager. `activate_span` is a generator-backed CM, so its
+    `finally` runs as soon as nothing references the generator; the pin's only strong reference is
+    the `PinToken` the registry hands back, and a caller that reads `.installed` off a temporary
+    undoes the fork on the very statement that installed it, silently, leaving the ambient UNIT
+    installed and the ambient SPAN not. That asymmetry ships a wrong parent at confidence 1.0 with
+    no marker.
     """
 
-    __slots__ = ("_fork", "_prev_scope", "_span_cm", "_token", "owner", "unit")
+    __slots__ = ("_fork", "_prev_scope", "_span_cm", "_token", "abandoned", "owner", "unit")
 
     def __init__(self, unit: Unit, *, pinned: bool) -> None:
         self.unit = unit
         self.owner = _current_task()
+        self.abandoned = False
         # The ONE entry point, in both modes. `context/_contextvar.py` installs
         # the conversation identity and the tracestate the unit carries, not
         # only the span context — a carrier that installed only the context
@@ -272,24 +271,22 @@ class _Carrier:
     def remove(self, *, where: str, debug: bool) -> None:
         """Undo the installation. MUST run on the task that installed it.
 
-        Both halves are attempted, each guarded on its own, and that is not
-        belt-and-braces. A cross-task removal raises `ValueError` from the FIRST
-        reset — a Token may only be reset in the Context that created it — and
-        bailing there would leave `activate_span`'s generator suspended at its
-        `yield`. The garbage collector closes such a generator on some later,
-        unrelated frame; its `finally` raises the same `ValueError` again, and
-        THAT one lands as an unraisable exception in the host's stderr with a
-        traceback the host cannot connect to anything it called. Driving the
-        generator to completion here — even into its failure — is what keeps a
-        misuse of `activate()` a counter instead of noise in someone's logs.
+        Both halves are attempted, each guarded on its own, and that is not belt-and-braces. A
+        cross-task removal raises `ValueError` from the FIRST reset — a Token may only be reset in
+        the Context that created it — and bailing there would leave `activate_span`'s generator
+        suspended at its `yield`. The garbage collector closes such a generator on some later,
+        unrelated frame; its `finally` raises the same `ValueError` again, and THAT one lands as an
+        unraisable exception in the host's stderr with a traceback the host cannot connect to
+        anything it called. Driving the generator to completion here — even into its failure — is
+        what keeps a misuse of `activate()` a counter instead of noise in someone's logs.
 
-        The pinned half has no generator to drive, so it enforces the same rule
-        by hand: a bare `set()` from another task would silently land on THAT
-        task's scope, which is worse than the `ValueError` a Token gives for
-        free. Raising here keeps a foreign unpin counted rather than silent.
+        The pinned half has no generator to drive, so it enforces the same rule by hand: a bare
+        `set()` from another task would silently land on THAT task's scope, which is worse than the
+        `ValueError` a Token gives for free. Raising here keeps a foreign unpin counted rather than
+        silent.
 
-        Two counts for one cross-task exit is therefore the honest tally: two
-        installations were left standing, and neither could be taken down.
+        Two counts for one cross-task exit is therefore the honest tally: two installations were
+        left standing, and neither could be taken down.
         """
         with guard(where, debug=debug):
             _ambient_unit.reset(self._token)
@@ -506,24 +503,27 @@ class Unit:
     # -- carriers --------------------------------------------------------
 
     @contextmanager
-    def activate(self) -> Iterator[None]:
+    def activate(self) -> Iterator[_Carrier]:
         """Make this unit the ambient parent for the CALLING TASK.
 
-        Enter and exit MUST happen on the same task/thread: a ContextVar Token
-        may only be reset in the Context it was created in. This is the ONLY way
-        to become a parent (I3) — computing a `SpanContext` and putting it in a
-        dict is not parenthood, because it opens neither the nested-manual-span
-        path, nor the interceptor latch, nor the `capture_mode=AGENT` gate.
+        Enter and exit MUST happen on the same task/thread: a ContextVar Token may only be reset in
+        the Context it was created in. This is the ONLY way to become a parent (I3) — computing a
+        `SpanContext` and putting it in a dict is not parenthood, because it opens neither the
+        nested-manual-span path, nor the interceptor latch, nor the `capture_mode=AGENT` gate.
 
-        A cross-task exit is COUNTED rather than raised: the reset would throw
-        `ValueError` into the host on a path the host did not ask for, and I6
-        forbids that. The leaked fork is bounded by the offending task's life.
+        A cross-task exit is COUNTED rather than raised: the reset would throw `ValueError` into the
+        host on a path the host did not ask for, and I6 forbids that. The leaked fork is bounded by
+        the offending task's life.
+
+        Yields the carrier, whose `abandoned` an exit at the recursion limit sets after writing the
+        restore point back (`_restore.py`): a later close then does nothing.
         """
         carrier = _Carrier(self, pinned=False)
         try:
-            yield
+            yield carrier
         finally:
-            carrier.remove(where="assembly._units.activate_exit", debug=self._registry._debug)
+            if not carrier.abandoned:
+                carrier.remove(where="assembly._units.activate_exit", debug=self._registry._debug)
 
     def bind(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap `fn` so each INVOCATION runs inside a fresh activation.

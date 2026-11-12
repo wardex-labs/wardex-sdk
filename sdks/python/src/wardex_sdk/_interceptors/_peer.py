@@ -82,7 +82,10 @@ in `_seam.py` can stay one line:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ._seam import _ConnectionState
 
 #: The host reported when neither the socket nor a TLS server name names the
 #: peer — the one placeholder `_on_request_bytes` asks about again.
@@ -151,3 +154,11 @@ def placeholder_host(obj: Any) -> str:
     `UNRESOLVED_HOST`. An attribute read, never a syscall — the one part of the
     placeholder that can change after the connection's first byte."""
     return str(getattr(obj, "server_hostname", None) or UNRESOLVED_HOST)
+
+
+def _url_host(obj: Any | None, st: _ConnectionState) -> str:
+    """The host a URL on this connection names: the TLS server name when
+    there is one, else the peer address `peer_address` recorded on `st`. One
+    expression for the WS swap site and `_seal`, so the WebSocket-transport
+    question and the HTTP span's URL are asked about the same host."""
+    return getattr(obj, "server_hostname", None) or st.server_hostname or st.server_address

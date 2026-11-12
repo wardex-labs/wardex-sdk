@@ -1,8 +1,10 @@
 """Drop ledger census: every place the SDK says it lost something, accounted for.
 
 A loss the SDK knows about leaves one of a few signals in the source: a
-`counters.bump`, an adapter's `count`, a `report_once` line, a `_report_lost`,
-or a call into the drop ledger (`record`, `record_items`, `lose`). Only the
+`counters.bump` (or, where the interpreter's recursion limit forbids a call, a
+`counters.tally.append`), an adapter's `count`, a `report_once` line, a
+`_report_lost`, or a call into the drop ledger (`record`, `record_items`,
+`lose`). Only the
 ledger reaches the receiver. So every one of those sites is recorded below with
 what happens to the loss it signals:
 
@@ -101,6 +103,13 @@ _UNITS = Pending("assembly-core unit tables and patches")
 _SIGNAL = Pending("signal-path shutdown tail")
 _REQUEST_CAP = Pending("OTLP request-cap drop")
 _NATIVE = Pending("native extension missing: no batch, the drop report included, can be encoded")
+#: wardex's own record of the bytes, close or line at hand, dropped where its
+#: work met the interpreter's recursion limit. The ledger cannot be told there:
+#: `record` is a Python call, and at the limit it raises again. The counter is a
+#: `counters.tally.append`, a C call.
+_AT_LIMIT = Pending(
+    "wardex's own record dropped at the recursion limit, where a ledger call raises"
+)
 
 _GUARDED = Structural("the line said for a swallow guard() has already recorded")
 _VERSION_REFUSED = NotADrop(
@@ -271,6 +280,16 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "an entry point that ran: evidence of coverage, not of a loss"
     ),
     ("_adapters/_context.py", "report_once", "f'{self.name}.{where}'"): _GUARDED,
+    ("_adapters/_context.py", "tally", "'adapters.context.close_at_limit'"): _AT_LIMIT,
+    ("_adapters/_context.py", "tally", "'adapters.context.control_flow_at_limit'"): _AT_LIMIT,
+    ("_adapters/_context.py", "tally", "'adapters.context.close_at_limit_not_restored'"): NotADrop(
+        "a close dropped at the limit on another task, whose scope fork could not be reset there; "
+        "the lost span is the close_at_limit tally beside it, and that task's carriers stay its own"
+    ),
+    ("_adapters/_context.py", "tally", "'adapters.context.close_at_limit_half_exited'"): NotADrop(
+        "the activation's own exit reset the ambient unit before the limit bit; the lost span is "
+        "the close_at_limit tally beside it"
+    ),
     ("_adapters/_context_bridge.py", "count", "'usage_hold_refused'"): NotADrop(
         "a bridge asked to hold usage it may not hold; its numbers stay demoted extras on the span"
     ),
@@ -825,6 +844,8 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_tracing.py", "bump", "'tracing.block_scope_retired'"): NotADrop(
         "a block taken down from another context; the consumer gets its own scope back"
     ),
+    # The span a block was closing when the close met the recursion limit: dropped whole.
+    ("_tracing.py", "tally", "'tracing.close_at_limit'"): _AT_LIMIT,
     # -- the byte seams and protocols
     ("_interceptors/_http1_requests.py", "bump", "'protocol.http1.request_unfinished'"): _SEAM,
     ("_interceptors/_http1_requests.py", "bump", "'protocol.http1.request_unobserved'"): _SEAM,
@@ -866,6 +887,41 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_interceptors/_mcp_stdio.py", "report_once", "'interceptors.mcp_stdio.pending_evicted'"): (
         _MCP_PENDING_TABLE
     ),
+    # A chunk's bytes, or a parser-latch line, that met the recursion limit inside wardex's own
+    # feed: the host's call had already returned, and the transaction the chunk belonged to is
+    # left short of it.
+    (
+        "_interceptors/_mcp_stdio.py",
+        "tally",
+        "'interceptors.mcp_stdio.disabled_report.recursion_limit'",
+    ): _AT_LIMIT,
+    ("_interceptors/_mcp_stdio.py", "tally", "'interceptors.mcp_stdio.readline.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_mcp_stdio.py", "tally", "'interceptors.mcp_stdio.receive.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_mcp_stdio.py", "tally", "'interceptors.mcp_stdio.send.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_mcp_stdio.py", "tally", "'interceptors.mcp_stdio.write.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_seam.py", "tally", "'interceptors.seam.disabled_report.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_socket.py", "tally", "'interceptors.socket.recv.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_socket.py", "tally", "'interceptors.socket.recv_into.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_socket.py", "tally", "'interceptors.socket.send.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_socket.py", "tally", "'interceptors.socket.sendall.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_ssl.py", "tally", "'interceptors.ssl.read.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_ssl.py", "tally", "'interceptors.ssl.recv.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_ssl.py", "tally", "'interceptors.ssl.recv_into.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_ssl.py", "tally", "'interceptors.ssl.send.recursion_limit'"): _AT_LIMIT,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.path_excluded'"): _POLICY,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.peer_unresolved'"): Marker(
         "PEER_UNRESOLVED", at="_interceptors/_seam.py"
@@ -887,7 +943,17 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_parent_forgotten'"): _SEAM,
     # A model call whose latch entry the cap evicted and whose answer the tracker never paired:
     # the wire record is lost (the chat unit keeps its promoted usage, so the number is not).
+    # Two bump sites: at close, and on overflow, the moment the bounded record forgets the
+    # stream. An answer that arrives after that forgetting is not taken back: it ships as
+    # `HTTP ? /` with no witness, so the count can overstate by one per forgotten-then-answered
+    # call. A stream a RST_STREAM ended (either peer) is let go uncounted: the native feed
+    # reports reset ids, and a request the host cancelled is not a loss.
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_call_unanswered'"): _SEAM,
+    # Any other stream whose latch entry the cap evicted while it held a parent, and whose answer
+    # never arrived. Fires only when the cap had already evicted the entry: an unanswered stream
+    # the cap never touched is not counted, though it leaves the same nothing at close. Reset
+    # streams are let go uncounted here too.
+    ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_unanswered'"): _SEAM,
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_witnessed'"): NotADrop(
         "the answer to a model call whose latch entry the cap evicted reaches the seal with the "
         "evicted parent as its witness, so the wire span's number is the only one counted"
@@ -1080,6 +1146,10 @@ def _signal(call: ast.Call, module: str, bindings: _Bindings) -> tuple[str, ast.
     first = call.args[0] if call.args else None
     if name == "bump" and isinstance(func, ast.Attribute):
         return "bump", first
+    if name == "append" and isinstance(func, ast.Attribute) and _tail(func.value) == "tally":
+        # `counters.tally.append(label)`: the frame-free count a site at the recursion limit
+        # makes in place of a bump (`Counters` in `_assembly/_diag.py` says why).
+        return "tally", first
     if name == "count" and isinstance(func, ast.Attribute) and module.startswith("_adapters/"):
         return "count", first
     if name == "report_once":
@@ -1266,6 +1336,7 @@ def test_the_census_sees_every_kind_of_signal(tmp_path):
     (src / "_adapters" / "mod.py").write_text(
         "def f(ctx, registry, counters, ledger):\n"
         "    counters.bump('a.b')\n"
+        "    counters.tally.append('t')\n"
         "    ctx.count('c')\n"
         "    report_once('line', key='k')\n"
         "    self._report_lost(1, why='w', key='lost')\n"
@@ -1280,6 +1351,7 @@ def test_the_census_sees_every_kind_of_signal(tmp_path):
     found = set(_scan(src))
     assert found == {
         ("_adapters/mod.py", "bump", "'a.b'"),
+        ("_adapters/mod.py", "tally", "'t'"),
         ("_adapters/mod.py", "count", "'c'"),
         ("_adapters/mod.py", "report_once", "'k'"),
         ("_adapters/mod.py", "report_lost", "'lost'"),
@@ -1339,6 +1411,14 @@ def _uncalled_signals(tree: ast.AST, module: str) -> list[str]:
     """Every place `tree` names a signal callable without calling it there."""
     bindings = _bindings(tree)
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    # `counters.tally` is a signal only as the receiver of an `.append` call.
+    appended_to = {
+        id(node.func.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+    }
     found: list[str] = []
     for node in ast.walk(tree):
         if id(node) in called:
@@ -1350,6 +1430,7 @@ def _uncalled_signals(tree: ast.AST, module: str) -> list[str]:
             name = spelled.attr
             hit = (
                 name in {"bump", "report_once", "_report_lost"}
+                or (name == "tally" and id(spelled) not in appended_to)
                 or (name == "count" and module.startswith("_adapters/"))
                 or (name in _LEDGER_CALLS and _tail(spelled.value) in bindings.modules)
             )
@@ -1389,6 +1470,8 @@ def test_the_renaming_rule_sees_each_way_of_renaming():
         "    hooks = [_ledger.record_items]\n"
         "    tally = getattr(counters, 'bump')\n"
         "    sink = ctx.count\n"
+        "    inbox = counters.tally\n"
+        "    counters.tally.append('fine')\n"
         "    for record in rows:\n"
         "        record.close()\n"
     )
@@ -1400,4 +1483,5 @@ def test_the_renaming_rule_sees_each_way_of_renaming():
         "_ledger.record_items",
         "getattr(counters, 'bump')",
         "ctx.count",
+        "counters.tally",
     }

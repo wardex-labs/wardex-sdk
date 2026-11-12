@@ -497,9 +497,10 @@ class _WithOnly(WithOnly):
         # meeting the interpreter's limit on the host's stack, typically while
         # the host's own RecursionError unwinds through each decorated level.
         # Raised, it would reach the host chained onto whatever the block was
-        # leaving with. So it is dropped, uncounted (counting pushes a frame),
-        # and the block leaves exactly as it would have without wardex: with the
-        # host's exception, or with none. `except` and `return` push no frame.
+        # leaving with. So it is dropped, tallied with `counters.tally` (a
+        # `bump` would push a frame), and the block leaves exactly as it would
+        # have without wardex: with the host's exception, or with none.
+        # `except`, the tally's `append` and `return` push no frame.
         try:
             if issubclass(type(exc), Exception) and self._span is not None:
                 try:
@@ -528,6 +529,7 @@ class _WithOnly(WithOnly):
                         _hub._current_scope.reset(undo[1]._token)
                     except (RuntimeError, ValueError):
                         pass
+            counters.tally.append("tracing.close_at_limit")
             return False
 
 

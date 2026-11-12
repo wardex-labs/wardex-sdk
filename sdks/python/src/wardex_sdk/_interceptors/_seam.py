@@ -63,7 +63,7 @@ from .._types import (
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
-from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
+from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, _url_host, peer_address, placeholder_host
 from ._trackers import _WebSocketTracker
 from ._txn import _Txn, _url_target
 
@@ -524,6 +524,8 @@ class ByteSeamInterceptor(InterceptorInterface):
                 if reason is not None:
                     st.disabled_logged = True
                     report_connection_parser_disabled(reason, st.server_address, self._client)
+        except RecursionError:  # at the limit: C calls only; the host's read already returned
+            counters.tally.append("interceptors.seam.disabled_report.recursion_limit")
         except Exception:  # noqa: BLE001 — off-span reporting must never break capture
             pass
         for txn in txns:
@@ -1170,11 +1172,3 @@ def _latched(txn: _Txn) -> Ambient:
     (design §3.3).
     """
     return Ambient(span_context=txn.parent, conversation=txn.conversation, tracestate=None)
-
-
-def _url_host(obj: Any | None, st: _ConnectionState) -> str:
-    """The host a URL on this connection names: the TLS server name when
-    there is one, else the peer address `peer_address` recorded on `st`. One
-    expression for the WS swap site and `_seal`, so the WebSocket-transport
-    question and the HTTP span's URL are asked about the same host."""
-    return getattr(obj, "server_hostname", None) or st.server_hostname or st.server_address

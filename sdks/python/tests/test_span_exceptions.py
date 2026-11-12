@@ -758,6 +758,19 @@ def _segments(stacktrace: str) -> list[str]:
     return _CHAIN_SEPARATOR.split(stacktrace)
 
 
+def _tracing_failures() -> dict[str, int]:
+    """wardex's own `tracing.*` failure counts. `tracing.close_at_limit` is left out: it
+    counts a span whose close met the recursion limit and was dropped, a loss of the
+    host's span rather than a failure of wardex's, and a deep recursion is exactly
+    where that happens (its own test is in `test_recursion_limit_tally.py`)."""
+    snapshot = counters.snapshot()
+    return {
+        k: n
+        for k, n in snapshot.items()
+        if k.startswith("tracing.") and k != "tracing.close_at_limit"
+    }
+
+
 def _chain_length(exc: BaseException) -> int:
     n = 0
     while exc is not None:
@@ -805,7 +818,7 @@ _HEADROOM = 400
 # `counters.bump`, at the same depth: the host received a RecursionError chained onto
 # wardex's, counted as a wardex internal failure. The guard now lets a RecursionError
 # through untouched, so both parities give the host its own exception alone and
-# count nothing. The parametrization stays as the guard against that coming back:
+# count no failure of wardex's. The parametrization stays as the guard against that coming back:
 # with the default limit, the parity was the depth pytest happened to start the test
 # at, and a pytest-xdist worker starts it a frame or so deeper than a plain run, so
 # the chained shape showed under `-n` and hid without it. Setting the limit relative
@@ -837,7 +850,7 @@ def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording,
     # nothing in wardex's diagnostics blaming wardex for the host's stack.
     assert _chain_length(caught.value) == 1
     assert _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR) == 0
-    assert {k: n for k, n in counters.snapshot().items() if k.startswith("tracing.")} == {}
+    assert _tracing_failures() == {}
 
     _hub.get_client().flush()
     spans = [sp for env in recording.envelopes for sp in env.spans]
@@ -916,7 +929,7 @@ def test_a_deep_recursion_through_a_decorated_generator_reaches_the_host_alone(
 
     assert _chain_length(caught.value) == 1
     assert _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR) == 0
-    assert {k: n for k, n in counters.snapshot().items() if k.startswith("tracing.")} == {}
+    assert _tracing_failures() == {}
 
     _hub.get_client().flush()
     spans = [sp for env in recording.envelopes for sp in env.spans]
@@ -953,7 +966,7 @@ def test_a_deep_recursion_through_a_span_block_reaches_the_host_alone(recording,
 
     assert _chain_length(caught.value) == 1
     assert _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR) == 0
-    assert {k: n for k, n in counters.snapshot().items() if k.startswith("tracing.")} == {}
+    assert _tracing_failures() == {}
 
     _hub.get_client().flush()
     spans = [sp for env in recording.envelopes for sp in env.spans]

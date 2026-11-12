@@ -115,6 +115,7 @@ from ._parentage import (
 )
 from ._patchset import PatchSet
 from ._policy import Prefilter, capture_mode_of, should_capture
+from ._restore import ambient_restore_point
 from ._snapshot import SnapshotDraft
 from ._units import (
     PinToken,
@@ -173,6 +174,7 @@ __all__ = [
     "UnitKind",
     "UnitRegistry",
     "VocabularyError",
+    "ambient_restore_point",
     "ambient_stated_conversation",
     "canonical_arguments",
     "cap_at_alias_tier",

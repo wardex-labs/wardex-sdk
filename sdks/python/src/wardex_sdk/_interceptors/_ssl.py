@@ -13,7 +13,7 @@ from __future__ import annotations
 import ssl
 from typing import TYPE_CHECKING, Any
 
-from .._assembly import Limitation
+from .._assembly import Limitation, counters
 from ._close_hook import _ssl_protocol_class, _sslobj_of
 from ._conn_timing import shared_timing_store
 from ._seam import ByteSeamInterceptor, _accepted_prefix, _ConnectionState
@@ -126,6 +126,8 @@ class SSLInterceptor(ByteSeamInterceptor):
                     if meth in ("send", "write") and isinstance(ret, int):
                         sent = _accepted_prefix(data, ret)
                     self._on_request_bytes(this, bytes(sent))
+            except RecursionError:  # at the limit: C calls only; the host's call returned
+                counters.tally.append("interceptors.ssl.send.recursion_limit")
             except Exception:
                 pass
             return ret
@@ -144,6 +146,8 @@ class SSLInterceptor(ByteSeamInterceptor):
                         self._on_response_bytes(this, bytes(ret))
                     elif _asked_for_bytes(args[0] if args else kwargs.get("buflen", 1024)):
                         self._on_response_eof(this)  # the peer's EOF (a clean TLS close, too)
+            except RecursionError:  # at the limit: C calls only; the host's call returned
+                counters.tally.append("interceptors.ssl.recv.recursion_limit")
             except Exception:
                 pass
             return ret
@@ -158,6 +162,8 @@ class SSLInterceptor(ByteSeamInterceptor):
                     self._on_response_bytes(this, bytes(buffer[:n]))
                 elif n == 0 and _asked_for_bytes(args[0] if args else kwargs.get("nbytes"), buffer):
                     self._on_response_eof(this)
+            except RecursionError:  # at the limit: C calls only; the host's call returned
+                counters.tally.append("interceptors.ssl.recv_into.recursion_limit")
             except Exception:
                 pass
             return n
@@ -224,6 +230,8 @@ class SSLInterceptor(ByteSeamInterceptor):
                         args[0] if args else kwargs.get("len", 1024), buffer
                     ):
                         self._on_response_eof(this)  # a clean close; a ragged one raises instead
+            except RecursionError:  # at the limit: C calls only; the host's call returned
+                counters.tally.append("interceptors.ssl.read.recursion_limit")
             except Exception:
                 pass
             return ret

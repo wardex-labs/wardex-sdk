@@ -674,7 +674,7 @@ def _probe_max_streams() -> bool:
     def surviving(limits) -> int | None:
         parser = _wardex_native.protocol.Http2Parser(limits)
         parser.feed(True, requests)
-        _opened, txns = parser.feed(False, responses)
+        _opened, txns, _reset = parser.feed(False, responses)
         # A stream evicted by the cap loses the request half it was holding,
         # so its transaction comes back without the method it was opened
         # with — and says so. A method-less transaction that does NOT say so
@@ -766,7 +766,7 @@ def test_max_streams_survivors_are_the_highest_ids():
     requests, responses = _h2_open_requests_then_respond(sids)
     parser = _wardex_native.protocol.Http2Parser(_native(max_streams=2))
     parser.feed(True, requests)
-    _opened, txns = parser.feed(False, responses)
+    _opened, txns, _reset = parser.feed(False, responses)
     kept = sorted(t.stream_id for t in txns if not t.request_evicted)
     assert kept == [13, 15]
     assert all(t.method == "" for t in txns if t.request_evicted)
