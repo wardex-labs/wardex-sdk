@@ -503,7 +503,9 @@ def set_tag(key: str, value: _AttributeValue | list | tuple | dict | None) -> No
       set on it. Submit through `wardex.bind_context(fn)`, or open
       `wardex.isolation_scope()` in each job.
 
-    A span-local attribute with the same key wins over the scope tag.
+    A span-local attribute with the same key wins over the scope tag. A span
+    reads the scope when it ends, so one held open across a `yield` that
+    another request's code resumes carries what that request set.
     """
     _hub.write_scope(_hub._isolation_scope, Scope.set_tag, key, value)
 
