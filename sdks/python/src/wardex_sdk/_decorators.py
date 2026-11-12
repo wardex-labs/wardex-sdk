@@ -591,11 +591,16 @@ def _result_bytes(result: object, limit: int) -> bytes:
 def workflow(fn: Callable[P, R]) -> Callable[P, R]: ...
 @overload
 def workflow(
-    fn: None = None, *, name: str | None = None
+    fn: None = None, *, name: str | None = None, capture_io: bool = False
 ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
-def workflow(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
-    """A whole run: `invoke_workflow {name}`, with `gen_ai.workflow.name`."""
-    return _decorate(fn, api="workflow", name=name, op=OperationName.INVOKE_WORKFLOW)
+def workflow(
+    fn: Callable[..., Any] | None = None, *, name: str | None = None, capture_io: bool = False
+) -> Any:
+    """A whole run: `invoke_workflow {name}`, with `gen_ai.workflow.name`.
+    `capture_io=True` records the arguments and return value, as on `@agent`."""
+    return _decorate(
+        fn, api="workflow", name=name, op=OperationName.INVOKE_WORKFLOW, capture_io=capture_io
+    )
 
 
 @overload
@@ -669,13 +674,17 @@ def tool(
 def step(fn: Callable[P, R]) -> Callable[P, R]: ...
 @overload
 def step(
-    fn: None = None, *, name: str | None = None
+    fn: None = None, *, name: str | None = None, capture_io: bool = False
 ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
-def step(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
+def step(
+    fn: Callable[..., Any] | None = None, *, name: str | None = None, capture_io: bool = False
+) -> Any:
     """One step of a larger run — a graph node, a pipeline stage, a phase.
 
     `execute_step {name}`, with `wardex.step.name`, as an adapter names a graph
     node. "step" also stays clear of the "task" asyncio, Celery and LangGraph
-    each already mean something else by.
+    each already mean something else by. `capture_io=True` as on `@agent`.
     """
-    return _decorate(fn, api="step", name=name, op=OperationName.EXECUTE_STEP)
+    return _decorate(
+        fn, api="step", name=name, op=OperationName.EXECUTE_STEP, capture_io=capture_io
+    )

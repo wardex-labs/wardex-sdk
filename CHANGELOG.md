@@ -104,9 +104,12 @@ All notable changes to this project are documented here. The format follows
 - **`wardex.current_span()`, `Span.set_input()`, `Span.set_output()` and
   `Span.add_event()`.** On a tool span the input and output export as
   `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`, masked and
-  capped like captured payloads. `@wardex.agent(capture_io=True)` and
-  `@wardex.tool(capture_io=True)` record the arguments and the return value,
-  up to `LimitsConfig.max_otlp_attribute_bytes`. It is off by default.
+  capped like captured payloads. `capture_io=True` on any of the four
+  decorators records the arguments and the return value, up to
+  `LimitsConfig.max_otlp_attribute_bytes`. It is off by default.
+  `Span.set_error()` takes the exception an `except` block holds. The dicts
+  of the `Scope` that `isolation_scope()` and `new_scope()` yield are
+  read-only; write through its setters.
 - **`wardex.explain(name)` and `python -m wardex_sdk explain NAME`.** Each
   limitation marker and loss reason says what happened, what it means for
   your data and what to do. `explain --all` prints every entry as Markdown,
@@ -604,7 +607,7 @@ All notable changes to this project are documented here. The format follows
   longer raises `RuntimeError: cannot enter context`, and one call's
   `set_user()` does not reach the next.
 - **`set_user` takes a string id, an integer id, a `uuid.UUID`, keyword
-  fields, a `UserInfo` or `None`.** Any other type raises `TypeError` at the call. A
+  fields, an id with keyword fields beside it, a `UserInfo` or `None`.** Any other type raises `TypeError` at the call. A
   call whose fields are all empty clears the user. The `Scope` that
   `isolation_scope()` and `new_scope()` yield reads and writes the block.
 - **A span started on an unbound thread while another span is open is

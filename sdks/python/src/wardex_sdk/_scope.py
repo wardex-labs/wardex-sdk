@@ -70,6 +70,9 @@ def user_from_call(user: object, keywords: dict[str, object]) -> UserInfo | None
     if user is NO_USER:
         found = UserInfo(**given)  # type: ignore[arg-type]  # checked by UserInfo itself
         return None if found == UserInfo() else found
+    named = checked_user(user) if given and "id" not in given else None
+    if given and named is not None and named.id is not None and named == UserInfo(id=named.id):
+        return UserInfo(id=named.id, **given)  # type: ignore[arg-type]  # an id, and its fields
     if given:
         raise TypeError(f"{USER_FORMS}; pass either the positional form or keywords, not both")
     return checked_user(user)

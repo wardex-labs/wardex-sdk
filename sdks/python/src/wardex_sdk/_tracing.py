@@ -161,16 +161,14 @@ class Span:
             _values.text("Span.set_status() message", message),
         )
 
-    def set_error(self, error_type: str, message: str = "") -> None:
-        """Name the failure. Pairs with `set_status(StatusCode.ERROR)`.
-
-        Without this the published surface could express the state that makes a
-        span illegal (`set_status(ERROR)`) and had no way to express the state
-        that makes it legal — so the only span a host ever marks as failed was
-        the only span the host could not keep. `_finish()` still supplies OTel's
-        `_OTHER` when a manual span is ERROR with no type, so forgetting this
-        call degrades the span rather than deleting it.
+    def set_error(self, error_type: str | BaseException | None, message: str = "") -> None:
+        """Name the failure. Pairs with `set_status(StatusCode.ERROR)`. The
+        exception itself may be given: its class names the type. Without this
+        call `_finish()` supplies OTel's `_OTHER` for an ERROR span, so a
+        forgotten call degrades the span rather than deleting it.
         """
+        if isinstance(error_type, BaseException):
+            error_type = _values.exception_type(type(error_type))
         self._draft.set_error(
             _values.text("Span.set_error() error_type", error_type, optional=True),
             _values.text("Span.set_error() message", message),

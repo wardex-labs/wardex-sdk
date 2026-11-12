@@ -7,6 +7,7 @@ import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from types import MappingProxyType
 from typing import Any, TypeVar
 
 from ._client import Client
@@ -340,7 +341,9 @@ def write_scope(var: ContextVar[Scope | None], apply: Callable[..., _R], *args: 
 
 def _block_field(name: str, trace: bool) -> property:
     def read(self: BlockScope) -> Any:
-        return getattr(self._scope(trace), name)
+        value = getattr(self._scope(trace), name)
+        # Read-only: a write in place would reach work started before it.
+        return MappingProxyType(value) if isinstance(value, dict) else value
 
     def write(self: BlockScope, value: Any) -> None:
         self._write(trace, Scope.set_user if name == "user" else _assign(name), value)

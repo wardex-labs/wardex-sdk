@@ -384,6 +384,28 @@ def test_a_write_through_the_yielded_scope_does_not_reach_a_task_started_before_
     assert _extra(spans["block"]) == {"user.id": "second"}
 
 
+@pytest.mark.parametrize("opener", [wardex.isolation_scope, wardex.new_scope])
+def test_the_yielded_scopes_dicts_are_read_only(rec, opener):
+    """Written in place, a tag reached tasks started before it; the setters
+    are the one way in."""
+    with opener() as scope:
+        scope.set_tag("k", "v")
+        assert scope.tags["k"] == "v"
+        with pytest.raises(TypeError):
+            scope.tags["inplace"] = "1"  # type: ignore[index]
+        with pytest.raises(TypeError):
+            scope.contexts["inplace"] = {}  # type: ignore[index]
+
+
+def test_set_user_takes_an_id_with_more_fields_beside_it(rec):
+    wardex.set_user("user-42", email="a@b.example")
+    with wardex.span("s"):
+        pass
+    extra = _extra(_spans(rec)["s"])
+    assert extra["user.id"] == "user-42"
+    assert "user.email" in extra
+
+
 def test_set_user_none_clears_the_user(rec):
     wardex.set_user("u1")
     wardex.set_user(None)

@@ -371,6 +371,31 @@ def test_a_method_exports_its_own_name_as_the_identity(wire):
     assert span["attributes"]["gen_ai.tool.name"] == "search"
 
 
+def test_set_error_takes_the_exception_an_except_block_holds(wire):
+    """What an `except` block has in hand is the exception; refusing it there
+    replaced the host's exception with a TypeError."""
+    with wardex.span("s") as s:
+        try:
+            raise KeyError("missing-row")
+        except KeyError as exc:
+            s.set_status(wardex.StatusCode.ERROR)
+            s.set_error(exc)
+    attributes = _shipped(wire)["s"]["attributes"]
+    assert attributes["error.type"] == "KeyError"
+
+
+@pytest.mark.parametrize("decorator", [wardex.workflow, wardex.step])
+def test_capture_io_is_taken_by_every_decorator(wire, decorator):
+    @decorator(capture_io=True)
+    def run(goal):
+        return {"done": goal}
+
+    assert run("ship") == {"done": "ship"}
+    [span] = _shipped(wire).values()
+    assert json.loads(span["attributes"]["wardex.input_data"]) == {"goal": "ship"}
+    assert json.loads(span["attributes"]["wardex.output_data"]) == {"done": "ship"}
+
+
 def test_a_decorated_agent_states_no_agent_type_it_did_not_observe(wire):
     @wardex.agent(name="helper")
     def helper():
