@@ -764,7 +764,7 @@ def _resolve_config(
     problems = [] if problems is None else problems
     given = backend if backend is not None else BackendConfig()
     resolved_backend = BackendConfig(
-        api_key=given.api_key or os.environ.get("WARDEX_API_KEY"),
+        api_key=given.api_key or (os.environ.get("WARDEX_API_KEY") or "").strip() or None,
         base_url=given.base_url or env_http_url("WARDEX_BASE_URL"),
         endpoint=given.endpoint or endpoint_from_env(),
         headers=given.headers,

@@ -58,6 +58,12 @@ class _Wire(wardex.Transport):
                     self.spans += scope["spans"]
 
 
+def wardex_sdk_config() -> WardexConfig:
+    from wardex_sdk._config import _resolve_config
+
+    return _resolve_config(backend=BackendConfig(api_key="k"))
+
+
 @pytest.fixture
 def wire() -> _Wire:
     _hub.reset_for_test()
@@ -116,6 +122,19 @@ def test_text_that_is_not_utf8_ships_escaped_and_costs_nothing(wire):
     assert upload["attributes"]["path"] == escaped
     assert upload["attributes"]["file"] == escaped
     assert upload["attributes"]["user.id"] == escaped
+    assert _losses() == []
+
+
+def test_a_service_name_that_is_not_utf8_ships_escaped_and_costs_nothing(monkeypatch):
+    """`os.environ` hands a non-UTF-8 byte back as a lone surrogate. In the
+    resource every batch carries, it cost every batch for the process's life."""
+    monkeypatch.setenv("WARDEX_SERVICE_NAME", "svc-" + _NOT_UTF8)
+    _hub.reset_for_test()
+    wire = _Wire()
+    _hub.set_client(Client(wardex_sdk_config(), wire))
+    with wardex.span("s"):
+        pass
+    assert set(_shipped(wire)) == {"s"}
     assert _losses() == []
 
 

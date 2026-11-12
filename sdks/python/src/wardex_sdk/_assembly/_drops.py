@@ -340,9 +340,12 @@ def report_undelivered_drops(client: object, *, who: str = "close()") -> None:
             for (reason, unit), n in sorted(held.items(), key=lambda kv: _ledger._wire_key(kv[0]))
             if n
         )
+        state = getattr(getattr(client, "_transport", None), "export_state", None)
+        to = getattr(state, "destination", None)
+        bound = f" bound for {to}" if isinstance(to, str) else ""
         line = (
-            f"{who} finished holding counts of lost data that no receiver has confirmed, and "
-            f"nothing will send them now (reason:unit=count): {counts}"
+            f"{who} finished holding counts of lost data{bound} that no receiver has confirmed, "
+            f"and nothing will send them now (reason:unit=count): {counts}"
         )
         totals = _ledger.snapshot().counts
         said = (

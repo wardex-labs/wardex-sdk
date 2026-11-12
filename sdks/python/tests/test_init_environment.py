@@ -180,6 +180,18 @@ def test_an_endpoint_argument_losing_to_a_key_from_the_environment_is_said_not_w
     assert "drop api_key" not in err
 
 
+def test_a_key_read_from_a_secret_file_with_its_newline_is_the_key(monkeypatch, capsys):
+    """A Kubernetes secret mounted as a file ends with a newline; the variable
+    holds it too. The whitespace is no part of a key."""
+    monkeypatch.setenv("WARDEX_API_KEY", project_key() + "\r\n")
+    wardex.init(intercept=False)
+    try:
+        assert "mistyped" not in capsys.readouterr().err
+        assert wardex.diagnostics().initialized
+    finally:
+        wardex.close(0.1)
+
+
 def test_an_unusable_key_from_the_environment_does_not_claim_it_won(monkeypatch, capsys):
     """The key produced no transport, so "endpoint ignored ... drop api_key"
     would contradict the next line and name an argument nobody passed."""

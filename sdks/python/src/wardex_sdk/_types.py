@@ -25,7 +25,7 @@ from ._enums import (
     ToolExecutionType,
     ToolType,
 )
-from ._values import check_agent, check_gen_ai, check_tool
+from ._values import check_agent, check_gen_ai, check_tool, wire_text
 from ._version import OTEL_SEMCONV_VERSION
 
 if TYPE_CHECKING:
@@ -668,6 +668,13 @@ class ResourceInfo:
     release: str = ""  # -> service.version
     environment: str = ""  # -> deployment.environment.name
     process_pid: int = 0  # -> process.pid; 0 = not stamped (drain stamps it live)
+
+    def __post_init__(self) -> None:
+        # Every batch carries these: one the wire cannot encode cost them all.
+        for name in ("service_name", "release", "environment"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, wire_text(value))
 
 
 @dataclass(frozen=True, slots=True)

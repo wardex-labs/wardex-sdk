@@ -265,8 +265,9 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
         _R.MODE_REFUSED: ReasonInfo(
             _U.REQUEST,
             "loss",
-            "capture_mode=AGENT declined an exchange outside any span that it did not "
-            "recognize as a model call.",
+            "capture_mode=AGENT declined an exchange outside any span that it keeps only "
+            "inside a span: one it did not recognize as a model call, or a call to a model API "
+            "it does not parse yet (Gemini, Bedrock, Cohere, Ollama).",
             "Open a span around the work, or pass init(capture_mode=CaptureMode.ALL).",
         ),
         _R.EXCLUDED_BY_POLICY: ReasonInfo(

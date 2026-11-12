@@ -1676,6 +1676,7 @@ def test_close_says_what_its_final_send_could_not_deliver(capsys):
         err = capsys.readouterr().err
         [line] = [ln for ln in err.splitlines() if "no receiver has confirmed" in ln]
         assert "network_error:span=2" in line
+        assert f"bound for {CLOSED}/v1/envelope" in line
         wardex_sdk.close()  # nothing new: nothing said again
         assert "no receiver has confirmed" not in capsys.readouterr().err
     finally:
