@@ -80,7 +80,9 @@ pub struct Limits {
     /// caller's own thread.
     pub max_body_bytes: usize,
     /// Body cap for every other content type. Opaque bytes yield no semantics,
-    /// so a small sample is kept purely for diagnostics.
+    /// so a small sample is kept purely for diagnostics. Also the cap on a
+    /// JSON request body outside any span kept only until its reply shows
+    /// whether it was a model call: most such bodies are uploads.
     pub max_opaque_body_bytes: usize,
     /// Body bytes the HTTP/1 and HTTP/2 parsers may hold at once, summed over
     /// every message still arriving in the process. `max_body_bytes` bounds
@@ -94,9 +96,12 @@ pub struct Limits {
     /// by side, so several large ones arriving together are each cut where
     /// the budget filled.
     ///
-    /// A body of an exchange with an LLM endpoint may use all of it; any other
-    /// body only half, so downloads, uploads and long-lived feeds leave the
-    /// other half to model calls however many of them are in flight.
+    /// A body of an exchange with an LLM endpoint may use all of it, one the
+    /// app asked to record (inside a span) three quarters, any other body
+    /// only half: downloads, uploads and long-lived feeds outside every span
+    /// leave the other half to model calls and recorded work however many of
+    /// them are in flight. On HTTP/2 every body but a model call's is held to
+    /// the half.
     ///
     /// A completed message is the host SDK's to bound once handed over (in the
     /// Python SDK, the deferred-parse queue's `max_parse_backlog_bytes`).

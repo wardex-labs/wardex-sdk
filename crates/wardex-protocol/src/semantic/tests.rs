@@ -154,6 +154,41 @@ fn body_shape_recognizes_a_call_on_localhost_without_naming_a_provider() {
 }
 
 #[test]
+fn a_declared_host_on_a_path_of_its_own_is_read_by_its_body_shape() {
+    // A gateway the app named in `intercept_hosts`, serving the Chat shape on
+    // a path no endpoint table knows: the shape picks the parser.
+    let s = parse_llm_declared(
+        "llm.corp.internal",
+        "/corp/llm/chat",
+        OPENAI_REQ,
+        OPENAI_CHAT,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.operation, "chat");
+    assert_eq!(s.usage.input_tokens(), Some(12));
+    assert!(s.provider_inferred);
+    // Undeclared, the same exchange is refused, and a declared host's body
+    // with no model-call shape is no model call.
+    assert!(parse_llm(
+        "llm.corp.internal",
+        "/corp/llm/chat",
+        OPENAI_REQ,
+        OPENAI_CHAT,
+        Limits::default()
+    )
+    .is_none());
+    assert!(parse_llm_declared(
+        "llm.corp.internal",
+        "/corp/search",
+        b"{}",
+        br#"{"ok":true}"#,
+        Limits::default()
+    )
+    .is_none());
+}
+
+#[test]
 fn non_llm_json_unknown_host_returns_none() {
     assert!(parse_llm(
         "127.0.0.1",

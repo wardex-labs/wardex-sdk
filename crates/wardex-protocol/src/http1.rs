@@ -7,7 +7,7 @@
 
 use wardex_limits::Limits;
 
-use crate::budget::{self, Reservation};
+use crate::budget::{self, Claim, Reservation};
 use crate::semantic::{treatment, Treatment};
 use crate::sse;
 
@@ -76,16 +76,19 @@ pub enum BodyPolicy {
 /// What a stream stored a message's body for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyUse {
-    /// Stored: the policy keeps every body.
+    /// Stored: the policy keeps every body. Second claim on
+    /// `max_in_flight_body_bytes` (`budget::Claim::Recorded`), after a model
+    /// call's: the app asked for this exchange.
     Kept,
     /// Stored, with first claim on `max_in_flight_body_bytes`: a request
     /// whose target is an LLM endpoint (`semantic::treatment`), or a response
     /// the caller said answers one (`BodyPolicy::ModelCall`).
     ModelCall,
-    /// Stored under `ModelCallsOnly` only until the reply is known: a JSON
-    /// POST to a path the endpoint table does not know. Only a reply that is
-    /// an event stream, whose grammar names its API on any path, makes it a
-    /// model call; the caller drops it otherwise.
+    /// Stored under `ModelCallsOnly` only until the reply is known, and at
+    /// most `max_opaque_body_bytes` of it: a JSON POST to a path the endpoint
+    /// table does not know. Only a reply that is an event stream, whose
+    /// grammar names its API on any path, makes it a model call; the caller
+    /// drops it otherwise.
     Provisional,
     /// Stored under `ModelCallsOnly`: a response that declares an event
     /// stream, or whose first bytes open one (`sse::opens_event_stream`).
@@ -94,6 +97,10 @@ pub enum BodyUse {
     /// and `truncated` stays false (no cap cut it).
     Skipped,
 }
+
+/// The buffer capacity a stream keeps between feeds; more is given back once
+/// the bytes that needed it are consumed.
+const RETAINED_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Incremental parser for one direction of a connection (request or response). Accumulates bytes and carves off completed messages.
 ///
@@ -484,8 +491,20 @@ impl Http1Stream {
                 None => {}
             }
         }
-        let model_call = msg.body_use == BodyUse::ModelCall;
-        let ceiling = budget::ceiling(self.limits.max_in_flight_body_bytes, model_call);
+        let claim = match msg.body_use {
+            BodyUse::ModelCall => Claim::ModelCall,
+            BodyUse::Kept => Claim::Recorded,
+            _ => Claim::Other,
+        };
+        let ceiling = budget::ceiling(self.limits.max_in_flight_body_bytes, claim);
+        // A provisional body waits for its reply after it has left the
+        // in-flight budget, so only a sample is kept of what is most often
+        // an upload: whole, many of them waiting at once were bounded by nothing.
+        let cap = if msg.body_use == BodyUse::Provisional {
+            cap.min(self.limits.max_opaque_body_bytes)
+        } else {
+            cap
+        };
         append_capped(msg, data, cap, &mut self.held, ceiling);
     }
 
@@ -587,6 +606,13 @@ impl Http1Stream {
             self.buf.drain(..self.pos);
         }
         self.pos = 0;
+        // A body written in one `sendall` arrives as one feed of its whole
+        // size; kept, that capacity would stay with a pooled connection for
+        // as long as it lives, one upload's worth per connection.
+        if self.buf.capacity() > RETAINED_BUFFER_BYTES && self.buf.len() < self.buf.capacity() / 4 {
+            self.buf
+                .shrink_to(self.buf.len().max(RETAINED_BUFFER_BYTES));
+        }
     }
 
     /// Advances the machine as far as the buffered bytes allow.
@@ -2222,6 +2248,62 @@ POST /upload HTTP/1.1\r\nContent-Type: application/octet-stream\r\nContent-Lengt
     }
 
     #[test]
+    fn a_large_write_does_not_leave_its_size_reserved_in_the_stream() {
+        let mut s = Http1Stream::new(true, Limits::default());
+        let mut upload = b"PUT /blob HTTP/1.1\r\nContent-Length: 1000000\r\n\r\n".to_vec();
+        upload.resize(upload.len() + 1_000_000, b'x');
+        assert_eq!(s.feed(&upload).len(), 1);
+        assert!(
+            s.buf.capacity() <= RETAINED_BUFFER_BYTES,
+            "{}",
+            s.buf.capacity()
+        );
+    }
+
+    #[test]
+    fn a_body_the_app_records_is_not_held_to_the_half_others_fill() {
+        // Traffic the app did not ask to record (a download outside every
+        // span) fills its half; a body it did (inside a span) still fits.
+        let limits = Limits {
+            max_in_flight_body_bytes: 20,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut download = Http1Stream::new(false, limits);
+        download.held = Reservation::in_pool(pool);
+        download.set_body_policy(BodyPolicy::ModelCallsOnly);
+        assert!(download
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 40\r\n\r\ndata: 0123456789")
+            .is_empty());
+        assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 10);
+        let mut tool = Http1Stream::new(false, limits);
+        tool.held = Reservation::in_pool(pool);
+        let msgs = tool.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nrows");
+        assert_eq!(msgs[0].body_use, BodyUse::Kept);
+        assert_eq!(msgs[0].body, b"rows");
+        assert!(!msgs[0].truncated);
+    }
+
+    #[test]
+    fn a_json_upload_kept_until_its_reply_decides_keeps_only_an_opaque_sample() {
+        // It waits for its reply after it has left the in-flight budget, so a
+        // whole upload held there would be bounded by nothing.
+        let limits = Limits {
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(true, limits);
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        let msgs = s.feed(
+            b"POST /index/_bulk HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n0123456789",
+        );
+        assert_eq!(msgs[0].body_use, BodyUse::Provisional);
+        assert_eq!(msgs[0].body, b"0123");
+        assert!(msgs[0].truncated);
+        assert_eq!(msgs[0].limitations, ["body_cap_exceeded"]);
+    }
+
+    #[test]
     fn other_bodies_leave_half_the_in_flight_budget_to_model_calls() {
         let limits = Limits {
             max_in_flight_body_bytes: 10,
@@ -2230,10 +2312,11 @@ POST /upload HTTP/1.1\r\nContent-Type: application/octet-stream\r\nContent-Lengt
         let pool = budget::private_pool();
         let mut download = Http1Stream::new(false, limits);
         download.held = Reservation::in_pool(pool);
+        download.set_body_policy(BodyPolicy::ModelCallsOnly);
         let mut call = Http1Stream::new(true, limits);
         call.held = Reservation::in_pool(pool);
         assert!(download
-            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n0123456789")
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 20\r\n\r\ndata: 0123")
             .is_empty());
         assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 5);
         let msgs = call.feed(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 5\r\n\r\n{\"a\"}");

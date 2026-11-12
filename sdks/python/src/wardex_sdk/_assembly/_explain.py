@@ -226,10 +226,13 @@ MARKERS: Mapping[Limitation, MarkerText] = MappingProxyType(
         ),
         _L.BODY_CAP_EXCEEDED: MarkerText(
             "An HTTP body was longer than wardex keeps of one, so it kept the first "
-            "max_body_bytes (max_opaque_body_bytes for a content type wardex does not parse) "
-            "and let the rest pass unrecorded.",
+            "max_body_bytes (max_opaque_body_bytes for a content type wardex does not parse, "
+            "and for a JSON request outside any span until its reply showed a model call), or "
+            "what the shared max_in_flight_body_bytes had room for, and let the rest pass "
+            "unrecorded.",
             "The payload is a prefix; anything parsed from the rest of it is missing.",
-            "Raise LimitsConfig(max_body_bytes=...) or LimitsConfig(max_opaque_body_bytes=...).",
+            "Raise LimitsConfig(max_body_bytes=...), LimitsConfig(max_opaque_body_bytes=...), "
+            "or LimitsConfig(max_in_flight_body_bytes=...) when many bodies arrive at once.",
         ),
         _L.GRPC_MESSAGE_TRUNCATED: MarkerText(
             "The last gRPC message in the captured body was incomplete, usually because the "

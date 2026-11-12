@@ -83,6 +83,15 @@ def test_the_generated_list_names_every_marker_and_reason():
         assert f"### `{name}`" in text, name
 
 
+def test_the_published_list_is_what_explain_prints():
+    """LIMITATIONS.md is `python -m wardex_sdk explain --all`: an explanation
+    changed without regenerating it publishes the old sentence."""
+    published = pathlib.Path(__file__).resolve().parents[3] / "LIMITATIONS.md"
+    assert published.read_text(encoding="utf-8") == markdown(), (
+        "regenerate it: python -m wardex_sdk explain --all > LIMITATIONS.md"
+    )
+
+
 _KNOB = re.compile(r"\b(max_[a-z0-9_]+|ws_sample_bytes|mcp_sniff_bytes)\b")
 _CALL = re.compile(r"\b(LimitsConfig|BatchingConfig|CodexExecConfig)\((\w+)=")
 

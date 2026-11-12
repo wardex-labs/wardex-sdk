@@ -825,12 +825,9 @@ def _parse_semantics(p: _PendingTxn) -> Any:
     The limits are THE JOB'S snapshot, not the seam's live attribute: that is wiring, not prose — a
     re-install between seal and finalize cannot change what bounds this parse.
     """
+    txn, declared = p.txn, p.prefilter is Prefilter.ALLOW  # named in `intercept_hosts`
     return parse_llm_semantics(
-        p.url_host,
-        p.txn.path,
-        p.txn.request_body,
-        p.txn.response_body,
-        p.limits,
+        p.url_host, txn.path, txn.request_body, txn.response_body, p.limits, declared=declared
     )
 
 

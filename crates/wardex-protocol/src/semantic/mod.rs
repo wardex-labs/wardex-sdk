@@ -354,25 +354,54 @@ pub fn parse_llm(
     resp: &[u8],
     limits: Limits,
 ) -> Option<LlmSemantics> {
+    parse_llm_by(host, path, req, resp, limits, false)
+}
+
+/// `parse_llm` for an exchange with a host the app named as an LLM endpoint
+/// (`intercept_hosts`): a non-streaming response on a path no endpoint table
+/// knows is read by its body's shape instead of refused, so a gateway serving
+/// an API shape on a path of its own is still a model call.
+pub fn parse_llm_declared(
+    host: &str,
+    path: &str,
+    req: &[u8],
+    resp: &[u8],
+    limits: Limits,
+) -> Option<LlmSemantics> {
+    parse_llm_by(host, path, req, resp, limits, true)
+}
+
+fn parse_llm_by(
+    host: &str,
+    path: &str,
+    req: &[u8],
+    resp: &[u8],
+    limits: Limits,
+    declared: bool,
+) -> Option<LlmSemantics> {
     let decoded = decode_body(resp, limits);
     let bounds = UsageBounds::from_limits(&limits);
     if let Some(s) = try_parse_sse(host, path, req, &decoded, bounds) {
         return Some(s);
     }
     // Non-streaming: the endpoint is decided by the path alone (conservative:
-    // a path that matches no endpoint is not an LLM call). On a host that
+    // a path that matches no endpoint is not an LLM call), except on a host the
+    // app declared, where the body's shape decides an unknown path. On a host that
     // proves no provider, the call still has to show it is an LLM call — a
     // host name that mentions a provider, or a provider-shaped body — and
     // then ships unlabelled and marked rather than as a guessed vendor.
-    let matched = endpoint::from_path(path)?;
-    let provider = endpoint::provider_for_host(host);
-    if provider.is_none()
-        && !host_mentions_a_provider(host)
-        && serde_json::from_slice::<serde_json::Value>(&decoded)
+    let shape = || {
+        serde_json::from_slice::<serde_json::Value>(&decoded)
             .ok()
             .and_then(|v| endpoint::from_body_shape(&v))
-            .is_none()
-    {
+    };
+    let matched = match endpoint::from_path(path) {
+        Some(matched) => matched,
+        None if declared => shape()?,
+        None => return None,
+    };
+    let provider = endpoint::provider_for_host(host);
+    if provider.is_none() && !host_mentions_a_provider(host) && shape().is_none() {
         return None;
     }
     let mut out = LlmSemantics {

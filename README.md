@@ -396,6 +396,14 @@ yet. Outside a span they are counted under `mode_refused` and said once per
 API; record them inside `wardex.span(...)` or with
 `capture_mode=CaptureMode.ALL`.
 
+A gateway that serves one of the parsed shapes on a path of its own (a
+company LLM proxy at `/corp/llm/chat`) is declared with
+`wardex.init(intercept_hosts=["llm.corp.example"])`: every call to that host
+is recorded, and a reply in an OpenAI or Anthropic shape is a model call on
+any path. A TLS host matches by the name the client connected with; a
+plaintext `http://` host matches only by its address, such as
+`10.0.0.7:4000`.
+
 ### Overhead
 
 Measured on one arm64 macOS machine at a load average of about 2, not a

@@ -41,7 +41,8 @@ use wardex_core::protocol::http1::{BodyPolicy, BodyUse, Http1Stream, ParsedHttp}
 use wardex_core::protocol::http2::{Http2Connection, Http2Transaction as CoreHttp2Txn};
 use wardex_core::protocol::json_rpc::{JsonRpcKind, JsonRpcMessage as CoreJsonRpc, JsonRpcStream};
 use wardex_core::protocol::semantic::{
-    parse_llm, treatment, ws_upgrade, LlmSemantics as CoreLlmSemantics, Treatment, WsUpgrade,
+    parse_llm, parse_llm_declared, treatment, ws_upgrade, LlmSemantics as CoreLlmSemantics,
+    Treatment, WsUpgrade,
 };
 use wardex_core::protocol::websocket::{
     WsFeedResult as CoreWsFeedResult, WsFrame as CoreWsFrame, WsParser as CoreWsParser,
@@ -1095,8 +1096,11 @@ fn normalize_finish_reason(provider: &str, raw: &str) -> PyResult<String> {
 /// parse is pure Rust (inflate + SSE + JSON + reassembly); the `LlmSemantics`
 /// pyclass wrapping happens after the GIL is re-acquired. No size threshold —
 /// release/re-acquire is µs, two orders under the smallest measured parse.
+///
+/// `declared`: the host is one the app named in `intercept_hosts`, so a path
+/// no endpoint table knows is read by the body's shape (`parse_llm_declared`).
 #[pyfunction]
-#[pyo3(signature = (host, path, req, resp, limits=None))]
+#[pyo3(signature = (host, path, req, resp, limits=None, declared=false))]
 fn parse_llm_semantics(
     py: Python<'_>,
     host: PyBackedStr,
@@ -1104,10 +1108,16 @@ fn parse_llm_semantics(
     req: PyBackedBytes,
     resp: PyBackedBytes,
     limits: Option<PyLimits>,
+    declared: bool,
 ) -> PyResult<Option<LlmSemantics>> {
     shielded(|| {
         let l = limits.map(|p| p.inner).unwrap_or_default();
-        let inner = py.allow_threads(move || parse_llm(&host, &path, &req, &resp, l));
+        let parse = if declared {
+            parse_llm_declared
+        } else {
+            parse_llm
+        };
+        let inner = py.allow_threads(move || parse(&host, &path, &req, &resp, l));
         Ok(inner.map(|inner| LlmSemantics { inner }))
     })
 }

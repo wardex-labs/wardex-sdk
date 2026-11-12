@@ -10,9 +10,12 @@
 //! with many large ones in flight each is cut wherever the budget filled, not only the last to
 //! start.
 //!
-//! The budget is not first come, first served for every body: one that cannot be a model call's
-//! by its exchange's target (`ceiling`) may take only half of it, so downloads, uploads and
-//! long-lived feeds can never take the room a model call needs.
+//! The budget is not first come, first served for every body (`ceiling`). A model call's body, by
+//! its exchange's target, may take all of it; a body the app asked to record (inside a span) three
+//! quarters; any other only half. So downloads, uploads and long-lived feeds outside every span can
+//! never take the room a model call or the app's own recorded work needs, and recorded work can
+//! never take a model call's last quarter. HTTP/2 cannot yet tell the app's streams apart, so every
+//! HTTP/2 body but a model call's is held to the half.
 //!
 //! A completed message is the caller's to bound: once handed back, its body is no longer held
 //! here.
@@ -27,15 +30,25 @@ pub fn held() -> usize {
     HELD.load(Ordering::Relaxed)
 }
 
-/// The level up to which a body may take from the budget (`Reservation::grow`'s `ceiling`): all of
-/// `max_in_flight_body_bytes` for a body of an exchange with an LLM endpoint (`model_call`), half
-/// of it for any other. The other half is therefore always there for model calls, however many
-/// other bodies are arriving.
-pub(crate) fn ceiling(max_in_flight_body_bytes: usize, model_call: bool) -> usize {
-    if model_call {
-        max_in_flight_body_bytes
-    } else {
-        max_in_flight_body_bytes / 2
+/// Which share of the budget a body may grow into (`ceiling`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Claim {
+    /// A body of an exchange with an LLM endpoint: all of it.
+    ModelCall,
+    /// A body the app asked to record: three quarters.
+    Recorded,
+    /// Any other body: half.
+    Other,
+}
+
+/// The level up to which a body may take from the budget (`Reservation::grow`'s `ceiling`). Each
+/// claim above `Other` therefore always has room the claims below it cannot fill, however many of
+/// their bodies are arriving.
+pub(crate) fn ceiling(max_in_flight_body_bytes: usize, claim: Claim) -> usize {
+    match claim {
+        Claim::ModelCall => max_in_flight_body_bytes,
+        Claim::Recorded => max_in_flight_body_bytes / 4 * 3,
+        Claim::Other => max_in_flight_body_bytes / 2,
     }
 }
 
@@ -135,9 +148,20 @@ mod tests {
         let pool = private_pool();
         let mut download = Reservation::in_pool(pool);
         let mut model_call = Reservation::in_pool(pool);
-        assert_eq!(download.grow(100, ceiling(100, false)), 50);
-        assert_eq!(download.grow(1, ceiling(100, false)), 0);
-        assert_eq!(model_call.grow(60, ceiling(100, true)), 50);
+        assert_eq!(download.grow(100, ceiling(100, Claim::Other)), 50);
+        assert_eq!(download.grow(1, ceiling(100, Claim::Other)), 0);
+        assert_eq!(model_call.grow(60, ceiling(100, Claim::ModelCall)), 50);
+    }
+
+    #[test]
+    fn recorded_bodies_have_room_others_cannot_fill_and_leave_a_quarter_to_model_calls() {
+        let pool = private_pool();
+        let mut download = Reservation::in_pool(pool);
+        let mut tool = Reservation::in_pool(pool);
+        let mut model_call = Reservation::in_pool(pool);
+        assert_eq!(download.grow(100, ceiling(100, Claim::Other)), 50);
+        assert_eq!(tool.grow(100, ceiling(100, Claim::Recorded)), 25);
+        assert_eq!(model_call.grow(100, ceiling(100, Claim::ModelCall)), 25);
     }
 
     #[test]

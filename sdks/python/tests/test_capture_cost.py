@@ -263,8 +263,8 @@ def test_bodies_in_flight_share_one_budget_and_one_arriving_into_a_full_budget_i
         transport=wardex.NoOpTransport(),
         adapters=wardex.AdaptersConfig(enabled=()),
         capture_mode=CaptureMode.ALL,
-        # Twice the room: a body that is no model call's may take half of the budget.
-        limits=LimitsConfig(max_in_flight_body_bytes=2 * (before + len(big) + 1000)),
+        # A recorded body that is no model call's may take three quarters of the budget.
+        limits=LimitsConfig(max_in_flight_body_bytes=(before + len(big) + 1000) * 4 // 3),
     )
     first = http.client.HTTPConnection("127.0.0.1", server.port)
     first.request("GET", "/first")
@@ -292,8 +292,9 @@ def test_bodies_in_flight_share_one_budget_and_one_arriving_into_a_full_budget_i
 
 @pytest.mark.parametrize("where", ["download inside a span", "event stream outside any span"])
 def test_bodies_that_are_no_model_call_leave_room_for_one(server, where):
-    """Traffic that cannot be a model call by its target fills its half of the budget, and a model
-    call arriving meanwhile is still stored whole: the span keeps its model and is not cut."""
+    """Traffic that cannot be a model call by its target fills its share of the budget (half
+    outside any span, three quarters for a span's own), and a model call arriving meanwhile is
+    still stored whole: the span keeps its model and is not cut."""
     server.body = (b"data: " + b"y" * 1000 + b"\n\n") * 400  # ~400 KB
     server.get_type = "text/event-stream" if "event stream" in where else "application/json"
     server.hold = threading.Event()
@@ -311,7 +312,8 @@ def test_bodies_that_are_no_model_call_leave_room_for_one(server, where):
             conn.request("GET", "/feed")
             resp = conn.getresponse()
             resp.read(len(server.body) - 1)
-        assert _held() <= budget // 2, "the download took more than its half"
+        share = budget // 4 * 3 if "inside" in where else budget // 2
+        assert _held() <= share, "the download took more than its share"
         with wardex.span("agent"):
             _post(server.port, "/v1/chat/completions", _CHAT_REQUEST)
         server.hold.set()
@@ -322,6 +324,38 @@ def test_bodies_that_are_no_model_call_leave_room_for_one(server, where):
     (call,) = [s for s in client_spans() if s.name == "HTTP POST /v1/chat/completions"]
     assert call.gen_ai is not None and call.gen_ai.request_model == "gpt-4o"
     assert Limitation.BODY_CAP_EXCEEDED not in call.capture_integrity.limitations
+
+
+def test_a_spans_own_bodies_have_room_traffic_outside_every_span_cannot_fill(server):
+    """A long download outside any span fills its half of the budget; the tool calls an agent
+    makes inside a span meanwhile are still stored whole."""
+    server.body = (b"data: " + b"y" * 1000 + b"\n\n") * 400  # ~400 KB
+    server.get_type = "text/event-stream"
+    server.hold = threading.Event()
+    rows = json.dumps({"rows": ["x" * 40] * 800}).encode()  # ~35 KB
+    tool = _Server(rows)
+    before = _held()
+    budget = 2 * (before + 150_000)  # the download alone could fill all of it
+    wardex.init(
+        transport=wardex.NoOpTransport(),
+        adapters=wardex.AdaptersConfig(enabled=()),
+        limits=LimitsConfig(max_in_flight_body_bytes=budget),
+    )
+    conn = http.client.HTTPConnection("127.0.0.1", server.port)
+    try:
+        conn.request("GET", "/feed")
+        resp = conn.getresponse()
+        resp.read(len(server.body) - 1)
+        with wardex.span("agent-tool"):
+            assert _get(tool.port, "/search") == rows
+        server.hold.set()
+        resp.read()
+    finally:
+        conn.close()
+        tool.close()
+    (search,) = [s for s in client_spans() if s.name == "HTTP GET /search"]
+    assert Limitation.BODY_CAP_EXCEEDED not in search.capture_integrity.limitations
+    assert search.transport.response_size == len(rows)
 
 
 # --- an overloaded parse queue -------------------------------------------------------------
@@ -482,3 +516,22 @@ def test_intercept_hosts_captures_a_tls_host_named_by_its_server_name(hosts, kep
     assert len(seam._client.spans) == kept
     if kept:
         assert seam._client.spans[0].capture_integrity.request_body_captured
+
+
+def test_a_declared_gateway_on_a_path_of_its_own_is_a_model_call(server):
+    """A gateway named in `intercept_hosts` serves the Chat shape on its own path: the reply's
+    shape makes it a model call, with the model and tokens, inside a span or not."""
+    server.post_reply = _CHAT_REPLY
+    wardex.init(
+        transport=wardex.NoOpTransport(),
+        adapters=wardex.AdaptersConfig(enabled=()),
+        intercept_hosts=["127.0.0.1"],
+    )
+    _post(server.port, "/corp/llm/chat", _CHAT_REQUEST)
+    server.post_reply = b'{"rows":[]}'
+    _post(server.port, "/corp/search", b'{"q":"x"}')
+    spans = {s.name: s for s in client_spans()}
+    call = spans["HTTP POST /corp/llm/chat"]
+    assert call.gen_ai is not None
+    assert call.gen_ai.request_model == "gpt-4o"
+    assert spans["HTTP POST /corp/search"].gen_ai is None, "a reply of no model-call shape"

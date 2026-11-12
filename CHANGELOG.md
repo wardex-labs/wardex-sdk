@@ -122,9 +122,12 @@ All notable changes to this project are documented here. The format follows
   exporter's destination, last success, last error and retry queue. Other
   transports return `None`.
 - **`LimitsConfig(max_in_flight_body_bytes=...)`, 64 MiB by default.** One
-  budget for the HTTP bodies all connections hold at once. A body that
-  cannot belong to a model call may use half of it. A body cut at the budget
-  is marked `body_cap_exceeded` and counted under `body_cap`.
+  budget for the HTTP bodies all connections hold while they arrive. A model
+  call's body may use all of it, a body inside a span three quarters, and
+  any other body half, so traffic outside every span cannot crowd out a
+  span's own tool calls. On HTTP/2 every body but a model call's is held to
+  the half. A body cut at the budget is marked `body_cap_exceeded` and
+  counted under `body_cap`.
 - **A call to a model API wardex does not parse yet is counted and said
   once.** A Gemini, Vertex AI, Bedrock, Cohere, Mistral or Ollama
   (`/api/chat`, `/api/generate`) call outside any span is counted under
@@ -572,7 +575,11 @@ All notable changes to this project are documented here. The format follows
   any span, under the default `capture_mode`, a request that cannot be a
   model call is decided at its head: its bodies are counted through, never
   stored or queued for a parse. Eight concurrent 25 MiB downloads add about
-  1 MB of peak memory, down from about 376 MB.
+  1 MB of peak memory, down from about 376 MB. A JSON upload outside any
+  span keeps at most `max_opaque_body_bytes` (256 KiB) while it waits for
+  its reply, and a large write no longer leaves its size allocated on a
+  pooled connection: sixteen 25 MiB JSON uploads add about 12 MB, down from
+  about 845 MB.
 - **Model calls keep their model and tokens when other traffic is heavy.** A
   burst of internal HTTP calls no longer fills the parse queue or the body
   budget ahead of them.
@@ -580,7 +587,10 @@ All notable changes to this project are documented here. The format follows
   outside spans.** A company gateway's reply is kept when it declares
   `text/event-stream` or its first bytes are SSE.
 - **`intercept_hosts` matches a TLS host by the name the client connected
-  with**, and accepts bracketed IPv6 entries such as `[::1]:8443`.
+  with**, and accepts bracketed IPv6 entries such as `[::1]:8443`. On a host
+  named there, a JSON reply in an OpenAI or Anthropic API shape is a model
+  call on any path, so a company gateway at `/corp/llm/chat` ships its model,
+  tokens and messages. A plaintext host matches only by its address.
 - **Requests no longer share tags, users or accounts.** A value set inside
   an asyncio task, a `wardex.bind_context` thread or a scope block stays
   there. A loop that sets each request's user and then starts that request

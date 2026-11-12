@@ -372,8 +372,9 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
         _R.BODY_CAP: ReasonInfo(
             _U.SPAN,
             "partial",
-            "A body was cut at its capture limit (max_body_bytes, max_opaque_body_bytes, or "
-            "the shared max_in_flight_body_bytes).",
+            "A body was cut at its capture limit (max_body_bytes, max_opaque_body_bytes, which "
+            "also bounds a JSON request outside any span until its reply showed a model call, "
+            "or the shared max_in_flight_body_bytes).",
             "Raise LimitsConfig(max_body_bytes=...), max_opaque_body_bytes for a content type "
             "wardex does not parse, or max_in_flight_body_bytes when many bodies arrive at once.",
         ),

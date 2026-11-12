@@ -9,7 +9,7 @@ use fluke_hpack::Decoder;
 
 use wardex_limits::Limits;
 
-use crate::budget::{self, process_pool, Reservation};
+use crate::budget::{self, process_pool, Claim, Reservation};
 use crate::semantic::{treatment, Treatment};
 
 /// A carved raw HTTP/2 frame.
@@ -824,7 +824,12 @@ impl Http2Connection {
             // regains later must not splice a later part onto the prefix.
             if !*truncated {
                 let room = cap.saturating_sub(target.len());
-                let ceiling = budget::ceiling(limits.max_in_flight_body_bytes, st.model_call);
+                let claim = if st.model_call {
+                    Claim::ModelCall
+                } else {
+                    Claim::Other
+                };
+                let ceiling = budget::ceiling(limits.max_in_flight_body_bytes, claim);
                 let take = held.grow(room.min(body.len()), ceiling);
                 target.extend_from_slice(&body[..take]);
                 if take < body.len() {
