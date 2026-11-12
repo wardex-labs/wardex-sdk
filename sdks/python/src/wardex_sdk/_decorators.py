@@ -196,7 +196,7 @@ def _call_site(code: Any) -> CallSite | None:
         site = CallSite(
             file=_call_site_file(source.co_filename, module),
             line=source.co_firstlineno,
-            function=code.__name__,
+            function=_name_of(code, code),
             module=module,
         )
     return site
@@ -296,8 +296,9 @@ def _decorate(
     the identity semconv key: `gen_ai.agent.name` from an `AgentAttributes`,
     `gen_ai.tool.name` from a `ToolAttributes`, `gen_ai.workflow.name`, or
     `wardex.step.name`. Without a given name, the span name is the qualified
-    one (`Researcher.run`, so two classes' methods differ) and the identity
-    key the function's own (`run`), the name an adapter would report. An
+    one (`Researcher.run`, so two classes' methods differ), and so is the
+    identity key, except a tool's: `gen_ai.tool.name` is the function's own
+    (`search`), the name a model calls it by and an adapter reports. An
     agent block built here states no `wardex.agent.type`: running a function
     shows neither that it is the primary agent nor whose sub-agent it is.
     """
@@ -328,7 +329,8 @@ def _decorate(
     def shaped(fn: Any, shape: str, code: Any) -> Any:
         chosen = name or (given.name if given is not None else None)
         span_name = f"{op.value} {chosen or _name_of(fn, code)}"
-        identity = chosen or _identity_of(fn, code) or _name_of(fn, code)
+        own = _identity_of(fn, code) if api == "tool" else None
+        identity = chosen or own or _name_of(fn, code)
         agent_block = agent
         tool_block = tool
         if api == "agent" and agent_block is None:

@@ -301,7 +301,9 @@ with wardex.conversation("support-chat", id="session-123"):
 
 The decorators produce `invoke_agent researcher` and `execute_tool search`
 spans (`@workflow` and `@step` produce `invoke_workflow` and
-`execute_step`); without `name=`, the name is the qualified function name.
+`execute_step`); without `name=`, the name is the qualified function name
+(`Researcher.run`), and so is the agent's, workflow's or step's identity,
+while a tool's `gen_ai.tool.name` is the function's own (`search`).
 On a generator the span lasts from the first item to the last. Every span
 inside a `conversation()` block, model calls included, carries
 `gen_ai.conversation.id`, and the spans after `set_user` and `set_account`

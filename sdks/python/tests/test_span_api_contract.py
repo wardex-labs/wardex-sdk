@@ -330,6 +330,12 @@ def test_two_classes_methods_of_one_name_are_two_span_names(wire):
     Writer().run()
     shipped = _shipped(wire)
     assert {"invoke_agent Researcher.run", "invoke_agent Writer.run"} <= set(shipped)
+    # Two agents, so two identities: an agent view keyed on the name must not
+    # merge them, and nothing outside the process names an agent by `run`.
+    for qualified in ("Researcher.run", "Writer.run"):
+        attributes = shipped[f"invoke_agent {qualified}"]["attributes"]
+        assert attributes["gen_ai.agent.name"] == qualified
+        assert attributes["code.function.name"].endswith(f".{qualified}")
 
 
 def test_a_method_exports_its_own_name_as_the_identity(wire):

@@ -624,9 +624,12 @@ All notable changes to this project are documented here. The format follows
 - **A bare `@wardex.span` fails where it is written**, with a message that
   points at `@wardex.workflow`, `@wardex.agent`, `@wardex.step` and
   `@wardex.tool`.
-- **A decorated method exports its own name as `gen_ai.tool.name` or
-  `gen_ai.agent.name`** (`search`, the name adapters report). The span name
-  keeps the qualified name.
+- **A decorated method exports its own name as `gen_ai.tool.name`**
+  (`search`, the name a model calls it by and adapters report). The span
+  name keeps the qualified name. An agent, workflow or step method exports
+  its qualified name (`Researcher.run`) as `gen_ai.agent.name`,
+  `gen_ai.workflow.name` or `wardex.step.name`, so two classes' `run`
+  methods are two agents; `code.function.name` is qualified the same way.
 - **In a decorated generator, `wardex.current_span()` after a `yield` inside
   a `with wardex.span()` block returns that block's span.**
 - **Masking keeps version strings.** `numpy==1.26.4.1`, `v1.2.3.4`,
