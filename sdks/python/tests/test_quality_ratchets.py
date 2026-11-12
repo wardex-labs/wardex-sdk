@@ -481,7 +481,7 @@ _OVERSIZED_BUDGET = {
     # (`_open_child`, the start instant, the error sentences) moved out to
     # `_openai_agents_kinds.py` beside those kinds, with the model call's join.
     "_adapters/_openai_agents.py": 1465,
-    "_client.py": 1565,
+    "_client.py": 1564,
     "_adapters/_context.py": 1305,
     "_interceptors/_seam.py": 1153,
     "_adapters/_langgraph.py": 1035,

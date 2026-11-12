@@ -1021,6 +1021,25 @@ def test_a_retry_after_past_the_backoff_cap_is_said_as_the_receiver_asked(receiv
     assert "backing off up to" not in line
 
 
+def test_ctrl_c_during_close_still_counts_the_batch_close_was_sending(monkeypatch, capsys):
+    """A KeyboardInterrupt the program catches lands while close() waits on
+    its final export: that batch is counted, and the line names it."""
+
+    def urlopen(request, timeout=None):
+        raise KeyboardInterrupt  # what the main thread gets, mid-wait
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    client = _client(transport)
+    for _ in range(4):
+        client.capture_span(_span())
+    with pytest.raises(KeyboardInterrupt):
+        client.close(1.0)
+    client.close(1.0)
+    assert _lost(DropReason.SEND_UNCONFIRMED) == 4
+    assert _lines(capsys.readouterr().err, "4 span(s)")
+
+
 def test_a_request_that_fails_after_close_is_counted_not_queued(monkeypatch, capsys):
     def refuse(request, timeout=None):
         raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))

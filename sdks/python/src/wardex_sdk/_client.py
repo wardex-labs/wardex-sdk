@@ -76,12 +76,7 @@ def _receiver_unreachable(transport: Transport) -> bool:
 
 
 # The default budget for close(), and the value an unusable argument falls back
-# to. An alias, not a second literal: this used to be its own `5.0` next to
-# three more in `transport/_base.py` and `transport/_console.py`, under a
-# comment claiming the signature default and the fallback could not drift --
-# true of the two uses in THIS module and false of the other three, which is
-# the worst kind of comment to leave standing. One definition now, in
-# `transport/_base.py`, where the `Transport` defaults that must match it live.
+# to: an alias of the one definition, beside the `Transport` defaults that match it.
 _DEFAULT_TIMEOUT = DEFAULT_TIMEOUT
 
 
@@ -1456,7 +1451,11 @@ class Client:
         #     sit in the buffer silently; raised before, `_admit` reports it as lost.
         self._finalize_drained = True
         final_budget = _left(deadline) if wait_for_export else 0.0
-        self._drain(final_budget, final=True, named_by_caller=named_by_caller)  # 5. final drain
+        try:
+            self._drain(final_budget, final=True, named_by_caller=named_by_caller)  # 5. final drain
+        except BaseException:  # Ctrl-C: the last close(), so count what was in flight now
+            self._close_transport(0.0)
+            raise
         self._close_transport(_left(deadline))  # 6.
         say_slow_close(self._transport, time.monotonic() - started, budget)
 
