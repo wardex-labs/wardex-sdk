@@ -365,7 +365,7 @@ class OtlpHttpTransport(Transport):
                 self._hold(bodies, shipped)
             return None
 
-        rejected = 0
+        rejected, page = 0, False
         for index, body in enumerate(bodies):
             # Every request reads the same deadline: what the caller bounded is
             # the call, so an oversized batch cannot multiply it by the number
@@ -426,6 +426,9 @@ class OtlpHttpTransport(Transport):
                 # A backend that refused one request refuses the next, and
                 # trying anyway spends the caller's budget one timeout at a time.
                 break
+            if not self._delivery.owns(flight):
+                break  # close() claimed it and counted it; its answer changes nothing
+            page = page or (answer is not None and answer.kind == "html")
             rejected += self._delivery.answered(answer, shipped - rejected)
             if index + 1 < len(bodies):
                 if not self._delivery.owns(flight):
@@ -433,7 +436,16 @@ class OtlpHttpTransport(Transport):
                 flight.units = self._units(bodies[index + 1 :], None)
         else:
             self._delivery.end(flight)
-            self._delivery.succeeded((shipped - rejected) or None)
+            if page:  # a 2xx with a web page: no OTLP receiver answered
+                record(DropReason.SEND_UNCONFIRMED, shipped - rejected)
+                report_once(
+                    f"the export to {self._delivery.destination} was answered with a web page, "
+                    "not an OTLP response: a proxy, a login page or a web app is at that "
+                    "address, and wardex counts the spans as not confirmed delivered "
+                    "(send_unconfirmed). Check the endpoint's host and path.",
+                    key="transport.otlp.web_page",
+                )
+            self._delivery.succeeded(None if page else (shipped - rejected) or None)
         # No `UNDELIVERED` on the failure path: the POST was attempted, so the
         # backend may hold the batch, and a resend would duplicate it.
         return None

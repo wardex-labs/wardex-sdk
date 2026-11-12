@@ -341,8 +341,8 @@ class WardexTransport(Transport):
             self._delivery.refused(exc, waited=time.monotonic() - started)
             self._lost(envelope, exc, spans, timeout, effective, started)
             return None
-        self._delivery.end(flight)
-        self._delivery.succeeded(spans)
+        if self._delivery.end(flight):  # else close() claimed it and counted it
+            self._delivery.succeeded(spans)
         # No `UNDELIVERED` on the failure path either: the POST was attempted,
         # so the receiver may hold the batch, and a resend would duplicate it.
         return None

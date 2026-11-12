@@ -933,6 +933,94 @@ def test_a_signal_that_ends_the_process_behind_a_hung_export_counts_what_dies(
     client.close(0.1)
 
 
+class _LateOk:
+    """A 2xx answer, as `urlopen` returns one."""
+
+    def __init__(self, body: bytes = b"", content_type: str = "application/x-protobuf") -> None:
+        self.body = body
+        self.headers = {"content-type": content_type}
+
+    def __enter__(self) -> _LateOk:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def read(self, n: int = -1) -> bytes:
+        return self.body
+
+
+@pytest.mark.parametrize("wire", ["otlp", "wardex"])
+@pytest.mark.parametrize("answer", [b"", b"\x0a\x02\x08\x01"], ids=["plain", "partial"])
+def test_an_export_answered_after_close_gave_up_on_it_is_not_counted_again(
+    monkeypatch, capsys, wire, answer
+):
+    """close() counted the batch as not confirmed; the 200 that comes later must
+    neither count part of it a second time nor announce a first delivery."""
+    release, calls = threading.Event(), []
+
+    def urlopen(request, timeout=None):
+        calls.append(1)
+        release.wait(10.0)
+        return _LateOk(answer)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    if wire == "otlp":
+        transport = OtlpHttpTransport("http://collector.invalid/v1/traces")
+    else:
+        transport = WardexTransport("http://receiver.invalid", project_key())
+    client = _client(transport)
+    for _ in range(3):
+        client.capture_span(_span())
+    worker = threading.Thread(target=client.flush, args=(5.0,), daemon=True)
+    worker.start()
+    time.sleep(0.2)
+    assert len(calls) == 1, "the export is not in flight"
+    client.close(0.3)
+    release.set()
+    worker.join(5.0)
+
+    counts = {k: n for k, n in _ledger.snapshot().counts.items() if k[1] is DropUnit.SPAN}
+    assert counts == {(DropReason.SEND_UNCONFIRMED, DropUnit.SPAN): 3}
+    assert not _lines(capsys.readouterr().err, "first export delivered")
+
+
+def test_a_web_page_answering_200_is_no_delivery(monkeypatch, capsys):
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda request, timeout=None: _LateOk(b"<html>login</html>", "text/html"),
+    )
+    OtlpHttpTransport("http://collector.invalid/v1/traces").export(_envelope(2))
+    err = capsys.readouterr().err
+    assert not _lines(err, "first export delivered")
+    [line] = _lines(err, "web page")
+    assert "http://collector.invalid/v1/traces" in line
+    assert _lost(DropReason.SEND_UNCONFIRMED) == 2
+
+
+@pytest.mark.parametrize(
+    ("encoding", "content_type", "body"),
+    [
+        ("gzip", "application/x-protobuf", b"\x1f\x8b\x08\x00garbage-after-the-header"),
+        ("", "application/json", b'{"partialSuccess":{"rejectedSpans":1e999}}'),
+    ],
+    ids=["bad-gzip", "json-infinity"],
+)
+def test_an_answer_wardex_cannot_read_is_never_an_error(encoding, content_type, body):
+    from wardex_sdk.transport._otlp_answer import read_answer
+
+    assert read_answer(content_type, encoding, body).kind == "other"
+
+
+def test_a_retry_after_past_the_backoff_cap_is_said_as_the_receiver_asked(receiver, capsys):
+    receiver.answers.append((503, {"Retry-After": "900"}, b""))
+    OtlpHttpTransport(f"{receiver.base}/v1/traces").export(_envelope())
+    [line] = _lines(capsys.readouterr().err, "HTTP 503")
+    assert "retries after 900s, as the receiver asked" in line
+    assert "backing off up to" not in line
+
+
 def test_a_request_that_fails_after_close_is_counted_not_queued(monkeypatch, capsys):
     def refuse(request, timeout=None):
         raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))

@@ -880,6 +880,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.in_flight_at_close'"): L(
         "SEND_UNCONFIRMED", at="transport/_delivery.py"
     ),
+    ("transport/_otlp_http.py", "report_once", "'transport.otlp.web_page'"): L("SEND_UNCONFIRMED"),
     ("transport/_delivery.py", "report_once", "f'transport.{self._wire}.in_flight_at_signal'"): L(
         "SEND_UNCONFIRMED", at="transport/_delivery.py"
     ),
@@ -901,6 +902,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         at="transport/_otlp_http.py",
     ),
     ("transport/_otlp_http.py", "record", "DropReason.BUDGET_EXHAUSTED"): L("BUDGET_EXHAUSTED"),
+    ("transport/_otlp_http.py", "record", "DropReason.SEND_UNCONFIRMED"): L("SEND_UNCONFIRMED"),
     ("transport/_otlp_http.py", "record", "lost_as"): L(
         "NETWORK_ERROR",
         "SEND_ERROR",

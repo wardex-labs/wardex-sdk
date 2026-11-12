@@ -9,8 +9,8 @@ nothing but the standard library, so a caller can count or report them.
 
 from __future__ import annotations
 
-import gzip
 import json
+import zlib
 from collections.abc import Iterator
 from typing import NamedTuple
 
@@ -36,7 +36,8 @@ def read_answer(content_type: str, content_encoding: str, body: bytes) -> Answer
     media = content_type.split(";", 1)[0].strip().lower()
     try:
         if content_encoding.strip().lower() == "gzip" and body:
-            body = gzip.decompress(body)[:MAX_ANSWER_BYTES]
+            # Bounded as it inflates: a small answer can expand a thousandfold.
+            body = zlib.decompressobj(wbits=31).decompress(body, MAX_ANSWER_BYTES)
         if not body:
             return Answer("otlp", media)
         if media in ("text/html", "application/xhtml+xml") or body.lstrip()[:1] == b"<":
@@ -45,7 +46,7 @@ def read_answer(content_type: str, content_encoding: str, body: bytes) -> Answer
             return _from_json(media, json.loads(body))
         if media in ("application/x-protobuf", "application/protobuf"):
             return _from_protobuf(media, body)
-    except (OSError, EOFError, ValueError, TypeError, AttributeError, IndexError):
+    except Exception:  # noqa: BLE001 — the far end's bytes; an answer read wrong is "other"
         pass
     return Answer("other", media)
 

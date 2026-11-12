@@ -343,11 +343,9 @@ _FIRST_SUCCESS_PID: list[int] = []
 class Delivery:
     """One transport's retry queue, backoff, outage reporting and state.
 
-    Used under the transport's own serialization (`export`/`flush`/`close` are
-    never entered by two threads at once). The one overlap is a `close()` that
-    gave up waiting on an export still running on the worker; each queue step
-    is then a single deque operation, so the worst outcome is a body counted on
-    the side it ended on."""
+    Used under the transport's own serialization. The one overlap is a
+    `close()` beside an export still running on the worker, and `_lock`
+    settles which of the two accounts each body."""
 
     def __init__(
         self,
@@ -379,8 +377,8 @@ class Delivery:
         self._outage_attempts = 0
         self._outage_dropped = 0
         self._outage_said_at: float | None = None
-        # Guards `_flights` and `_closed`: close() and the exporter settle who
-        # accounts what is in flight. Re-entrant, so a signal handler that
+        # Guards `_flights`, `_closed` and the append to `_held`: close() and the
+        # exporter settle who accounts what. Re-entrant, so a signal handler that
         # interrupts its holder on the same thread cannot deadlock on it.
         self._lock = threading.RLock()
         self._flights: list[Held] = []
@@ -450,7 +448,11 @@ class Delivery:
     # -- queue -------------------------------------------------------------
 
     def hold(self, item: Held) -> None:
-        if self._closed:
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._held.append(item)
+        if closed:
             # Nothing will ever send it: a closed transport is not flushed again.
             self.lose(item, item.reason)
             report_once(
@@ -460,7 +462,6 @@ class Delivery:
                 key=f"transport.{self._wire}.failed_after_close",
             )
             return
-        self._held.append(item)
         while len(self._held) > 1 and (
             len(self._held) > RETRY_MAX_BATCHES
             or sum(len(h.body) for h in self._held) > RETRY_MAX_BYTES
@@ -582,7 +583,7 @@ class Delivery:
             flights, self._flights = self._flights, []
         if not flights:
             return None
-        self._held = deque(h for h in self._held if all(h is not f for f in flights))
+        self._held = deque(h for h in tuple(self._held) if all(h is not f for f in flights))
         totals: dict[DropUnit, int] = {}
         for flight in flights:
             self.lose(flight, DropReason.SEND_UNCONFIRMED)
@@ -705,6 +706,7 @@ class Delivery:
         self.last_reason = self._classify(exc)[0]
         self._failures += 1
         delay = retry_after(exc)
+        asked = delay is not None
         if delay is None:
             delay = self._backoff()
         self._not_before = now + delay
@@ -720,8 +722,9 @@ class Delivery:
             message = (
                 f"{self._article} {self._label} export to {self.destination} failed "
                 f"({self._last_error}); "
-                f"wardex holds {what} and retries after {delay:.0f}s, backing off up to "
-                f"{BACKOFF_MAX_S:.0f}s (at most {RETRY_MAX_BATCHES} requests are held). "
+                f"wardex holds {what} and retries after {delay:.0f}s, "
+                + ("as the receiver asked" if asked else f"backing off up to {BACKOFF_MAX_S:.0f}s")
+                + f" (at most {RETRY_MAX_BATCHES} requests are held). "
                 "What it drops is counted in wardex.diagnostics().losses."
             )
         else:
