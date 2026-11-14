@@ -69,7 +69,7 @@ caps in `CaptureLimits`. Being uncollected also excludes it from the 3.10 floor
 check, which runs pytest — so after editing it, run it once more under
 `.venv-py310/bin/python`. Nothing else will catch a 3.11+-only call in there.
 
-Four more files are uncollected for the same reason and run only when a
+Five more files are uncollected for the same reason and run only when a
 person does. Each names the change that should trigger it:
 
 | File | Run it when you touch | Needs |
@@ -78,6 +78,7 @@ person does. Each names the change that should trigger it:
 | `sdks/python/tests/e2e_usage_pricing_langfuse.py` | usage fields, the OTel bridge's usage keys, or the OTLP exporter (asserts Langfuse prices the export exactly once; `--dry-run` is the syntax pass for 3.10) | a live Langfuse with `WARDEX_E2E_LANGFUSE*` set |
 | `sdks/python/tests/bench_parse_off_loop.py` | the parse-off-loop worker, the GIL release in `parse_llm_semantics`, or anything on the streaming hot path (event-loop drift, throughput, the GIL budget the bench itself prints) | nothing; `--quick` for a smoke run, report the full run |
 | `sdks/python/tests/bench_fork_semantics.py` | the fork hook, `Runtime._fork_reinit_us`, or the per-batch pid stamp | nothing |
+| `sdks/python/tests/bench_host_overhead.py` | the byte seams' send/recv wrappers, the HTTP/1 tracker or parser, the request-head capture decision (`_interceptors/_admission.py`), or anything else a request wardex does not keep passes through (budget: the added host-thread CPU per request the bench prints) | nothing; `--quick` for a smoke run, report the full run |
 
 The Rust core carries eight more. They are marked `#[ignore]`, so `cargo test
 --workspace` compiles them and runs none of them — it counts them in the
@@ -247,6 +248,12 @@ reader benefit.
 
 - Protobuf Rust types are generated at build time by `crates/wardex-codec/build.rs`
   (prost-build + vendored protoc). Edit `proto/wardex/v1/*.proto`, not generated code.
+- `LIMITATIONS.md` is the output of `python -m wardex_sdk explain --all`. After
+  you add or reword a limitation marker (`MARKERS` in
+  `sdks/python/src/wardex_sdk/_assembly/_explain.py`) or a loss reason
+  (`REASONS` in `_assembly/_drop_reasons.py`), regenerate it with
+  `uv run python -m wardex_sdk explain --all > LIMITATIONS.md`. No gate checks
+  that it is current.
 
 ## Architecture (one mental model)
 
@@ -257,7 +264,7 @@ lower one, never a higher one. Asserted by
 if it and the table in that file are not the same fact.
 
 ```
-rank 0   `_config_checks.py` · `_enums.py` · `_hash.py` · `_native.py` · `_source_paths.py` · `_suppress.py` · `_version.py` · `_wardex_native`
+rank 0   `_config_checks.py` · `_enums.py` · `_hash.py` · `_native.py` · `_source_paths.py` · `_suppress.py` · `_values.py` · `_version.py` · `_wardex_native`
 rank 1   `_diagnostics.py` · `_limits.py` · `_types.py`
 rank 2   `_config.py` · `_hub.py` · `_scope.py`
 rank 3   `context/`
@@ -268,12 +275,12 @@ rank 7   `_worker.py` · `transport/`
 rank 8   `_client.py` · `_finalize.py`
 rank 9   `_adapters/` · `_interceptors/`
 rank 10  `_runtime.py`
-rank 11  `_decorators.py` · `_snapshot_api.py` · `_tracing.py`
-rank 12  `__init__.py` · `testing/`
+rank 11  `_decorators.py` · `_environment.py` · `_snapshot_api.py` · `_tracing.py`
+rank 12  `__init__.py` · `__main__.py` · `testing/`
 ```
 
 - Ranks 2..10 are the order the imports are meant to have, not one they already
-  have. Twelve of the twenty-nine Python units form a single import cycle, and
+  have. Twelve of the thirty-two Python units form a single import cycle, and
   `_hub.py` is its hinge: it hands out the process-global client, so nearly
   every layer below imports it, and to do that it imports `_client.py` and
   `_runtime.py`. No rank is widened to absorb that cycle. The five imports that

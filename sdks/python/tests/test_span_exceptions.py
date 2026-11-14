@@ -65,8 +65,17 @@ class ToolFailed(Exception):
 
 
 def _spans(t: _Recording) -> dict:
+    """Spans keyed by subject: `execute_tool search` is `search` here."""
     _hub.get_client().flush()
-    return {sp.name: sp for env in t.envelopes for sp in env.spans}
+    return {_subject(sp.name): sp for env in t.envelopes for sp in env.spans}
+
+
+def _subject(name: str) -> str:
+    """A span name without the operation a decorator's span name starts with."""
+    for operation in ("invoke_workflow", "invoke_agent", "execute_tool", "execute_step"):
+        if name.startswith(operation + " "):
+            return name[len(operation) + 1 :]
+    return name
 
 
 def _exception_events(sp) -> list[dict]:
@@ -86,7 +95,12 @@ def _otlp_events(t: _Recording, name: str) -> list[dict]:
             decoded = native.codec.decode_otlp_traces(gzip.decompress(body))
             for rs in decoded["resource_spans"]:
                 for ss in rs["scope_spans"]:
-                    out += [ev for sp in ss["spans"] if sp["name"] == name for ev in sp["events"]]
+                    out += [
+                        ev
+                        for sp in ss["spans"]
+                        if _subject(sp["name"]) == name
+                        for ev in sp["events"]
+                    ]
     return out
 
 
@@ -99,7 +113,7 @@ def _envelope_events(t: _Recording, name: str) -> list[dict]:
         )
         for item in decode(wire)["items"]:
             sp = item.get("span")
-            if sp and sp["name"] == name:
+            if sp and _subject(sp["name"]) == name:
                 out += [
                     {**ev, "attributes": {a["key"]: a["value"] for a in ev["attributes"]}}
                     for ev in sp["events"]
@@ -830,7 +844,12 @@ def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording,
     formatted N traces of up to 2N frames while the host unwound: about 10 s and
     20 MB of text for one RecursionError that unwinds in 10 ms without recording.
     Each traceback now keeps its frames nearest the raise and says how many came
-    before."""
+    before.
+
+    Where the recursion limit is hit depends on how deep the runner's stack starts:
+    on one parity it is inside the span-open path, where a guarded read fails and
+    the guard's own bookkeeping raises again, so the trace is a chain of two
+    tracebacks. Both starts run, so the bound is held on both shapes."""
 
     @wardex.tool
     def descend(n):

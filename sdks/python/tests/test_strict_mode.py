@@ -13,6 +13,7 @@ installed package metadata already carries the entry point.
 
 from __future__ import annotations
 
+import importlib
 import re
 import subprocess
 import sys
@@ -51,6 +52,7 @@ def test_agent_runs(monkeypatch):
         adapters=AdaptersConfig(enabled=(AdapterName.OPENAI_AGENTS,)),
     )
     try:
+        import agents  # the code under test uses the framework; its adapter installs here
         assert 1 + 1 == 2
     finally:
         wardex.close()
@@ -71,6 +73,18 @@ def test_agent_runs():
 _NO_WARDEX_TEST = """
 def test_nothing_to_do_with_wardex():
     assert True
+"""
+
+# A test that calls `init()` in an environment that names no destination, as a
+# CI job usually does: wardex installs nothing, so there is nothing to check.
+_INIT_WITHOUT_A_DESTINATION_TEST = """
+import wardex_sdk as wardex
+
+def test_app():
+    wardex.init()
+    with wardex.span("a"):
+        pass
+    wardex.close()
 """
 
 # Inner tests that lose something on purpose, through the ledger itself.
@@ -231,8 +245,46 @@ def test_spans_a_full_buffer_evicted_fail_the_test_that_made_them(run):
     result.assert_outcomes(failed=1)
     out = result.stdout.str()
     assert re.search(r"queue_overflow: \d+ span\(s\)\. The buffer was full", out), out
-    assert "Raise limits.max_buffer_spans" in out
+    assert "Raise LimitsConfig(max_buffer_spans=...)" in out
     assert "--wardex-strict-allow=queue_overflow" in out
+
+
+_COLLECTOR_DOWN_TEST = """
+import socket
+
+import wardex_sdk as wardex
+from wardex_sdk import AdaptersConfig, BackendConfig
+
+_s = socket.socket()
+_s.bind(("127.0.0.1", 0))
+_PORT = _s.getsockname()[1]
+_s.close()  # nothing listens: every export is refused
+wardex.init(
+    backend=BackendConfig(endpoint=f"http://127.0.0.1:{_PORT}"),
+    adapters=AdaptersConfig(enabled=()),
+)
+
+def test_a():
+    with wardex.span("x"):
+        pass
+    wardex.flush(3)
+
+def test_b():
+    with wardex.span("y"):
+        pass
+    wardex.flush(3)
+"""
+
+
+def test_a_suite_whose_collector_is_down_fails(run):
+    """A refused export waits in the retry queue and becomes a loss only at
+    close(), after the last check; held after a failure, it is a gap now."""
+    result = run(_COLLECTOR_DOWN_TEST, "--wardex-strict")
+    result.assert_outcomes(failed=2)
+    out = result.stdout.str()
+    assert "export_held: 1 request(s)" in out, out
+    assert "ConnectionRefusedError" in out
+    assert "--wardex-strict-allow=export_held" in out
 
 
 def test_an_allowed_eviction_passes(run):
@@ -247,6 +299,19 @@ def test_a_session_that_never_initialized_wardex_fails(run):
     result.assert_outcomes(passed=1)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert "wardex was never initialized in this test session" in result.stdout.str()
+
+
+def test_a_session_whose_init_installed_nothing_fails_with_what_init_said(run):
+    """`init()` ran, so "never initialized" would name a fix the user already
+    applied. The failure quotes why it installed nothing, which names the fix."""
+    result = run(_INIT_WITHOUT_A_DESTINATION_TEST, "--wardex-strict")
+    result.assert_outcomes(passed=1)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    out = result.stdout.str()
+    assert "never initialized" not in out
+    assert "wardex.init() ran but installed nothing in this test session" in out
+    assert "no destination is configured" in out
+    assert "transport=wardex_sdk.NoOpTransport()" in out
 
 
 def test_the_entry_point_names_the_plugin_module_and_the_wheel_ships_it():
@@ -401,6 +466,14 @@ def test_under_xdist_a_session_that_never_initialized_wardex_fails(run_xdist):
     assert "wardex was never initialized in this test session" in result.stdout.str()
 
 
+def test_under_xdist_a_session_whose_init_installed_nothing_says_why(run_xdist):
+    result = run_xdist(_INIT_WITHOUT_A_DESTINATION_TEST, "--wardex-strict")
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    out = result.stdout.str()
+    assert "never initialized" not in out
+    assert "no destination is configured" in out
+
+
 def test_under_xdist_collecting_only_checks_nothing_and_passes(run_xdist):
     result = run_xdist(_NO_WARDEX_TEST, "--wardex-strict", "--collect-only")
     assert result.ret == 0, result.stdout.str()
@@ -452,6 +525,27 @@ def test_only_what_was_lost_after_the_baseline_is_a_gap(reading):
     assert [(g.reason, g.count) for g in gaps] == [("queue_overflow", 2), ("network_error", 1)]
     assert "queue_overflow: 2 span(s). queue_overflow happened" in gaps[0].line
     assert "do something about queue_overflow" in gaps[0].line
+
+
+def test_requests_held_after_a_failed_export_are_a_gap_until_they_go(reading):
+    def held(n, error="ConnectionRefusedError"):  # noqa: ANN001, ANN202
+        return Diagnostics(
+            initialized=True,
+            destination="http://collector:4318/v1/traces",
+            export_tracked=True,
+            last_export_error=error,
+            retry_queued=n,
+        )
+
+    reading["now"] = held(2)
+    [gap] = capture_gaps()
+    assert (gap.reason, gap.subject, gap.count) == ("export_held", "request", 2)
+    assert "http://collector:4318/v1/traces" in gap.line and "ConnectionRefusedError" in gap.line
+    assert capture_gaps(since=held(2)) == (), "the same queue is not said twice"
+    reading["now"] = held(3)
+    assert [g.count for g in capture_gaps(since=held(2))] == [1]
+    reading["now"] = held(0)
+    assert capture_gaps() == ()
 
 
 def test_a_drop_the_host_asked_for_is_not_a_gap(reading):
@@ -529,9 +623,25 @@ def test_the_assertion_lists_every_gap_and_how_to_accept_one(reading, monkeypatc
 
 
 def test_the_assertion_fails_when_wardex_was_never_initialized(monkeypatch):
-    monkeypatch.setattr("wardex_sdk._runtime.runtime", lambda: type("R", (), {"client": None})())
+    stub = type("R", (), {"client": None, "describe": lambda self: (False, ())})
+    monkeypatch.setattr("wardex_sdk._runtime.runtime", lambda: stub())
     with pytest.raises(CaptureGapError, match="never initialized"):
         assert_no_capture_gaps()
+
+
+@pytest.mark.no_destination
+def test_the_assertion_quotes_why_init_installed_nothing(capsys):
+    from wardex_sdk import _hub
+
+    _hub.reset_for_test()
+    wardex.init()
+    capsys.readouterr()
+    with pytest.raises(CaptureGapError) as raised:
+        assert_no_capture_gaps()
+    text = str(raised.value)
+    assert "never initialized" not in text
+    assert "wardex.init() ran but installed nothing" in text
+    assert "no destination is configured" in text
 
 
 def test_the_assertion_passes_on_a_clean_initialized_process():
@@ -590,6 +700,7 @@ def test_a_swallowed_internal_error_fails_the_check_and_says_where():
 
 def test_an_adapter_that_did_not_install_is_one_gap_under_its_own_name():
     """The ledger counts it too, twice over; the check says it once."""
+    importlib.import_module("agents")  # imported first, so the adapter is built at init()
     with mock.patch("wardex_sdk._adapters._make_adapter", side_effect=ImportError("x")):
         wardex.init(
             transport=wardex.NoOpTransport(),

@@ -448,7 +448,7 @@ def test_a_run_config_that_disables_tracing_is_counted_and_said_once(agents_env,
     }
     assert counters.get(_P + "tracing_disabled_run") == 2
     [line] = _warnings(wardex_log, "RunConfig(tracing_disabled=True)")
-    assert _P + "tracing_disabled_run" in line
+    assert "under framework_tracing_disabled" in line
 
 
 def test_a_positional_run_config_is_read_too(agents_env, wardex_log):
@@ -1113,7 +1113,7 @@ def test_a_kind_nothing_maps_is_counted_and_said_once_by_its_class_name(agents_e
         wardex.close()
     assert counters.get(_P + "span_kind_ignored") == 2
     [line] = _warnings(wardex_log, "does not map")
-    assert "_HostSpanData" in line and _P + "span_kind_ignored" in line
+    assert "_HostSpanData" in line and "under framework_span_kind_unmapped" in line
 
 
 # --------------------------------------------------------------------------
@@ -1140,7 +1140,7 @@ def test_a_span_whose_trace_is_not_current_is_counted_and_said_once(agents_env, 
     finally:
         wardex.close()
     assert counters.get(_P + "trace_lookup_miss") == 2
-    assert len(_warnings(wardex_log, _P + "trace_lookup_miss")) == 1
+    assert len(_warnings(wardex_log, "current trace is not its own")) == 1
 
 
 def test_a_tool_span_lost_at_its_start_is_said_once_not_twice(agents_env, wardex_log):
@@ -1157,7 +1157,7 @@ def test_a_tool_span_lost_at_its_start_is_said_once_not_twice(agents_env, wardex
     assert counters.get(_P + "trace_lookup_miss") == 1
     assert counters.get(_P + "tool_end_unmatched") == 1
     assert len(wardex_log.lines(logging.WARNING)) == 1
-    assert len(_warnings(wardex_log, _P + "trace_lookup_miss")) == 1
+    assert len(_warnings(wardex_log, "current trace is not its own")) == 1
 
 
 def test_a_span_from_a_task_the_run_left_behind_is_said_with_its_own_reason(
@@ -1196,7 +1196,7 @@ def test_a_span_from_a_task_the_run_left_behind_is_said_with_its_own_reason(
         wardex.close()
     assert counters.get(_P + "span_after_run") == 1
     assert counters.get(_P + "span_without_run") == 0
-    assert len(_warnings(wardex_log, _P + "span_after_run")) == 1
+    assert len(_warnings(wardex_log, "after its run had ended")) == 1
     assert _warnings(wardex_log, "never saw") == []
 
 
@@ -1212,4 +1212,4 @@ def test_spans_of_a_run_wardex_never_saw_start_are_said_once(agents_env, scenari
         finally:
             wardex.close()
     assert counters.get(_P + "span_without_run") >= 2
-    assert len(_warnings(wardex_log, _P + "span_without_run")) == 1
+    assert len(_warnings(wardex_log, "whose start wardex never saw")) == 1

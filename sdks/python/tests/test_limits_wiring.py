@@ -479,7 +479,8 @@ _DEFAULT_RESOLUTION_ALLOWED: dict[str, int] = {
     "_interceptors/_mcp_stdio.py": 2,
     # `_max_streams`' fallback when there is no native object, and
     # `_WebSocketTracker`'s `sample_cap=None` fallback.
-    "_interceptors/_trackers.py": 2,
+    "_interceptors/_trackers.py": 1,
+    "_interceptors/_ws_tracker.py": 1,
     # The byte seam's pre-install defaults, whose own comment says why.
     "_interceptors/_seam.py": 1,
 }
@@ -797,7 +798,7 @@ def _nat(site: str, field: str):
 
 def _ws_tracker(s: _Sites) -> Any:
     """A WebSocket tracker built the way the seam builds one, per upgrade."""
-    from wardex_sdk._interceptors._trackers import _WebSocketTracker
+    from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 
     return _WebSocketTracker(
         path="/",
@@ -841,6 +842,10 @@ _DELIVERY: dict[str, tuple[tuple[str, Any], ...]] = {
     "max_opaque_body_bytes": (
         ("native", _nat("ssl_seam", "max_opaque_body_bytes")),
         ("native", _nat("mcp", "max_opaque_body_bytes")),
+    ),
+    "max_in_flight_body_bytes": (
+        ("native", _nat("ssl_seam", "max_in_flight_body_bytes")),
+        ("native", _nat("socket_seam", "max_in_flight_body_bytes")),
     ),
     "max_stream_buffer_bytes": (
         ("native", _nat("ssl_seam", "max_stream_buffer_bytes")),
@@ -920,6 +925,7 @@ _ROUND_A = LimitsConfig(
     max_headers=7,
     max_body_bytes=4096,
     max_opaque_body_bytes=8192,
+    max_in_flight_body_bytes=3145728,
     max_stream_buffer_bytes=16384,
     max_decoded_bytes=32768,
     max_streams=3,
@@ -946,6 +952,7 @@ _ROUND_B = LimitsConfig(
     max_headers=41,
     max_body_bytes=8192,
     max_opaque_body_bytes=16384,
+    max_in_flight_body_bytes=6291456,
     max_stream_buffer_bytes=32768,
     max_decoded_bytes=65536,
     max_streams=43,
@@ -1019,6 +1026,7 @@ def _observe(limits: LimitsConfig) -> dict[str, list[tuple[str, int]]]:
     from wardex_sdk._config import AdaptersConfig, AnthropicAgentSdkConfig
 
     wardex_sdk.init(
+        transport=wardex_sdk.NoOpTransport(),
         intercept=True,
         limits=limits,
         adapters=AdaptersConfig(anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True)),

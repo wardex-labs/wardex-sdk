@@ -32,6 +32,14 @@ from wardex_sdk.transport._base import Transport
 
 DECORATORS = {"workflow": workflow, "agent": agent, "tool": tool, "step": step}
 
+#: The operation each decorator's span name starts with, as an adapter's does.
+OPERATIONS = {
+    "workflow": "invoke_workflow",
+    "agent": "invoke_agent",
+    "tool": "execute_tool",
+    "step": "execute_step",
+}
+
 
 class _Recording(Transport):
     def __init__(self):
@@ -56,7 +64,16 @@ def _spans(t: _Recording):
 
 
 def _by_name(t: _Recording):
-    return {sp.name: sp for sp in _spans(t)}
+    """Spans keyed by what they are named for: a decorated span's operation
+    prefix is left off here and asserted in the shape matrix below."""
+    return {_subject(sp.name): sp for sp in _spans(t)}
+
+
+def _subject(name: str) -> str:
+    for operation in OPERATIONS.values():
+        if name.startswith(operation + " "):
+            return name[len(operation) + 1 :]
+    return name
 
 
 def _parent(sp):
@@ -434,11 +451,14 @@ def test_every_supported_shape_runs_inside_its_span(recording, shape, api, form)
     seen = decorated("x") if how == "call" else asyncio.run(decorated("x"))
     (sp,) = _spans(recording)
     assert seen == sp.context.span_id.value.hex()
-    assert sp.name == ("named" if form == "called" else _expected_bare_name(target))
+    subject = "named" if form == "called" else _expected_bare_name(target)
+    assert sp.name == f"{OPERATIONS[api]} {subject}"
 
 
 def _expected_bare_name(target):
-    return getattr(target, "__name__", None) or target.func.__name__
+    """The qualified name, from the last `<locals>.` on: `_Holder.method`."""
+    named = target.func if isinstance(target, functools.partial) else target
+    return named.__qualname__.rsplit("<locals>.", 1)[-1]
 
 
 @pytest.mark.parametrize("api", sorted(DECORATORS))
@@ -446,7 +466,7 @@ def test_a_builtin_is_wrapped_with_no_call_site(recording, api):
     decorated = DECORATORS[api](len)
     assert decorated([1, 2, 3]) == 3
     (sp,) = _spans(recording)
-    assert sp.name == "len"
+    assert sp.name == f"{OPERATIONS[api]} len"
     assert sp.call_site is None
 
 
@@ -468,8 +488,9 @@ def test_above_staticmethod_and_classmethod_the_descriptor_is_kept(recording, ap
     static_result = Tools.search("a")
     class_result = Tools().build("b")
     spans = _by_name(recording)
-    assert static_result == ("static", "a", spans["search"].context.span_id.value.hex())
-    assert class_result == ("Tools", "b", spans["build"].context.span_id.value.hex())
+    # Named by the qualified name, so another class's `search` is another span name.
+    assert static_result == ("static", "a", spans["Tools.search"].context.span_id.value.hex())
+    assert class_result == ("Tools", "b", spans["Tools.build"].context.span_id.value.hex())
 
 
 def test_a_cache_wrapper_keeps_its_cache_api(recording):

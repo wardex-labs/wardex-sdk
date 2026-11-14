@@ -203,14 +203,15 @@ def test_sigterm_ships_the_open_run_marked_with_its_finished_children_under_it(t
     assert rc == -signal.SIGTERM  # the default termination is unchanged
     spans = [json.loads(line) for line in out.read_text().splitlines()]
     names = sorted(s["name"] for s in spans)
-    assert names == ["chat", "inner", "run", "stream"]  # each exactly once
+    # each exactly once
+    assert names == ["chat", "execute_tool stream", "inner", "invoke_workflow run"]
     by = {s["name"]: s for s in spans}
-    run = by["run"]
+    run = by["invoke_workflow run"]
     assert run["parent"] is None
     assert run["markers"] == ["unit_interrupted"]
     assert by["chat"]["parent"] == run["span"]
     assert by["chat"]["markers"] == []  # it finished on its own
-    for still_open in ("inner", "stream"):
+    for still_open in ("inner", "execute_tool stream"):
         assert by[still_open]["parent"] == run["span"]
         assert by[still_open]["markers"] == ["unit_interrupted"]
         assert by[still_open]["end"] <= run["end"]  # newest first: no child outlives its parent

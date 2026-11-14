@@ -992,27 +992,30 @@ mod tests {
         assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]));
     }
 
-    /// The label is proven only on Bedrock's own runtime host. A gateway on the
-    /// Converse path is labelled from the API shape (or a hostname hint) and
-    /// says it guessed.
+    /// The label comes from Bedrock's own runtime hosts alone. A gateway or a
+    /// private alias on the Converse path is still read as Converse, and ships
+    /// no provider name, marked as unproven.
     #[test]
-    fn bedrock_label_is_inferred_off_the_runtime_host() {
+    fn bedrock_label_is_left_empty_off_the_runtime_host() {
         let resp = fixture!("bedrock_converse", "response.json");
         for host in ["127.0.0.1", "llm-gateway.corp", "my-bedrock-proxy.corp"] {
             let s = parsed(host, BEDROCK_CONVERSE_PATH, b"{}", resp);
-            assert_eq!(s.provider, "aws.bedrock", "{host}");
+            assert_eq!(s.provider, "", "{host}");
             assert!(s.provider_inferred, "{host}");
+            assert_eq!(s.usage.output_tokens(), Some(500), "{host}: still read");
         }
         let body: Vec<u8> = converse_stream_frames().concat();
         let s = parsed("127.0.0.1", BEDROCK_STREAM_PATH, b"{}", &body);
-        assert_eq!(s.provider, "aws.bedrock");
+        assert_eq!(s.provider, "");
         assert!(s.provider_inferred);
+        assert!(s.reassembled_from_stream);
         let s = parsed(
             "vpce-0abc-1def.bedrock-runtime.eu-west-1.vpce.amazonaws.com",
             BEDROCK_CONVERSE_PATH,
             b"{}",
             resp,
         );
+        assert_eq!(s.provider, "aws.bedrock");
         assert!(!s.provider_inferred);
     }
 

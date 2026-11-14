@@ -39,7 +39,9 @@ _ECHO = (
 @pytest.mark.asyncio
 async def test_anyio_stdio_tools_call_is_captured():
     # No framework adapter: the seam's span is then the call's execute_tool span.
-    wardex.init(intercept=True, adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(
+        transport=wardex.NoOpTransport(), intercept=True, adapters=wardex.AdaptersConfig(enabled=())
+    )
     proc = await anyio.open_process([sys.executable, "-c", _ECHO])
     req = (
         b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
@@ -85,7 +87,7 @@ async def test_an_mcp_size_is_the_payload_as_captured_not_the_bytes_on_the_pipe(
     result as the SDK captures them, re-encoded as compact JSON. The server's
     spacing and `\\u` escapes are not counted, so the figure is smaller than
     what crossed the pipe here; the schema says exactly that."""
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     proc = await anyio.open_process([sys.executable, "-c", _ESCAPING_SERVER])
     params = {"name": "greet", "arguments": {"who": "세계"}}
     request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}
@@ -110,7 +112,7 @@ async def test_an_mcp_size_is_the_payload_as_captured_not_the_bytes_on_the_pipe(
 
 @pytest.mark.asyncio
 async def test_raw_asyncio_stdio_tools_call_is_captured():
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
@@ -137,7 +139,7 @@ async def test_raw_asyncio_stdio_tools_call_is_captured():
 async def test_anyio_spawn_does_not_double_wrap_via_asyncio_seam():
     """A process spawned via the anyio path must skip the asyncio auxiliary seam
     (no double-wrapping)."""
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["mcp_stdio"]
@@ -196,7 +198,12 @@ async def test_mcp_stream_buffer_limit_reaches_the_parser_through_the_intercepto
     travelled from LimitsConfig through the interceptor into the native
     parser (not a value re-derived independently, e.g. re-reading config).
     """
-    wardex.init(intercept=True, debug=True, limits=LimitsConfig(max_stream_buffer_bytes=64))
+    wardex.init(
+        transport=wardex.NoOpTransport(),
+        intercept=True,
+        debug=True,
+        limits=LimitsConfig(max_stream_buffer_bytes=64),
+    )
     proc = await anyio.open_process([sys.executable, "-c", _JUNK_BURST])
     await _drain_stdout(proc)
     await proc.wait()
@@ -212,7 +219,12 @@ async def test_disabled_reason_logged_once_per_mcp_stream(capsys):
     # (see test_ssl_interceptor.py). No span is ever produced (nothing to carry
     # the reason), so debug mode logs it instead — exactly once per stream, not
     # once per read that keeps arriving after the parser has already latched off.
-    wardex.init(intercept=True, debug=True, limits=LimitsConfig(max_stream_buffer_bytes=64))
+    wardex.init(
+        transport=wardex.NoOpTransport(),
+        intercept=True,
+        debug=True,
+        limits=LimitsConfig(max_stream_buffer_bytes=64),
+    )
     proc = await anyio.open_process([sys.executable, "-c", _JUNK_LOOP])
     await _drain_stdout(proc)
     await proc.wait()
@@ -249,7 +261,7 @@ async def test_without_anyio_the_interceptor_declines_that_seam_and_keeps_the_ot
     reset_reports_for_test()
     counters.reset()
 
-    wardex.init(intercept=True)  # must not raise
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)  # must not raise
 
     assert get_registry().is_installed("mcp_stdio")
     assert backend.AsyncIOBackend.__dict__["open_process"] is untouched, (
@@ -299,7 +311,7 @@ from wardex_sdk._interceptors._registry import get_registry
 
 assert _mcp_stdio._aio_backend is None, "anyio was reachable after all; the probe proves nothing"
 
-wardex.init(intercept=True)
+wardex.init(transport=wardex.NoOpTransport(), intercept=True)
 
 reg = get_registry()
 assert reg.is_installed("ssl"), "ssl"
@@ -363,7 +375,7 @@ from wardex_sdk._interceptors._registry import get_registry
 assert _mcp_stdio._aio_backend is None, "the broken anyio was imported after all"
 assert counters.get("interceptors.mcp_stdio.anyio_unavailable") >= 1, "the failure was silent"
 
-wardex.init(intercept=True)
+wardex.init(transport=wardex.NoOpTransport(), intercept=True)
 assert get_registry().is_installed("mcp_stdio"), "mcp_stdio"
 print("OK")
 """
@@ -428,7 +440,9 @@ async def test_a_subprocess_that_only_streams_stdout_detaches():
     wrapper, so this subprocess paid the tee, the copy and a JSON-RPC parse
     attempt on every read for as long as it lived.
     """
-    wardex.init(intercept=True, limits=LimitsConfig(mcp_sniff_bytes=64))
+    wardex.init(
+        transport=wardex.NoOpTransport(), intercept=True, limits=LimitsConfig(mcp_sniff_bytes=64)
+    )
     proc = await anyio.open_process([sys.executable, "-c", _STDOUT_ONLY])
     teed_send, teed_receive = proc.stdin.send, proc.stdout.receive
 
@@ -441,7 +455,7 @@ async def test_a_subprocess_that_only_streams_stdout_detaches():
 
 @pytest.mark.asyncio
 async def test_a_server_that_dies_does_not_strand_its_pending_request():
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     proc = await anyio.open_process([sys.executable, "-c", _DIES_WITHOUT_ANSWERING])
     state = _state_of(proc)
     await proc.stdin.send(
@@ -457,7 +471,7 @@ async def test_a_server_that_dies_does_not_strand_its_pending_request():
 
 @pytest.mark.asyncio
 async def test_a_raw_asyncio_server_that_dies_does_not_strand_its_pending_request():
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",

@@ -27,7 +27,7 @@ impl PyLimits {
         max_buffer_spans=None, max_buffer_bytes=None, replay_buffer_size=None,
         max_otel_bridge_body_bytes=None, max_otel_bridge_spans_per_session=None,
         zstd_level=None, max_otlp_attribute_bytes=None, max_otlp_request_bytes=None,
-        max_link_targets=None
+        max_link_targets=None, max_in_flight_body_bytes=None
     ))]
     #[expect(
         clippy::too_many_arguments,
@@ -60,6 +60,7 @@ impl PyLimits {
         max_otlp_attribute_bytes: Option<usize>,
         max_otlp_request_bytes: Option<usize>,
         max_link_targets: Option<usize>,
+        max_in_flight_body_bytes: Option<usize>,
     ) -> PyResult<Self> {
         shielded(|| {
             let d = Limits::default();
@@ -97,6 +98,8 @@ impl PyLimits {
                     max_otlp_request_bytes: max_otlp_request_bytes
                         .unwrap_or(d.max_otlp_request_bytes),
                     max_link_targets: max_link_targets.unwrap_or(d.max_link_targets),
+                    max_in_flight_body_bytes: max_in_flight_body_bytes
+                        .unwrap_or(d.max_in_flight_body_bytes),
                 },
             })
         })
@@ -206,6 +209,10 @@ impl PyLimits {
     fn max_link_targets(&self) -> usize {
         self.inner.max_link_targets
     }
+    #[getter]
+    fn max_in_flight_body_bytes(&self) -> usize {
+        self.inner.max_in_flight_body_bytes
+    }
 }
 
 /// The core's default limits as a plain dict. The Python mirror asserts key
@@ -244,6 +251,7 @@ fn limits_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
         out.set_item("max_otlp_attribute_bytes", d.max_otlp_attribute_bytes)?;
         out.set_item("max_otlp_request_bytes", d.max_otlp_request_bytes)?;
         out.set_item("max_link_targets", d.max_link_targets)?;
+        out.set_item("max_in_flight_body_bytes", d.max_in_flight_body_bytes)?;
         Ok(out)
     })
 }

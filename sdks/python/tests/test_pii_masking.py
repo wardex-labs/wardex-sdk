@@ -323,7 +323,8 @@ class TestMaskingFailure:
         assert "[EMAIL]" in kept["wardex.input_data"]
         assert "wardex.limitations" not in kept
         assert counters.get("transport.otlp.pii_scrubbed") == 1
-        (report,) = [line for line in lines if "transport.otlp.pii_scrubbed" in line]
+        (report,) = [line for line in lines if "PII masking failed" in line]
+        assert "under internal_sdk_error" in report
         assert "john.doe" not in report
 
     def test_a_wardex_envelope_record_masking_failed_on_ships_emptied_marked_and_counted(self):
@@ -364,4 +365,4 @@ class TestMaskingFailure:
         transport = WardexTransport("http://127.0.0.1:1", "test-key")
         lines = _report_lines(lambda: transport.export(env, timeout=1.0))
         assert counters.get("transport.wardex.pii_scrubbed") == 2
-        assert any("transport.wardex.pii_scrubbed" in line for line in lines)
+        assert any("PII masking failed" in line for line in lines)

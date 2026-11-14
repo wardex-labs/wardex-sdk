@@ -3,7 +3,7 @@ import json
 import pytest
 
 from wardex_sdk._assembly import Limitation
-from wardex_sdk._interceptors._trackers import _WebSocketTracker
+from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 
 
 def _frame(fin: bool, opcode: int, payload: bytes) -> bytes:

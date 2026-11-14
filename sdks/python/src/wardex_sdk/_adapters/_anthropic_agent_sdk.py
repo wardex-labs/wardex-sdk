@@ -44,6 +44,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from .._assembly import (
+    DropReason,
     Limitation,
     PatchSet,
     SpanIntent,
@@ -52,6 +53,7 @@ from .._assembly import (
     diag_info,
     diag_warning,
     guard,
+    record,
     report_once,
 )
 from .._config import AnthropicAgentSdkConfig
@@ -69,19 +71,16 @@ from ._session_state import _BridgeBinding
 if TYPE_CHECKING:
     from .._client import Client
 
-# Every event injected here has a consumer in `SessionAssembler.on_hook`, and
-# that is a rule, not a coincidence: each injected hook costs a blocking
-# control-protocol round trip the CLI awaits at the exact moment the hook
-# fires, so an unconsumed event is latency paid for nothing.
+# Every event injected here has a consumer in `SessionAssembler.on_hook`, and that is a rule, not a
+# coincidence: each injected hook costs a blocking control-protocol round trip the CLI awaits at the
+# exact moment the hook fires, so an unconsumed event is latency paid for nothing.
 #
-# `Stop` is deliberately NOT injected. Its payload is `BaseHookInput` plus
-# `stop_hook_active` only (verified against claude-agent-sdk 0.2.x
-# `StopHookInput`) — no timestamps — so it cannot correct a chat span's end
-# (message arrival) or the root's end (transport close); and the failures it
-# could theoretically catch (a stale pending prompt, a stale turn start)
-# presuppose `UserPromptSubmit` was dropped on the same control channel that
-# delivered Stop. Revisit if the CLI ever puts timing or verdict data in the
-# Stop payload.
+# `Stop` is deliberately NOT injected. Its payload is `BaseHookInput` plus `stop_hook_active` only
+# (verified against claude-agent-sdk 0.2.x `StopHookInput`) — no timestamps — so it cannot correct a
+# chat span's end (message arrival) or the root's end (transport close); and the failures it could
+# theoretically catch (a stale pending prompt, a stale turn start) presuppose `UserPromptSubmit` was
+# dropped on the same control channel that delivered Stop. Revisit if the CLI ever puts timing or
+# verdict data in the Stop payload.
 _WARDEX_HOOK_EVENTS = (
     "PreToolUse",
     "PostToolUse",
@@ -305,13 +304,14 @@ def _tool_input(args: Any) -> bytes:
     contain a raise, so a narrower except is a place the host breaks over a span attribute nobody
     would have missed.
 
-    Not a silent swallow: the counter is the record, and an empty body ships
-    with `response_body_captured=False` beside it.
+    Not a silent swallow: it is recorded as `payload_unserializable`, and an
+    empty body ships with `response_body_captured=False` beside it.
     """
     try:
         return json.dumps(args).encode()
     except Exception:  # noqa: BLE001 — the host's own object; see above
         counters.bump("adapters.anthropic.tool_input_unserializable")
+        record(DropReason.PAYLOAD_UNSERIALIZABLE, where="adapters.anthropic_agent_sdk")
         return b""
 
 

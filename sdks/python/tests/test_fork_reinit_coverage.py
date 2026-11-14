@@ -44,15 +44,17 @@ import pytest
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "wardex_sdk"
 
 #: Function names that ARE fork-reset paths. `_at_fork_reinit` is the
-#: protocol; the other three are the special entry points the design names
-#: (the runtime's own hook, the diagnostics' no-acquire reset, and the
-#: receiver's child-safe teardown).
+#: protocol; the others are the special entry points the design names
+#: (the runtime's own hook, the diagnostics' no-acquire reset, the
+#: receiver's child-safe teardown, and the transport hook the runtime calls
+#: on the active transport in the child).
 _RESET_FNS = frozenset(
     {
         "_at_fork_reinit",
         "after_in_child",
         "diag_reset_for_new_process",
         "close_inherited_after_fork",
+        "at_fork_child",
     }
 )
 
@@ -88,7 +90,7 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_interceptors/_trackers.py", "_evicted_admitting"): (
         "per-connection tracker state; rides _ConnectionState, dropped by the seam's clear"
     ),
-    ("_interceptors/_trackers.py", "_close_from"): (
+    ("_interceptors/_ws_tracker.py", "_close_from"): (
         "per-connection tracker state; rides _ConnectionState, dropped by the seam's clear"
     ),
     ("_interceptors/_trackers.py", "_model_paths"): (
@@ -114,8 +116,27 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_adapters/_registry.py", "_installed"): "install record, kept (I-fork-4)",
     ("_adapters/_registry.py", "_contexts"): "install record, kept (I-fork-4)",
     ("_adapters/_registry.py", "_statuses"): "install record, kept (I-fork-4)",
+    ("_adapters/_registry.py", "_waiting"): (
+        "installs armed on a framework import, kept: the import hook crossed the fork "
+        "in sys.meta_path and the child's import of the framework still installs"
+    ),
+    # -- a once-per-process notice: the child runs the same event loop kind
+    #    the parent said it about, so it has nothing new to say.
+    ("_interceptors/_socket.py", "_UVLOOP_SAID"): (
+        "once-per-process uvloop notice; the parent said and counted it, the child runs the "
+        "same loop kind"
+    ),
+    # -- the import hook's per-thread import stack: only the forking thread
+    #    survives a fork, and the import it is in the middle of, if any,
+    #    carries on in the child, so its depth count stays true.
+    ("_adapters/_on_import.py", "finding"): "per-thread import stack, carries on in the child",
+    ("_adapters/_on_import.py", "depths"): "per-thread import stack, carries on in the child",
     ("_interceptors/_registry.py", "_installed"): "install record, kept (I-fork-4)",
     ("context/_inject.py", "_installed"): "patch record, kept (I-fork-4)",
+    ("_hub.py", "_said"): (
+        "said-once keys of advisory log lines; a child inheriting them stays quiet about "
+        "a line the parent process already wrote, and names no connection, span or pid"
+    ),
     ("_assembly/_patchset.py", "_patches"): "restore records, kept (I-fork-4)",
     # -- a memo of a pure function, keyed by every input it reads: what the
     #    child finds in it is exactly what it would have computed itself.
@@ -127,6 +148,9 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     # -- signal dispositions cross the fork with the signal table itself; the
     #    child's handlers are as installed as the parent's (design §3.8).
     ("_runtime.py", "_prev_handlers"): "signal dispositions survive fork by design (§3.8)",
+    # -- what the last init() said about its configuration: the child inherits
+    #    that configuration with the memory image, so the account stays true.
+    ("transport/_resolve.py", "said"): "init()'s account of the configuration the child also runs",
     # -- the owner-typed scan counts a lock at its allocation site AND at the
     #    site holding the instance; this is the one same-module double count.
     ("_runtime.py", "_RUNTIME"): (
@@ -469,6 +493,7 @@ _WALK_ALLOWED_POPULATED: dict[str, str] = {
     "_installed": "install/patch records are kept (I-fork-4)",
     "_contexts": "install records are kept (I-fork-4)",
     "_statuses": "install records are kept (I-fork-4)",
+    "_waiting": "installs armed on a framework import; the hook crossed the fork (I-fork-4)",
     "_patches": "restore records are kept (I-fork-4)",
     "_prev_handlers": "signal dispositions survive fork by design (§3.8)",
     "_limits": "resolved config projection — immutable by convention",

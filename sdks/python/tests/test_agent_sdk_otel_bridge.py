@@ -945,7 +945,7 @@ def test_traceparent_is_injected_for_slice_one_only_under_its_full_gate(receiver
             monkeypatch.delenv("CLAUDE_CODE_ENABLE_TELEMETRY", raising=False)
         env = {"TRACEPARENT": "00-" + "ff" * 16 + "-" + "ee" * 8 + "-01"} if preset else {}
         opts = claude_agent_sdk.ClaudeAgentOptions(env=env)
-        with _hub.isolation_scope():
+        with _hub.new_scope():
             if ambient:
                 _hub.get_current_scope().active_span_context = ambient_ctx
             out = _prepare_options(opts, adapter)
@@ -971,7 +971,7 @@ def test_traceparent_is_injected_for_slice_one_only_under_its_full_gate(receiver
     adapter = AnthropicAgentSdkAdapter()
     adapter._propagation_enabled = True
     monkeypatch.setenv("CLAUDE_CODE_ENABLE_TELEMETRY", "1")
-    with _hub.isolation_scope():
+    with _hub.new_scope():
         scope = _hub.get_current_scope()
         scope.active_span_context = ambient_ctx
         scope.tracestate = "vendor=1"

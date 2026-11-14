@@ -3,14 +3,15 @@ from __future__ import annotations
 import functools
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
-from . import _hub, _runtime
+from . import _hub, _runtime, _values
 from ._assembly import (
     EMPTY_AMBIENT,
+    DropReason,
     Evidence,
     ParentSource,
     SpanDraft,
@@ -19,6 +20,7 @@ from ._assembly import (
     guard,
     latch_ambient,
     parent_is_closed_unit,
+    record,
     report_once,
     resolve_observed,
     resolve_parentage,
@@ -31,16 +33,16 @@ from ._types import (
     ConversationContext,
     GenAIAttributes,
     InternalSpan,
+    InternalSpanEvent,
     ToolAttributes,
 )
 from .context._contextvar import fork_scope
+from .context._current_span import _CURRENT_SPAN, _make_current, _unmake_current
 from .context._with_only import WithOnly
 
 if TYPE_CHECKING:
-    # Type-only: these three name the span machinery, which stays out of this
-    # module's runtime namespace — the `noqa: ANN201` escape these properties
-    # used to wear existed to dodge exactly this import, and a TYPE_CHECKING
-    # import states the same fact without leaving the properties untyped.
+    # Type-only: these name the span machinery, which stays out of this
+    # module's runtime namespace, without leaving the properties untyped.
     from ._assembly import Limitation
     from ._scope import Scope
     from ._types import CorrelationInfo, SpanContext, SpanId
@@ -50,10 +52,8 @@ class Span:
     """The object `wardex.span()` yields — a published surface over a `SpanDraft`.
 
     Every attribute below is a view onto the draft, so the manual path and the
-    observation paths build the same object through the same validation. That is
-    §6.4's point about the two `execute_tool` shapes: this path used to ship
-    spans with no `capture_sources`, no `capture_integrity` and no
-    `correlation`, purely because it was a second constructor.
+    observation paths build the same object through the same validation, with
+    the same `capture_sources`, `capture_integrity` and `correlation`.
 
     The draft is in MANUAL mode, which changes exactly two things and no more:
     the name is the host's (`wardex.span("anything")` is a published API), and
@@ -70,7 +70,9 @@ class Span:
 
     def __init__(self, draft: SpanDraft) -> None:
         self._draft = draft
-        self.end_time_ns = 0
+        self._end_time_ns = 0
+        self._outer: Span | None = None  # what `current_span()` falls back to once closed
+        self._open = True
 
     @property
     def context(self) -> SpanContext:
@@ -82,19 +84,26 @@ class Span:
 
     @start_time_ns.setter
     def start_time_ns(self, value: int) -> None:
-        self._draft._start_ns = value
+        self._draft._start_ns = _values.timestamp("Span.start_time_ns", value)
 
-    # Views onto the draft of what this object exposed as plain attributes
-    # before the draft backed it. They stay WRITABLE: every one of them was a
-    # settable attribute on a published object, and turning a working assignment
-    # into an `AttributeError` inside a user's `with` block is a break wardex
-    # gains nothing from — the draft still decides what a legal span is, in
-    # `_finish()`, which is where the check belongs.
+    @property
+    def end_time_ns(self) -> int:
+        """The end instant in ns since the epoch; 0 means "when the block ends"."""
+        return self._end_time_ns
+
+    @end_time_ns.setter
+    def end_time_ns(self, value: int) -> None:
+        self._end_time_ns = _values.timestamp("Span.end_time_ns", value)
+
+    # Views onto the draft, WRITABLE because each was a settable attribute of a
+    # published object. Each setter checks the type on the host's own line: the
+    # exporter reads these for a whole batch at once, and a wrong type found
+    # there fails every span in it. An enum field takes the member or its value
+    # string (`s.status = "error"`); anything else raises naming what is accepted.
     #
-    # `correlation` and `parent_span_id` are the two exceptions and they are
-    # read-only on purpose: parentage is decided by `_assembly/_parentage.py`
-    # (I1) and a span whose parent the host overwrote after the fact would
-    # contradict the trace it was already forked into.
+    # `correlation` and `parent_span_id` are read-only: parentage is decided by
+    # `_assembly/_parentage.py` (I1), and a parent the host overwrote after the
+    # fact would contradict the trace the span was already forked into.
 
     @property
     def name(self) -> str:
@@ -102,23 +111,25 @@ class Span:
 
     @name.setter
     def name(self, value: str) -> None:
-        self._draft.rename(value)
+        self._draft.rename(_values.text("Span.name", value))
 
     @property
     def kind(self) -> SpanKind:
         return self._draft._kind or SpanKind.INTERNAL
 
     @kind.setter
-    def kind(self, value: SpanKind) -> None:
-        self._draft._kind = value
+    def kind(self, value: SpanKind | str) -> None:
+        self._draft._kind = _values.enum_member("Span.kind", SpanKind, value)
 
     @property
     def status(self) -> StatusCode:
         return self._draft._status
 
     @status.setter
-    def status(self, value: StatusCode) -> None:
-        self._draft.set_status(value, self._draft._status_message)
+    def status(self, value: StatusCode | str) -> None:
+        self._draft.set_status(
+            _values.enum_member("Span.status", StatusCode, value), self._draft._status_message
+        )
 
     @property
     def status_message(self) -> str:
@@ -126,7 +137,7 @@ class Span:
 
     @status_message.setter
     def status_message(self, value: str) -> None:
-        self._draft._status_message = value
+        self._draft._status_message = _values.text("Span.status_message", value)
 
     @property
     def conversation(self) -> ConversationContext | None:
@@ -134,7 +145,7 @@ class Span:
 
     @conversation.setter
     def conversation(self, value: ConversationContext | None) -> None:
-        self._draft.set_conversation(value)
+        self._draft.set_conversation(_values.block("Span.conversation", ConversationContext, value))
 
     @property
     def correlation(self) -> CorrelationInfo | None:
@@ -144,26 +155,73 @@ class Span:
     def parent_span_id(self) -> SpanId | None:
         return self._draft._parentage.parent_span_id
 
-    def set_status(self, code: StatusCode, message: str = "") -> None:
-        self._draft.set_status(code, message)
+    def set_status(self, code: StatusCode | str, message: str = "") -> None:
+        self._draft.set_status(
+            _values.enum_member("Span.set_status() code", StatusCode, code),
+            _values.text("Span.set_status() message", message),
+        )
 
-    def set_error(self, error_type: str, message: str = "") -> None:
-        """Name the failure. Pairs with `set_status(StatusCode.ERROR)`.
-
-        Without this the published surface could express the state that makes a
-        span illegal (`set_status(ERROR)`) and had no way to express the state
-        that makes it legal — so the only span a host ever marks as failed was
-        the only span the host could not keep. `_finish()` still supplies OTel's
-        `_OTHER` when a manual span is ERROR with no type, so forgetting this
-        call degrades the span rather than deleting it.
+    def set_error(self, error_type: str | BaseException | None, message: str = "") -> None:
+        """Name the failure. Pairs with `set_status(StatusCode.ERROR)`. The
+        exception itself may be given: its class names the type. Without this
+        call `_finish()` supplies OTel's `_OTHER` for an ERROR span, so a
+        forgotten call degrades the span rather than deleting it.
         """
-        self._draft.set_error(error_type, message)
+        if isinstance(error_type, BaseException):
+            error_type = _values.exception_type(type(error_type))
+        self._draft.set_error(
+            _values.text("Span.set_error() error_type", error_type, optional=True),
+            _values.text("Span.set_error() message", message),
+        )
 
     def set_gen_ai(self, attrs: GenAIAttributes) -> None:
-        self._draft.set_gen_ai(attrs)
+        self._draft.set_gen_ai(
+            _values.block("Span.set_gen_ai()", GenAIAttributes, attrs, optional=False)
+        )
 
-    def set_attribute(self, key: str, value: str | int | float | bool) -> None:
-        self._draft.set_extra(key, value)
+    def set_attribute(
+        self, key: str, value: _values.AttributeValue | list | tuple | dict | None
+    ) -> None:
+        """Set one attribute on this span. Accepted values: see `attribute_value`.
+
+        A list, tuple or dict is sent as its JSON text; None removes what was
+        set under `key` on this span.
+        """
+        stored = _values.attribute_value("Span.set_attribute", key, value)
+        if stored is None:
+            self._draft._extra[:] = [pair for pair in self._draft._extra if pair[0] != key]
+        else:
+            self._draft.set_extra(key, stored)
+
+    def add_event(self, name: str, attributes: Mapping[str, Any] | None = None) -> None:
+        """Record a point-in-time event on this span, stamped now.
+
+        The attribute values follow `set_attribute`'s rules; a None value is
+        left out. Exported as an OTLP span event, the channel the recorded
+        exception already uses.
+        """
+        self._draft._events.append(
+            InternalSpanEvent(
+                name=_values.wire_text(_values.text("Span.add_event() name", name)),
+                timestamp_ns=time.time_ns(),
+                attributes=_values.event_attributes("Span.add_event", attributes),
+            )
+        )
+
+    def set_input(self, value: str | bytes | Any) -> None:
+        """Record what this span's work was given: str, bytes, or a JSON-serialisable value.
+
+        Exported like an adapter's payload: on a tool span as
+        `gen_ai.tool.call.arguments`, on any other as `wardex.input_data`;
+        masked by the configured PII policy and cut at export by
+        `LimitsConfig.max_otlp_attribute_bytes`.
+        """
+        self._draft._input_data = _values.payload("Span.set_input()", value)
+
+    def set_output(self, value: str | bytes | Any) -> None:
+        """Record what this span's work produced; `set_input`'s rules, as
+        `gen_ai.tool.call.result` or `wardex.output_data`."""
+        self._draft._output_data = _values.payload("Span.set_output()", value)
 
     @property
     def gen_ai(self) -> GenAIAttributes | None:
@@ -179,7 +237,7 @@ class Span:
         if value is None:
             self._draft._gen_ai = None
         else:
-            self._draft.set_gen_ai(value)
+            self._draft.set_gen_ai(_values.block("Span.gen_ai", GenAIAttributes, value))
 
     @property
     def agent(self) -> AgentAttributes | None:
@@ -187,7 +245,7 @@ class Span:
 
     @agent.setter
     def agent(self, value: AgentAttributes | None) -> None:
-        self._draft._agent = value
+        self._draft._agent = _values.block("Span.agent", AgentAttributes, value)
 
     @property
     def tool(self) -> ToolAttributes | None:
@@ -195,7 +253,7 @@ class Span:
 
     @tool.setter
     def tool(self, value: ToolAttributes | None) -> None:
-        self._draft._tool = value
+        self._draft._tool = _values.block("Span.tool", ToolAttributes, value)
 
     @property
     def operation(self) -> OperationName | str | None:
@@ -203,7 +261,7 @@ class Span:
 
     @operation.setter
     def operation(self, value: OperationName | str | None) -> None:
-        self._draft.set_operation_label(value)
+        self._draft.set_operation_label(_values.operation("Span.operation", value))
 
     @property
     def workflow_name(self) -> str | None:
@@ -211,7 +269,7 @@ class Span:
 
     @workflow_name.setter
     def workflow_name(self, value: str | None) -> None:
-        self._draft.set_workflow_name(value)
+        self._draft.set_workflow_name(_values.text("Span.workflow_name", value, optional=True))
 
     @property
     def call_site(self) -> CallSite | None:
@@ -219,29 +277,29 @@ class Span:
 
     @call_site.setter
     def call_site(self, value: CallSite | None) -> None:
-        self._draft.set_call_site(value)
+        self._draft.set_call_site(_values.block("Span.call_site", CallSite, value))
 
     @property
     def input_data(self) -> bytes:
         return self._draft._input_data
 
     @input_data.setter
-    def input_data(self, value: bytes) -> None:
-        self._draft._input_data = value
+    def input_data(self, value: bytes | str) -> None:
+        self._draft._input_data = _values.raw("Span.input_data", value)
 
     @property
     def output_data(self) -> bytes:
         return self._draft._output_data
 
     @output_data.setter
-    def output_data(self, value: bytes) -> None:
-        self._draft._output_data = value
+    def output_data(self, value: bytes | str) -> None:
+        self._draft._output_data = _values.raw("Span.output_data", value)
 
     def _finish(self) -> InternalSpan:
         # Private on purpose: the context manager owns completion. A public
         # `finish()` on a CM-yielded object was a second way to end the span,
         # and the one the `with` block then ran again on the way out.
-        return self._draft.finish(self.end_time_ns or time.time_ns())
+        return self._draft.finish(self._end_time_ns or time.time_ns())
 
 
 #: The parentage a span that will never be emitted hangs off. Minted ONCE at
@@ -250,6 +308,25 @@ class Span:
 #: no members. Each still gets its OWN draft — a shared one would accumulate
 #: every host's `set_attribute` for the life of the process.
 _NULL_PARENTAGE = resolve_parentage(EMPTY_AMBIENT, Evidence(ParentSource.UNRESOLVED))
+
+
+def _shippable(finished: InternalSpan | None) -> InternalSpan | None:
+    """`finished`, or None (said once) when a field would fail the exporter's whole batch."""
+    if finished is None:
+        return None
+    field_name = _values.unshippable(finished)
+    if field_name is None:
+        return finished
+    counters.bump("tracing.manual_span_unshippable")
+    record(DropReason.UNMARSHALLABLE, 1)
+    report_once(
+        f"wardex: a span was left out of the export because its {field_name} holds a "
+        "value of a type the exporter cannot encode; the other spans in its batch are "
+        "not affected. Set span fields through the Span methods and properties, which "
+        "check the type where you set it",
+        key="tracing.manual_span_unshippable",
+    )
+    return None
 
 
 @contextmanager
@@ -297,6 +374,7 @@ def _begin(
         # inherits the same hazard, so it asks it too rather than having a
         # second answer.
         ambient = latch_ambient()
+        unbound_root = ambient.span_context is None and _hub.on_unbound_thread()
         parentage = resolve_observed(
             ambient, parent_closed=parent_is_closed_unit(ambient.span_context)
         )
@@ -337,25 +415,31 @@ def _begin(
         if stepped:
             yield lost
             return
-        with degraded_run():
-            yield lost
+        current = _make_current(lost)
+        try:
+            with degraded_run():
+                yield lost
+        finally:
+            _unmake_current(lost, current)
         return
 
     builder = Span(draft)
     installed = None if stepped else _install_parent(draft.context)
+    current = None if stepped else _make_current(builder)
     tracked = None
     with guard("tracing.manual_track", debug=_debug_enabled()):
-        tracked = _runtime.runtime().track_open_span(
-            id(builder), functools.partial(_interrupt, builder)
-        )
+        interrupt = functools.partial(_interrupt, builder)
+        interrupt.unbound_root = unbound_root  # type: ignore[attr-defined]  # `unseen_parent`
+        tracked = _runtime.runtime().track_open_span(id(builder), interrupt)
     # What `_WithOnly.__exit__` undoes when this close cannot run at all (see there).
-    builder._undo = (tracked, installed)  # type: ignore[attr-defined]
+    builder._undo = (tracked, installed, current)  # type: ignore[attr-defined]
     try:
         yield builder
     finally:
         # None: `_WithOnly.__exit__` gave this close up, and a late close of the suspended
         # generator must neither take the scope down again nor ship the span.
         if getattr(builder, "_undo", None) is not None:
+            _unmake_current(builder, current)
             if installed is not None:
                 with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
                     installed.take_down()
@@ -368,6 +452,7 @@ def _begin(
             # way out of code that has nothing to do with wardex.
             with guard("tracing.manual_span", debug=_debug_enabled()):
                 finished = builder._finish()
+            finished = _shippable(finished)
             client = None
             with guard("tracing.manual_client", debug=_debug_enabled()):
                 client = _hub.get_client()
@@ -379,6 +464,9 @@ def _begin(
             if untaken and client is not None and finished is not None:
                 with guard("tracing.manual_emit", debug=_debug_enabled()):
                     client.capture_span(finished)
+            # Nothing is left to undo, and kept, the Token would hold the span this one replaced:
+            # a closed span the task still reads past would keep every span before it.
+            builder._undo = None  # type: ignore[attr-defined]
 
 
 def _interrupt(span: Span, marker: Limitation, end_ns: int) -> InternalSpan | None:
@@ -393,7 +481,7 @@ def _interrupt(span: Span, marker: Limitation, end_ns: int) -> InternalSpan | No
     with guard("tracing.manual_interrupt", debug=_debug_enabled()):
         span._draft.add_limitation(marker)
         finished = span._draft.finish(span.end_time_ns or end_ns)
-    return finished
+    return _shippable(finished)
 
 
 class _Installed:
@@ -462,9 +550,8 @@ def _debug_enabled() -> bool:
 class _WithOnly(WithOnly):
     """`WithOnly` for the two span openers, which also record the host's exception.
 
-    `@span("x")` on an `async def` used to compile, run, and silently close the
-    span before any awaited work started (see `WithOnly`). The refusal here
-    names the decorators that do it right.
+    `@span("x")` on an `async def` would close the span before any awaited
+    work started (see `WithOnly`); the refusal names the decorators that work.
     """
 
     __slots__ = ("_span",)
@@ -481,6 +568,14 @@ class _WithOnly(WithOnly):
     def __enter__(self) -> Span:
         self._span = self._cm.__enter__()
         return self._span
+
+    # `async with` runs the same block: nothing in opening or closing a span
+    # awaits, and the span covers every `await` inside the block like any code.
+    async def __aenter__(self) -> Span:
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
+        return self.__exit__(exc_type, exc, tb)
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
         # Recorded HERE rather than in `_begin`, because this is the one place
@@ -516,17 +611,24 @@ class _WithOnly(WithOnly):
             # (the limit was lowered inside the block, so it closes with fewer free frames than it
             # opened with). The span is lost either way; it must not also stay in the open-span
             # table, nor stay installed as the parent of what this thread opens next, an edge to a
-            # span that never ships. C calls only, which push no frame: a Token already used, or
-            # made in another Context, is refused, and the scope stays as `take_down` left it.
-            # `_undo = None` makes a later close of the suspended generator do nothing.
+            # span that never ships, nor stay what `current_span()` answers. C calls only, which
+            # push no frame: a Token already used, or made in another Context, is refused, and the
+            # scope stays as `take_down` left it. `_undo = None` makes a later close of the
+            # suspended generator do nothing.
             undo = getattr(self._span, "_undo", None)
             if undo is not None:
                 self._span._undo = None  # type: ignore[union-attr]
+                self._span._open = False  # type: ignore[union-attr]
                 if undo[0] is not None:
                     undo[0].pop(id(self._span), None)
                 if undo[1] is not None:
                     try:
                         _hub._current_scope.reset(undo[1]._token)
+                    except (RuntimeError, ValueError):
+                        pass
+                if undo[2] is not None:
+                    try:
+                        _CURRENT_SPAN.reset(undo[2])
                     except (RuntimeError, ValueError):
                         pass
             counters.tally.append("tracing.close_at_limit")
@@ -607,8 +709,8 @@ def conversation(
     what it does after the block ends.
 
     A task or callback started inside the block keeps the id after the block
-    ends, however it ends; `wardex.isolation_scope()` steps out of the
-    conversation, `wardex.continue_trace()` does not. A block held across a
+    ends, however it ends; neither `wardex.isolation_scope()` nor
+    `wardex.continue_trace()` clears it. A block held across a
     `yield` in a generator the consumer abandons is closed elsewhere, and the
     consumer gets its own scope back: at once when the block is closed on the
     consumer task's own event loop on Python 3.12+ (the usual case: an abandoned
@@ -616,6 +718,8 @@ def conversation(
     so a thread, a task or a `copy_context()` it takes before that read still
     carries this id.
     """
+    _values.span_name("conversation", name)
+    _values.operation("wardex.conversation() op", op)
     return _WithOnly("conversation", _conversation(name, id=id, op=op))
 
 
@@ -643,7 +747,16 @@ def span(
     agent: AgentAttributes | None = None,
     tool: ToolAttributes | None = None,
 ) -> AbstractContextManager[Span]:
-    """Open a hand-named span over the host's block and yield it as a `Span`."""
+    """Open a hand-named span over the host's block and yield it as a `Span`.
+
+    `with` or `async with`. `kind` takes a `SpanKind` or its value (`"client"`).
+    A wrong argument raises here, at the call, naming what is accepted.
+    """
+    _values.span_name("span", name)
+    kind = _values.enum_member("wardex.span() kind", SpanKind, kind)
+    _values.operation("wardex.span() op", op)
+    _values.block("wardex.span() agent", AgentAttributes, agent)
+    _values.block("wardex.span() tool", ToolAttributes, tool)
     return _WithOnly("span", _span(name, op, kind, agent, tool))
 
 
@@ -660,7 +773,7 @@ def _record_exception(span: Span, exc: Exception, tb: TracebackType | None) -> N
     encoder masks them on both wires, and the OTLP value cap cuts them there.
     """
     draft = span._draft
-    name = _exception_type(type(exc))  # outside any guard, which is why it is TOTAL
+    name = _values.exception_type(type(exc))  # outside any guard, which is why it is TOTAL
     with guard("tracing.exception_status", debug=_debug_enabled()):
         if draft._status is StatusCode.UNSET:
             draft.set_status(StatusCode.ERROR, draft._status_message)
@@ -680,50 +793,3 @@ def _record_exception(span: Span, exc: Exception, tb: TracebackType | None) -> N
             "exception.stacktrace": stack,
         }
         draft.add_event("exception", time.time_ns(), **attrs)
-
-
-def _exception_type(cls: type) -> str:
-    """The class's fully qualified name, bare for a builtin — OTel Python's rule.
-
-    TOTAL, because it runs outside any guard on the host's way out of a block,
-    over a class that is the host's: a metaclass can make `__module__` a
-    property, or refuse every lookup, and what it raises would leave the block
-    in place of the host's own exception. Python's own lookup goes first, so
-    the name matches the last line of the stack trace; when it raises or gives
-    something that is not a string, the names come from `type`'s own
-    descriptors, which read what the class statement stored and run nothing
-    of the host's. Only exact `str` values are compared or joined, so a string
-    subclass's `__eq__` or `__format__` never runs either.
-    """
-    try:
-        module, qualname = cls.__module__, cls.__qualname__
-    except Exception:
-        module = qualname = None
-    module = _exact_str(module)
-    if module is None:
-        module = _exact_str(_stored_module(cls))
-    qualname = _exact_str(qualname)
-    if qualname is None:
-        # Never raises: every class has a qualified name, and this getter reads
-        # it from the type object itself.
-        qualname = str.__str__(type.__dict__["__qualname__"].__get__(cls))
-    if module is None or module in ("", "builtins"):
-        return qualname
-    return f"{module}.{qualname}"
-
-
-def _stored_module(cls: type) -> object:
-    """The `__module__` the class statement stored, or None when it stored none."""
-    try:
-        return type.__dict__["__module__"].__get__(cls)
-    except Exception:
-        return None
-
-
-def _exact_str(value: object) -> str | None:
-    """`value` as an exact `str` (a copy, for a subclass), or None if it is no string.
-
-    `type()` and a subclass check against `str` read the object's real type, so
-    unlike `isinstance` they never ask the object for its `__class__`.
-    """
-    return str.__str__(value) if issubclass(type(value), str) else None

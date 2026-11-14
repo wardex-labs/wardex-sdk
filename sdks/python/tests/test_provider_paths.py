@@ -72,7 +72,7 @@ def test_classify_path_table(path: str, want: str | None):
 def test_traces_ingest_is_excluded_under_agent_mode():
     with queued_server([(200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
             assert _request(host, port, "POST", "/v1/traces/ingest", _INGEST) == 200
             assert client_spans() == []
             assert counters.get("interceptors.seam.path_excluded") == 1
@@ -85,7 +85,9 @@ def test_traces_ingest_is_excluded_under_all_mode():
     with the whole run record as `input_data`; the exclusion beats ALL."""
     with queued_server([(200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+            wardex.init(
+                transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL
+            )
             assert _request(host, port, "POST", "/v1/traces/ingest", _INGEST) == 200
             assert client_spans() == []
             assert counters.get("interceptors.seam.path_excluded") == 1
@@ -98,7 +100,9 @@ def test_traces_ingest_is_excluded_above_intercept_hosts():
     still captures every other request to the named host."""
     with queued_server([(200, b"{}"), (200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True, intercept_hosts=[f"{host}:{port}"])
+            wardex.init(
+                transport=wardex.NoOpTransport(), intercept=True, intercept_hosts=[f"{host}:{port}"]
+            )
             assert _request(host, port, "POST", "/v1/traces/ingest", _INGEST) == 200
             assert client_spans() == []
             assert counters.get("interceptors.seam.path_excluded") == 1
@@ -114,7 +118,7 @@ def test_traces_ingest_inside_workflow_is_still_excluded():
     exclusion is the one exception, so the run record never rides along."""
     with queued_server([(200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
 
             @wardex.workflow(name="run")
             def run() -> None:
@@ -134,7 +138,7 @@ def test_conversation_create_is_dropped_and_counted_under_agent_mode():
     and outside a local span it is still dropped — but now counted."""
     with queued_server([(200, _CONVERSATION), (200, _ITEMS)]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
             assert _request(host, port, "POST", "/v1/conversations", b"{}") == 200
             assert _request(host, port, "GET", "/v1/conversations/conv_1/items") == 200
             assert client_spans() == []
@@ -147,7 +151,9 @@ def test_conversation_create_is_dropped_and_counted_under_agent_mode():
 def test_conversation_items_are_plain_http_under_all_mode():
     with queued_server([(200, _ITEMS)]) as (host, port):
         try:
-            wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+            wardex.init(
+                transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL
+            )
             body = b'{"items":[{"role":"user","content":"hello"}]}'
             assert _request(host, port, "POST", "/v1/conversations/conv_1/items", body) == 200
             spans = client_spans()
@@ -164,7 +170,7 @@ def test_conversation_items_are_plain_http_under_all_mode():
 def test_conversation_call_inside_workflow_is_a_child_http_span():
     with queued_server([(200, _DELETED)]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
 
             @wardex.workflow(name="run")
             def run() -> None:
@@ -188,7 +194,7 @@ def test_root_level_conversations_path_is_not_provider_state():
     (Intercom, Front) out of the count."""
     with queued_server([(200, b"{}")]) as (host, port):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
             assert _request(host, port, "POST", "/conversations", b"{}") == 200
             assert client_spans() == []
             assert counters.get("interceptors.seam.provider_state_dropped") == 0
@@ -205,7 +211,7 @@ def test_responses_compact_is_a_billable_llm_call_under_agent_mode():
         port,
     ):
         try:
-            wardex.init(intercept=True)
+            wardex.init(transport=wardex.NoOpTransport(), intercept=True)
             req = llm_fixture("openai_responses_compact", "request.json")
             assert _request(host, port, "POST", "/v1/responses/compact", req) == 200
             spans = client_spans()
@@ -218,9 +224,9 @@ def test_responses_compact_is_a_billable_llm_call_under_agent_mode():
             assert sp.gen_ai.response_id == "resp_cmp1"
             assert not sp.gen_ai.finish_reasons
             assert sp.gen_ai.response_status is None
-            # provider from the body shape: the host here is 127.0.0.1, so the
-            # label is a guess and the span says so, once, with one count
-            assert sp.gen_ai.provider == ProviderName.OPENAI
+            # the host here is 127.0.0.1, which names no provider: the label is
+            # left off rather than guessed, and the span says so, once, with one count
+            assert sp.gen_ai.provider is None
             assert Limitation.PROVIDER_INFERRED in sp.capture_integrity.limitations
             assert counters.get("protocol.semantic.provider_inferred") == 1
             extra = dict(sp.extra)
@@ -263,3 +269,43 @@ def test_an_inferred_provider_label_is_marked_and_counted():
 
     assert provider_limitation(_Sem("openai", True)) is Limitation.PROVIDER_INFERRED
     assert counters.get("protocol.semantic.provider_inferred") == 1
+
+
+def test_a_host_that_names_no_provider_ships_no_provider_name():
+    """An OpenAI-shaped call to a host no known provider operates keeps its
+    gen_ai block but carries no `gen_ai.provider.name`, and a known vendor's
+    host is named by its registry name rather than by the API shape."""
+    from wardex_sdk._protocol import parse_llm_semantics
+    from wardex_sdk._semantics import build_gen_ai
+
+    req = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).encode()
+    resp = json.dumps(
+        {
+            "id": "c",
+            "object": "chat.completion",
+            "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    ).encode()
+    gateway = parse_llm_semantics("llm-gw.corp.internal", "/v1/chat/completions", req, resp)
+    assert build_gen_ai(gateway).provider is None
+    groq = parse_llm_semantics("api.groq.com", "/openai/v1/chat/completions", req, resp)
+    assert build_gen_ai(groq).provider == ProviderName.GROQ
+    azure = parse_llm_semantics(
+        "res.openai.azure.com", "/openai/deployments/d/chat/completions", req, resp
+    )
+    assert build_gen_ai(azure).provider == ProviderName.AZURE_AI_OPENAI
+
+
+def test_an_unanswered_call_to_an_unnamed_host_is_still_identified():
+    """A refused call keeps its identity when the host names no provider: the
+    request still named a model at a recognized LLM endpoint."""
+    from wardex_sdk._semantics import identifies_llm_call
+
+    class _Unanswered(_Sem):
+        operation = "chat"
+        request_model = "m"
+
+    assert identifies_llm_call(_Unanswered("", True))
+    assert not identifies_llm_call(_Unanswered("", False))

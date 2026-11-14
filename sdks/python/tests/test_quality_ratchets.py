@@ -475,19 +475,17 @@ _MODULE_CEILING = 800
 #: count, as `wc -l`). Each may only shrink; a module not listed here may not
 #: cross the ceiling; a module that drops below it is removed from this dict.
 _OVERSIZED_BUDGET = {
-    "_assembly/_units.py": 2100,
+    "_assembly/_units.py": 2097,
     "_adapters/_assembler.py": 1929,
     # Lowered from 1588 when the span pieces its later span kinds share with it
     # (`_open_child`, the start instant, the error sentences) moved out to
     # `_openai_agents_kinds.py` beside those kinds, with the model call's join.
     "_adapters/_openai_agents.py": 1465,
-    "_client.py": 1565,
+    "_client.py": 1564,
     # Lowered from 1305 when the four site enums moved to `_context_vocab.py`, paying for the
     # unit exit that drops its own close at the recursion limit.
     "_adapters/_context.py": 1275,
-    # Lowered from 1180 when `_url_host` moved to `_peer.py`, beside the other answers about
-    # which host a seam span names, paying for the parser-latch report's recursion-limit tally.
-    "_interceptors/_seam.py": 1174,
+    "_interceptors/_seam.py": 1146,
     "_adapters/_langgraph.py": 1035,
     # Raised by exactly one member (h2_request_evicted, 53): the closed
     # Limitation enum cannot move a member out, and the census demands each
@@ -646,9 +644,6 @@ def test_wheel_declares_zero_runtime_dependencies():
 #: docstring removes the name from this set in the same commit.
 _UNDOCUMENTED_BUDGET = frozenset(
     {
-        "workflow",
-        "agent",
-        "tool",
         "get_traceparent",
         "get_trace_headers",
         "WardexAsgiMiddleware",

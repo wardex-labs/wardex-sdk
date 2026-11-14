@@ -210,6 +210,9 @@ class Ambient:
     span_context: SpanContext | None
     conversation: ConversationContext | None
     tracestate: str | None
+    #: With no span context: why a parent may exist that the latching Context
+    #: could not see (`_hub.unseen_parent`), which makes a root UNRESOLVED.
+    unseen_parent: str | None = None
 
     @property
     def is_local(self) -> bool:
@@ -229,10 +232,12 @@ def latch_ambient() -> Ambient:
     adapter silently breaks the tree.
     """
     scope = _hub.get_current_scope()
+    parent = scope.active_span_context
     return Ambient(
-        span_context=scope.active_span_context,
+        span_context=parent,
         conversation=scope.conversation,
         tracestate=scope.tracestate,
+        unseen_parent=None if parent is not None else _hub.unseen_parent(scope),
     )
 
 
@@ -248,6 +253,11 @@ def resolve_parentage(ambient: Ambient, evidence: Evidence = AMBIENT) -> Parenta
             if evidence.source is ParentSource.CONTEXTVAR
             else evidence.source
         )
+        if src is ParentSource.TRACE_ROOT and ambient.unseen_parent is not None:
+            # Not a root by observation: a parent may exist that the latching
+            # Context could not see, so the edge is unresolved, never guessed.
+            src = ParentSource.UNRESOLVED
+            _hub.explain_unseen_parent(ambient.unseen_parent)
         return Parentage(
             trace_id=TraceId.generate(),  # THE ONLY CALL SITE IN THE SDK
             parent_span_id=None,

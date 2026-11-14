@@ -21,7 +21,8 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
 
 from .. import _hub
@@ -31,9 +32,11 @@ from .._adapters._registry import AdapterRegistry
 from .._assembly import Limitation, counters
 from .._assembly._diag import reset_reports_for_test
 from .._assembly._units import _ambient_unit
+from .._enums import StatusCode
 from .._finalize import FinalizeQueue, Leftover
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
-from .._types import Envelope
+from .._native import native
+from .._types import Envelope, EnvelopeHeader, SdkInfo
 from ..transport._base import DEFAULT_TIMEOUT, Transport
 
 
@@ -234,6 +237,14 @@ def never_installed(
 
 
 @dataclass(frozen=True)
+class EventNode:
+    """One event on a shipped span: its name and attributes as OTLP carries them."""
+
+    name: str
+    attributes: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class SpanNode:
     """One shipped span, reduced to what a causal claim is made of.
 
@@ -242,6 +253,13 @@ class SpanNode:
     `_assembly/`, because an edge written anywhere else is an edge nobody
     resolved. Nothing here can BUILD a span — that is the whole reason the rule
     can stay hard rather than acquiring an exception for a reader.
+
+    The last three fields answer what a host's own test asks of a span ("the
+    tool failed", "`user.id` was stamped") and take no part in equality, which
+    stays the causal reduction above. `attributes` is the span's attributes as
+    an OTLP backend receives them: the `gen_ai.*` blocks flattened, scope tags
+    and user stamped, `error.type` included, before PII masking (as everything
+    a `RecordingTransport` holds is). `events` likewise.
     """
 
     name: str
@@ -251,6 +269,11 @@ class SpanNode:
     strategy: Any
     confidence: float | None
     limitations: tuple[Limitation, ...]
+    status: StatusCode | None = field(default=None, compare=False)
+    attributes: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({}), compare=False
+    )
+    events: tuple[EventNode, ...] = field(default=(), compare=False)
 
 
 def read_spans(spans: Sequence[Any]) -> tuple[SpanNode, ...]:
@@ -264,6 +287,7 @@ def read_spans(spans: Sequence[Any]) -> tuple[SpanNode, ...]:
     for span in spans:
         integrity = span.capture_integrity
         correlation = span.correlation
+        attributes, events = _as_exported(span)
         out.append(
             SpanNode(
                 name=span.name,
@@ -273,9 +297,43 @@ def read_spans(spans: Sequence[Any]) -> tuple[SpanNode, ...]:
                 strategy=correlation.strategy if correlation is not None else None,
                 confidence=correlation.confidence if correlation is not None else None,
                 limitations=tuple(integrity.limitations) if integrity is not None else (),
+                status=span.status,
+                attributes=attributes,
+                events=events,
             )
         )
     return tuple(out)
+
+
+#: The header a one-span envelope needs to pass through the encoder. The
+#: OTLP span attributes do not read it.
+_READER_HEADER = EnvelopeHeader(
+    event_id="",
+    sdk=SdkInfo(name="wardex.python", version="", python_version="", os="", arch=""),
+    sent_at_ns=0,
+)
+
+
+def _as_exported(span: Any) -> tuple[Mapping[str, Any], tuple[EventNode, ...]]:
+    """The span's attributes and events through the real OTLP encoder, masking off.
+
+    The encoder rather than a re-derivation here, so what a test asserts is
+    what a backend receives: a second copy of the flattening rules would agree
+    with the first only until one of them changed.
+    """
+    body = native.codec.encode_otlp_traces(Envelope(header=_READER_HEADER, spans=(span,)))
+    decoded = native.codec.decode_otlp_traces(body)
+    (exported,) = [
+        sp
+        for resource in decoded["resource_spans"]
+        for scope in resource["scope_spans"]
+        for sp in scope["spans"]
+    ]
+    events = tuple(
+        EventNode(name=ev["name"], attributes=MappingProxyType(dict(ev["attributes"])))
+        for ev in exported["events"]
+    )
+    return MappingProxyType(dict(exported["attributes"])), events
 
 
 @dataclass(frozen=True)
@@ -357,6 +415,9 @@ def collapse_onto_root(nodes: Sequence[SpanNode], *, root: str) -> tuple[SpanNod
             strategy=node.strategy,
             confidence=node.confidence,
             limitations=node.limitations,
+            status=node.status,
+            attributes=node.attributes,
+            events=node.events,
         )
         for node in nodes
     )
@@ -461,6 +522,7 @@ class AdapterSubject:
 
 __all__ = [
     "AdapterSubject",
+    "EventNode",
     "LiveAdapter",
     "RecordingClient",
     "RecordingTransport",

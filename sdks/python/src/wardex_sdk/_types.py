@@ -25,6 +25,7 @@ from ._enums import (
     ToolExecutionType,
     ToolType,
 )
+from ._values import check_agent, check_gen_ai, check_tool, wire_text
 from ._version import OTEL_SEMCONV_VERSION
 
 if TYPE_CHECKING:
@@ -95,8 +96,8 @@ class GenAIAttributes:
     # `crates/wardex-protocol/src/usage.rs` makes it true for everything
     # wardex parses, and `SpanDraft.set_gen_ai` counts violations
     # (`assembly.builder.gen_ai_usage_not_inclusive`) for blocks built by
-    # hand. This dataclass stays validation-free by layering: it sits below
-    # `_assembly`, which owns the counters.
+    # hand. The constructor checks only types: it sits below `_assembly`,
+    # which owns the counters.
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_input_tokens: int | None = None
@@ -133,6 +134,9 @@ class GenAIAttributes:
 
     prompt_name: str | None = None  # gen_ai.prompt.name (optional)
 
+    def __post_init__(self) -> None:
+        check_gen_ai(self)
+
 
 @dataclass(frozen=True, slots=True)
 class AgentAttributes:
@@ -140,8 +144,13 @@ class AgentAttributes:
     id: str | None = None
     description: str | None = None
     version: str | None = None
-    agent_type: AgentType = AgentType.PRIMARY
+    # None leaves `wardex.agent.type` off the span: `@wardex.agent` sees a
+    # function run, not whether it is the primary agent or another's sub-agent.
+    agent_type: AgentType | None = AgentType.PRIMARY
     parent_agent: str | None = None
+
+    def __post_init__(self) -> None:
+        check_agent(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,9 +160,14 @@ class ToolAttributes:
     description: str | None = None  # gen_ai.tool.description (new)
     # gen_ai.tool.type (new): function/extension/datastore
     type: ToolType | str | None = None
-    # wardex-custom (network/in_process)
-    execution_type: ToolExecutionType = ToolExecutionType.NETWORK
+    # wardex-custom: how the tool body ran. UNKNOWN unless the builder observed
+    # it: a block built by hand has not, and `@wardex.tool` fills IN_PROCESS
+    # because it is the one that ran the body.
+    execution_type: ToolExecutionType = ToolExecutionType.UNKNOWN
     # tool.call.arguments / result use InternalSpan.input_data / output_data
+
+    def __post_init__(self) -> None:
+        check_tool(self)
 
 
 # --- Replay / harness new types ---
@@ -655,6 +669,13 @@ class ResourceInfo:
     environment: str = ""  # -> deployment.environment.name
     process_pid: int = 0  # -> process.pid; 0 = not stamped (drain stamps it live)
 
+    def __post_init__(self) -> None:
+        # Every batch carries these: one the wire cannot encode cost them all.
+        for name in ("service_name", "release", "environment"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, wire_text(value))
+
 
 @dataclass(frozen=True, slots=True)
 class ClientReport:
@@ -746,6 +767,10 @@ class ParsedMessage:
     # parser's close flush produces it; a fact, not a marker — the tracker
     # decides what the span says about it.
     incomplete: bool = False
+    # What the parser's body policy stored the body for (`RawHttpMessage.body_use`):
+    # "kept", "model_call", "provisional", "stream", or "skipped" (the capture policy could
+    # not use it: `body` is empty and is not the body's size).
+    body_use: str = "kept"
 
 
 # --- Callback protocols (concrete signatures instead of Callable) ---
@@ -771,13 +796,3 @@ class BeforeSendEnvelopeCallback(TypingProtocol):
     def __call__(self, envelope: Envelope) -> Envelope | None:
         """Return the received envelope to send, None to cancel the batch."""
         ...
-
-
-class SpanEnrichCallback(TypingProtocol):
-    """Used when Interceptors enrich an existing Span with transport attributes."""
-
-    def __call__(self, span: InternalSpan, transport: TransportAttributes) -> InternalSpan: ...
-
-
-class FlushCallback(TypingProtocol):
-    def __call__(self, envelope: Envelope) -> None: ...

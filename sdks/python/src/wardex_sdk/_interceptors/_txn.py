@@ -49,6 +49,10 @@ class _Txn:
     #: nothing the gate acts on, and calling it degraded let bodies out under a mode that had
     #: filtered the traffic. `parent_evicted` alone stays the marker (`resolve_observed`).
     parent_lost: bool = False
+    #: With no parent: why one may exist that the issuing context could not see
+    #: (`_hub.unseen_parent`), latched beside `parent` for the same reason. It makes the span's
+    #: root edge unresolved rather than a confident trace root.
+    unseen_parent: str | None = None
     #: The parent the latch cap evicted from a model call's entry (`_Http2Tracker`): never placed,
     #: only handed to the seal's model-call witness (`witness_request`), so a bridge chat unit above
     #: a parentless answer still learns that the wire carries the call's usage.
@@ -66,6 +70,11 @@ class _Txn:
     #: parser stopped. The seam ships a size only for a half that was.
     request_counted: bool = True
     response_counted: bool = True
+    #: Was this half's body stored at all? False when the parser's body policy left it unstored
+    #: because the capture policy could not use it (`ParsedMessage.body_use`): the body field is
+    #: empty, which is not a captured empty body, and the half has no size.
+    request_body_kept: bool = True
+    response_body_kept: bool = True
     #: `ParsedMessage.incomplete`: status and headers were observed, how the exchange ended was not.
     response_cut: bool = False
     #: The HTTP/2 stream this transaction rode; None on HTTP/1.

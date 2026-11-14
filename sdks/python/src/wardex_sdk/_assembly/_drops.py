@@ -87,7 +87,9 @@ def count_drain_drop(cause: str, envelope: Envelope, spans: deque, snapshots: de
     return f"{n_spans} span(s)" + (f" and {n_snapshots} state snapshot(s)" if n_snapshots else "")
 
 
-def report_export_failed(what: str, counter: str, reason: str, spans: int, hint: str = "") -> None:
+def report_export_failed(
+    what: str, counter: str, reason: str, spans: int, hint: str = "", *, credentials: bool = False
+) -> None:
     """A POST that failed outright -- refused, unanswered, or answered with an error.
 
     `what` names the exporter ("a wardex export", "an OTLP export"), `counter` is
@@ -95,19 +97,19 @@ def report_export_failed(what: str, counter: str, reason: str, spans: int, hint:
     exception TYPE name, never the exception's message. One wording for both
     exporters, so they cannot drift about what a failed export means.
 
-    TWO keys per exporter, and the split is the hint's. With one, the first
-    failure -- a DNS blip or a 503 while the receiver boots -- spent the line,
-    and a 401 after it never got to say "check the key" for the rest of the
-    process. Not one key per reason: a status is whatever the receiver, or a
-    proxy in front of it, sends back, so per-status keys let the far end choose
-    how many lines this process prints. A refused credential gets its own line;
-    every other failure shares one.
+    TWO keys per exporter, split by `credentials` (the receiver refused the
+    credentials). With one, the first failure -- a DNS blip or a 503 while the
+    receiver boots -- spent the line, and a 401 after it never got to say
+    "check the key" for the rest of the process. Not one key per reason: a
+    status is whatever the receiver, or a proxy in front of it, sends back, so
+    per-status keys let the far end choose how many lines this process prints.
+    A refused credential gets its own line; every other failure shares one.
     """
     report_once(
         f"{what} failed ({reason}); its {spans} span(s) were not confirmed delivered and are "
-        f"not resent.{hint} Every failed export is counted under {counter}; re-run with "
-        "debug=True to see each failure.",
-        key=f"{counter}:credentials" if hint else counter,
+        f"not resent.{hint} wardex.diagnostics().losses counts every failed export by its "
+        "reason; re-run with debug=True to see each failure.",
+        key=f"{counter}:credentials" if credentials else counter,
     )
 
 
@@ -134,9 +136,9 @@ def report_buffer_evicted(evicted: int, *, debug: bool) -> None:
         counters.bump("client.buffer.evicted")
     report_once(
         f"the buffer was full, so {evicted} item(s) were evicted oldest-first before they "
-        "could be exported, and nothing will resend them. Raise limits.max_buffer_spans / "
-        "limits.max_buffer_bytes to keep more (every eviction is counted under "
-        "client.buffer.evicted)",
+        "could be exported, and nothing will resend them. Raise "
+        "LimitsConfig(max_buffer_spans=...) or LimitsConfig(max_buffer_bytes=...) to keep "
+        "more; wardex.diagnostics().losses counts every eviction under queue_overflow",
         key="client.buffer.evicted",
     )
     if debug:
@@ -156,8 +158,8 @@ def report_transport_raised(call: str, exc: BaseException, *, debug: bool) -> No
     record(DropReason.SEND_ERROR, unit=DropUnit.FAILURE)
     report_once(
         f"the transport's {call}() raised and was ignored; anything it was still holding "
-        f"may not have been sent (counted under {counter}; re-run with debug=True for the "
-        "error)",
+        "may not have been sent (wardex.diagnostics().losses counts it under send_error; "
+        "re-run with debug=True for the error)",
         key=counter,
     )
     if debug:
@@ -206,8 +208,8 @@ def report_worker_pass_raised(name: str) -> None:
     record(DropReason.INTERNAL_SDK_ERROR, where="worker.drain_raised")
     report_once(
         f"a background pass of {name} raised and was skipped; whatever it was handling "
-        "may be lost, and the worker keeps running (counted under worker.drain_raised; "
-        "re-run with debug=True for the error)",
+        "may be lost, and the worker keeps running (wardex.diagnostics().losses counts it "
+        "under internal_sdk_error; re-run with debug=True for the error)",
         key="worker.drain_raised",
     )
 
@@ -220,7 +222,7 @@ def report_signal_flush_raised() -> None:
     counters.bump("_runtime.signal_flush_raised")
     report_once(
         "the flush wardex runs when the process is signalled to stop raised; spans still "
-        "buffered were not sent (counted under _runtime.signal_flush_raised)",
+        "buffered were not sent",
         key="_runtime.signal_flush_raised",
     )
 
@@ -236,7 +238,7 @@ def report_open_spans_untracked() -> None:
     report_once(
         "more manual spans were open at once than wardex tracks for shutdown, so one "
         "opened past that bound is not shipped if the process stops while it is still "
-        "open (counted under _runtime.open_spans_full)",
+        "open",
         key="_runtime.open_spans_full",
     )
 
@@ -255,8 +257,8 @@ def report_open_spans_unshipped(lost: int) -> None:
     report_once(
         f"{lost} span(s) still open when the process was stopping did not fit in the "
         "buffer beside the finished spans already in it, and were not shipped. Raise "
-        "limits.max_buffer_spans, or give close() a larger budget (counted under "
-        "_runtime.open_spans_unshipped)",
+        "LimitsConfig(max_buffer_spans=...), or give close() a larger budget "
+        "(wardex.diagnostics().losses counts them under shutdown_tail)",
         key="_runtime.open_spans_unshipped",
     )
 
@@ -338,9 +340,12 @@ def report_undelivered_drops(client: object, *, who: str = "close()") -> None:
             for (reason, unit), n in sorted(held.items(), key=lambda kv: _ledger._wire_key(kv[0]))
             if n
         )
+        state = getattr(getattr(client, "_transport", None), "export_state", None)
+        to = getattr(state, "destination", None)
+        bound = f" bound for {to}" if isinstance(to, str) else ""
         line = (
-            f"{who} finished holding counts of lost data that no receiver has confirmed, and "
-            f"nothing will send them now (reason:unit=count): {counts}"
+            f"{who} finished holding counts of lost data{bound} that no receiver has confirmed, "
+            f"and nothing will send them now (reason:unit=count): {counts}"
         )
         totals = _ledger.snapshot().counts
         said = (

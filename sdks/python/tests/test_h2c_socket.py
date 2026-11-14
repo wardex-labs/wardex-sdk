@@ -8,6 +8,7 @@ first, so the gate latches to "ignore" → no contamination.
 
 from __future__ import annotations
 
+import functools
 import json
 import socket
 import threading
@@ -19,7 +20,8 @@ import pytest
 
 import wardex_sdk as wardex
 from conftest import client_spans
-from wardex_sdk import ConsoleTransport, _hub
+from wardex_sdk import ConsoleTransport, NoOpTransport, _hub
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import CaptureSource
 from wardex_sdk._interceptors._registry import get_registry
 
@@ -150,6 +152,27 @@ def test_h2c_llm_call_captured():
         assert sp.gen_ai is not None  # LLM identified
         assert ("network.protocol.version", "2") in sp.extra  # HTTP/2
         assert CaptureSource.SOCKET in sp.capture_sources
+    finally:
+        stop.set()
+        srv.close()
+
+
+@pytest.mark.parametrize("bound", [False, True], ids=["plain-thread", "bound-thread"])
+def test_an_h2c_model_call_from_an_unbound_thread_while_a_span_is_open_is_not_a_confident_root(
+    bound,
+):
+    stop, srv, host, port = _h2c_server(_LLM_RESP)
+    try:
+        wardex.init(transport=NoOpTransport(), intercept=True)
+        body = b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+        call = functools.partial(_h2c_post, host, port, "/v1/chat/completions", body)
+        with wardex.span("agent"):
+            thread = threading.Thread(target=wardex.bind_context(call) if bound else call)
+            thread.start()
+            thread.join()
+        (sp,) = client_spans()
+        assert (sp.parent_span_id is not None) is bound
+        assert (Limitation.PARENT_UNRESOLVED in sp.capture_integrity.limitations) is not bound
     finally:
         stop.set()
         srv.close()

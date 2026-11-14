@@ -23,6 +23,7 @@ from dataclasses import replace
 from typing import Any, TypeVar
 
 from .._assembly import (
+    DropReason,
     Evidence,
     Limitation,
     ParentSource,
@@ -36,6 +37,7 @@ from .._assembly import (
     counters,
     guard,
     latch_ambient,
+    record,
 )
 from .._enums import (
     AgentType,
@@ -165,13 +167,11 @@ class SessionAssembler:
         self._bridge = bridge
         self._by_key: dict[int, _Session] = {}
         self._by_session_id: dict[str, _Session] = {}
-        # Bounds for the tables this assembler may have to BUILD, resolved from
-        # the CLIENT's config and never from a bare `LimitsConfig()`. A caller
-        # that hands us no registry still configured one, and process defaults
-        # would silently replace the user's values — which is the exact half of
-        # this class that was already doing so. `client=None` still yields the
-        # core defaults, which is the honest answer for a caller with no config
-        # at all.
+        # Bounds for the tables this assembler may have to BUILD, resolved from the CLIENT's config
+        # and never from a bare `LimitsConfig()`. A caller that hands us no registry still
+        # configured one, and process defaults would silently replace the user's values — which is
+        # the exact half of this class that was already doing so. `client=None` still yields the
+        # core defaults, which is the honest answer for a caller with no config at all.
         cfg = getattr(client, "config", None)
         lim = cfg.limits if cfg is not None else LimitsConfig()
         resolved = lim.resolved()
@@ -188,18 +188,15 @@ class SessionAssembler:
         # compared against a name the CLI spells differently — is what it
         # replaces; `Unit.claim()` arbitrates on a normalized key instead.
         #
-        # SUPPLIED, not built, when the adapter has one: the registry the
-        # adapter's `AdapterContext` holds must be the SAME object, or `owner`
-        # scoping is meaningless — `sole_live(owner=...)` and
-        # `close_all(owner=...)` answer questions about one table, and two
-        # tables give two adapters no way to be told apart inside either. Built
-        # here only for a caller that has no context yet, which is every test
-        # that drives this class directly — and one production path: an adapter
-        # installed by hand, without going through `wardex.init()`. That path is
-        # documented and warned about, not unsupported, so the registry it gets
-        # owes the host every bound the host configured. It used to get two of
-        # the four, forwarded from the adapter, and there was no third place a
-        # bound could arrive from.
+        # SUPPLIED, not built, when the adapter has one: the registry the adapter's `AdapterContext`
+        # holds must be the SAME object, or `owner` scoping is meaningless — `sole_live(owner=...)`
+        # and `close_all(owner=...)` answer questions about one table, and two tables give two
+        # adapters no way to be told apart inside either. Built here only for a caller that has no
+        # context yet, which is every test that drives this class directly — and one production
+        # path: an adapter installed by hand, without going through `wardex.init()`. That path is
+        # documented and warned about, not unsupported, so the registry it gets owes the host every
+        # bound the host configured. It used to get two of the four, forwarded from the adapter, and
+        # there was no third place a bound could arrive from.
         self._units = (
             units
             if units is not None
@@ -500,7 +497,7 @@ class SessionAssembler:
                     )
                     draft.set_agent(
                         AgentAttributes(
-                            name=agent_type, id=agent_id, agent_type=AgentType.SUB_AGENT
+                            name=str(agent_type), id=str(agent_id), agent_type=AgentType.SUB_AGENT
                         )
                     )
                     draft.add_limitation(_BASE_LIMITATION)
@@ -613,11 +610,10 @@ class SessionAssembler:
             self._by_session_id.pop(sess.session_id, None)
         self._close_chats(sess)
         self._drain_children(sess, now)
-        # The retirement half of the pending buffer's conservation rule: the
-        # root already shipped, so there is no finalize-time merge left to
-        # wait for — every held draft goes out NOW, unmerged, deferred markers
-        # applied, and the receiver slot is unfiled so it cannot outlive the
-        # session that reserved it.
+        # The retirement half of the pending buffer's conservation rule: the root already shipped,
+        # so there is no finalize-time merge left to wait for — every held draft goes out NOW,
+        # unmerged, deferred markers applied, and the receiver slot is unfiled so it cannot outlive
+        # the session that reserved it.
         self._flush_pending(sess)
         self._retire_bridge(sess)
         return None
@@ -636,6 +632,7 @@ class SessionAssembler:
         with self._guard("adapters.assembler.otel_bridge_retire"):
             self._bridge.take(sess.bridge.trace_id_hex, sess.session_id)
         counters.bump("adapters.assembler.otel_bridge_retired")
+        record(DropReason.BRIDGE_RETIRED, where="adapters.anthropic.otel_bridge")
 
     def _resume(self, sess: _Session, previous: _Session) -> None:
         """Carry a retired session's identity onto the root that replaces it.
@@ -881,6 +878,8 @@ class SessionAssembler:
             counters.bump("adapters.assembler.stream_usage_totals_unpaired")
         if ev.usage_overflowed:
             counters.bump("adapters.assembler.stream_usage_overflowed")
+        if ev.usage_totals_unpaired or ev.usage_overflowed:
+            record(DropReason.USAGE_WITHHELD, where="adapters.anthropic_agent_sdk")
         key = ev.parent_tool_use_id
         held = sess.open_chats.get(key)
         chat = None
@@ -1550,6 +1549,7 @@ class SessionAssembler:
         while len(sess.pending) >= self._max_session_entries:
             oldest = sess.pending.pop(0)
             counters.bump("adapters.assembler.otel_bridge_pending_overflow")
+            record(DropReason.BRIDGE_MERGE_SKIPPED, where="adapters.anthropic.otel_bridge")
             self._emit_pending(oldest)
         sess.pending.append(rec)
 

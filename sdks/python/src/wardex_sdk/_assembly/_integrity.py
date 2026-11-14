@@ -668,8 +668,8 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     BODY_CAP_EXCEEDED = "body_cap_exceeded"
-    """An HTTP body was stored up to ``max_body_bytes`` / ``max_opaque_body_bytes``
-    and the rest was consumed without being kept.
+    """An HTTP body was stored up to ``max_body_bytes`` / ``max_opaque_body_bytes`` or the room
+    ``max_in_flight_body_bytes`` left, and the rest was consumed without being kept.
 
     On HTTP/1 the marker is produced in Rust: ``crates/wardex-protocol/src/http1.rs``,
     ``append_capped``. It crosses the PyO3 boundary as ``Vec<&'static str>``
@@ -701,9 +701,9 @@ Two emit sites, and the first is the mechanism the second restates.
     """The WebSocket content sample hit ``ws_sample_bytes`` in either direction,
     so the body bytes on this span are a prefix of the conversation.
 
-    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``, from the truncation
-    flags ``_append_sample`` sets when the accumulated sample passes the cap — resolved from
-    ``limits_defaults()["ws_sample_bytes"]`` (and passed as ``sample_cap`` by
+    Emitted from ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``, from the
+    truncation flags ``_append_sample`` sets when the accumulated sample passes the cap — resolved
+    from ``limits_defaults()["ws_sample_bytes"]`` (and passed as ``sample_cap`` by
     ``_interceptors/_seam.py``). NOT ``max_ws_frame_bytes``: that one bounds a single frame's
     declared length in ``crates/wardex-protocol/src/websocket.rs`` and an oversize frame does not
     truncate anything — it disables the parser, which surfaces as ``FRAME_PARSE_FAILED``.
@@ -818,11 +818,11 @@ Two emit sites, and the first is the mechanism the second restates.
     """The framing layer failed, so the transport fields on this span are partial or synthesized.
 
     Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (gRPC frame parse raised; the span falls
-    back to plain h2 fields), ``_interceptors/_trackers.py::_WebSocketTracker._build_txn`` (either
-    direction's frame parser latched off) and ``_Http1Tracker._response_txn`` there (an HTTP/1
-    response's stream ended before its framing did — a Content-Length not reached, a chunked body
-    short of its last chunk, an unframed body let go before the peer's EOF: the body is what came,
-    its size unset, a 2xx status UNSET). Before the census the first two emitted the free strings
+    back to plain h2 fields), ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``
+    (either direction's frame parser latched off) and ``_interceptors/_trackers.py::_Http1Tracker``
+    (an HTTP/1 response's stream ended before its framing did — a Content-Length not reached, a
+    chunked body short of its last chunk, an unframed body let go before the peer's EOF: the body
+    is what came, its size unset, a 2xx status UNSET). The first two replaced the free strings
     ``grpc_parse_failed`` and ``ws_parse_failed``. On an HTTP span, look at the server, the network
     or the client that let go: the parser read every byte that came.
 
@@ -850,7 +850,7 @@ Two emit sites, and the first is the mechanism the second restates.
     span are not readable content.
 
     Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (any request or response message had its
-    compressed flag set) and ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``
+    compressed flag set) and ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``
     (permessage-deflate negotiated). Before the census those two sites emitted the free strings
     ``grpc_compressed`` and ``ws_compressed``.
 
@@ -882,8 +882,8 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     PROVIDER_INFERRED = "provider_inferred"
-    """``gen_ai.provider.name`` is a guess: not read off the provider's own host but off a hostname
-    that merely contains its name (proxy, mock, Azure deployment), the body shape, or the API shape.
+    """An LLM call on a host no known provider operates (a gateway, a local server, a mock), so
+    ``gen_ai.provider.name`` is left off rather than guessed from the API shape.
 
     Decided by ``_semantics/_genai.py::provider_limitation`` from the native ``provider_inferred``,
     counted as ``protocol.semantic.provider_inferred``, attached by ``_seam.py::_assemble`` on an
@@ -975,9 +975,9 @@ Two emit sites, and the first is the mechanism the second restates.
     gap. Not ``PARSE_BACKLOG_FULL`` / ``PARSE_SKIPPED_AT_SHUTDOWN``: those skip a parse for capacity
     and a knob restores it.
 
-    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``, decided on the first
-    client message and stamped at close; the seam's gate reads the same fact (``_Txn.ws_llm_call``)
-    as a capture claim, and ``_seam.py::_build_ws_span`` counts it — at close, before the gate.
+    Emitted from ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``, decided on the
+    first client message and stamped at close; the seam's gate reads it (``_Txn.ws_llm_call``) as a
+    capture claim, and ``_seam.py::_build_ws_span`` counts it — at close, before the gate.
     """
 
     # ------------------------------------------------------------------

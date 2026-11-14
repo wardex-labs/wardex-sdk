@@ -7,8 +7,8 @@ a worker thread (`anyio.to_thread`), so this is the production path, not a stand
 
 What each test pins:
 
-* A plain run (`/converse`): the wire CHAT is a Bedrock model call (`aws.bedrock`, the model id
-  from the request path, usage with the cache-read tokens counted into the input), parented to
+* A plain run (`/converse`): the wire CHAT is a Bedrock model call (the model id from the
+  request path, usage with the cache-read tokens counted into the input), parented to
   the bridge's chat unit. The chat unit keeps the framework's numbers demoted and claims no wire
   absence, so the trace bills the call once.
 * A streamed run (`/converse-stream`, the AWS event stream encoding): the same, with the usage the
@@ -19,8 +19,9 @@ What each test pins:
   the tool runs as an `execute_tool` unit under the run, and each of the two model calls is billed
   once.
 
-The fake listens on 127.0.0.1, not a `bedrock-runtime.*.amazonaws.com` host, so the wire span
-names Bedrock from the request path alone and says so with `PROVIDER_INFERRED`.
+The fake listens on 127.0.0.1, not a `bedrock-runtime.*.amazonaws.com` host, so the wire span is
+read as Converse from the request path alone, names no provider, and says so with
+`PROVIDER_INFERRED`; the chat unit names `aws.bedrock`, as pydantic-ai's own span does.
 """
 
 from __future__ import annotations
@@ -111,16 +112,16 @@ def _assert_bedrock_call(wire: Any, chat: Any, usage: tuple[int, int], *, stream
     """`wire` is a Bedrock model call parented to `chat`, owning `usage`; `chat` keeps the
     framework's copy demoted and claims no wire absence."""
     assert wire.parent_span_id == chat.context.span_id
-    assert wire.gen_ai.provider == ProviderName.AWS_BEDROCK
+    assert wire.gen_ai.provider is None
     assert wire.gen_ai.request_model == MODEL_ID
     assert (wire.gen_ai.input_tokens, wire.gen_ai.output_tokens) == usage
     assert bool(wire.gen_ai.stream) is stream
     assert (Limitation.REASSEMBLED_FROM_STREAM in _limitations(wire)) is stream
     # The fake answers on 127.0.0.1, which proves no provider; a real
-    # bedrock-runtime.<region>.amazonaws.com host would not carry this marker.
+    # bedrock-runtime.<region>.amazonaws.com host names `aws.bedrock` with no marker.
     assert Limitation.PROVIDER_INFERRED in _limitations(wire)
 
-    assert chat.gen_ai.provider == ProviderName.AWS_BEDROCK, "named as the wire names it"
+    assert chat.gen_ai.provider == ProviderName.AWS_BEDROCK, "pydantic-ai's own provider name"
     assert (chat.gen_ai.input_tokens, chat.gen_ai.output_tokens) == (None, None)
     demoted = extras(chat)
     assert (demoted[_DEMOTED + "input_tokens"], demoted[_DEMOTED + "output_tokens"]) == usage

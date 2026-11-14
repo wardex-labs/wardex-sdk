@@ -335,7 +335,7 @@ def _h2_writer_latched():
 
     tracker = _Http2Tracker()
     tracker.on_request_bytes(_h2_headers(1))
-    assert tracker._latch[1][4] is False, "precondition: no issuer was recorded for stream 1"
+    assert tracker._latch[1][5] is False, "precondition: no issuer was recorded for stream 1"
     return tracker._latch[1][0]
 
 

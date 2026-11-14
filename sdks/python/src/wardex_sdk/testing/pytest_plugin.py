@@ -18,7 +18,9 @@ With the flag, every test is checked with the account `strict.py` defines
   wardex at import, a plugin, collection) fails the session, and so does what
   happened after the last test, once wardex is flushed;
 - a session that ran tests and never initialized wardex fails: the flag
-  asked for a check, and a pass would claim one. A session that ran no test
+  asked for a check, and a pass would claim one. When `init()` ran and
+  installed nothing (no destination, the kill switch), the failure quotes
+  what it said, which names the cause and the fix. A session that ran no test
   (`--collect-only`, everything deselected) checks nothing and says nothing.
 
 ONE BASELINE, NEVER RE-TAKEN. Each check reads `wardex.diagnostics()` once,
@@ -48,7 +50,7 @@ from typing import Any
 import pytest
 
 from .._diagnostics import Diagnostics
-from .strict import CaptureGap, gaps_between, render
+from .strict import CaptureGap, gaps_between, render, said_why
 
 _SECTION = "wardex --wardex-strict"
 _WORKER_KEY = "wardex_strict"
@@ -64,6 +66,9 @@ class StrictMode:
         self._ran = 0
         self._called = False
         self._ever_live = False
+        #: What `init()` said when it ran and installed nothing, so the session
+        #: failure can quote the cause instead of claiming it was never called.
+        self._idle_said: tuple[str, ...] = ()
         self._failures: list[str] = []
         self._worker = getattr(config, "workerinput", None) is not None
         self._controller = not self._worker and getattr(config.option, "dist", "no") != "no"
@@ -130,6 +135,10 @@ class StrictMode:
             if _runtime.runtime().client is not None:
                 flush()
                 self._ever_live = True
+            else:
+                from .. import diagnostics
+
+                self._idle_said = diagnostics().config_problems
             gaps = self._check()
             if gaps:
                 self._failures.append(
@@ -142,6 +151,7 @@ class StrictMode:
                 session.config.workeroutput[_WORKER_KEY] = {
                     "ran": self._ran,
                     "live": self._ever_live,
+                    "idle_said": list(self._idle_said),
                     "failures": list(self._failures),
                 }
                 return
@@ -156,10 +166,17 @@ class StrictMode:
         if found:
             self._ran += found["ran"]
             self._ever_live = self._ever_live or found["live"]
+            self._idle_said = self._idle_said or tuple(found.get("idle_said", ()))
             self._failures.extend(found["failures"])
 
     def _fail_if_unchecked(self) -> None:
-        if self._ran and not self._ever_live:
+        if self._ran and not self._ever_live and self._idle_said:
+            header = (
+                "--wardex-strict was given, and wardex.init() ran but installed nothing in this "
+                "test session, so nothing was checked"
+            )
+            self._failures.append(said_why(header, self._idle_said))
+        elif self._ran and not self._ever_live:
             self._failures.append(
                 "--wardex-strict was given, but wardex was never initialized in this test "
                 "session, so nothing was checked. Initialize wardex in the code under test "

@@ -381,7 +381,11 @@ def test_init_wires_propagation_and_close_unwires():
 
     _hub.reset_for_test()
     orig = httpx.Client.send
-    wardex_sdk.init(intercept=False, propagation=PropagationConfig(enabled=True))
+    wardex_sdk.init(
+        transport=wardex_sdk.NoOpTransport(),
+        intercept=False,
+        propagation=PropagationConfig(enabled=True),
+    )
     assert httpx.Client.send is not orig
     wardex_sdk.close()
     assert httpx.Client.send is orig
@@ -392,7 +396,7 @@ def test_init_without_flag_does_not_patch():
 
     _hub.reset_for_test()
     orig = httpx.Client.send
-    wardex_sdk.init(intercept=False)
+    wardex_sdk.init(transport=wardex_sdk.NoOpTransport(), intercept=False)
     assert httpx.Client.send is orig
     wardex_sdk.close()
 
@@ -409,7 +413,7 @@ def test_default_init_patches_no_http_client():
     """
     _hub.reset_for_test()
     before = _patched_attributes()
-    wardex_sdk.init()
+    wardex_sdk.init(transport=wardex_sdk.NoOpTransport())
     try:
         assert _patched_attributes() == before
     finally:
@@ -564,7 +568,11 @@ def test_concurrent_init_does_not_stack_propagation_patches():
 
     def racer():
         barrier.wait(timeout=5)
-        wardex_sdk.init(intercept=False, propagation=PropagationConfig(enabled=True))
+        wardex_sdk.init(
+            transport=wardex_sdk.NoOpTransport(),
+            intercept=False,
+            propagation=PropagationConfig(enabled=True),
+        )
 
     threads = [threading.Thread(target=racer) for _ in range(4)]
     for t in threads:
@@ -587,7 +595,11 @@ def test_a_request_in_flight_while_the_sdk_closes_neither_crashes_nor_leaks():
     """
     _hub.reset_for_test()
     before = _patched_attributes()
-    wardex_sdk.init(intercept=False, propagation=PropagationConfig(enabled=True))
+    wardex_sdk.init(
+        transport=wardex_sdk.NoOpTransport(),
+        intercept=False,
+        propagation=PropagationConfig(enabled=True),
+    )
     seen: list[str | None] = []
 
     def closing_handler(request: httpx.Request) -> httpx.Response:
@@ -623,7 +635,12 @@ def test_close_under_live_traffic_raises_nothing_into_the_host():
     """
     _hub.reset_for_test()
     before = _patched_attributes()
-    wardex_sdk.init(intercept=False, propagation=PropagationConfig(enabled=True))
+    wardex_sdk.init(
+        transport=wardex_sdk.NoOpTransport(),
+        intercept=False,
+        propagation=PropagationConfig(enabled=True),
+    )
+    assert _patched_attributes() != before, "the patch under test was not installed"
     errors: list[BaseException] = []
     stop = threading.Event()
     started = threading.Barrier(5)

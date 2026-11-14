@@ -284,9 +284,9 @@ def test_a_raising_export_is_said_once_per_process_and_counted_every_time(capsys
     lines = [ln for ln in err.splitlines() if ln.strip()]
     assert lines == [
         f"[wardex] transport export raised; a batch of {N} span(s) was dropped and is not "
-        "retried, because the transport may have sent part of it (every such drop is counted "
-        f"under {EXPORT_RAISED}; re-run with debug=True for the traceback)"
-    ], f"expected exactly one line naming the counter, got {err!r}"
+        "retried, because the transport may have sent part of it (wardex.diagnostics().losses "
+        "counts each such drop under send_error; re-run with debug=True for the traceback)"
+    ], f"expected exactly one line naming where the drops are counted, got {err!r}"
     assert "backend exploded" not in err, "the exception's text is debug-gated"
     c.close(0.5)
 

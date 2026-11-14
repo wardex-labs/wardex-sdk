@@ -47,7 +47,7 @@ def test_ws_upgrade_to_close_emits_one_span():
     # _emit_ws), so under the AGENT-mode default this generic-traffic test
     # needs an active local span to latch onto, which it deliberately has
     # none of — it targets WS frame/tracker capture, not the policy gate.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
@@ -85,7 +85,7 @@ def test_ws_upgrade_to_close_emits_one_span():
 
 def test_no_close_flushes_on_uninstall_with_marker():
     # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk._interceptors._registry import get_registry
 
     registry = get_registry()
@@ -110,7 +110,7 @@ def test_no_close_flushes_on_uninstall_with_marker():
 
 def test_deflate_negotiation_marks_compressed():
     # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk._interceptors._registry import get_registry
 
     registry = get_registry()
@@ -138,7 +138,7 @@ def test_deflate_negotiation_marks_compressed():
 
 def test_client_close_error_code_maps_error_status():
     # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk._enums import StatusCode
     from wardex_sdk._interceptors._registry import get_registry
 
@@ -178,7 +178,7 @@ def test_close_flushes_ws_span_to_transport():
             pass
 
     # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     rec = _RecordingTransport()
     _hub.get_client()._transport = rec
     from wardex_sdk._interceptors._registry import get_registry
@@ -217,7 +217,7 @@ def _session(host: str, path: str, *, deflate: bool, first: bytes) -> None:
     """One WebSocket session under the DEFAULT capture mode (AGENT, no local
     span): upgrade, one client Text, two server Texts, server close 1001 and
     the client's answering close."""
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
@@ -286,7 +286,7 @@ def test_ws_llm_counters_move_at_connection_close():
     """Counted from the seam when the connection's one span is built, not
     from the tracker on the first message: after the first client message
     nothing has moved, after the closing handshake exactly one count has."""
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
@@ -367,9 +367,9 @@ def _plain_session(mode: CaptureMode | None) -> None:
     """One ordinary WebSocket session on a memory-BIO-shaped object: it has a
     `server_hostname` and no `getpeername()`, so the port is never read."""
     if mode is None:
-        wardex.init(intercept=True)
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     else:
-        wardex.init(intercept=True, capture_mode=mode)
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=mode)
     from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]

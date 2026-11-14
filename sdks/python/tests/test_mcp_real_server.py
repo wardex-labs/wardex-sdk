@@ -64,7 +64,9 @@ async def test_a_structured_only_tool_result_from_a_real_server_is_the_spans_out
     server = tmp_path / "weather_server.py"
     server.write_text(_SERVER)
     # No framework adapter, so this seam's span is the call's execute_tool span.
-    wardex.init(intercept=True, adapters=wardex.AdaptersConfig(enabled=()))
+    wardex.init(
+        transport=wardex.NoOpTransport(), intercept=True, adapters=wardex.AdaptersConfig(enabled=())
+    )
 
     with anyio.fail_after(60):
         params = StdioServerParameters(command=sys.executable, args=[str(server)])

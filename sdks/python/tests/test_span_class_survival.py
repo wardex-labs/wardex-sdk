@@ -41,7 +41,8 @@ from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode, CaptureSource, SpanKind, StatusCode, ToolExecutionType
 from wardex_sdk._interceptors._mcp_stdio import _ProcState
 from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
-from wardex_sdk._interceptors._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
+from wardex_sdk._interceptors._trackers import _Http1Tracker, _Http2Tracker
+from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 from wardex_sdk._tracing import conversation
 from wardex_sdk._tracing import span as manual_span
 

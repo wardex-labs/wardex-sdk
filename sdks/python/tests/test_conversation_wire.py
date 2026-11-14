@@ -56,7 +56,8 @@ from wardex_sdk._assembly import (
 )
 from wardex_sdk._enums import CaptureMode, SpanKind
 from wardex_sdk._interceptors._seam import _latched
-from wardex_sdk._interceptors._trackers import _Txn, _WebSocketTracker
+from wardex_sdk._interceptors._trackers import _Txn
+from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 from wardex_sdk._semantics import REQUEST_CONVERSATION_KEY
 from wardex_sdk._types import ConversationContext
 from wardex_sdk.testing import RecordingTransport
@@ -223,8 +224,8 @@ def test_every_span_inside_a_conversation_carries_its_id(llm):
     assert names == sorted(
         [
             "support-chat",
-            "turn",
-            "lookup",
+            "invoke_workflow turn",
+            "execute_tool lookup",
             "rank",
             "HTTP POST /v1/responses",
             "HTTP POST /v1/responses",

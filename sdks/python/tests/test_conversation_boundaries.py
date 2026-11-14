@@ -6,8 +6,8 @@ backend grouping by `gen_ai.conversation.id` turned into wrong numbers:
 
 * An incoming trace continued INSIDE a conversation (`continue_trace`,
   `continue_from_otel`) started from a blank scope, so every call inside the
-  request lost the id. `isolation_scope()` still does, on purpose: it is how a
-  host steps out of a conversation.
+  request lost the id. `isolation_scope()` keeps it too: it isolates identity,
+  not the trace.
 * A block inside an async generator that the consumer abandoned with `break`
   is closed by the event loop on a task of its own. The consumer's context
   was never handed back the scope from before the block, so every later call
@@ -116,7 +116,11 @@ def test_a_trace_continued_inside_a_conversation_keeps_the_conversation(llm, ent
         _post(host, port, "after-block")
 
     spans = _shipped(run)
-    for span in (_named(spans, "handle"), _named(spans, "lookup"), _call(spans, "in-request")):
+    for span in (
+        _named(spans, "handle"),
+        _named(spans, "execute_tool lookup"),
+        _call(spans, "in-request"),
+    ):
         assert _conv(span) == "X", span.name
     assert _conv(_call(spans, "after-block")) is None
 
@@ -143,10 +147,9 @@ def test_a_continued_trace_still_starts_over_while_the_conversation_carries_on()
     assert _conv(joined) == _conv(restarted) == "X"
 
 
-def test_isolation_scope_steps_out_of_a_conversation(llm):  # noqa: F811
-    """`isolation_scope()` is a fresh current scope, and the way to run work
-    that must not be counted in the conversation around it: nothing inside it
-    carries the id, and the block's own spans after it do again."""
+def test_isolation_scope_keeps_the_conversation_around_it(llm):  # noqa: F811
+    """`isolation_scope()` isolates identity, not causality: spans and calls
+    inside it keep the conversation (and the parent) they would have had."""
     host, port = llm
 
     def run() -> None:
@@ -158,8 +161,8 @@ def test_isolation_scope_steps_out_of_a_conversation(llm):  # noqa: F811
                 pass
 
     spans = _shipped(run)
-    assert _conv(_named(spans, "shared-cache-refresh")) is None
-    assert _conv(_call(spans, "isolated")) is None
+    assert _conv(_named(spans, "shared-cache-refresh")) == "X"
+    assert _conv(_call(spans, "isolated")) == "X"
     assert _conv(_named(spans, "back-in-the-conversation")) == "X"
 
 
@@ -459,7 +462,7 @@ def test_a_retired_scope_does_not_keep_its_installer_alive():
     [
         pytest.param(lambda: wardex.continue_trace({}), True, id="continue_trace"),
         pytest.param(wardex.isolation_scope, True, id="isolation_scope"),
-        pytest.param(wardex.new_scope, False, id="new_scope"),
+        pytest.param(wardex.new_scope, True, id="new_scope"),
     ],
 )
 def test_a_scope_entered_in_an_abandoned_generator_is_taken_back_too(enter, isolates):

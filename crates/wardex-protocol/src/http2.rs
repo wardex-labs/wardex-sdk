@@ -2,11 +2,15 @@
 //! The frame decoder carves out the 9-byte header + payload; Http2Connection then assigns meaning.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::AtomicUsize;
 
 use fluke_hpack::decoder::DecoderError;
 use fluke_hpack::Decoder;
 
 use wardex_limits::Limits;
+
+use crate::budget::{self, process_pool, Claim, Reservation};
+use crate::semantic::{treatment, Treatment};
 
 /// A carved raw HTTP/2 frame.
 #[derive(Clone)]
@@ -333,6 +337,14 @@ struct StreamState {
     // whether that half's length is the size of what crossed the wire.
     req_truncated: bool,
     resp_truncated: bool,
+    /// Each body's share of `max_in_flight_body_bytes`, given back when this
+    /// entry is dropped: completed (its bodies moved into the transaction),
+    /// evicted, or cleared with the connection.
+    req_held: Reservation,
+    resp_held: Reservation,
+    /// The request's `:path` is an LLM endpoint (`semantic::treatment`): both
+    /// bodies have first claim on the budget (`budget::ceiling`).
+    model_call: bool,
     /// A client header block was decoded into this entry. Only such an entry
     /// has a request half to lose, so only evicting one of these may raise
     /// the eviction mark — an entry built from DATA alone (a stream opened
@@ -464,6 +476,9 @@ pub struct Http2Connection {
     /// was never evicted.
     first_request: u32,
     limits: Limits,
+    /// What every stream's body reservations count against: the process
+    /// pool, or a private one in this crate's tests (see `budget`).
+    pool: &'static AtomicUsize,
 }
 
 impl std::fmt::Debug for Http2Connection {
@@ -515,6 +530,7 @@ impl Http2Connection {
             evicted_paths: BTreeMap::new(),
             first_request: 0,
             limits,
+            pool: process_pool(),
         }
     }
 
@@ -652,8 +668,11 @@ impl Http2Connection {
         } else {
             &mut self.streams
         };
+        let pool = self.pool;
         table.entry(stream_id).or_insert_with(|| StreamState {
             request_evicted: evicted,
+            req_held: Reservation::in_pool(pool),
+            resp_held: Reservation::in_pool(pool),
             ..Default::default()
         })
     }
@@ -856,7 +875,11 @@ impl Http2Connection {
         for (name, value) in headers {
             match name.as_slice() {
                 b":method" => st.method = Some(String::from_utf8_lossy(&value).into_owned()),
-                b":path" => st.path = Some(String::from_utf8_lossy(&value).into_owned()),
+                b":path" => {
+                    let path = String::from_utf8_lossy(&value).into_owned();
+                    st.model_call = treatment(&path) == Some(Treatment::LlmCall);
+                    st.path = Some(path);
+                }
                 b":status" => {
                     st.status = String::from_utf8_lossy(&value).trim().parse().ok();
                 }
@@ -923,17 +946,26 @@ impl Http2Connection {
                 st.resp_content_type.as_deref()
             };
             let cap = crate::http1::cap_for_content_type(this_direction_ct, &limits);
-            let (target, truncated) = if from_client {
-                (&mut st.req_body, &mut st.req_truncated)
+            let (target, truncated, held) = if from_client {
+                (&mut st.req_body, &mut st.req_truncated, &mut st.req_held)
             } else {
-                (&mut st.resp_body, &mut st.resp_truncated)
+                (&mut st.resp_body, &mut st.resp_truncated, &mut st.resp_held)
             };
-            let room = cap.saturating_sub(target.len());
-            if body.len() <= room {
-                target.extend_from_slice(body);
-            } else {
-                target.extend_from_slice(&body[..room]);
-                *truncated = true;
+            // Nothing is stored once a body was cut: room the in-flight budget
+            // regains later must not splice a later part onto the prefix.
+            if !*truncated {
+                let room = cap.saturating_sub(target.len());
+                let claim = if st.model_call {
+                    Claim::ModelCall
+                } else {
+                    Claim::Other
+                };
+                let ceiling = budget::ceiling(limits.max_in_flight_body_bytes, claim);
+                let take = held.grow(room.min(body.len()), ceiling);
+                target.extend_from_slice(&body[..take]);
+                if take < body.len() {
+                    *truncated = true;
+                }
             }
         }
         if frame.flags & FLAG_END_STREAM != 0 {
@@ -2157,6 +2189,100 @@ mod tests {
         assert!(!shown.contains("planted-secret-7f3a"), "{shown}");
         assert!(!shown.contains("112, 108, 97"), "{shown}");
         assert!(shown.contains("response_body_len: 19"), "{shown}");
+    }
+
+    #[test]
+    fn the_in_flight_budget_cuts_a_body_where_it_fills_and_frees_it_with_the_stream() {
+        let limits = Limits {
+            max_in_flight_body_bytes: 10,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut c = Http2Connection::new(limits);
+        c.pool = pool;
+
+        let block = |path: &'static [u8]| hpack(&[(b":method", b"POST"), (b":path", path)]);
+        let mut req = frame(0x1, FH, 1, &block(b"/v1/messages"));
+        req.extend_from_slice(&frame(0x0, 0, 1, b"012345"));
+        req.extend_from_slice(&frame(0x1, FH, 3, &block(b"/v1/chat/completions")));
+        req.extend_from_slice(&frame(0x0, FS, 3, b"abcdefgh"));
+        feed_setup(&mut c, true, &req);
+        assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 10);
+
+        let r = c.feed(
+            false,
+            &frame(0x1, FH | FS, 3, &hpack(&[(b":status", b"200")])),
+        );
+        let txn = r.transactions.first().expect("the newer stream completes");
+        assert_eq!(
+            txn.request_body, b"abcd",
+            "only the room the older body left"
+        );
+        assert!(txn.request_truncated);
+        assert_eq!(
+            pool.load(std::sync::atomic::Ordering::Relaxed),
+            6,
+            "the completed stream gave its share back"
+        );
+        drop(c);
+        assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn other_streams_leave_half_the_in_flight_budget_to_model_calls() {
+        let limits = Limits {
+            max_in_flight_body_bytes: 10,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut c = Http2Connection::new(limits);
+        c.pool = pool;
+        let block = |path: &'static [u8]| hpack(&[(b":method", b"POST"), (b":path", path)]);
+        let mut req = frame(0x1, FH, 1, &block(b"/upload"));
+        req.extend_from_slice(&frame(0x0, 0, 1, b"0123456789"));
+        req.extend_from_slice(&frame(0x1, FH, 3, &block(b"/v1/messages")));
+        req.extend_from_slice(&frame(0x0, FS, 3, b"abcde"));
+        feed_setup(&mut c, true, &req);
+        let r = c.feed(
+            false,
+            &frame(0x1, FH | FS, 3, &hpack(&[(b":status", b"200")])),
+        );
+        let txn = r.transactions.first().expect("the model call completes");
+        assert_eq!(txn.request_body, b"abcde", "the upload took only its half");
+        assert!(!txn.request_truncated);
+    }
+
+    #[test]
+    fn finish_gives_back_the_share_of_the_bodies_it_hands_back() {
+        let limits = Limits {
+            max_in_flight_body_bytes: 64,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut c = Http2Connection::new(limits);
+        c.pool = pool;
+        let req = hpack(&[(b":method", b"POST"), (b":path", b"/v1/chat/completions")]);
+        let mut buf = frame(FRAME_HEADERS, FH, 1, &req);
+        buf.extend_from_slice(&frame(FRAME_DATA, FS, 1, b"{}"));
+        buf.extend_from_slice(&frame(FRAME_HEADERS, FH, 3, &req));
+        buf.extend_from_slice(&frame(FRAME_DATA, 0, 3, b"0123"));
+        feed_setup(&mut c, true, &buf);
+        let mut resp = frame(FRAME_HEADERS, FH, 1, &hpack(&[(b":status", b"200")]));
+        resp.extend_from_slice(&frame(FRAME_DATA, 0, 1, b"data: x\n\n"));
+        feed_setup(&mut c, false, &resp);
+        assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 2 + 4 + 9);
+
+        let out = c.finish();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            pool.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "the stream handed back gave its share back; the unanswered one keeps its own"
+        );
+        drop(out);
+        assert!(c.finish().is_empty());
+        drop(c);
+        assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]

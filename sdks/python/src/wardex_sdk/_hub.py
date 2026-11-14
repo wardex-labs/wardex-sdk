@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from types import MappingProxyType
+from typing import Any, TypeVar
 
 from ._client import Client
 from ._runtime import runtime
 from ._scope import Scope, UserInfo, merge_scopes, merged_tags_and_user, merged_trace_fields
+from ._suppress import suppress_capture
 from ._types import SpanContext
+from ._values import AttributeValue
+
+_R = TypeVar("_R")
 
 _global_scope: Scope = Scope()
 _current_scope: ContextVar[Scope | None] = ContextVar("wardex_current_scope", default=None)
@@ -62,16 +70,105 @@ def get_isolation_scope() -> Scope:
     scope = _isolation_scope.get()
     if scope is None:
         scope = Scope()
+        scope._implicit = True
         _isolation_scope.set(scope)
-    return scope if scope._retired_to is None else _settled(_isolation_scope, scope)
+        return scope
+    return scope if _block_of(scope)._retired_to is None else _settled(_isolation_scope, scope)
+
+
+def _block_of(scope: Scope) -> Scope:
+    """The scope a block installed, for `scope` or for a copy a write made of it."""
+    return scope if scope._origin is None else scope._origin
+
+
+#: Keys `say_once` has already written. A dict, for `report_once`'s reason:
+#: `setdefault` decides "was I first" in one C call. The values are inert.
+_said: dict[str, object] = {}
+
+
+def say_once(key: str, message: str) -> None:
+    """Warn once per process on the `wardex_sdk` logger; never raise.
+
+    For the layers below the diagnostics module, which cannot import it: the
+    line is written here, with capture suppressed as that module does for a
+    log handler that ships records over HTTP.
+    """
+    mark = object()
+    if _said.setdefault(key, mark) is not mark:
+        return
+    try:
+        with suppress_capture():
+            logging.getLogger("wardex_sdk").warning(message)
+    except Exception:  # noqa: BLE001 - a host log handler may raise; the host's call goes on
+        return
 
 
 def get_current_scope() -> Scope:
     scope = _current_scope.get()
     if scope is None:
         scope = Scope()
+        scope._implicit = True
         _current_scope.set(scope)
-    return scope if scope._retired_to is None else _settled(_current_scope, scope)
+        return scope
+    return scope if _block_of(scope)._retired_to is None else _settled(_current_scope, scope)
+
+
+#: `unseen_parent`'s reasons, as the `Ambient` that latched one carries them.
+UNBOUND_THREAD = "unbound_thread"
+TRACEPARENT_UNREADABLE = "traceparent_unreadable"
+
+
+def unseen_parent(scope: Scope) -> str | None:
+    """Why a trace root about to start under `scope` may have a parent wardex could not see.
+
+    `scope` is the running Context's current scope with no active span, read
+    where the work is issued. Two causes are observable, and each makes the
+    root an unresolved edge instead of a confident one (no parent is guessed):
+    a `continue_trace` whose traceparent could not be parsed, and a thread
+    Python started with an empty context (a plain `Thread`, an executor worker)
+    working while a span is open elsewhere in the process that is not itself
+    such a thread's root. A context that a wardex block, a bound thread or a
+    span reached is not the second: there a root is what the code asked for.
+    Nor is a root beside other unbound threads' roots: a thread-per-request
+    program without middleware has one per worker, and none parents another.
+    """
+    if scope._parent_unreadable:
+        return TRACEPARENT_UNREADABLE
+    if not on_unbound_thread(scope):
+        return None
+    # A root opened on an unbound thread marks its `Interrupt` so (`_tracing`).
+    # A snapshot: other threads open and close spans meanwhile.
+    open_now = list(runtime()._open_spans.values())
+    if any(not getattr(interrupt, "unbound_root", False) for interrupt in open_now):
+        return UNBOUND_THREAD
+    return None
+
+
+def on_unbound_thread(scope: Scope | None = None) -> bool:
+    """Whether `scope` (the current one by default) is what a thread Python
+    started with an empty context reads: no wardex block, no bound context, not
+    the main thread, not wardex's."""
+    scope = get_current_scope() if scope is None else scope
+    iso = _isolation_scope.get()
+    if not scope._implicit or (iso is not None and not iso._implicit):
+        return False
+    thread = threading.current_thread()
+    return thread is not threading.main_thread() and not thread.name.startswith("wardex-")
+
+
+def explain_unseen_parent(reason: str) -> None:
+    """Say once why a root was recorded as unresolved; the traceparent case was said at entry."""
+    if reason == UNBOUND_THREAD:
+        say_once(
+            UNBOUND_THREAD,
+            "A span or model call started on a thread that carries no wardex context "
+            "while a span was open elsewhere, so wardex cannot tell which trace it belongs "
+            "to; it is recorded without a parent and marked parent_unresolved. If it belongs "
+            "to the open span, start the thread's function through wardex.bind_context(fn) "
+            "(also for executor.submit and loop.run_in_executor). If it is work of its own, "
+            "open it inside wardex.isolation_scope(), wardex.continue_trace(headers) or the "
+            "ASGI/WSGI middleware.",
+        )
 
 
 class _Here:
@@ -131,9 +228,9 @@ def retire(fork: Scope, prev: Scope, owner: _Here) -> None:
     consumer that abandons stream after stream holds a link or two, never a
     chain through every turn it ever had.
     """
-    while prev._retired_to is not None and prev._retired_by is owner:
-        prev = prev._retired_to
-    if prev is not fork:
+    while (block := _block_of(prev))._retired_to is not None and block._retired_by is owner:
+        prev = block._retired_to
+    if _block_of(prev) is not fork:
         fork._retired_by = owner
         fork._retired_to = prev
 
@@ -141,12 +238,12 @@ def retire(fork: Scope, prev: Scope, owner: _Here) -> None:
 def _settled(var: ContextVar[Scope | None], scope: Scope) -> Scope:
     """`scope` as the running Context reads it: what `retire` left, in the installer only."""
     mine = None
-    while scope._retired_to is not None:
+    while (block := _block_of(scope))._retired_to is not None:
         if mine is None:
             mine = here()
-        if scope._retired_by is not mine:
+        if block._retired_by is not mine:
             break
-        scope = scope._retired_to
+        scope = block._retired_to
         var.set(scope)
     return scope
 
@@ -176,7 +273,8 @@ def _settle_from_afar(
 
 
 def _settle_in(owner: _Here, var: ContextVar[Scope | None], gone: Scope, prev: Scope) -> None:
-    if var.get() is gone and here() is owner:
+    now = var.get()
+    if now is not None and _block_of(now) is gone and here() is owner:
         var.set(prev)
 
 
@@ -197,7 +295,8 @@ def take_down(
     try:
         var.reset(token)
     except ValueError:  # the Token was made in another Context
-        if var.get() is installed:
+        now = var.get()
+        if now is not None and _block_of(now) is installed:
             var.set(prev)
         retire(installed, prev, owner)
         _settle_from_afar(owner, var, installed, prev)
@@ -219,38 +318,156 @@ def get_merged_tags_and_user() -> tuple[dict[str, str], UserInfo | None]:
     return merged_tags_and_user(get_global_scope(), get_isolation_scope(), get_current_scope())
 
 
+def write_scope(var: ContextVar[Scope | None], apply: Callable[..., _R], *args: Any) -> _R:
+    """Apply one write to the running Context's scope in `var` by installing a changed copy.
+
+    A scope bound in a ContextVar is never changed in place by a write. Work
+    started from this Context (an asyncio task, a `bind_context` thread, a
+    `copy_context()`) holds the same object, so an in-place write would reach
+    it: a dispatcher that sets one request's user and then starts the next
+    request would retag every request it had already started. The copy is
+    changed and installed here alone, so work started earlier keeps what it was
+    started with and nothing written elsewhere arrives here. `apply` runs on
+    the copy before it is installed: a write that raises changes nothing.
+    """
+    scope = get_current_scope() if var is _current_scope else get_isolation_scope()
+    fork = scope.clone()
+    fork._implicit = scope._implicit
+    fork._origin = _block_of(scope)
+    result = apply(fork, *args)
+    var.set(fork)
+    return result
+
+
+def _block_field(name: str, trace: bool) -> property:
+    def read(self: BlockScope) -> Any:
+        value = getattr(self._scope(trace), name)
+        # Read-only: a write in place would reach work started before it.
+        return MappingProxyType(value) if isinstance(value, dict) else value
+
+    def write(self: BlockScope, value: Any) -> None:
+        self._write(trace, Scope.set_user if name == "user" else _assign(name), value)
+
+    return property(read, write)
+
+
+def _assign(name: str) -> Callable[[Scope, Any], None]:
+    return lambda scope, value: setattr(scope, name, value)
+
+
+class BlockScope(Scope):
+    """The `Scope` that `wardex.isolation_scope()` and `wardex.new_scope()` yield.
+
+    Not an object of its own: the block's scope as the running Context sees
+    it. Every write installs a changed copy (`write_scope`), so an object
+    handed out at entry would miss the block's later writes and take writes
+    that nothing reads. While the block is open this reads and writes the
+    ContextVars, through the same copy-on-write as the module-level setters;
+    once the block ends it holds a detached copy of what the block ended with.
+    Tags, user and contexts live in `data_var`; the trace fields in `trace_var`.
+    """
+
+    tags = _block_field("tags", trace=False)
+    user = _block_field("user", trace=False)
+    contexts = _block_field("contexts", trace=False)
+    active_span_context = _block_field("active_span_context", trace=True)
+    conversation = _block_field("conversation", trace=True)
+    tracestate = _block_field("tracestate", trace=True)
+
+    def __init__(
+        self, data_var: ContextVar[Scope | None], trace_var: ContextVar[Scope | None]
+    ) -> None:
+        self._vars = (data_var, trace_var)
+        self._ended: tuple[Scope, Scope] | None = None
+
+    def _scope(self, trace: bool) -> Scope:
+        if self._ended is not None:
+            return self._ended[trace]
+        return get_current_scope() if self._vars[trace] is _current_scope else get_isolation_scope()
+
+    def _write(self, trace: bool, apply: Callable[..., _R], *args: Any) -> _R:
+        if self._ended is not None:
+            return apply(self._ended[trace], *args)
+        return write_scope(self._vars[trace], apply, *args)
+
+    def set_tag(self, key: str, value: AttributeValue | list | tuple | dict | None) -> None:
+        self._write(False, Scope.set_tag, key, value)
+
+    def set_user(self, user: UserInfo | str | int | None) -> None:
+        self._write(False, Scope.set_user, user)
+
+    def set_context(self, key: str, value: dict[str, Any]) -> tuple[list[str], int]:
+        return self._write(False, Scope.set_context, key, value)
+
+    def end(self) -> None:
+        self._ended = (self._scope(False).clone(), self._scope(True).clone())
+
+
+@contextmanager
+def public_isolation_scope() -> Iterator[Scope]:
+    """`isolation_scope()` for the public API, yielding a `BlockScope` over the isolation scope."""
+    with isolation_scope():
+        yield from _handed(BlockScope(_isolation_scope, _isolation_scope))
+
+
+@contextmanager
+def public_new_scope() -> Iterator[Scope]:
+    """`new_scope()` for the public API: identity in its isolation fork, trace in its current."""
+    with new_scope():
+        yield from _handed(BlockScope(_isolation_scope, _current_scope))
+
+
+def _handed(handle: BlockScope) -> Iterator[Scope]:
+    try:
+        yield handle
+    finally:
+        handle.end()
+
+
 @contextmanager
 def new_scope() -> Iterator[Scope]:
-    prev, owner = get_current_scope(), here()
-    forked = prev.clone()
-    token = _current_scope.set(forked)
+    """Fork both the current scope and the isolation scope for the block.
+
+    Yields the CURRENT fork, where a direct `scope.set_tag()` or a trace field
+    lands. Module-level setters inside the block write to the isolation fork,
+    so they too end with the block; a nested block forks this one, and work
+    started inside reads it and writes copies of its own.
+    """
+    prev_cur, prev_iso, owner = get_current_scope(), get_isolation_scope(), here()
+    forked = prev_cur.clone()
+    data = prev_iso.data_fork()
+    iso_token = _isolation_scope.set(data)
+    cur_token = _current_scope.set(forked)
     try:
         yield forked
     finally:
-        take_down(_current_scope, token, forked, prev, owner)
+        take_down(_current_scope, cur_token, forked, prev_cur, owner)
+        take_down(_isolation_scope, iso_token, data, prev_iso, owner)
 
 
 @contextmanager
-def isolation_scope(*, keep_conversation: bool = False) -> Iterator[Scope]:
+def isolation_scope(*, restart_trace: bool = False) -> Iterator[Scope]:
     """Fork the current isolation scope for the block (Sentry 2.x semantics).
 
-    A CLONE, not a blank scope: the ambient context — tags, user, contexts —
-    is inherited, and mutations made inside the block stay on the fork and are
-    discarded with it. The current scope is replaced with a fresh one for the
-    block, which is also how a host steps out of a `wardex.conversation(...)`.
+    A copy, not a blank scope: the ambient tags, user and contexts are
+    inherited, and writes made inside the block stay on the fork and are
+    discarded with it. The trace position is NOT touched: a span opened inside
+    keeps the parent and conversation it would have had outside, because
+    isolating identity must not cut the tree.
 
-    `keep_conversation` is for trace continuation (`continue_trace`): a request
-    continued inside a conversation is still in it, so the fresh scope keeps the
+    `restart_trace` is for trace continuation (`continue_trace`) alone: the
+    current scope is replaced for the block by a fresh one that keeps the
     conversation while the trace (parent, tracestate) starts over.
     """
     owner = here()
     prev_iso, prev_cur = get_isolation_scope(), get_current_scope()
-    new_iso = prev_iso.clone()
-    fresh = Scope(conversation=prev_cur.conversation if keep_conversation else None)
+    new_iso = prev_iso.data_fork()
     iso_token = _isolation_scope.set(new_iso)
-    cur_token = _current_scope.set(fresh)
+    fresh = Scope(conversation=prev_cur.conversation) if restart_trace else None
+    cur_token = None if fresh is None else _current_scope.set(fresh)
     try:
         yield new_iso
     finally:
-        take_down(_current_scope, cur_token, fresh, prev_cur, owner)
+        if fresh is not None and cur_token is not None:
+            take_down(_current_scope, cur_token, fresh, prev_cur, owner)
         take_down(_isolation_scope, iso_token, new_iso, prev_iso, owner)

@@ -3,23 +3,21 @@
 from __future__ import annotations
 
 import warnings as _warnings
-from collections.abc import Iterator as _Iterator
 from collections.abc import Sequence as _Sequence
 from contextlib import AbstractContextManager as _AbstractContextManager
-from contextlib import contextmanager as _contextmanager
 from typing import Any as _Any
-from urllib.parse import urlsplit as _urlsplit
+from uuid import UUID as _UUID
 
 from . import _hub, _runtime
 from ._assembly import _ledger
 from ._assembly import diag_info as _diag_info
-from ._assembly import diag_warning as _diag_warning
+from ._assembly import report_once as _report_once
+from ._assembly._explain import explain
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT
 from ._client import Client as _Client
 from ._config import (
-    WARDEX_INGEST_HOSTS as _WARDEX_INGEST_HOSTS,
-)
-from ._config import (
+    _MOVED,
+    _REMOVED,
     AdaptersConfig,
     AnthropicAgentSdkConfig,
     BackendConfig,
@@ -31,10 +29,12 @@ from ._config import (
     _non_default_adapter_options,
 )
 from ._config import _resolve_config as _resolve_config_from_env
-from ._config import region_of_key as _region_of_key
+from ._config_checks import disabled_by as _disabled_by
 from ._config_checks import endpoint_named_for_wardex as _endpoint_named_for_wardex
 from ._config_checks import env_typo_messages as _env_typo_messages
-from ._config_checks import unusable_env_endpoint as _unusable_env_endpoint
+from ._config_checks import refuses_unknown_init_keywords as _refuses_unknown_init_keywords
+from ._config_checks import require_instance as _require_instance
+from ._config_checks import require_optional_str as _require_optional_str
 from ._decorators import agent, step, tool, workflow
 from ._diagnostics import AdapterStatus, Diagnostics, Loss
 from ._enums import (
@@ -66,7 +66,10 @@ from ._limits import LimitsConfig
 # they are free to change shape there.
 from ._native import NATIVE_OK as _NATIVE_OK
 from ._native import unavailable_reason as _unavailable_reason
+from ._scope import ACCOUNT_KEY as _ACCOUNT_KEY
+from ._scope import NO_USER as _NO_USER
 from ._scope import Scope, UserInfo
+from ._scope import user_from_call as _user_from_call
 from ._snapshot_api import capture_state_snapshot
 from ._tracing import Span, conversation, span
 from ._types import (
@@ -81,9 +84,11 @@ from ._types import (
     ToolDefinition,
     ToolDefinitionSet,
 )
+from ._values import AttributeValue as _AttributeValue
 from ._version import __version__
 from .context._asgi import WardexAsgiMiddleware
 from .context._contextvar import bind_context
+from .context._current_span import current_span
 from .context._propagate import (
     continue_from_otel,
     continue_trace,
@@ -96,6 +101,10 @@ from .transport._base import Transport
 from .transport._console import ConsoleTransport
 from .transport._noop import NoOpTransport
 from .transport._otlp_http import OtlpHttpTransport
+from .transport._resolve import announce_pii_env as _announce_pii_env
+from .transport._resolve import default_transport as _default_transport
+from .transport._resolve import said as _said
+from .transport._resolve import say as _say
 from .transport._wardex import WardexTransport
 
 __all__ = [
@@ -103,6 +112,7 @@ __all__ = [
     "init",
     "conversation",
     "span",
+    "current_span",
     "workflow",
     "agent",
     "step",
@@ -110,12 +120,14 @@ __all__ = [
     "capture_state_snapshot",
     "set_tag",
     "set_user",
+    "set_account",
     "set_context",
     "isolation_scope",
     "new_scope",
     "flush",
     "close",
     "diagnostics",
+    "explain",
     "bind_context",
     "continue_trace",
     "continue_from_otel",
@@ -175,20 +187,25 @@ __all__ = [
 ]
 
 
-def _traces_endpoint(endpoint: str) -> str:
-    """The URL the default OTLP/HTTP transport actually POSTs to.
-
-    THE ENDPOINT RULE (documented on `BackendConfig.endpoint`): a configured
-    URL whose path is empty or `/` is a collector base address, so the OTLP
-    traces path `/v1/traces` is appended; a URL with an explicit path is used
-    verbatim. Applied here, at transport construction, and NEVER written back
-    into `config.backend.endpoint` — the config reads back as written.
-    """
-    if _urlsplit(endpoint).path in ("", "/"):
-        return endpoint.rstrip("/") + "/v1/traces"
-    return endpoint
+def _install_nothing() -> None:
+    """End `init()` with nothing installed, so every public call stays the no-op
+    it is before `init()`; a previous `init()`'s client is closed."""
+    if _runtime.runtime().client is not None:
+        _runtime.runtime().teardown()
 
 
+@_refuses_unknown_init_keywords(
+    moved=_MOVED,
+    removed=_REMOVED,
+    groups=(
+        ("backend", BackendConfig),
+        ("pii", PIIConfig),
+        ("batching", BatchingConfig),
+        ("limits", LimitsConfig),
+        ("propagation", PropagationConfig),
+        ("adapters", AdaptersConfig),
+    ),
+)
 def init(
     *,
     transport: Transport | None = None,
@@ -212,7 +229,9 @@ def init(
 
     The keyword parameters are `WardexConfig`'s fields plus `transport=` — a
     drift test holds the two signatures together — and `None` for a config
-    group means that group's defaults.
+    group means that group's defaults. A keyword that belongs to a group
+    (`endpoint=`, `api_key=`) is refused with the spelling that works:
+    `backend=BackendConfig(endpoint=...)`.
 
     RESOLUTION ORDER, per field: an explicit argument wins; an unset one falls
     back to its environment variable; only then does the default apply. The
@@ -223,63 +242,81 @@ def init(
         backend.endpoint     WARDEX_ENDPOINT, else
                              OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, else
                              OTEL_EXPORTER_OTLP_ENDPOINT
-        backend.headers      OTEL_EXPORTER_OTLP_HEADERS
-        service_name         WARDEX_SERVICE_NAME
-        release              WARDEX_RELEASE
-        environment          WARDEX_ENVIRONMENT
-        debug                WARDEX_DEBUG=true (case-insensitive)
+        backend.headers      OTEL_EXPORTER_OTLP_HEADERS (OTLP destination only)
+        service_name         WARDEX_SERVICE_NAME, else OTEL_SERVICE_NAME, else
+                             service.name in OTEL_RESOURCE_ATTRIBUTES
+        release              WARDEX_RELEASE, else service.version in
+                             OTEL_RESOURCE_ATTRIBUTES
+        environment          WARDEX_ENVIRONMENT, else deployment.environment
+                             (.name) in OTEL_RESOURCE_ATTRIBUTES
+        debug                WARDEX_DEBUG
+        pii.mode             WARDEX_PII=off (on, the default, masks)
+        (kill switch)        WARDEX_DISABLED, else OTEL_SDK_DISABLED
 
-    so `wardex.init()` with only `WARDEX_API_KEY` set is a working first run.
-    A set `WARDEX_*` variable outside this table is named in a
-    `WardexConfigWarning` together with the closest name in it -- a warning,
-    so a stray variable cannot stop a process from starting, unless the
-    process turns warnings into errors (`-W error`), which reaches it like any
-    other. An endpoint variable that is not an http(s) URL is left unused
-    rather than exported to; when nothing else names a destination, a
-    `WARDEX_ENDPOINT` like that raises `ValueError` and an OTel one warns.
-    What the environment resolved is written into the config the client
-    carries — `client.config` answers with the resolved values, not the bare
-    arguments. `WARDEX_DEBUG` can only turn `debug` ON: `debug=False` is this
-    signature's default and therefore cannot veto the variable.
+    Booleans accept 1/true/yes/on and 0/false/no/off, case ignored.
+    `WARDEX_DEBUG` can only turn `debug` ON (`debug=False` is the default, so
+    it cannot veto). The client's config carries what the environment resolved.
+
+    THE ENVIRONMENT NEVER RAISES. A variable wardex cannot use is said in one
+    stderr line naming it and the fix, and kept in
+    `diagnostics().config_problems`; when it was the destination, wardex
+    installs nothing. The same value as an ARGUMENT raises
+    `TypeError`/`ValueError`. THE KILL SWITCH, `WARDEX_DISABLED=1` (or
+    `OTEL_SDK_DISABLED=true`), installs nothing and says so once.
 
     TRANSPORT RESOLUTION, in precedence order, decided by what was configured
     and nothing else:
 
-      1. an explicit `transport=` carries its own address and wins outright;
+      1. an explicit `transport=` instance carries its own address and wins
+         outright (`ConsoleTransport()` prints to stdout, for a first look);
       2. `backend.api_key` names a wardex project, so `WardexTransport` is
          built against the receiver the key's region names — or against
-         `backend.base_url` for a self-hosted receiver; a `base_url` with no
-         key is refused with `ValueError`, and a key whose region this build
-         does not know is refused the same way rather than sent anywhere;
+         `backend.base_url` for a self-hosted receiver. A key that fails its
+         checksum, or a `base_url` that is not an http(s) URL, raises as an
+         argument and, read from the environment, is said on stderr and
+         exports nothing;
       3. `backend.endpoint` builds the OTLP/HTTP exporter against a
-         third-party collector (a bare collector address gets `/v1/traces`
-         appended; an explicit path is used verbatim — see
-         `BackendConfig.endpoint`), with `backend.headers` as its request
-         headers;
-      4. with none of those, wardex installs `NoOpTransport`, captures into
-         nothing, and says so once on stderr.
+         third-party collector (`/v1/traces` is appended unless the path
+         already ends with it; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is used as
+         written — see `BackendConfig.endpoint`), with `backend.headers` as
+         its request headers;
+      4. with none of those, wardex installs nothing and says so once on
+         stderr, naming `WARDEX_ENDPOINT` and `WARDEX_API_KEY`.
 
     When a setting loses a precedence fight — the endpoint under an explicit
     `transport=` or under a project key, PII exemptions under `PIIMode.OFF`,
-    an `interceptors=` selection under `intercept=False` — a
-    `WardexConfigWarning` is emitted, because a config value that loses in
-    silence is indistinguishable from one that was honoured. The endpoint
-    counts only when it was given to wardex, as the argument or as
-    `WARDEX_ENDPOINT`: one inherited from the OTel variables, which every OTel
-    SDK in the process shares, was never set for wardex and is not announced.
+    an `interceptors=` selection under `intercept=False` — it is announced,
+    because a config value that loses in silence is indistinguishable from one
+    that was honoured: as a `WardexConfigWarning` when every side of it is an
+    argument, on stderr when a side came from the environment. An endpoint
+    inherited from the OTel variables, which every OTel SDK in the process
+    shares, was never set for wardex and is not announced.
 
     `intercept=True` is the default: `init()` is the consent and
     zero-instrumentation capture is the product. Mutation of outbound traffic
     (`propagation`) stays opt-in; PII masking stays on.
 
-    EXCEPTIONS: this call — configuration time — raises `TypeError`/`ValueError`
-    on a bad argument like any Python constructor; every other public call is a
-    safe no-op before `init()` and never raises into host code afterwards.
-
     DIAGNOSTICS go to the stdlib logger `wardex_sdk` (default: one-line stderr
-    messages prefixed `[wardex] `); configuration conflicts are
-    `warnings.warn(..., WardexConfigWarning)`.
+    messages prefixed `[wardex] `).
     """
+    for name, value, cls in (
+        ("backend", backend, BackendConfig),
+        ("pii", pii, PIIConfig),
+        ("batching", batching, BatchingConfig),
+        ("limits", limits, LimitsConfig),
+        ("propagation", propagation, PropagationConfig),
+    ):
+        # `adapters` is judged by `WardexConfig`, whose refusal names the
+        # selection-tuple spelling it replaced.
+        _require_instance(name, value, cls)
+    _require_instance("transport", transport, Transport, example="ConsoleTransport()")
+    for name, value in (
+        ("service_name", service_name),
+        ("release", release),
+        ("environment", environment),
+    ):
+        _require_optional_str(name, value)
+    problems: list[str] = []
     config = _resolve_config_from_env(
         backend=backend,
         pii=pii,
@@ -296,18 +333,28 @@ def init(
         environment=environment,
         before_send_envelope=before_send_envelope,
         debug=debug,
+        problems=problems,
     )
-    # A `WARDEX_*` variable wardex does not read -- `WARDEX_ENDPONT` -- was read
-    # by nobody and mentioned by nobody, and its symptom (no spans) looked
-    # exactly like a healthy backend receiving nothing. Named here with the
-    # closest real name. A warning rather than a raise, unlike a bad argument:
-    # a stray variable left in a deployment's environment must not be able to
-    # stop a process from starting.
-    for message in _env_typo_messages():
-        _warnings.warn(message, WardexConfigWarning, stacklevel=2)
-    # The config is built FIRST so that a caller's bad argument still raises
-    # the same TypeError/ValueError it raises with a working wheel. Degraded
-    # mode must not turn a programming error into a shrug.
+    # Every argument has been judged: from here on nothing raises for a value
+    # the environment supplied, and what is said replaces the last call's.
+    _said.clear()
+    before_switch = len(problems)
+    switch = _disabled_by(problems)
+    if switch is not None:
+        # A bad value of the switch variables themselves is still said: it is
+        # why the other one decided. The rest is moot with nothing installed.
+        for message in problems[before_switch:]:
+            _say(message)
+        _say(
+            f"{switch} is set, so wardex installed nothing and captures and exports nothing. "
+            "To turn wardex on, unset it or set WARDEX_DISABLED=0."
+        )
+        _install_nothing()
+        return
+    # A stray `WARDEX_ENDPONT` reads as "no spans", like a healthy backend
+    # receiving nothing. Said, not warned: `-W error` would stop the host.
+    for message in (*_env_typo_messages(), *problems):
+        _say(message)
     if not _NATIVE_OK:
         # Without the core there is nothing to capture WITH, and the failure is
         # one nobody can fix from Python. Returning here is what makes degraded
@@ -315,23 +362,15 @@ def init(
         # interceptor, adapter, propagation patch, atexit hook or signal handler
         # is ever installed, and every one of those modules -- each of which
         # still reaches the extension -- stays unreachable by construction.
-        #
-        # The diagnostic line is not optional. Silently doing nothing is the
-        # other failure mode and it is the worse one: it looks exactly like a
-        # backend that is up and receiving no traffic, so nobody goes looking.
-        _diag_warning(
+        _say(
             f"native extension unavailable, wardex is disabled: "
             f"nothing will be captured or exported ({_unavailable_reason()})"
         )
         return
-    # The three known conflict cases, announced UNCONDITIONALLY as warnings —
-    # they used to hide behind `debug`, which printed them in exactly the
-    # configuration nobody runs. Each is a setting another setting disables:
-    # legal, but never to be confused with a setting that was honoured.
-    if config.backend.base_url and not config.backend.api_key:
-        # A receiver address with nothing to authenticate with. Not a warning:
-        # every POST would be a 401 the transport is fail-silent about, which
-        # is the silent-ignore outcome a config change may not have.
+    given = backend if backend is not None else BackendConfig()
+    if given.base_url and not config.backend.api_key:
+        # A receiver address with nothing to authenticate with, written in
+        # code: every POST would be a 401 the transport is fail-silent about.
         raise ValueError(
             "backend.base_url names a wardex receiver but backend.api_key is unset; "
             "a receiver rejects unauthenticated requests. Set WARDEX_API_KEY or "
@@ -339,30 +378,19 @@ def init(
         )
     # Judged on the endpoint the host gave WARDEX -- the argument, else
     # `WARDEX_ENDPOINT` -- not on the resolved one: an endpoint inherited from
-    # the process-wide OTel variables was never passed to wardex, and the
-    # warning used to name it to a host that had set it for other tooling.
-    named_endpoint = _endpoint_named_for_wardex(backend.endpoint if backend is not None else None)
-    if transport is not None and named_endpoint:
-        _warnings.warn(
-            "backend endpoint ignored: transport= carries its own address",
-            WardexConfigWarning,
-            stacklevel=2,
-        )
-    elif config.backend.api_key and named_endpoint:
-        # Two destinations named, and they do not mix: the project key routes
-        # to the wardex receiver and is never sent to a third-party collector.
-        # Said once, here, rather than letting the OTLP address sit inert.
-        _warnings.warn(
-            "backend endpoint ignored: api_key routes to the wardex receiver "
-            "(drop api_key to export OTLP to that collector instead)",
-            WardexConfigWarning,
-            stacklevel=2,
-        )
+    # the process-wide OTel variables was never passed to wardex.
+    endpoint_loser = "backend endpoint" if given.endpoint else "WARDEX_ENDPOINT"
+    if transport is not None and _endpoint_named_for_wardex(given.endpoint):
+        reason = "transport= carries its own address"
+        if given.endpoint:
+            _warnings.warn(f"backend endpoint ignored: {reason}", WardexConfigWarning, stacklevel=3)
+        else:
+            _say(f"WARDEX_ENDPOINT ignored: {reason}")
     if config.pii.mode is PIIMode.OFF and config.pii.disabled_categories:
         _warnings.warn(
             "pii disabled_categories has no effect when pii mode is OFF",
             WardexConfigWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
     if config.pii.mode is PIIMode.OFF and (
         config.pii.extra_secret_names or config.pii.reveal_names
@@ -370,7 +398,7 @@ def init(
         _warnings.warn(
             "pii extra_secret_names and reveal_names have no effect when pii mode is OFF",
             WardexConfigWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
     if config.interceptors is not None and not config.intercept:
         # Detected here rather than at install time: `_interceptors/` keeps the
@@ -379,7 +407,7 @@ def init(
         _warnings.warn(
             "interceptors=... has no effect without intercept=True",
             WardexConfigWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
     if config.adapters.enabled is not None:
         # Adapter options set while the SAME config object's `enabled=`
@@ -395,83 +423,41 @@ def init(
                     f"adapters.{name.value} options set but {name.value} is "
                     "excluded by adapters.enabled",
                     WardexConfigWarning,
-                    stacklevel=2,
+                    stacklevel=3,
                 )
+    if pii is None:
+        _announce_pii_env(config.pii.mode)
     if config.debug:
-        # One line, at install time, with the RESOLVED config — the env
-        # fallbacks and canonicalized collections included. `api_key` is
-        # `repr=False`, so no credential can ride along.
-        _diag_info(f"resolved config: {config!r}")
+        # One line, at install time, with the RESOLVED config, masked as the
+        # report masks it: a URL's query and a header value can hold a secret.
+        from . import _environment
+
+        flat = ", ".join(f"{name}={value}" for name, value in _environment.flatten(config))
+        _diag_info(f"resolved config: {flat}")
     if transport is not None:
         resolved_transport = transport
-    elif config.backend.api_key:
-        # `backend.api_key` is WIRED here: the project key names a wardex
-        # project, so the default exporter is the wardex receiver's, and the
-        # key rides only in that request's Authorization header — never in
-        # any stderr line or repr (`api_key` is `repr=False` on the config,
-        # and the transport never echoes it).
-        #
-        # `base_url` wins over the region table on purpose: a self-hosted
-        # receiver issues keys in the same form, and its operator names it.
-        # Without one, the key's region tag is the whole of the routing —
-        # an unknown tag raises rather than falls back, because a batch sent
-        # to the wrong receiver is a 401 the transport is silent about.
-        base_url = config.backend.base_url
-        if base_url is None:
-            region = _region_of_key(config.backend.api_key)
-            try:
-                base_url = _WARDEX_INGEST_HOSTS[region]
-            except KeyError:
-                raise ValueError(
-                    f"api_key names region {region!r}, which this SDK version has no "
-                    f"receiver for (known: {sorted(_WARDEX_INGEST_HOSTS)}). Set "
-                    f"WARDEX_BASE_URL to the receiver's address, or upgrade wardex-sdk."
-                ) from None
-        resolved_transport = WardexTransport(
-            base_url,
-            config.backend.api_key,
-            debug=config.debug,
-        )
-    elif config.backend.endpoint:
-        # A third-party collector: the OTLP exporter, with whatever headers
-        # that collector wants. The project key is NOT among them.
-        resolved_transport = OtlpHttpTransport(
-            _traces_endpoint(config.backend.endpoint),
-            headers=dict(config.backend.headers) if config.backend.headers else None,
-            debug=config.debug,
-        )
     else:
-        resolved_transport = NoOpTransport()
-        unusable = _unusable_env_endpoint()
-        # Judged only here, where that value would have been the destination;
-        # under a `transport=` or a key it lost anyway, and the "endpoint
-        # ignored" warning above already named a `WARDEX_ENDPOINT` that did.
-        if unusable == "WARDEX_ENDPOINT":
-            # wardex's own variable, and nothing else names a destination: a
-            # process that would export nothing, refused at configuration time
-            # like the same value passed as the argument.
-            raise ValueError(
-                "WARDEX_ENDPOINT must be an absolute http:// or https:// URL with a host, such "
-                "as 'http://collector:4318'; the value set has no such scheme or no host, and "
-                "with no transport= or api_key it would be wardex's only destination, so every "
-                "export would fail. Write the scheme and the host."
+        default, config = _default_transport(config, given)
+        if default is None:
+            _install_nothing()
+            return
+        if config.backend.api_key and _endpoint_named_for_wardex(given.endpoint):
+            # Announced only now that the key produced a transport: a key that
+            # did not would make this line contradict the one it said. The key
+            # routes to the wardex receiver and is never sent to a collector.
+            key = "api_key" if given.api_key else "WARDEX_API_KEY"
+            fix = "drop api_key" if given.api_key else "unset WARDEX_API_KEY"
+            reason = (
+                f"{key} routes to the wardex receiver "
+                f"({fix} to export OTLP to that collector instead)"
             )
-        if unusable is not None:
-            _warnings.warn(
-                f"{unusable} is set but is not an http:// or https:// URL, so wardex does not "
-                "export to it (wardex exports OTLP over HTTP; a scheme-less host:port is the "
-                "form gRPC exporters take). Set WARDEX_ENDPOINT or backend.endpoint to the "
-                "collector's OTLP/HTTP address.",
-                WardexConfigWarning,
-                stacklevel=2,
-            )
-        # Unconditional, like the degraded-mode line and for the same reason: a
-        # wardex that captures into nothing looks exactly like a backend that
-        # is up and receiving no traffic, so nobody goes looking.
-        _diag_info(
-            "no transport, backend.api_key or backend.endpoint configured: "
-            "capturing, exporting nothing"
-        )
+            if given.endpoint and given.api_key:
+                _warnings.warn(
+                    f"backend endpoint ignored: {reason}", WardexConfigWarning, stacklevel=3
+                )
+            else:
+                _say(f"{endpoint_loser} ignored: {reason}")
+        resolved_transport = default
     # Plumbing, not subclass hooks: the private setters install what
     # `Transport.encode()` — the sanctioned, masked path to wire bytes — reads.
     resolved_transport._set_pii_policy(config.pii)
@@ -489,75 +475,176 @@ def init(
     _runtime.runtime().install(client, config)
 
 
-def set_tag(key: str, value: str) -> None:
-    """Set a tag on the ISOLATION scope; exported spans captured under it carry it.
+def set_tag(key: str, value: _AttributeValue | list | tuple | dict | None) -> None:
+    """Set a tag that exported spans in this scope carry as an attribute.
 
-    The isolation scope, not the process-global one (Sentry 2.x semantics): a
-    tag set inside one request's `isolation_scope()` — one tenant, one job —
-    stays that unit's and cannot bleed onto every other thread's spans. A tag
-    set outside any `isolation_scope()` block lands on the ambient context's
-    own isolation scope and behaves like a process-wide tag in a simple script.
-    A span-local attribute with the same key wins over the scope tag.
+    The value follows `Span.set_attribute`'s rule: a list, tuple or dict is
+    sent as its JSON text, None removes the tag, and a non-str key or a value
+    the wire cannot hold raises here (`ValueError` for an int past 64 bits).
+
+    The tag lands on the running context's isolation scope (Sentry 2.x
+    semantics), and these rules decide which spans see it:
+
+    * Work started from this context afterwards (an asyncio task, a thread
+      started through `wardex.bind_context`) reads it. A later write here
+      does not reach work already started, so a loop that sets each
+      request's user and then starts that request gives each its own.
+    * A tag set inside a task, a bound thread, or an `isolation_scope()` /
+      `new_scope()` block stays there: siblings, the code that started the
+      task and the code after the block never see it. That includes a
+      function run through `asyncio.to_thread()`, which is how FastAPI and
+      Starlette run a plain `def` dependency: a `set_user()` there does not
+      reach the request. Set identity in the `async def` code, or return the
+      value and set it there.
+    * A new `threading.Thread` starts with NO tags, because Python gives a
+      new thread an empty context. Wrap its target in
+      `wardex.bind_context(fn)` to carry tags set at startup into it.
+    * A pool thread (a `ThreadPoolExecutor` worker, `loop.run_in_executor`)
+      is not new for the jobs after its first: it keeps what earlier jobs
+      set on it. Submit through `wardex.bind_context(fn)`, or open
+      `wardex.isolation_scope()` in each job.
+
+    A span-local attribute with the same key wins over the scope tag. A span
+    reads the scope when it ends, so one held open across a `yield` that
+    another request's code resumes carries what that request set.
     """
-    _hub.get_isolation_scope().set_tag(key, value)
+    _hub.write_scope(_hub._isolation_scope, Scope.set_tag, key, value)
 
 
-def set_user(user: UserInfo | None) -> None:
-    """Attach `user` to the ISOLATION scope; exported spans carry `user.*`.
+def set_user(
+    user: UserInfo | str | int | None = _NO_USER,
+    /,
+    *,
+    id: str | int | None = None,
+    email: str | None = None,
+    username: str | None = None,
+    ip_address: str | None = None,
+) -> None:
+    """Attach the end user to the scope; exported spans carry `user.*`.
 
-    `UserInfo.id/email/username` map to the `user.id`/`user.email`/`user.name`
-    span attributes and `ip_address` to `client.address`; `None` fields are
-    skipped. `set_user(None)` clears the user again. Same scope targeting as
-    `set_tag` — see its docstring.
+    Accepted forms, anything else raises `TypeError` here::
+
+        wardex.set_user("user-42")                       # the user id
+        wardex.set_user(42)                              # an int id is sent as "42"
+        wardex.set_user(id="user-42", email="a@b.example")
+        wardex.set_user(wardex.UserInfo(id="user-42"))
+        wardex.set_user(None)                            # clear it again
+
+    `id`/`email`/`username` map to the `user.id`/`user.email`/`user.name`
+    span attributes and `ip_address` to `client.address`; None or empty
+    fields are skipped, and a call whose fields are all None or empty (an
+    anonymous user) clears the user. Scoped exactly like `set_tag`: see its
+    docstring.
     """
-    _hub.get_isolation_scope().set_user(user)
+    resolved = _user_from_call(
+        user, {"id": id, "email": email, "username": username, "ip_address": ip_address}
+    )
+    _hub.write_scope(_hub._isolation_scope, Scope.set_user, resolved)
+
+
+def set_account(id: str | int | _UUID | None) -> None:
+    """Attribute the work in this scope to one of YOUR customers: `wardex.account.id`.
+
+    An account is the customer's customer: the company or workspace your
+    agent serves, the unit you compare behaviour across. It is not your
+    wardex login or project. Scoped exactly like `set_user`, so set it per
+    request::
+
+        async def handle(request):
+            with wardex.continue_trace(request.headers):
+                wardex.set_account(request.state.workspace_id)
+                await run_agent(request)
+
+    `id` is a `str`, an `int` or a `uuid.UUID` (sent as its text); None or
+    "" clears the account, so a request with no workspace goes on. Anything
+    else raises `TypeError` here. The id is masked like any value: one that
+    reads as an e-mail, an IP address or a phone number ships as a
+    placeholder, so use an opaque id.
+    """
+    if isinstance(id, _UUID) or type(id) is int:
+        id = str(id)
+    elif id is not None and not isinstance(id, str):
+        raise TypeError(
+            "set_account() takes the account id as a str, an int or a uuid.UUID (None clears "
+            f"it), got {type(id).__name__}"
+        )
+    _hub.write_scope(_hub._isolation_scope, Scope.set_tag, _ACCOUNT_KEY, id or None)
 
 
 def set_context(key: str, value: dict[str, _Any]) -> None:
-    """Store a named context payload on the ISOLATION scope.
+    """Attach a named payload to the scope; its scalars reach exported spans.
 
-    Same scope targeting as `set_tag`. Contexts hold arbitrary host objects and
-    are NOT stamped onto exported spans; they are readable back off the scope.
+    Each `str`/`int`/`float`/`bool` value is stamped as the attribute
+    `wardex.context.<key>.<name>` (masked like every attribute), at most 32
+    keys per payload. Other values stay on the scope and are
+    not exported; that is said once on the `wardex_sdk` logger. A second call
+    with the same `key` replaces the first payload. Scoped exactly like
+    `set_tag`. A non-str `key` or a non-mapping `value` raises `TypeError`.
     """
-    _hub.get_isolation_scope().set_context(key, value)
+    skipped, over = _hub.write_scope(_hub._isolation_scope, Scope.set_context, key, value)
+    if skipped:
+        _report_once(
+            f"wardex.set_context({key!r}): {sorted(skipped)[:5]} hold values that are not "
+            "str, int, float or bool, so they are kept on the scope and not recorded on "
+            "spans. Pass scalar values (for example str(value)) to record them.",
+            key="wardex.set_context.non_scalar",
+        )
+    if over:
+        _report_once(
+            f"wardex.set_context({key!r}): {over} keys past the first 32 are kept on the "
+            "scope and not recorded on spans. Split the payload into several named contexts.",
+            key="wardex.set_context.too_many_keys",
+        )
 
 
 def isolation_scope() -> _AbstractContextManager[Scope]:
-    """Fork the current isolation scope for the block, then restore it.
+    """A request or job boundary: identity set inside stays inside.
 
-    The new isolation scope is a CLONE of the current one — ambient context
-    (tags, user, contexts) is inherited, and mutations made inside the block
-    are isolated to it (Sentry 2.x fork semantics). The current scope is
-    replaced with a fresh one for the block's duration, which is also how to
-    step out of a `wardex.conversation(...)`: spans inside carry none.
-    (`continue_trace` keeps the conversation instead.) As a decorator it serves
-    a plain function only (see `WithOrSyncDecorator`).
+    Use it around one unit of work that has its own user, account or tags,
+    when nothing has opened one for you (`continue_trace`, the ASGI/WSGI
+    middleware and the framework adapters already do)::
+
+        for job in queue:
+            with wardex.isolation_scope():
+                wardex.set_account(job.account_id)
+                process(job)
+
+    The block starts from a copy of the enclosing tags, user and contexts;
+    whatever is set inside is discarded at exit. The yielded `Scope` reads and
+    writes the block, as the module-level setters inside it do. The trace is
+    untouched: spans inside keep the parent and conversation they would have
+    had. As a decorator it serves a plain function only (see
+    `WithOrSyncDecorator`).
     """
     return _WithOrSyncDecorator(
         "isolation_scope",
-        _isolation_scope(),
+        _hub.public_isolation_scope(),
         "Open it inside the function: `with wardex.isolation_scope():`.",
     )
 
 
-@_contextmanager
-def _isolation_scope() -> _Iterator[Scope]:
-    with _hub.isolation_scope() as s:
-        yield s
-
-
 def new_scope() -> _AbstractContextManager[Scope]:
-    """Fork the current scope for the block, then restore it. As a decorator it
-    serves a plain function only (see `WithOrSyncDecorator`)."""
+    """A temporary override inside a request: everything set in it ends with it.
+
+    Use it to label a few calls differently without changing the request's
+    identity::
+
+        wardex.set_user("user-42")            # the whole request
+        with wardex.new_scope():
+            wardex.set_tag("phase", "retry")  # only the calls in here
+            call_model()
+
+    `set_tag`/`set_user`/`set_account`/`set_context` inside the block write to
+    the block and are gone at exit; nested blocks compose; a task started
+    inside reads the block and keeps its own writes. The yielded `Scope` reads
+    and writes the block too. As a decorator it serves a plain function only
+    (see `WithOrSyncDecorator`).
+    """
     return _WithOrSyncDecorator(
-        "new_scope", _new_scope(), "Open it inside the function: `with wardex.new_scope():`."
+        "new_scope",
+        _hub.public_new_scope(),
+        "Open it inside the function: `with wardex.new_scope():`.",
     )
-
-
-@_contextmanager
-def _new_scope() -> _Iterator[Scope]:
-    with _hub.new_scope() as s:
-        yield s
 
 
 def flush(timeout: float | None = None) -> None:
@@ -645,9 +732,29 @@ def diagnostics() -> Diagnostics:
     when the native extension is unavailable. After `close()` the adapters are
     still described as the last `init()` left them, so a check made once the
     run is over reads what happened; before the first `init()` there are none.
+
+    `config_problems` is every line the most recent `init()` said about its
+    configuration -- a variable it could not use, the kill switch, no
+    destination -- which is where to look when `initialized` is False.
+
+    It also carries what a bug report needs (versions, the native module, the
+    resolved configuration with secrets masked, the exporter and where it
+    sends, what wardex patched, its threads); `.report()` renders all of it as
+    text safe to paste. `python -m wardex_sdk doctor` prints that report and
+    sends one test span to say whether the install works.
     """
+    # Imported here, not at the top: the package root's imports run through
+    # the cycle `_hub` settles, and this module's would enter it from the side.
+    from . import _environment
+
     live, adapters = _runtime.runtime().describe()
-    return Diagnostics(initialized=live, adapters=adapters, losses=_losses())
+    return Diagnostics(
+        initialized=live,
+        adapters=adapters,
+        losses=_losses(),
+        config_problems=tuple(_said),
+        **_environment.environment(),
+    )
 
 
 def _losses() -> tuple[Loss, ...]:

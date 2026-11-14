@@ -66,13 +66,16 @@ class AdapterName(Enum):
 class AdapterState(Enum):
     """What one adapter is doing in this process, as `wardex.diagnostics()` reports it.
 
-    Closed, and each member is a different thing to do next. `ABSENT` and
-    `DISABLED` are nothing to look at; `UNSUPPORTED`, `FAILED` and `SHADOWED`
-    mean the framework is here and its spans are not, which is the case that
-    used to read as installed.
+    Closed, and each member is a different thing to do next. `ABSENT`,
+    `DISABLED` and `WAITING_FOR_IMPORT` are nothing to look at; `UNSUPPORTED`,
+    `FAILED` and `SHADOWED` mean the framework is here and its spans are not,
+    which is the case that used to read as installed.
     """
 
     INSTALLED = "installed"
+    # The framework is installed and the application has not imported it yet;
+    # the adapter installs right after that import finishes.
+    WAITING_FOR_IMPORT = "waiting_for_import"
     UNSUPPORTED = "unsupported"  # the framework is here; its surface is not one this wardex knows
     FAILED = "failed"  # the adapter raised while installing
     SHADOWED = "shadowed"  # a local package answers the framework's import name

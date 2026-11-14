@@ -31,7 +31,7 @@ def test_h2_call_is_captured(h2_server):
     # capture_mode=ALL: this test targets HTTP/2 span assembly (method/status/
     # body/headers-stripped), not the AGENT-mode policy gate, and there is no
     # active local span for AGENT mode to latch onto.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     with httpx.Client(http2=True, verify=_verify_ctx()) as client:
         resp = client.post(
             f"{h2_server}/v1/messages",
@@ -54,7 +54,7 @@ def test_h2_call_is_captured(h2_server):
 
 
 def test_h2_capture_nests_under_active_span(h2_server):
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
 
     @wardex.agent(name="researcher")
     def run() -> None:

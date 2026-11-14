@@ -80,7 +80,7 @@ def _verify_ctx() -> ssl.SSLContext:
 def test_sync_https_call_is_captured(tls_server):
     # capture_mode=ALL: targets generic HTTP span assembly, not the AGENT-mode
     # policy gate; no active local span here for AGENT mode to latch onto.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     resp = httpx.post(
         f"{tls_server}/v1/messages",
         headers={"Authorization": "Bearer sk-secret-xyz"},
@@ -107,7 +107,7 @@ def test_sync_https_call_is_captured(tls_server):
 @pytest.mark.asyncio
 async def test_async_https_call_is_captured(tls_server):
     # capture_mode=ALL: same rationale as the sync variant above.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     async with httpx.AsyncClient(verify=_verify_ctx()) as client:
         resp = await client.post(f"{tls_server}/v1/messages", json={"model": "y"})
     assert resp.status_code == 200
@@ -118,7 +118,7 @@ async def test_async_https_call_is_captured(tls_server):
 
 
 def test_capture_nests_under_active_span(tls_server):
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
 
     @wardex.agent(name="researcher")
     def run() -> None:
@@ -138,7 +138,7 @@ def test_capture_nests_under_active_span(tls_server):
 
 def test_sync_capture_populates_connect_and_handshake(tls_server):
     # capture_mode=ALL: targets connect/handshake timing, not the policy gate.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     resp = httpx.post(f"{tls_server}/v1/ping", json={}, verify=_verify_ctx())
     assert resp.status_code == 200
 
@@ -150,7 +150,7 @@ def test_sync_capture_populates_connect_and_handshake(tls_server):
 
 def test_sync_keepalive_second_request_is_reused(tls_server):
     # capture_mode=ALL: targets connection-reuse tracking, not the policy gate.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     with httpx.Client(verify=_verify_ctx()) as client:
         r1 = client.post(f"{tls_server}/v1/ping", json={})
         r2 = client.post(f"{tls_server}/v1/ping", json={})
@@ -171,7 +171,7 @@ def test_sync_connection_opened_before_init_leaves_reuse_unset(tls_server):
     # in the store — so it cannot say the request it sees is the first.
     with httpx.Client(verify=_verify_ctx()) as client:
         assert client.post(f"{tls_server}/v1/ping", json={}).status_code == 200
-        wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
         assert client.post(f"{tls_server}/v1/ping", json={}).status_code == 200
 
     (sp,) = [s for s in _captured_spans() if s.kind == SpanKind.CLIENT]
@@ -237,7 +237,7 @@ def test_resolve_timing_an_ssl_object_stamped_at_creation_is_a_fresh_connection(
 @pytest.mark.asyncio
 async def test_async_capture_populates_handshake(tls_server):
     # capture_mode=ALL: targets async handshake timing, not the policy gate.
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     async with httpx.AsyncClient(verify=_verify_ctx()) as client:
         resp = await client.post(f"{tls_server}/v1/messages", json={"model": "y"})
     assert resp.status_code == 200
@@ -280,7 +280,7 @@ def test_install_uninstall_restores_originals():
         originals[(asyncio.unix_events._UnixSelectorEventLoop, "create_connection")] = (
             asyncio.unix_events._UnixSelectorEventLoop.create_connection
         )
-    wardex.init(intercept=True)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True)
     # everything is patched
     for (cls, meth), orig in originals.items():
         assert getattr(cls, meth) is not orig
@@ -542,7 +542,7 @@ async def test_anyio_tls_reads_the_peer_off_the_byte_stream(tls_server, fresh_co
 
     port = int(tls_server.rsplit(":", 1)[1])
     url = f"https://localhost:{port}/v1/messages"
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     async with httpx.AsyncClient(verify=_verify_ctx()) as client:
         resp = await client.post(url, json={"model": "y"})
     assert resp.status_code == 200
@@ -606,7 +606,7 @@ async def test_asyncio_tls_reads_the_peer_off_the_transport(tls_server, fresh_co
     from wardex_sdk._assembly import counters
 
     port = int(tls_server.rsplit(":", 1)[1])
-    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
     assert b"200" in await _asyncio_tls_post(tls_server)
 
     spans = [s for s in _captured_spans() if s.kind == SpanKind.CLIENT]
@@ -631,7 +631,7 @@ async def test_an_asyncio_tls_connection_made_before_init_stays_unread(tls_serve
     from wardex_sdk._assembly import counters
 
     async def init_after_the_handshake() -> None:
-        wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
 
     assert b"200" in await _asyncio_tls_post(tls_server, writer_ready=init_after_the_handshake)
 

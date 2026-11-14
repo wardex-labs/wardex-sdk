@@ -77,8 +77,11 @@ class _Sem:
     "the parser found a model or a token count", i.e. the single bit the policy
     consumes as `agent_semantic`. Every other field answers None, which is what
     the real parser returns for something it did not find, so the emit path
-    downstream of the gate runs for real rather than against a mock.
+    downstream of the gate runs for real rather than against a mock. The
+    operation is the exception: the real parser always names one.
     """
+
+    operation = "chat"
 
     def __init__(self, *, core: bool) -> None:
         self.core = core

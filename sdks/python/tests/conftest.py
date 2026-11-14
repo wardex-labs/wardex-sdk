@@ -35,6 +35,21 @@ def llm_fixture(case: str, name: str) -> bytes:
     return (LLM_FIXTURES / case / name).read_bytes()
 
 
+def project_key(region: str = "us", secret: str = "Q" * 43) -> str:
+    """A wardex project key that passes `init()`'s checksum: `wdx_<region>_`,
+    43 base62 secret characters, then the CRC32 of everything before it in 6
+    base62 characters. Not a key any receiver issued."""
+    import zlib
+
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    body = f"wdx_{region}_{secret[:43].ljust(43, '0')}"
+    value, digits = zlib.crc32(body.encode()), ""
+    while value:
+        value, digit = divmod(value, 62)
+        digits = alphabet[digit] + digits
+    return body + digits.rjust(6, "0")
+
+
 def client_spans() -> list:
     """The CLIENT spans the hub's client holds — after `_settle()`, because
     finalization runs on the worker and a bare read races it."""
@@ -130,11 +145,47 @@ def _shield_tests_from_ambient_env(monkeypatch):
         "WARDEX_RELEASE",
         "WARDEX_ENVIRONMENT",
         "WARDEX_DEBUG",
+        "WARDEX_DISABLED",
+        "OTEL_SDK_DISABLED",
+        "OTEL_SERVICE_NAME",
+        "OTEL_RESOURCE_ATTRIBUTES",
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "no_destination: this test calls init() with no destination on purpose "
+        "(opts out of the conftest check that init() installed something)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _init_without_a_destination_is_deliberate(request):
+    """`init()` with no destination installs nothing, so a test that calls it
+    to exercise a patch, a worker or an adapter would pass while testing an
+    untouched process. Such a test passes `transport=NoOpTransport()`; one
+    that is about the no-destination outcome says so with the marker."""
+    import wardex_sdk
+
+    # What the last `init()` said outlives it; each test reads only its own.
+    wardex_sdk._said.clear()
+    yield
+    if request.node.get_closest_marker("no_destination"):
+        return
+    if any(line.startswith("wardex is not running: no destination") for line in wardex_sdk._said):
+        pytest.fail(
+            "this test called wardex_sdk.init() with no destination, so wardex installed "
+            "nothing and the test exercised an untouched process. Pass "
+            "transport=wardex_sdk.NoOpTransport(), or mark the test no_destination if "
+            "that outcome is what it checks."
+        )
 
 
 @pytest.fixture(autouse=True)
