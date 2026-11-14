@@ -496,12 +496,12 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     NO_WIRE_EVIDENCE = "no_wire_evidence"
-    """The span was assembled entirely from framework callbacks; no interceptor
-    ever saw the bytes, so payloads are the framework's account of them.
+    """Assembled from framework callbacks: no interceptor READ the bytes as a model call (none saw
+    them, or none parses that endpoint), so its payloads and usage are the framework's account.
 
-    Emitted from ``_adapters/_codex_exec.py`` on every span that carries a ``codex exec`` run's
-    payload: the prompt the host wrote to stdin and the answer it read back, without the
-    instructions Codex wraps around the prompt. Other adapters await the ownership table of §8.2.
+    Emitted from ``_adapters/_codex_exec.py`` on each ``codex exec`` payload span (stdin prompt and
+    answer), ``_adapters/_pydantic_ai.py`` on a chat built at its end, and ``settle_usage`` in
+    ``_assembly/_usage_hold.py`` on a bridge chat unit it promoted usage on (no model call sealed).
     """
 
     POSSIBLE_DUPLICATE_CHAT = "possible_duplicate_chat"
@@ -701,9 +701,9 @@ Two emit sites, and the first is the mechanism the second restates.
     """The WebSocket content sample hit ``ws_sample_bytes`` in either direction,
     so the body bytes on this span are a prefix of the conversation.
 
-    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``, from the truncation
-    flags ``_append_sample`` sets when the accumulated sample passes the cap — resolved from
-    ``limits_defaults()["ws_sample_bytes"]`` (and passed as ``sample_cap`` by
+    Emitted from ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``, from the
+    truncation flags ``_append_sample`` sets when the accumulated sample passes the cap — resolved
+    from ``limits_defaults()["ws_sample_bytes"]`` (and passed as ``sample_cap`` by
     ``_interceptors/_seam.py``). NOT ``max_ws_frame_bytes``: that one bounds a single frame's
     declared length in ``crates/wardex-protocol/src/websocket.rs`` and an oversize frame does not
     truncate anything — it disables the parser, which surfaces as ``FRAME_PARSE_FAILED``.
@@ -818,11 +818,11 @@ Two emit sites, and the first is the mechanism the second restates.
     """The framing layer failed, so the transport fields on this span are partial or synthesized.
 
     Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (gRPC frame parse raised; the span falls
-    back to plain h2 fields), ``_interceptors/_trackers.py::_WebSocketTracker._build_txn`` (either
-    direction's frame parser latched off) and ``_Http1Tracker._response_txn`` there (an HTTP/1
-    response's stream ended before its framing did — a Content-Length not reached, a chunked body
-    short of its last chunk, an unframed body let go before the peer's EOF: the body is what came,
-    its size unset, a 2xx status UNSET). Before the census the first two emitted the free strings
+    back to plain h2 fields), ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``
+    (either direction's frame parser latched off) and ``_interceptors/_trackers.py::_Http1Tracker``
+    (an HTTP/1 response's stream ended before its framing did — a Content-Length not reached, a
+    chunked body short of its last chunk, an unframed body let go before the peer's EOF: the body
+    is what came, its size unset, a 2xx status UNSET). The first two replaced the free strings
     ``grpc_parse_failed`` and ``ws_parse_failed``. On an HTTP span, look at the server, the network
     or the client that let go: the parser read every byte that came.
 
@@ -850,7 +850,7 @@ Two emit sites, and the first is the mechanism the second restates.
     span are not readable content.
 
     Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (any request or response message had its
-    compressed flag set) and ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``
+    compressed flag set) and ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``
     (permessage-deflate negotiated). Before the census those two sites emitted the free strings
     ``grpc_compressed`` and ``ws_compressed``.
 
@@ -975,9 +975,9 @@ Two emit sites, and the first is the mechanism the second restates.
     gap. Not ``PARSE_BACKLOG_FULL`` / ``PARSE_SKIPPED_AT_SHUTDOWN``: those skip a parse for capacity
     and a knob restores it.
 
-    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``, decided on the first
-    client message and stamped at close; the seam's gate reads the same fact (``_Txn.ws_llm_call``)
-    as a capture claim, and ``_seam.py::_build_ws_span`` counts it — at close, before the gate.
+    Emitted from ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``, decided on the
+    first client message and stamped at close; the seam's gate reads it (``_Txn.ws_llm_call``) as a
+    capture claim, and ``_seam.py::_build_ws_span`` counts it — at close, before the gate.
     """
 
     # ------------------------------------------------------------------

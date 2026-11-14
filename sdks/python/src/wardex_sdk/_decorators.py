@@ -33,9 +33,10 @@ from . import _hub, _values
 from ._assembly import degraded_run, guard, report_once
 from ._enums import OperationName, SpanKind, ToolExecutionType
 from ._source_paths import _call_site_file
-from ._tracing import _CURRENT_SPAN, _NULL_PARENTAGE, Span, _debug_enabled, _span, _WithOnly
+from ._tracing import _NULL_PARENTAGE, Span, _debug_enabled, _span, _WithOnly
 from ._types import AgentAttributes, CallSite, ToolAttributes
 from .context._contextvar import fork_scope
+from .context._current_span import _CURRENT_SPAN
 
 P = ParamSpec("P")
 R = TypeVar("R")

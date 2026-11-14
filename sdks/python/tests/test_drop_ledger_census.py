@@ -1,8 +1,10 @@
 """Drop ledger census: every place the SDK says it lost something, accounted for.
 
 A loss the SDK knows about leaves one of a few signals in the source: a
-`counters.bump`, an adapter's `count`, a `report_once` line, a `_report_lost`,
-or a call into the drop ledger (`record`, `record_items`, `lose`). Only the
+`counters.bump` (or, where the interpreter's recursion limit forbids a call, a
+`counters.tally.append`), an adapter's `count`, a `report_once` line, a
+`_report_lost`, or a call into the drop ledger (`record`, `record_items`,
+`lose`). Only the
 ledger reaches the receiver. So every one of those sites is recorded below with
 what happens to the loss it signals:
 
@@ -95,6 +97,13 @@ _UNITS = Pending("assembly-core unit tables and patches")
 _SIGNAL = Pending("signal-path shutdown tail")
 _REQUEST_CAP = Pending("OTLP request-cap drop")
 _NATIVE = Pending("native extension missing: no batch, the drop report included, can be encoded")
+#: wardex's own record of the bytes, close or line at hand, dropped where its
+#: work met the interpreter's recursion limit. The ledger cannot be told there:
+#: `record` is a Python call, and at the limit it raises again. The counter is a
+#: `counters.tally.append`, a C call.
+_AT_LIMIT = Pending(
+    "wardex's own record dropped at the recursion limit, where a ledger call raises"
+)
 
 _GUARDED = Structural("the line said for a swallow guard() has already recorded")
 _VERSION_REFUSED = NotADrop(
@@ -297,6 +306,27 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "an entry point that ran: evidence of coverage, not of a loss"
     ),
     ("_adapters/_context.py", "report_once", "f'{self.name}.{where}'"): _GUARDED,
+    ("_adapters/_context.py", "tally", "'adapters.context.close_at_limit'"): _AT_LIMIT,
+    ("_adapters/_context.py", "tally", "'adapters.context.control_flow_at_limit'"): _AT_LIMIT,
+    ("_adapters/_context.py", "tally", "'adapters.context.close_at_limit_not_restored'"): NotADrop(
+        "a close dropped at the limit on another task, whose scope fork could not be reset there; "
+        "the lost span is the close_at_limit tally beside it, and that task's carriers stay its own"
+    ),
+    ("_adapters/_context.py", "tally", "'adapters.context.close_at_limit_half_exited'"): NotADrop(
+        "the activation's own exit reset the ambient unit before the limit bit; the lost span is "
+        "the close_at_limit tally beside it"
+    ),
+    ("_adapters/_context_bridge.py", "count", "'usage_hold_refused'"): NotADrop(
+        "a bridge asked to hold usage it may not hold; its numbers stay demoted extras on the span"
+    ),
+    ("_adapters/_context_bridge.py", "count", "'tool_call_ambiguous'"): NotADrop(
+        "two live tool units share the name and the arguments; the wire call keeps the seam's own "
+        "placement and ships"
+    ),
+    ("_adapters/_context_bridge.py", "count", "'tool_call_prefix_unproved'"): NotADrop(
+        "a prefixed tool unit recorded no arguments to prove the wire call is its own; the wire "
+        "call keeps the seam's own placement and ships"
+    ),
     ("_adapters/_conversation.py", "count", "shadowed_counter"): NotADrop(
         "the host's conversation id wins over the framework's, which stays on the span"
     ),
@@ -490,6 +520,112 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_openai_agents_kinds.py", "report_once", "f'adapters.openai_agents.{reason}'"): (
         L("FRAMEWORK_SPAN_KIND_UNMAPPED", "FRAMEWORK_EVENT_UNMATCHED")
     ),
+    # -- adapters: Pydantic AI
+    ("_adapters/_pydantic_ai.py", "count", "'attempt_without_chat'"): NotADrop(
+        "a failed attempt with no chat unit to hang under is left off by policy; the model "
+        "call it belonged to still ships"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'attribute_not_scalar'"): NotADrop(
+        "a framework attribute with no scalar form is left off by policy; its span ships"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'chat_lost_no_parent'"): NotADrop(
+        "a chat span that ended before it named its model, with no open run to sit under, "
+        "sent nothing; there is no model call to lose"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'chat_open_off_start_task'"): NotADrop(
+        "a tally: the chat unit opened off its span's task and is reached through the "
+        "current-span resolver; it ships"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'chat_opened_at_end'"): Marker("NO_WIRE_EVIDENCE"),
+    ("_adapters/_pydantic_ai.py", "count", "'end_without_start'"): NotADrop(
+        "an end for a span this install never saw start; nothing of it was open to lose"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'held_close'"): NotADrop(
+        "a run held open until its last child closes; it ships then"
+    ),
+    ("_adapters/_pydantic_ai_attach.py", "count", "'instrumentation_replaced'"): NotADrop(
+        "a tally: the host replaced the instrumentation settings after init() without "
+        "`instrument_all`, so wardex could not follow; the host's choice, said once at close"
+    ),
+    ("_adapters/_pydantic_ai_attach.py", "count", "'instrumentation_followed'"): NotADrop(
+        "a tally: wardex attached to the instrumentation the host set after init(); nothing lost"
+    ),
+    ("_adapters/_pydantic_ai_attach.py", "count", "'instrumentation_off'"): NotADrop(
+        "a tally: the host turned pydantic-ai's instrumentation off after init(); there are no "
+        "framework spans to lose, and wire-level model calls still ship"
+    ),
+    ("_adapters/_pydantic_ai_attach.py", "count", "'instrumentation_not_followed'"): NotADrop(
+        "a tally: the host moved pydantic-ai's instrumentation after init() to a setup that "
+        "takes no span processor; the host's choice, said once, and wire-level model calls "
+        "still ship"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'instrumentation_unreachable'"): L(
+        "INSTRUMENTATION_UNAVAILABLE", at="_adapters/__init__.py"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'late_callback'"): NotADrop(
+        "a framework callback after uninstall; the uninstall already closed and shipped the span"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'pin_refused'"): Marker(
+        "CORRELATION_CONFLICT", at="_assembly/_units.py"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'pin_stranded'"): NotADrop(
+        "a pin left behind is released; nothing is dropped"
+    ),
+    ("_adapters/_pydantic_ai_attach.py", "count", "'processor_left_inert'"): NotADrop(
+        "a processor the provider cannot remove stays registered and records nothing"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'schema_version'"): NotADrop(
+        "a tally of an instrumentation schema this release was not written against; spans ship"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'unknown_attribute'"): NotADrop(
+        "an attribute no table names is left off and counted as drift; its span ships"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'unknown_span'"): NotADrop(
+        "a span the framework emits that wardex does not record by policy; work inside it "
+        "nests under the ambient unit"
+    ),
+    (
+        "_adapters/_pydantic_ai_attach.py",
+        "report_once",
+        "'adapters.pydantic_ai.processor_left_inert'",
+    ): NotADrop("a processor the provider cannot remove stays registered and records nothing"),
+    (
+        "_adapters/_pydantic_ai_attach.py",
+        "report_once",
+        "'adapters.pydantic_ai.instrumentation_replaced'",
+    ): NotADrop(
+        "the host replaced the instrumentation settings after init() without `instrument_all`; "
+        "said once at close"
+    ),
+    (
+        "_adapters/_pydantic_ai_attach.py",
+        "report_once",
+        "'adapters.pydantic_ai.instrumentation_followed'",
+    ): NotADrop("wardex attached to the instrumentation the host set after init(); said once"),
+    (
+        "_adapters/_pydantic_ai_attach.py",
+        "report_once",
+        "'adapters.pydantic_ai.instrumentation_off'",
+    ): NotADrop("the host turned pydantic-ai's instrumentation off after init(); said once"),
+    (
+        "_adapters/_pydantic_ai_attach.py",
+        "report_once",
+        "'adapters.pydantic_ai.instrumentation_not_followed'",
+    ): NotADrop(
+        "the host moved pydantic-ai's instrumentation after init() to a setup that takes no span "
+        "processor; said once"
+    ),
+    ("_adapters/_pydantic_ai.py", "report_once", "'adapters.pydantic_ai.schema_version'"): (
+        NotADrop(
+            "an instrumentation schema this release was not written against, said once; spans ship"
+        )
+    ),
+    ("_adapters/_pydantic_ai.py", "report_once", "'adapters.pydantic_ai.unreachable'"): L(
+        "INSTRUMENTATION_UNAVAILABLE", at="_adapters/__init__.py"
+    ),
+    ("_adapters/_pydantic_ai.py", "report_once", "f'adapters.pydantic_ai.degraded.{where}'"): (
+        _GUARDED
+    ),
     # -- adapters: the OTel bridge
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.attr_dropped'"): (
         NotADrop("an attribute outside the bridge's allow-list, left out by policy")
@@ -567,6 +703,24 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "f'adapters.{label}.otel_bridge.undecodable'",
     ): L("BRIDGE_REQUEST_REJECTED"),
     # -- assembly core
+    ("_assembly/_bridge_latch.py", "bump", "'assembly._bridge_latch.parent_resolved'"): NotADrop(
+        "a request parented one level deeper, to a bridge unit below the ambient one; nothing lost"
+    ),
+    (
+        "_assembly/_bridge_latch.py",
+        "bump",
+        "'assembly._bridge_latch.tool_call_resolved'",
+    ): NotADrop(
+        "a wire tool call parented to the bridge's live tool unit of its name; nothing lost"
+    ),
+    (
+        "_assembly/_bridge_latch.py",
+        "bump",
+        "'assembly._bridge_latch.tool_call_unproved'",
+    ): NotADrop(
+        "a tool unit matched by name only, outside the writer's run; the wire call keeps the "
+        "seam's own placement and ships"
+    ),
     ("_assembly/_builder.py", "bump", "'assembly.builder.gen_ai_usage_not_inclusive'"): NotADrop(
         "an observation about upstream usage numbers; the span ships whole"
     ),
@@ -680,6 +834,26 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_assembly/_units.py", "bump", "'assembly._units.stale_pin_ambient'"): _UNITS,
     ("_assembly/_units.py", "bump", "'assembly._units.stale_pin_foreign_registry'"): _UNITS,
     ("_assembly/_units.py", "bump", "f'assembly._units.{where}_table_full'"): _UNITS,
+    ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.hold_refused'"): NotADrop(
+        "a usage hold refused; the framework's numbers stay demoted extras on the span"
+    ),
+    ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.promote_skipped'"): NotADrop(
+        "a demoted usage pair left where it was, still on the span as an extra"
+    ),
+    (
+        "_assembly/_usage_hold.py",
+        "bump",
+        "'assembly._usage_hold.late_wire_usage_demoted'",
+    ): NotADrop(
+        "a wire span sealed after its unit promoted the same call's usage; its numbers move to "
+        "wardex.usage_late.* extras on the span, so the call is counted once"
+    ),
+    ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.usage_kept_demoted'"): NotADrop(
+        "the wire span under the unit carries the usage; the framework's copy stays demoted"
+    ),
+    ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.usage_promoted'"): Marker(
+        "NO_WIRE_EVIDENCE"
+    ),
     # -- the client
     ("__init__.py", "report_once", "'wardex.set_context.non_scalar'"): NotADrop(
         "a value an attribute cannot hold stays on the scope; the line, said at the "
@@ -734,6 +908,8 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_tracing.py", "bump", "'tracing.manual_span_unshippable'"): L("UNMARSHALLABLE"),
     ("_tracing.py", "record", "DropReason.UNMARSHALLABLE"): L("UNMARSHALLABLE"),
     ("_tracing.py", "report_once", "'tracing.manual_span_unshippable'"): L("UNMARSHALLABLE"),
+    # The span a block was closing when the close met the recursion limit: dropped whole.
+    ("_tracing.py", "tally", "'tracing.close_at_limit'"): _AT_LIMIT,
     # -- the byte seams and protocols
     ("_interceptors/_http1_requests.py", "bump", "'protocol.http1.request_unfinished'"): _SEAM,
     ("_interceptors/_http1_requests.py", "bump", "'protocol.http1.request_unobserved'"): _SEAM,
@@ -747,6 +923,11 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "report_once",
         "'interceptors.mcp_stdio.protocol_version_unreadable'",
     ): _VERSION_REFUSED,
+    (
+        "_interceptors/_mcp_result.py",
+        "bump",
+        "'interceptors.mcp_stdio.nested_under_tool_unit'",
+    ): NotADrop("the seam's tools/call nested under the framework's execute_tool; the span ships"),
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.anyio_unavailable'"): _MCP,
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.execute_tool_ceded'"): (
         _TOOL_CEDED
@@ -774,6 +955,41 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_interceptors/_mcp_stdio.py", "report_once", "'interceptors.mcp_stdio.pending_evicted'"): (
         L("TABLE_FULL")
     ),
+    # A chunk's bytes, or a parser-latch line, that met the recursion limit inside wardex's own
+    # feed: the host's call had already returned, and the transaction the chunk belonged to is
+    # left short of it.
+    (
+        "_interceptors/_mcp_stdio.py",
+        "tally",
+        "'interceptors.mcp_stdio.disabled_report.recursion_limit'",
+    ): _AT_LIMIT,
+    ("_interceptors/_mcp_stdio.py", "tally", "'interceptors.mcp_stdio.readline.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_mcp_stdio.py", "tally", "'interceptors.mcp_stdio.receive.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_mcp_stdio.py", "tally", "'interceptors.mcp_stdio.send.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_mcp_stdio.py", "tally", "'interceptors.mcp_stdio.write.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_seam.py", "tally", "'interceptors.seam.disabled_report.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_socket.py", "tally", "'interceptors.socket.recv.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_socket.py", "tally", "'interceptors.socket.recv_into.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_socket.py", "tally", "'interceptors.socket.send.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_socket.py", "tally", "'interceptors.socket.sendall.recursion_limit'"): (
+        _AT_LIMIT
+    ),
+    ("_interceptors/_ssl.py", "tally", "'interceptors.ssl.read.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_ssl.py", "tally", "'interceptors.ssl.recv.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_ssl.py", "tally", "'interceptors.ssl.recv_into.recursion_limit'"): _AT_LIMIT,
+    ("_interceptors/_ssl.py", "tally", "'interceptors.ssl.send.recursion_limit'"): _AT_LIMIT,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.path_excluded'"): _POLICY,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.peer_unresolved'"): Marker(
         "PEER_UNRESOLVED", at="_interceptors/_seam.py"
@@ -790,7 +1006,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ),
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.ws_llm_endpoint_unconfirmed'"): _SEAM,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.ws_llm_semantics_unread'"): Marker(
-        "WS_LLM_SEMANTICS_UNREAD", at="_interceptors/_trackers.py"
+        "WS_LLM_SEMANTICS_UNREAD", at="_interceptors/_ws_tracker.py"
     ),
     # Plaintext HTTP on a uvloop loop never passes the socket methods the seam patches;
     # recorded once its first response is seen.
@@ -804,6 +1020,23 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     # An HTTP/2 body past its cap bumps nothing: the span ships with
     # `Limitation.BODY_CAP_EXCEEDED`, and the limitation census holds that site.
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_parent_forgotten'"): _SEAM,
+    # A model call whose latch entry the cap evicted and whose answer the tracker never paired:
+    # the wire record is lost (the chat unit keeps its promoted usage, so the number is not).
+    # Two bump sites: at close, and on overflow, the moment the bounded record forgets the
+    # stream. An answer that arrives after that forgetting is not taken back: it ships as
+    # `HTTP ? /` with no witness, so the count can overstate by one per forgotten-then-answered
+    # call. A stream a RST_STREAM ended (either peer) is let go uncounted: the native feed
+    # reports reset ids, and a request the host cancelled is not a loss.
+    ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_call_unanswered'"): _SEAM,
+    # Any other stream whose latch entry the cap evicted while it held a parent, and whose answer
+    # never arrived. Fires only when the cap had already evicted the entry: an unanswered stream
+    # the cap never touched is not counted, though it leaves the same nothing at close. Reset
+    # streams are let go uncounted here too.
+    ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_unanswered'"): _SEAM,
+    ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_witnessed'"): NotADrop(
+        "the answer to a model call whose latch entry the cap evicted reaches the seal with the "
+        "evicted parent as its witness, so the wire span's number is the only one counted"
+    ),
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.request_unobserved'"): _SEAM,
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.stream_evicted'"): Marker(
         "H2_REQUEST_EVICTED", at="_interceptors/_trackers.py"
@@ -1035,6 +1268,10 @@ def _signal(call: ast.Call, module: str, bindings: _Bindings) -> tuple[str, ast.
     first = call.args[0] if call.args else None
     if name == "bump" and isinstance(func, ast.Attribute):
         return "bump", first
+    if name == "append" and isinstance(func, ast.Attribute) and _tail(func.value) == "tally":
+        # `counters.tally.append(label)`: the frame-free count a site at the recursion limit
+        # makes in place of a bump (`Counters` in `_assembly/_diag.py` says why).
+        return "tally", first
     if name == "count" and isinstance(func, ast.Attribute) and module.startswith("_adapters/"):
         return "count", first
     if name == "report_once":
@@ -1221,6 +1458,7 @@ def test_the_census_sees_every_kind_of_signal(tmp_path):
     (src / "_adapters" / "mod.py").write_text(
         "def f(ctx, registry, counters, ledger):\n"
         "    counters.bump('a.b')\n"
+        "    counters.tally.append('t')\n"
         "    ctx.count('c')\n"
         "    report_once('line', key='k')\n"
         "    self._report_lost(1, why='w', key='lost')\n"
@@ -1235,6 +1473,7 @@ def test_the_census_sees_every_kind_of_signal(tmp_path):
     found = set(_scan(src))
     assert found == {
         ("_adapters/mod.py", "bump", "'a.b'"),
+        ("_adapters/mod.py", "tally", "'t'"),
         ("_adapters/mod.py", "count", "'c'"),
         ("_adapters/mod.py", "report_once", "'k'"),
         ("_adapters/mod.py", "report_lost", "'lost'"),
@@ -1294,6 +1533,14 @@ def _uncalled_signals(tree: ast.AST, module: str) -> list[str]:
     """Every place `tree` names a signal callable without calling it there."""
     bindings = _bindings(tree)
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    # `counters.tally` is a signal only as the receiver of an `.append` call.
+    appended_to = {
+        id(node.func.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+    }
     found: list[str] = []
     for node in ast.walk(tree):
         if id(node) in called:
@@ -1305,6 +1552,7 @@ def _uncalled_signals(tree: ast.AST, module: str) -> list[str]:
             name = spelled.attr
             hit = (
                 name in {"bump", "report_once", "_report_lost"}
+                or (name == "tally" and id(spelled) not in appended_to)
                 or (name == "count" and module.startswith("_adapters/"))
                 or (name in _LEDGER_CALLS and _tail(spelled.value) in bindings.modules)
             )
@@ -1344,6 +1592,8 @@ def test_the_renaming_rule_sees_each_way_of_renaming():
         "    hooks = [_ledger.record_items]\n"
         "    tally = getattr(counters, 'bump')\n"
         "    sink = ctx.count\n"
+        "    inbox = counters.tally\n"
+        "    counters.tally.append('fine')\n"
         "    for record in rows:\n"
         "        record.close()\n"
     )
@@ -1355,4 +1605,5 @@ def test_the_renaming_rule_sees_each_way_of_renaming():
         "_ledger.record_items",
         "getattr(counters, 'bump')",
         "ctx.count",
+        "counters.tally",
     }

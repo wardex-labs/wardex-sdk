@@ -194,7 +194,8 @@ def test_python_side_fallback_defaults_match_core():
     from wardex_sdk._assembly import UnitRegistry
     from wardex_sdk._interceptors._conn_timing import ConnTimingStore
     from wardex_sdk._interceptors._mcp_stdio import _ProcState
-    from wardex_sdk._interceptors._trackers import _Http2Tracker, _WebSocketTracker
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+    from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 
     core = _wardex_native.limits_defaults()
 
@@ -704,7 +705,7 @@ def _probe_max_streams() -> bool:
     def surviving(limits) -> int | None:
         parser = _wardex_native.protocol.Http2Parser(limits)
         parser.feed(True, requests)
-        _opened, txns = parser.feed(False, responses)
+        _opened, txns, _reset = parser.feed(False, responses)
         # A stream evicted by the cap loses the request half it was holding,
         # so its transaction comes back without the method it was opened
         # with — and says so. A method-less transaction that does NOT say so
@@ -796,7 +797,7 @@ def test_max_streams_survivors_are_the_highest_ids():
     requests, responses = _h2_open_requests_then_respond(sids)
     parser = _wardex_native.protocol.Http2Parser(_native(max_streams=2))
     parser.feed(True, requests)
-    _opened, txns = parser.feed(False, responses)
+    _opened, txns, _reset = parser.feed(False, responses)
     kept = sorted(t.stream_id for t in txns if not t.request_evicted)
     assert kept == [13, 15]
     assert all(t.method == "" for t in txns if t.request_evicted)

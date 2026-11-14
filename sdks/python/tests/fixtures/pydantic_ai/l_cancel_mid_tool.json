@@ -1,0 +1,78 @@
+{
+ "scenario": "l_cancel_mid_tool",
+ "spans": [
+  {
+   "name": "invoke_agent cancelled",
+   "kind": "INTERNAL",
+   "parent": null,
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "model_name": "test",
+    "agent_name": "cancelled",
+    "gen_ai.agent.name": "cancelled",
+    "gen_ai.agent.call.id": "01a1b75d-3b41-7295-947b-19e2d3fb10ee",
+    "gen_ai.conversation.id": "01a1b75d-3b41-7295-947b-19e394b630d5",
+    "gen_ai.operation.name": "invoke_agent",
+    "logfire.msg": "cancelled run",
+    "gen_ai.aggregated_usage.input_tokens": 51,
+    "gen_ai.aggregated_usage.output_tokens": 4,
+    "pydantic_ai.all_messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"x\"}]}]",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"pydantic_ai.all_messages\":{\"..."
+   },
+   "events": []
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent cancelled",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "cancelled",
+    "gen_ai.agent.call.id": "01a1b75d-3b41-7295-947b-19e2d3fb10ee",
+    "gen_ai.conversation.id": "01a1b75d-3b41-7295-947b-19e394b630d5",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"slow\",\"parameters_json_schema\":{...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"slow\",\"parameters\":{\"additionalP...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"x\"}]}]",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"pyd_...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 51,
+    "gen_ai.usage.output_tokens": 4,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  },
+  {
+   "name": "execute_tool slow",
+   "kind": "INTERNAL",
+   "parent": "invoke_agent cancelled",
+   "status": "ERROR",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.tool.name": "slow",
+    "gen_ai.tool.call.id": "pyd_ai_tool_call_id__slow",
+    "gen_ai.tool.call.arguments": "{\"x\":0}",
+    "gen_ai.agent.name": "cancelled",
+    "gen_ai.agent.call.id": "01a1b75d-3b41-7295-947b-19e2d3fb10ee",
+    "gen_ai.conversation.id": "01a1b75d-3b41-7295-947b-19e394b630d5",
+    "logfire.msg": "running tool: slow",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.tool.call.arguments\":..."
+   },
+   "events": [
+    {
+     "name": "exception",
+     "attributes": {
+      "exception.type": "asyncio.exceptions.CancelledError",
+      "exception.escaped": "True"
+     }
+    }
+   ]
+  }
+ ]
+}

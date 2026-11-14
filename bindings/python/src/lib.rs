@@ -175,6 +175,12 @@ impl Http2Transaction {
     fn request_ended(&self) -> bool {
         self.inner.request_ended
     }
+    /// The response half ended: false only for a transaction `finish` handed
+    /// back at connection close, whose response body is what arrived so far.
+    #[getter]
+    fn response_ended(&self) -> bool {
+        self.inner.response_ended
+    }
     #[getter]
     fn content_type(&self) -> Option<String> {
         self.inner.content_type.clone()
@@ -206,6 +212,10 @@ struct Http2Parser {
     inner: Http2Connection,
 }
 
+/// The streams one `Http2Parser.feed` call opened: `(stream_id, request path)`,
+/// the path None when the request carried none or the bound dropped it.
+type OpenedStreams = Vec<(u32, Option<String>)>;
+
 #[pymethods]
 impl Http2Parser {
     #[new]
@@ -219,19 +229,30 @@ impl Http2Parser {
         })
     }
 
+    /// Feeds `data` read in the direction `from_client` names. Returns
+    /// `(opened, transactions, reset)`: `opened` holds a `(stream_id, path)`
+    /// pair for each stream whose request ended in this call, the path read
+    /// as it ended (None when the request carried none or the bound dropped
+    /// it), `transactions` the exchanges whose response ended, and `reset`
+    /// the stream ids a RST_STREAM from either peer ended in this call.
     fn feed(
         &mut self,
         from_client: bool,
         data: &[u8],
-    ) -> PyResult<(Vec<u32>, Vec<Http2Transaction>)> {
+    ) -> PyResult<(OpenedStreams, Vec<Http2Transaction>, Vec<u32>)> {
         shielded(|| {
             let r = self.inner.feed(from_client, data);
+            let opened = r
+                .opened_request_streams
+                .into_iter()
+                .zip(r.opened_request_paths)
+                .collect();
             let txns = r
                 .transactions
                 .into_iter()
                 .map(|inner| Http2Transaction { inner })
                 .collect();
-            Ok((r.opened_request_streams, txns))
+            Ok((opened, txns, r.reset_streams))
         })
     }
 
@@ -239,6 +260,20 @@ impl Http2Parser {
     /// still parsing normally.
     fn disabled_reason(&self) -> PyResult<Option<&'static str>> {
         shielded(|| Ok(self.inner.disabled_reason()))
+    }
+
+    /// The connection closed: every stream whose response status arrived and
+    /// whose response never ended, as transactions with `response_ended`
+    /// false. Later frames for those streams are discarded.
+    fn finish(&mut self) -> PyResult<Vec<Http2Transaction>> {
+        shielded(|| {
+            Ok(self
+                .inner
+                .finish()
+                .into_iter()
+                .map(|inner| Http2Transaction { inner })
+                .collect())
+        })
     }
 }
 

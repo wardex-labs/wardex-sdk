@@ -343,6 +343,28 @@ def test_only_a_final_release_in_a_tested_minor_is_measured(version, measured):
     assert is_measured(entry, version) is measured
 
 
+@pytest.mark.parametrize(
+    ("version", "measured"),
+    [
+        ("2.0.0", True),
+        ("2.66.0", True),
+        ("2.66", True),
+        ("3.0.0", False),
+        ("1.99.0", False),
+        ("2.66.0rc1", False),
+        ("2.66.0.post1", False),
+        ("2.5.1", False),
+    ],
+    ids=["first", "measured", "two-part", "next-major", "previous-major", "rc", "post", "bad"],
+)
+def test_a_bare_major_measures_every_final_release_of_it(version, measured):
+    """A framework that releases a minor every week is measured as a whole major, because
+    what its adapter reads carries its own version and is checked at install; the rest of
+    the rule (final releases only, `known_bad` excluded) is the minor rule's."""
+    entry = Measured("x", ("2",), known_bad=("2.5.1",))
+    assert is_measured(entry, version) is measured
+
+
 def test_every_shipped_adapter_has_a_row_in_the_table():
     assert set(MEASURED) == set(AdapterName)
 
@@ -360,6 +382,8 @@ def _test_pins() -> dict[str, tuple[str, str]]:
 
 
 def _minor_after(minor: str) -> str:
+    if "." not in minor:
+        return str(int(minor) + 1)  # a bare major: the pin's ceiling is the next major
     major, number = minor.split(".")
     return f"{major}.{int(number) + 1}"
 
@@ -398,4 +422,8 @@ def test_diagnostics_reads_no_framework(lines):
     any time without paying for, or executing, a framework import."""
     before = set(sys.modules)
     wardex.diagnostics()
-    assert not {m for m in set(sys.modules) - before if m.split(".")[0] in ("agents", "langgraph")}
+    assert not {
+        m
+        for m in set(sys.modules) - before
+        if m.split(".")[0] in ("agents", "langgraph", "pydantic_ai", "opentelemetry")
+    }

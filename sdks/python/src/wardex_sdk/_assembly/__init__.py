@@ -72,6 +72,13 @@ from .._types import (
     GenAIAttributes,
     ToolAttributes,
 )
+from ._bridge_latch import (
+    canonical_arguments,
+    latch_parent,
+    latch_tool_call,
+    set_span_resolver,
+    set_tool_call_resolver,
+)
 from ._builder import NULL_DRAFT, OTEL_ERROR_TYPE_OTHER, IntegrityBuilder, SpanDraft
 from ._diag import (
     Counters,
@@ -116,6 +123,7 @@ from ._parentage import (
 )
 from ._patchset import PatchSet
 from ._policy import Prefilter, capture_mode_of, should_capture
+from ._restore import ambient_restore_point
 from ._snapshot import SnapshotDraft
 from ._units import (
     PinToken,
@@ -127,6 +135,7 @@ from ._units import (
     ambient_stated_conversation,
     parent_is_closed_unit,
 )
+from ._usage_hold import demote_late_usage, hold_framework_usage, witness_request
 from ._vocab import (
     Block,
     LinkReason,
@@ -173,7 +182,9 @@ __all__ = [
     "UnitKind",
     "UnitRegistry",
     "VocabularyError",
+    "ambient_restore_point",
     "ambient_stated_conversation",
+    "canonical_arguments",
     "cap_at_alias_tier",
     "capture_mode_of",
     "child_of",
@@ -182,12 +193,16 @@ __all__ = [
     "debug_host_error",
     "debug_refused_call",
     "degraded_run",
+    "demote_late_usage",
     "diag_info",
     "diag_warning",
     "guard",
+    "hold_framework_usage",
     "in_degraded_run",
     "is_declared_extra_key",
     "latch_ambient",
+    "latch_parent",
+    "latch_tool_call",
     "lose",
     "parent_is_closed_unit",
     "record",
@@ -204,6 +219,9 @@ __all__ = [
     "report_worker_pass_raised",
     "resolve_observed",
     "resolve_parentage",
+    "set_span_resolver",
+    "set_tool_call_resolver",
     "should_capture",
     "vocabulary_name",
+    "witness_request",
 ]

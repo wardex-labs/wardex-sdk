@@ -416,7 +416,7 @@ def test_an_overloaded_parse_queue_does_not_count_ordinary_traffic_as_lost(serve
     ("path", "api"),
     [
         ("/v1beta/models/gemini-2.0-flash:generateContent", "the Google Gemini API"),
-        ("/model/anthropic.claude-3-haiku/converse", "Amazon Bedrock"),
+        ("/model/anthropic.claude-3-haiku/invoke", "Amazon Bedrock"),
         ("/api/chat", "the Ollama API"),
     ],
 )
@@ -429,6 +429,27 @@ def test_a_refused_call_to_an_unread_model_api_is_counted_and_said_once(server, 
     lines = [line for line in capsys.readouterr().err.splitlines() if api in line]
     assert len(lines) == 1, lines
     assert "wardex.span" in lines[0] and "capture_mode=CaptureMode.ALL" in lines[0]
+
+
+def test_a_bedrock_converse_call_is_read_not_refused_as_an_unread_api(server, capsys):
+    """Converse is parsed, so a call to it ships as a model call rather than as an unread API's
+    refusal. 127.0.0.1 proves no provider: the span names none and says so."""
+    server.post_reply = json.dumps(
+        {
+            "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 3, "outputTokens": 1, "totalTokens": 4},
+        }
+    ).encode()
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
+    _post(server.port, "/model/anthropic.claude-3-haiku/converse", b'{"messages":[]}')
+    (span,) = client_spans()
+    assert span.gen_ai.request_model == "anthropic.claude-3-haiku"
+    assert (span.gen_ai.input_tokens, span.gen_ai.output_tokens) == (3, 1)
+    assert span.gen_ai.provider is None
+    assert Limitation.PROVIDER_INFERRED in span.capture_integrity.limitations
+    assert "mode_refused" not in _losses()
+    assert "Amazon Bedrock" not in capsys.readouterr().err
 
 
 def test_ordinary_refusals_are_not_counted_as_model_calls(server, capsys):

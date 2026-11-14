@@ -455,14 +455,12 @@ class Runtime:
             if client is not None:
                 with guard("client.fork_reinit_failed"):
                     client._at_fork_reinit()
-            # step 3 — interceptors: per-connection tracking through the
-            # registry (patches stay installed), then the shared module
-            # singletons — the timing store's parent filenos, the close
-            # registry's parent object ids, and the propagation module's own
-            # lock (`uninstall_propagation()` is unconditionally on the
-            # child's teardown path, so that lock inherited held would hang
-            # atexit). All three module holders are reached through
-            # `sys.modules`: never imported means nothing to reset.
+            # step 3 — interceptors: per-connection tracking through the registry (patches stay
+            # installed), then the shared module singletons — the timing store's parent filenos,
+            # the close registry's parent object ids, the uvloop loss already counted, and the
+            # propagation module's own lock (`uninstall_propagation()` is unconditionally on the
+            # child's teardown path, so that lock inherited held would hang atexit). Each module
+            # holder is reached through `sys.modules`: never imported means nothing to reset.
             with guard("interceptors.fork_reinit_failed"):
                 if self._interceptors is not None:
                     self._interceptors._at_fork_reinit()
@@ -478,6 +476,7 @@ class Runtime:
             # the extension point is a duck-typed `at_fork_child()` the
             # transport may implement; ours are stateless and don't.
             with guard("adapters.fork_reinit_failed"):
+                _fork_reinit_module("_assembly._usage_hold")  # first: an adapter raise skips none
                 if self._adapters is not None:
                     self._adapters._at_fork_reinit()
             if client is not None:

@@ -5,7 +5,6 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from contextvars import ContextVar
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +37,7 @@ from ._types import (
     ToolAttributes,
 )
 from .context._contextvar import fork_scope
+from .context._current_span import _CURRENT_SPAN, _make_current, _unmake_current
 from .context._with_only import WithOnly
 
 if TYPE_CHECKING:
@@ -309,32 +309,6 @@ class Span:
 #: every host's `set_attribute` for the life of the process.
 _NULL_PARENTAGE = resolve_parentage(EMPTY_AMBIENT, Evidence(ParentSource.UNRESOLVED))
 
-#: The innermost span a `wardex.span()` block or a decorator opened in this
-#: context. Each span keeps the one it replaced (`Span._outer`), so a span that
-#: closed in another Context than it opened in — a generator's body, finished
-#: elsewhere — is skipped rather than reported as current.
-_CURRENT_SPAN: ContextVar[Span | None] = ContextVar("wardex_current_span", default=None)
-
-
-def current_span() -> Span | None:
-    """The innermost wardex span open in this context, or None outside every one.
-
-    The span a `with wardex.span(...)` block or a `@workflow`/`@agent`/`@tool`/
-    `@step` function is running under, so the code inside can call
-    `set_input`, `set_output`, `set_attribute` or `add_event` on it. Spans an
-    adapter opens for a framework are not returned: they are not the host's to
-    write. Never raises. Before `init()` a block's span is returned as well; like
-    the block, it records nothing.
-    """
-    return _open_from(_CURRENT_SPAN.get())
-
-
-def _open_from(span: Span | None) -> Span | None:
-    """`span`, or the first open span it was opened under."""
-    while span is not None and not span._open:
-        span = span._outer
-    return span
-
 
 def _shippable(finished: InternalSpan | None) -> InternalSpan | None:
     """`finished`, or None (said once) when a field would fail the exporter's whole batch."""
@@ -457,34 +431,42 @@ def _begin(
         interrupt = functools.partial(_interrupt, builder)
         interrupt.unbound_root = unbound_root  # type: ignore[attr-defined]  # `unseen_parent`
         tracked = _runtime.runtime().track_open_span(id(builder), interrupt)
+    # What `_WithOnly.__exit__` undoes when this close cannot run at all (see there).
+    builder._undo = (tracked, installed, current)  # type: ignore[attr-defined]
     try:
         yield builder
     finally:
-        _unmake_current(builder, current)
-        if installed is not None:
-            with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
-                installed.take_down()
-        # Finished, and its client found, BEFORE it leaves the table: a signal
-        # landing between the pop and the capture finds the span neither
-        # tracked nor buffered, so that gap is kept to the capture alone.
-        finished = None
-        # `_finish()` validates, and a vocabulary breach must not reach the host
-        # (I6) — a `with wardex.span(...)` block would otherwise raise on the
-        # way out of code that has nothing to do with wardex.
-        with guard("tracing.manual_span", debug=_debug_enabled()):
-            finished = builder._finish()
-        finished = _shippable(finished)
-        client = None
-        with guard("tracing.manual_client", debug=_debug_enabled()):
-            client = _hub.get_client()
-        # Gone from the table means a shutdown already shipped this span,
-        # marked as cut off, while the block was still open; a second copy
-        # under the same span id would contradict it. No `return` here: in a
-        # `finally` it would swallow the host's exception.
-        untaken = tracked is None or tracked.pop(id(builder), None) is not None
-        if untaken and client is not None and finished is not None:
-            with guard("tracing.manual_emit", debug=_debug_enabled()):
-                client.capture_span(finished)
+        # None: `_WithOnly.__exit__` gave this close up, and a late close of the suspended
+        # generator must neither take the scope down again nor ship the span.
+        if getattr(builder, "_undo", None) is not None:
+            _unmake_current(builder, current)
+            if installed is not None:
+                with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
+                    installed.take_down()
+            # Finished, and its client found, BEFORE it leaves the table: a signal
+            # landing between the pop and the capture finds the span neither
+            # tracked nor buffered, so that gap is kept to the capture alone.
+            finished = None
+            # `_finish()` validates, and a vocabulary breach must not reach the host
+            # (I6) — a `with wardex.span(...)` block would otherwise raise on the
+            # way out of code that has nothing to do with wardex.
+            with guard("tracing.manual_span", debug=_debug_enabled()):
+                finished = builder._finish()
+            finished = _shippable(finished)
+            client = None
+            with guard("tracing.manual_client", debug=_debug_enabled()):
+                client = _hub.get_client()
+            # Gone from the table means a shutdown already shipped this span,
+            # marked as cut off, while the block was still open; a second copy
+            # under the same span id would contradict it. No `return` here: in a
+            # `finally` it would swallow the host's exception.
+            untaken = tracked is None or tracked.pop(id(builder), None) is not None
+            if untaken and client is not None and finished is not None:
+                with guard("tracing.manual_emit", debug=_debug_enabled()):
+                    client.capture_span(finished)
+            # Nothing is left to undo, and kept, the Token would hold the span this one replaced:
+            # a closed span the task still reads past would keep every span before it.
+            builder._undo = None  # type: ignore[attr-defined]
 
 
 def _interrupt(span: Span, marker: Limitation, end_ns: int) -> InternalSpan | None:
@@ -500,28 +482,6 @@ def _interrupt(span: Span, marker: Limitation, end_ns: int) -> InternalSpan | No
         span._draft.add_limitation(marker)
         finished = span._draft.finish(span.end_time_ns or end_ns)
     return _shippable(finished)
-
-
-def _make_current(span: Span) -> Any:
-    """Make `span` what `current_span()` answers here; the token to undo it with."""
-    span._outer = current_span()
-    return _CURRENT_SPAN.set(span)
-
-
-def _unmake_current(span: Span, token: Any) -> None:
-    span._open = False
-    # Closed in another Context, it stays in the one it opened in: linking it on
-    # to closed spans would keep every span a long-lived task ever opened.
-    span._outer = _open_from(span._outer)
-    if token is None:
-        return
-    try:
-        _CURRENT_SPAN.reset(token)
-    except ValueError:
-        # Ended in another Context than it began in (a generator's body
-        # finished elsewhere): that Context keeps the span, which `_open`
-        # now makes `current_span()` step past.
-        pass
 
 
 class _Installed:
@@ -627,15 +587,52 @@ class _WithOnly(WithOnly):
         # `__class__`, which is the host's code and can raise in place of the
         # exception the host is raising. `type()` and a subclass check against a
         # builtin run nothing of the host's.
-        if issubclass(type(exc), Exception) and self._span is not None:
-            try:
-                _record_exception(self._span, exc, tb)
-            except BaseException:
-                # A signal landing mid-record must not leave the span unfinished
-                # and its fork installed as the active parent.
-                self._cm.__exit__(exc_type, exc, tb)
-                raise
-        return self._cm.__exit__(exc_type, exc, tb)
+        #
+        # A RecursionError out of the work below is wardex's own bookkeeping
+        # meeting the interpreter's limit on the host's stack, typically while
+        # the host's own RecursionError unwinds through each decorated level.
+        # Raised, it would reach the host chained onto whatever the block was
+        # leaving with. So it is dropped, tallied with `counters.tally` (a
+        # `bump` would push a frame), and the block leaves exactly as it would
+        # have without wardex: with the host's exception, or with none.
+        # `except`, the tally's `append` and `return` push no frame.
+        try:
+            if issubclass(type(exc), Exception) and self._span is not None:
+                try:
+                    _record_exception(self._span, exc, tb)
+                except BaseException:
+                    # A signal landing mid-record must not leave the span
+                    # unfinished and its fork installed as the active parent.
+                    self._cm.__exit__(exc_type, exc, tb)
+                    raise
+            return self._cm.__exit__(exc_type, exc, tb)
+        except RecursionError:
+            # The close may have stopped before `_begin`'s `finally` ran, or partway through it
+            # (the limit was lowered inside the block, so it closes with fewer free frames than it
+            # opened with). The span is lost either way; it must not also stay in the open-span
+            # table, nor stay installed as the parent of what this thread opens next, an edge to a
+            # span that never ships, nor stay what `current_span()` answers. C calls only, which
+            # push no frame: a Token already used, or made in another Context, is refused, and the
+            # scope stays as `take_down` left it. `_undo = None` makes a later close of the
+            # suspended generator do nothing.
+            undo = getattr(self._span, "_undo", None)
+            if undo is not None:
+                self._span._undo = None  # type: ignore[union-attr]
+                self._span._open = False  # type: ignore[union-attr]
+                if undo[0] is not None:
+                    undo[0].pop(id(self._span), None)
+                if undo[1] is not None:
+                    try:
+                        _hub._current_scope.reset(undo[1]._token)
+                    except (RuntimeError, ValueError):
+                        pass
+                if undo[2] is not None:
+                    try:
+                        _CURRENT_SPAN.reset(undo[2])
+                    except (RuntimeError, ValueError):
+                        pass
+            counters.tally.append("tracing.close_at_limit")
+            return False
 
 
 @contextmanager

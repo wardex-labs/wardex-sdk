@@ -83,6 +83,7 @@ _SEAM = "_interceptors/_seam.py"
 _MCP = "_interceptors/_mcp_stdio.py"
 _GENAI = "_semantics/_genai.py"
 _CX = "_adapters/_codex_exec.py"
+_PA = "_adapters/_pydantic_ai.py"
 
 #: Every `set_extra` call in the package: (module, key as written, value as
 #: written) and where the value comes from. One row per call, so a key written
@@ -162,6 +163,14 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_CX, "'wardex.codex.item_type'", "ev.item_type", HOST),
     (_CX, "'wardex.codex.version'", "view.version", HOST),
     (_CX, "'wardex.codex.error'", "messages[-1][:500]", HOST),
+    # -- the Pydantic AI bridge --
+    (_PA, "'wardex.framework'", "_FRAMEWORK", LITERAL),
+    # The instrumentation schema version the host's pydantic-ai spans are written in.
+    (_PA, "'wardex.pydantic_ai.schema_version'", "schema", NUMBER),
+    # The one loop that copies the framework's own values, renamed through the closed
+    # tables in `_pydantic_ai_attrs.py`: run ids, demoted usage counts, cost, cache and
+    # retry facts. Mixed, so judged as the host's: nothing is exempted from the walk.
+    (_PA, "key", "value", HOST),
     # -- the LangGraph adapter --
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),
@@ -217,6 +226,11 @@ _SITES: list[tuple[str, str, str, str]] = [
     # Traffic, so judged like any other text the request carried.
     (_GENAI, "REQUEST_CONVERSATION_KEY", "stated", HOST),
     (_GENAI, "REQUEST_CONVERSATION_KEY", "stated", HOST),
+    # -- the usage hold --
+    # A late wire span's typed token counts, moved out of its usage block
+    # because the unit above it already shipped them, and the flag saying so.
+    ("_assembly/_usage_hold.py", "LATE_USAGE_PREFIX + field", "value", NUMBER),
+    ("_assembly/_usage_hold.py", "LATE_USAGE_DEMOTED_KEY", "True", NUMBER),
     # -- the published API: `Span.set_attribute` and a snapshot's attributes --
     ("_tracing.py", "key", "stored", HOST),
     # The name a host gave `@wardex.step`, or its function's name: the host's.

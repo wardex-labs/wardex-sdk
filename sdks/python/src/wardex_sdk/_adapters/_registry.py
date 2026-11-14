@@ -261,7 +261,9 @@ class AdapterRegistry:
         # down after a clean return is the decline. An adapter that keeps no
         # such flag (a test double, an out-of-tree adapter) is taken at its word.
         if ok and getattr(adapter, "_installed", True) is not False:
-            self._statuses[name] = _installed_status(name)
+            self._statuses[name] = _installed_status(
+                name, getattr(adapter, "unmeasured_reason", "")
+            )
             return
 
         with guard(f"adapters.{name}.install_rollback"):
@@ -269,7 +271,11 @@ class AdapterRegistry:
         ctx.patches.restore_all()
         self._installed.pop(name, None)
         self._contexts.pop(name, None)
-        self._statuses[name] = _unsupported_status(name) if ok else _failed_status(name)
+        self._statuses[name] = (
+            _unsupported_status(name, getattr(adapter, "decline_reason", ""))
+            if ok
+            else _failed_status(name)
+        )
 
     def record(self, status: AdapterStatus) -> None:
         """File the status of an adapter that was never handed to `install`."""

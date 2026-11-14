@@ -15,6 +15,7 @@ so each test controls when (and whether) it is imported.
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import logging
 import os
 import subprocess
@@ -246,10 +247,13 @@ def test_an_untested_version_is_said_when_the_adapter_installs(framework, lines,
 
 def test_the_framework_module_keeps_its_own_loader(framework):
     """Whatever wardex wraps the loader with is gone once the module runs:
-    `importlib.resources`, `inspect.getsource` and `reload` read it."""
+    `importlib.resources`, `inspect.getsource` and `reload` read it. Another
+    package's path hook may hand out its own subclass (one of the suite's
+    dependencies installs beartype's), so the check is "not wardex's"."""
     _init()
     module = importlib.import_module(_FW)
-    assert type(module.__loader__).__name__ == "SourceFileLoader"
+    assert isinstance(module.__loader__, importlib.machinery.SourceFileLoader)
+    assert not type(module.__loader__).__module__.startswith("wardex_sdk")
     assert module.__spec__.loader is module.__loader__
     importlib.reload(module)
 
@@ -258,7 +262,7 @@ _REAL = textwrap.dedent(
     """
     import json, sys, time
     import wardex_sdk as wardex
-    frameworks = ("agents", "langgraph", "claude_agent_sdk")
+    frameworks = ("agents", "langgraph", "claude_agent_sdk", "pydantic_ai")
     wardex.init(transport=wardex.NoOpTransport())
     imported = sorted(m for m in frameworks if m in sys.modules)
     waiting = sorted(
@@ -283,7 +287,7 @@ def test_init_imports_none_of_the_installed_frameworks():
     assert out.returncode == 0, out.stderr
     report = __import__("json").loads(out.stdout.strip().splitlines()[-1])
     assert report["imported"] == []
-    assert report["waiting"] == ["anthropic_agent_sdk", "langgraph", "openai_agents"]
+    assert report["waiting"] == ["anthropic_agent_sdk", "langgraph", "openai_agents", "pydantic_ai"]
     assert report["after"]["openai_agents"] == "installed"
     assert report["after"]["langgraph"] == "waiting_for_import"
 

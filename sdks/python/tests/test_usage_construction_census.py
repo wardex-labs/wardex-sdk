@@ -35,12 +35,18 @@ import wardex_sdk
 #:   attributes, whose `input_tokens` already includes the cached part —
 #:   measured: the calls' usages sum exactly to the stream's turn total.
 #:
+#: * `_adapters/_pydantic_ai_attrs.py` — `chat_block`, the Pydantic AI chat
+#:   and failed-attempt block: no usage in the block; the core promotes the
+#:   framework's demoted numbers at close when no wire request was witnessed,
+#:   and pydantic's `input_tokens` already include cache reads.
+#:
 #: (`dataclasses.replace` on an existing block is not a construction site:
 #: it can only start from a block one of these two produced.)
 _FROZEN_SITES = {
     "_semantics/_genai.py": 1,
     "_adapters/_assembler.py": 1,
     "_adapters/_codex_exec.py": 2,
+    "_adapters/_pydantic_ai_attrs.py": 1,
 }
 
 

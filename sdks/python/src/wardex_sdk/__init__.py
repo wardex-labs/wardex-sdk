@@ -71,7 +71,7 @@ from ._scope import NO_USER as _NO_USER
 from ._scope import Scope, UserInfo
 from ._scope import user_from_call as _user_from_call
 from ._snapshot_api import capture_state_snapshot
-from ._tracing import Span, conversation, current_span, span
+from ._tracing import Span, conversation, span
 from ._types import (
     AgentAttributes,
     BeforeSendEnvelopeCallback,
@@ -88,6 +88,7 @@ from ._values import AttributeValue as _AttributeValue
 from ._version import __version__
 from .context._asgi import WardexAsgiMiddleware
 from .context._contextvar import bind_context
+from .context._current_span import current_span
 from .context._propagate import (
     continue_from_otel,
     continue_trace,

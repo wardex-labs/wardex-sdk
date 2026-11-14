@@ -56,7 +56,8 @@ from wardex_sdk._assembly import (
 )
 from wardex_sdk._enums import CaptureMode, SpanKind
 from wardex_sdk._interceptors._seam import _latched
-from wardex_sdk._interceptors._trackers import _Txn, _WebSocketTracker
+from wardex_sdk._interceptors._trackers import _Txn
+from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 from wardex_sdk._semantics import REQUEST_CONVERSATION_KEY
 from wardex_sdk._types import ConversationContext
 from wardex_sdk.testing import RecordingTransport

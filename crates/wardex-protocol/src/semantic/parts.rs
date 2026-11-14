@@ -227,11 +227,19 @@ pub const FINISH_REASONS: &[&str] = &["stop", "length", "tool_call", "content_fi
 /// `["tool_calls"]` from Chat next to `["tool_call"]` from Responses) on the
 /// one attribute dashboards group by.
 pub fn normalize_finish_reason(provider: &str, raw: &str) -> String {
+    // Bedrock Converse's `stopReason` spells Anthropic's stops (whatever the
+    // model family) and adds its two filter outcomes.
     let v = match (provider, raw) {
-        (_, "stop") | ("anthropic", "end_turn" | "stop_sequence") => "stop",
-        (_, "length") | ("anthropic", "max_tokens") | ("openai", "max_output_tokens") => "length",
-        (_, "tool_calls" | "function_call") | ("anthropic", "tool_use") => "tool_call",
-        (_, "content_filter") | ("anthropic", "refusal") => "content_filter",
+        (_, "stop") | ("anthropic" | "aws.bedrock", "end_turn" | "stop_sequence") => "stop",
+        (_, "length")
+        | ("anthropic" | "aws.bedrock", "max_tokens")
+        | ("openai", "max_output_tokens") => "length",
+        (_, "tool_calls" | "function_call") | ("anthropic" | "aws.bedrock", "tool_use") => {
+            "tool_call"
+        }
+        (_, "content_filter")
+        | ("anthropic", "refusal")
+        | ("aws.bedrock", "guardrail_intervened" | "content_filtered") => "content_filter",
         ("openai", "failed" | "cancelled") => FINISH_ERROR,
         _ => return raw.to_string(), // total: unknown passes through as itself
     };

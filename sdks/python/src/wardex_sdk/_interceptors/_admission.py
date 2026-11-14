@@ -172,10 +172,9 @@ _UNREAD_MODEL_HOSTS: tuple[tuple[str, str], ...] = (
 )
 #: The last path segment of Gemini's and Vertex AI's generation methods (`models/{m}:{method}`).
 _GEMINI_METHODS = (":generateContent", ":streamGenerateContent")
-#: Bedrock Runtime's operations on a model (`/model/{id}/{operation}`).
-_BEDROCK_OPERATIONS = frozenset(
-    {"converse", "converse-stream", "invoke", "invoke-with-response-stream"}
-)
+#: Bedrock Runtime's InvokeModel operations on a model (`/model/{id}/{operation}`): each model
+#: family's own body shape. Converse and ConverseStream are read (the endpoint table's rows).
+_BEDROCK_OPERATIONS = frozenset({"invoke", "invoke-with-response-stream"})
 #: Ollama's native endpoints, at the end of the path (a proxy may prefix them). A path rather than
 #: a host: Ollama runs wherever its user put it.
 _OLLAMA_PATHS = ("/api/chat", "/api/generate")
@@ -213,9 +212,12 @@ def count_refusal(treatment: str | None, host: str, path: str, debug: bool) -> N
     """The capture mode refused this exchange. A Conversations-API path (provider state, no model)
     is counted. A head that names a model API wardex does not parse yet was a model call refused
     only for not being recognised: recorded as `mode_refused` and said once per API, with what to
-    do. Any other refusal is ordinary traffic outside agent work and stays uncounted. Under debug,
-    every refusal is said by host and path with why, rate-limited (`debug_refused_call`)."""
-    api = None if treatment == "provider_state" else unread_model_api(host, path)
+    do. Any other refusal is ordinary traffic outside agent work and stays uncounted, as is a path
+    the endpoint table reads (`llm_call`, Bedrock's Converse on its own host among them): that API
+    is parsed, and this exchange was simply not a model call. Under debug, every refusal is said by
+    host and path with why, rate-limited (`debug_refused_call`)."""
+    unread = treatment not in ("provider_state", "llm_call")
+    api = unread_model_api(host, path) if unread else None
     if debug:
         what = api and f"a call to {api}, which wardex does not parse yet"
         if treatment == "provider_state":

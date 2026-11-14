@@ -132,7 +132,7 @@ All notable changes to this project are documented here. The format follows
   the half. A body cut at the budget is marked `body_cap_exceeded` and
   counted under `body_cap`.
 - **A call to a model API wardex does not parse yet is counted and said
-  once.** A Gemini, Vertex AI, Bedrock, Cohere, Mistral or Ollama
+  once.** A Gemini, Vertex AI, Bedrock InvokeModel, Cohere, Mistral or Ollama
   (`/api/chat`, `/api/generate`) call outside any span is counted under
   `mode_refused`, with one stderr line per API that says how to record it.
 - **`service_name`, `release` and `environment` fall back to the
@@ -152,6 +152,25 @@ All notable changes to this project are documented here. The format follows
   OpenTelemetry span and inside `with wardex.continue_from_otel():`.
 - **`wardex.testing.SpanNode` gains `status`, `attributes` and `events`.** A
   host test can assert that a tool failed or that `user.id` was stamped.
+- **Amazon Bedrock Converse calls are now recorded as model calls.** Before,
+  a request to `bedrock-runtime.<region>.amazonaws.com/model/<id>/converse` or
+  `/converse-stream` (what pydantic-ai's Bedrock model and boto3's `converse`
+  send) was an ordinary HTTP span with no model, no messages and no token
+  usage. Now both carry the provider `aws.bedrock`, the model id from the
+  request path, the input messages and system prompt, the reply's text, tool
+  calls and reasoning, the finish reason, and token usage with cached input
+  counted into the input total. A ConverseStream response, which arrives in
+  AWS's binary event-stream encoding rather than as server-sent events, is
+  reassembled into one reply. A stream that ends with an exception
+  (`throttlingException` and the like) marks the call failed with that
+  exception's name. An HTTP error answering a ConverseStream request is
+  recorded as the failed call it is, not as a stream that could not be read. A
+  pydantic-ai agent's model call on Bedrock names the provider `aws.bedrock` on
+  pydantic-ai's span too, as the wire span does. Bedrock's older InvokeModel API (`/invoke`,
+  `/invoke-with-response-stream`) is still not read as a model call, because
+  its bodies are each model family's own format. A Converse call to any other
+  host (a private DNS name, a gateway, a local stand-in) is read the same way
+  and carries no provider name, with the `provider_inferred` marker.
 
 - **wardex now says when an adapter is on a framework release it was not
   tested against, and when an adapter did not install at all.** A framework
@@ -161,12 +180,12 @@ All notable changes to this project are documented here. The format follows
   leave no tree at all while wardex still counted the adapter as installed.
   Now each adapter carries the releases it was tested on (openai-agents
   0.22.x, langgraph 1.2.x with langgraph-prebuilt 1.1.x, claude-agent-sdk
-  0.2.x). On another release it still installs and records, and one
-  `[wardex]` line, when the adapter installs, names the installed version,
-  the tested range and the pin back to it. An adapter that finds its
-  framework but not the surface it was written for, or that raises while
-  installing, is no longer counted as installed, and says so once with the
-  version it found. The new `wardex.diagnostics()` returns every adapter's
+  0.2.x, pydantic-ai-slim 2.x). On another release it still installs and
+  records, and one `[wardex]` line, when the adapter installs, names the
+  installed version, the tested range and the pin back to it. An adapter that
+  finds its framework but not the surface it was written for, or that raises
+  while installing, is no longer counted as installed, and says so once with
+  the version it found. The new `wardex.diagnostics()` returns every adapter's
   `AdapterState` (`installed`, `waiting_for_import`, `unsupported`,
   `failed`, `shadowed`, `absent`, `disabled`), the framework
   version, whether that version was tested, and the line wardex printed about
@@ -197,6 +216,73 @@ All notable changes to this project are documented here. The format follows
   for (`before_send_envelope` returning None) is counted there and is not a
   failure. Adapter states are now kept after `close()`, so a check made once
   the run is over still reads them.
+
+- **A Pydantic AI agent run is now a tree in the trace.** Before, only the
+  HTTP calls a pydantic-ai agent made were recorded, each one the root of its
+  own trace, so a run with three model calls and two tools read as three
+  unrelated requests. Now every agent run, model call and tool call
+  pydantic-ai instruments is a span (`invoke_agent`, `chat`, `execute_tool`,
+  a nested agent run as a sub-agent with its parent named), read live from
+  pydantic-ai's own OpenTelemetry spans, and the model call wardex reads on
+  the wire is nested under its `chat` span, streamed responses (`run_stream`)
+  included. What changes for you: install the framework and call
+  `wardex.init()`, nothing else. The adapter installs when your application
+  imports pydantic-ai (at `init()` if it already has). If pydantic-ai's
+  instrumentation was off, the adapter turns it on with wardex's own tracer
+  provider and `close()` turns it back off; wardex never sets the global
+  OpenTelemetry tracer or meter
+  provider, so a later `logfire.configure()` still takes effect. If it was
+  already on (Logfire, your own `InstrumentationSettings`), wardex adds a span
+  processor to that setup and your exporter receives exactly what it did
+  before; a provider with no way to remove a processor keeps wardex's
+  registered but inert after `close()`, and one that accepts no processor is
+  declined as `unsupported`, each said once on stderr. Token usage is read
+  from the wire; pydantic-ai's own numbers are kept under
+  `wardex.pydantic_ai.otel.*`, so a model call is never counted twice, and a
+  model call with no HTTP request under it (`TestModel`, a `FunctionModel`
+  that sends nothing) carries pydantic-ai's numbers as its usage and
+  `no_wire_evidence`. A request to an API wardex does not read as a model call
+  (Bedrock InvokeModel, a custom model's own endpoint) is treated the same
+  way: the request's span has no usage, and the model call carries
+  pydantic-ai's numbers and `no_wire_evidence`, counted once. So does a model
+  call whose response never completed (a timeout, a cancellation) or that was
+  sent over a WebSocket connection. When the request's span ships only later,
+  at connection close (an HTTP/2 stream whose end the server sent after the
+  client stopped reading), it carries no token usage; its numbers are under
+  `wardex.usage_late.*`, so the call is still counted once. Calling
+  `Agent.instrument_all(...)` or `logfire.instrument_pydantic_ai()` after
+  `init()` replaces wardex's setup, and your setup stays in place after
+  `close()`; wardex attaches to the new setup and keeps recording, said once on
+  stderr. `Agent.instrument_all(True)`
+  with no OpenTelemetry provider configured keeps wardex's own setup, as at
+  `init()`. Instrumentation turned off after `init()`, or moved to a setup that
+  accepts no span processor, is said once and the adapter records nothing from
+  then on; model calls are still captured from the wire. When wardex turned instrumentation on
+  itself, pydantic-ai's spans carry the ids of the spans wardex exports, so a
+  span your own tracer opens inside a run or a tool names wardex's run or
+  tool span as its parent. Tool arguments and results, and the run's messages,
+  go through the capture limits and masking like every other value. An MCP
+  tool call is the framework's `execute_tool` span under the run, and the
+  stdio interceptor's `MCP tools/call` span, carrying the JSON-RPC request and
+  response, nests under it in both connect orders and under a toolset shared
+  by several agents. The two are matched by tool name and arguments, and a
+  prefixed toolset (`.prefixed("srv")` or `MCP(tool_prefix="srv")`) nests too,
+  matched by its arguments (a prefixed name alone is never enough, and a call
+  that could belong to an exact name or a prefixed one nests under neither):
+  two calls of one tool in flight at once each nest under their own span, and
+  another MCP client's call with other arguments is never nested under the
+  agent's. When
+  two calls with the same arguments are in flight at once, the interceptor's
+  span keeps its own placement (under the run, or in a trace of its own when
+  the agent was entered with `async with agent` before the run) and the
+  adapter counts it as `adapters.pydantic_ai.tool_call_ambiguous`. An agent given its own instrumentation (`agent.instrument = ...`,
+  an `Instrumentation` capability, an `InstrumentedModel`) is not seen by the
+  adapter. `AdapterName.PYDANTIC_AI`; detected from `pydantic-ai-slim`;
+  tested on 2.x, because the contract the adapter reads is pydantic-ai's
+  instrumentation schema version 5, versioned apart from the package; a
+  schema version other than 5 is said once when the adapter installs, files the adapter as
+  `measured=False` in `wardex.diagnostics()`, and is recorded on the run as
+  `wardex.pydantic_ai.schema_version`.
 
 - **A `codex exec` your code runs is now an agent run in the trace.** Codex
   talks to its model from its own process, so before, an app that ran
@@ -359,6 +445,15 @@ All notable changes to this project are documented here. The format follows
   `test_quality_ratchets.py` fails if one of them is added and not named here.
 
 ### Changed
+
+- **A model call issued while an OpenTelemetry span that a wardex bridge owns
+  is current is parented to that span's unit, not to the enclosing run.** A
+  streamed response is read on the task that consumes it, where the run is
+  the innermost wardex span, so context alone would place the request beside
+  the bridge's model-call span instead of under it. The request is now placed
+  under the bridge's span whenever that span is the current OpenTelemetry
+  span and sits inside the unit the request would otherwise have gone to. Code that
+  uses no bridge adapter pays nothing for it and sees no change.
 
 - **openai-agents 0.23 is a tested release.** It was the release `pip install
   openai-agents` installed, and wardex said on every `init()` that it had not
@@ -667,6 +762,71 @@ All notable changes to this project are documented here. The format follows
 - **Claude Agent SDK adapter: a `SubagentStart` hook whose agent id is a
   number still opens the sub-agent span.**
 
+- **A `RecursionError` from your own code now reaches you as raised.** Before,
+  when the limit was hit inside a decorated function, a decorated generator or
+  an adapter's span (a LangGraph node that re-invokes its graph), a second
+  `RecursionError` from wardex's own frames could come chained onto yours. In
+  those cases, and in a `wardex.span` block, wardex also counted the error as
+  one of its own internal failures. Now nothing is chained onto it and wardex
+  no longer counts it as its own error. That holds when the limit is lowered
+  inside the span too: if a `wardex.span` block or an adapter's span
+  (LangGraph, Pydantic AI and the other adapters built on the same unit)
+  closes with too little room left for wardex to finish it, its close is
+  dropped and counted (`tracing.close_at_limit`,
+  `adapters.context.close_at_limit`), the span is closed later by its parent's
+  teardown or lost, and it no longer stays the parent of the next span on that
+  thread or task, on Python 3.12 and later at every depth where the exit can
+  start at all; on 3.10 and 3.11, where C calls count against the limit too,
+  one frame of room is still needed. If such a span is closed on a different
+  thread or task from the one that opened it (a generator closed elsewhere),
+  wardex leaves that other thread's current span and context untouched, where
+  it used to overwrite them (`adapters.context.close_at_limit_not_restored`).
+  The open of such a span also no longer asks "is there a running event loop"
+  by catching an exception, which at the limit chained that exception onto
+  yours.
+- **A streamed model call over HTTP/2 is recorded even when your client stops
+  reading at the last event.** The OpenAI SDK stops reading an HTTP/2 stream at
+  `[DONE]` and leaves it open, so a server or proxy that sends the stream's end
+  in a separate, later frame left that call with no wire span, and the token
+  usage it carried never reached your traces. Now, when the connection closes,
+  such a stream ships with everything that arrived, usage included. It is
+  marked `frame_parse_failed` and its status is left unset, because its end
+  was never seen, as an HTTP/1 response cut by a close already was. Under a
+  bridge adapter's chat span (pydantic-ai) the call is still counted once: the
+  chat span keeps pydantic-ai's numbers and `no_wire_evidence`, and the HTTP/2
+  span ships under it without token usage, the numbers it read kept under
+  `wardex.usage_late.*` with `wardex.usage_late.demoted` set to say so.
+- **A model call on an HTTP/2 connection with more open streams than
+  `max_streams` is no longer counted twice under a bridge adapter's chat
+  span.** When the per-connection bound dropped a stream's parent, the chat
+  span reported the framework's token usage as if no wire call had been seen,
+  and the wire span reported the same usage again. wardex now reads a model
+  call's path in the same parse that sees its request end, and keeps it when
+  the bound drops the request's header block before its body ends, so the path
+  survives both when two requests are sent in one write and when two tasks
+  interleave their frames on one connection with `max_streams=1` (each used to
+  lose it). Its answer ships under that path even when the bound also dropped
+  the request (named `HTTP ? /v1/chat/completions` and marked
+  `h2_request_evicted`, where it used to be `HTTP ? /`). The chat span keeps
+  the framework's numbers aside, as it does for every other call. If the
+  answer arrives after the chat span has closed, the wire span's numbers move
+  to `wardex.usage_late.*` instead. `protocol.http2.evicted_witnessed` counts
+  each such answer. `protocol.http2.evicted_call_unanswered` counts a dropped
+  model call whose answer never arrived; its usage stays on the chat span.
+  `protocol.http2.evicted_unanswered` counts any other request that the bound
+  dropped while it was issued under a span and whose answer never arrived.
+  Both counts leave out a stream that a `RST_STREAM` ended, whether your
+  client cancelled the request or the server refused it: no answer was due, so
+  nothing was lost. Such a stream also no longer takes a slot from the bound.
+- **When wardex's own capture work hits the interpreter's recursion limit, the
+  dropped record is now counted.** The socket and TLS wrappers, the MCP stdio
+  tees and the seam's parser-latch report let your call through untouched when
+  their own bookkeeping meets the limit, but they used to drop that chunk's
+  record with no trace. Each such drop is now counted under
+  `interceptors.<seam>.<call or call family>.recursion_limit`, without pushing
+  a frame. Your own call and exception are unchanged. One site is still
+  uncounted: the header injection in `context/_inject.py`, which sits below
+  the counters in the import order.
 - **A read made of many small HTTP/2, WebSocket or JSON-RPC frames no longer
   stalls your thread.** Each of those parsers removed every frame it parsed
   from the front of its buffer, moving the rest of the read once per frame, on

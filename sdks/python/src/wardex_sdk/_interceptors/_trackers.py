@@ -3,24 +3,30 @@
 When the SSL interceptor (_ssl.py) streams plaintext bytes into a tracker, the tracker
 parses and correlates them according to the protocol (HTTP/1 or HTTP/2) and returns a
 list of _Txn (`_txn.py`). Span assembly is performed based solely on _Txn (protocol-agnostic).
+The WebSocket tracker an HTTP/1 upgrade swaps in is `_ws_tracker.py`.
 """
 
 from __future__ import annotations
 
-import re
 import time
 from typing import Any
 
 from .. import _hub, _wardex_native
-from .._assembly import Limitation, counters, parent_is_closed_unit, should_capture
+from .._assembly import (
+    Limitation,
+    counters,
+    latch_parent,
+    parent_is_closed_unit,
+    should_capture,
+)
 from .._enums import CaptureMode
-from .._protocol import WsParser
+from .._protocol import classify_path
 from .._protocol._http1 import Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, ParsedMessage, SpanContext
 from ._h2_issuer import IssuerLink
-from ._http1_requests import RequestSide
-from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope, same_issuer
+from ._http1_requests import RequestSide, header_get, is_ws_upgrade_request
+from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot
 from ._txn import _name_path, _Txn
 
 
@@ -33,16 +39,6 @@ def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: in
     for cum, ns in marks:
         if cum > header_len:
             return max(0.0, (ns - start_ns) / 1e6) if start_ns else None
-    return None
-
-
-def _header_get(headers: object, name: str) -> str | None:
-    """Looks up the value for name (case-insensitive) in ParsedMessage.headers
-    (a sequence of tuples)."""
-    target = name.lower()
-    for h in headers:  # type: ignore[union-attr]
-        if h[0].lower() == target:
-            return h[1]
     return None
 
 
@@ -81,24 +77,11 @@ def _merge_markers(*groups: tuple[Limitation, ...]) -> tuple[Limitation, ...]:
     return tuple(out)
 
 
-def _is_ws_upgrade_request(headers: object) -> bool:
-    up = _header_get(headers, "upgrade")
-    conn = _header_get(headers, "connection")
-    return (
-        up is not None
-        and "websocket" in up.lower()
-        and conn is not None
-        and "upgrade" in conn.lower()
-    )
-
-
-#: The `type` of the one client message the Responses WebSocket transport sends per call, searched
-#: for anywhere in the first client message rather than matched as a prefix: key order
-#: (`sort_keys`), a BOM or leading whitespace must not decide the connection's fate. The search is
-#: bounded by the message, which the frame parser already caps. Consulted only when nothing hides
-#: the payload.
-_RESPONSES_CREATE = re.compile(rb'"type"\s*:\s*"response\.create"')
-_StreamLatch = tuple[SpanContext | None, bool, ConversationContext | None, ScopeSnapshot, bool, int]
+#: A stream's latch entry: (parent, parent closed, conversation, scope, unseen parent, issuer
+#: proven, request start ns).
+_StreamLatch = tuple[
+    SpanContext | None, bool, ConversationContext | None, ScopeSnapshot, str | None, bool, int
+]
 
 
 class _Http1Tracker:
@@ -116,7 +99,7 @@ class _Http1Tracker:
 
     def _upgrade_requested(self) -> bool:
         request = self._requests.request
-        return request is not None and _is_ws_upgrade_request(request.headers)
+        return request is not None and is_ws_upgrade_request(request.headers)
 
     def keep_bodies(self, keep_all: bool) -> None:
         """The seam's answer, for the request bytes it feeds next, to "could the capture policy use
@@ -165,8 +148,8 @@ class _Http1Tracker:
         out: list[_Txn] = []
         for msg in self._resp.feed(data):
             # --- WS upgrade branch ---
-            if self._expect_ws and msg.status_code == 101 and _is_ws_upgrade_request(msg.headers):
-                ext = _header_get(msg.headers, "sec-websocket-extensions") or ""
+            if self._expect_ws and msg.status_code == 101 and is_ws_upgrade_request(msg.headers):
+                ext = header_get(msg.headers, "sec-websocket-extensions") or ""
                 leftover = self._resp_raw[msg.header_len :]
                 request, issue = self._requests.request, self._requests.issue
                 path = (request.url if request is not None else None) or "/"
@@ -291,8 +274,8 @@ class _Http1Tracker:
             ),
             version="1.1",
             ttft_ms=ttft,
-            event_stream=declares_event_stream(_header_get(msg.headers, "content-type")),
-            content_encoding=_header_get(msg.headers, "content-encoding"),
+            event_stream=declares_event_stream(header_get(msg.headers, "content-type")),
+            content_encoding=header_get(msg.headers, "content-encoding"),
         )
 
     def disabled_reason(self) -> str | None:
@@ -323,10 +306,11 @@ class _Http2Tracker:
         # scope identity — the issuer's, where `_h2_issuer` proved it — whether it was proved,
         # request start ns)
         #
-        # `_mk` pops on every transaction, so the entries that accumulate are the streams that end
-        # WITHOUT one: RST_STREAM, a GOAWAY that strands everything above `last_stream_id`, a server
-        # that stops mid-response. There is no per-stream close signal to act on — the parser
-        # reports transactions, not stream lifecycles.
+        # `_mk` pops on every transaction, and `_forget_reset` on every RST_STREAM the parser
+        # reports, so the entries that accumulate are the streams that end with neither: a GOAWAY
+        # that strands everything above `last_stream_id`, a server that stops mid-response. There is
+        # no close signal to act on for those — the parser reports transactions and resets, not
+        # stream lifecycles.
         #
         # So there are TWO bounds, because the first one is not reachable everywhere.
         # `on_connection_close` is the honest one and empties this table outright — but it is driven
@@ -375,34 +359,49 @@ class _Http2Tracker:
         self._evicted_admitting: set[int] = set()
         #: Who opened each stream, read in the opening call itself (`_h2_issuer`).
         self._issuers = IssuerLink(self._latch_cap)
+        #: The request path of each latched stream that is a model call (`classify_path`), taken
+        #: from the `feed` that opened it, which read it as the request ended: the native table
+        #: evicts with the same cap inside that same `feed`, so no question asked afterwards could
+        #: still answer it. Keys are latch keys.
+        self._model_paths: dict[int, str] = {}
+        #: Streams whose latch entry the cap evicted while it held a parent, with that parent and
+        #: the model-call path (None for any other request), until their answer arrives (`_mk`).
+        #: Bounded by the cap, lowest id dropped first; what is dropped or still here at close is
+        #: counted as unanswered. A stream a RST_STREAM ended leaves uncounted (`_forget_reset`).
+        self._evicted_calls: dict[int, tuple[SpanContext, str | None]] = {}
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         self._issuers.see(data)
-        opened, txns = self._conn.feed(True, data)
+        opened, txns, reset = self._conn.feed(True, data)
         now = time.time_ns()
-        # The WRITER's scope, which on a shared connection may be any task's: any
-        # of them flushes the others' queued frames. So it is the parent only of
-        # a stream with no proven issuer, and never anyone's conversation or
-        # identity (`IssuerLink.latch`).
+        # The WRITER's scope, which on a shared connection may be any task's: any of them flushes
+        # the others' queued frames. So it is the parent only of a stream with no proven issuer, and
+        # never anyone's conversation or identity (`IssuerLink.latch`).
         scope = _hub.get_current_scope()
         parent = scope.active_span_context
+        if opened:  # latched only for the streams this write opens
+            parent, _ = latch_parent(parent, None)
         parent_closed = parent_is_closed_unit(parent) if opened else False
         unseen = _hub.unseen_parent(scope) if opened and parent is None else None
-        for sid in opened:
+        for sid, path in opened:
             self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed, unseen), now)
+            if path is not None and classify_path(path) == "llm_call":
+                self._model_paths[sid] = path
         if opened:
-            low = min(opened)
+            low = min(sid for sid, _ in opened)
             self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)
-        # Drop-lowest-stream-id: ids only ever increase, so the entry evicted
-        # is the one likeliest to be stranded already. Lowest by id, not by
-        # insertion — a stream announced late (its request body ended after
-        # higher ids') is still the oldest request. Losing it costs that stream
-        # its parentage, never a span — `_mk` falls back to a parentless entry
-        # and says so on the span. `min` is a scan of at most `max_streams + 1`
-        # keys, run only on the writes that overflow the cap.
+        self._forget_reset(reset)  # before the cap runs: a cancelled stream is not one it evicts
+        # Drop-lowest-stream-id: ids only ever increase, so the entry evicted is the one likeliest
+        # to be stranded already. Lowest by id, not by insertion — a stream announced late (its
+        # request body ended after higher ids') is still the oldest request. Losing it costs that
+        # stream its parentage, never a span — `_mk` falls back to a parentless entry and says so on
+        # the span. `min` is a scan of at most `max_streams + 1` keys, run only on the writes that
+        # overflow the cap.
         while len(self._latch) > self._latch_cap:
             evicted = min(self._latch)
-            if _admits(*self._latch.pop(evicted)[:2]):
+            dropped = self._latch.pop(evicted)
+            self._remember_evicted_call(evicted, dropped[0])
+            if _admits(*dropped[:2]):
                 self._evicted_admitting.add(evicted)
                 if len(self._evicted_admitting) > self._latch_cap:
                     # A late answer to the forgotten stream is refused under AGENT like traffic
@@ -412,9 +411,51 @@ class _Http2Tracker:
             self._latch_evicted_below = max(self._latch_evicted_below, evicted)
         return self._ship(txns)
 
+    def _remember_evicted_call(self, stream_id: int, parent: SpanContext | None) -> None:
+        """Remember a stream whose latch entry the cap evicted while it held a parent, so that its
+        answer never arriving is counted rather than silent.
+
+        For a model call it also keeps what the seal's model-call witness (`witness_request`) needs:
+        its answer reaches `_seal` with no parent, so the seal would witness nothing, and a bridge
+        chat unit above it would promote its framework usage while the wire span ships its own, one
+        call counted twice. The witness is handed over with the answer (`_Txn.evicted_parent`), not
+        given here: a call whose answer never arrives must leave the unit's number promoted, or the
+        usage is lost with no wire span to carry it.
+
+        Any other request keeps only the fact: its answer, if it comes, says the eviction on its own
+        span (`_mk`), and one that never comes would otherwise leave no trace that wardex latched a
+        stream under agent work and lost it. A stream that held no parent lost nothing."""
+        path = self._model_paths.pop(stream_id, None)
+        if parent is None:
+            return
+        self._evicted_calls[stream_id] = (parent, path)
+        if len(self._evicted_calls) > self._latch_cap:
+            self._count_unanswered(self._evicted_calls.pop(min(self._evicted_calls))[1])
+
+    def _forget_reset(self, reset: list[int]) -> None:
+        """Let go of every stream a RST_STREAM ended, from either peer, without counting it.
+
+        No transaction will ever complete for such a stream, so its latch entry, model-call path
+        and evicted-call record would otherwise wait for an answer that cannot come, and the cap or
+        the close would then count it as `evicted_unanswered` / `evicted_call_unanswered`. A request
+        the host itself cancelled, or one the server refused, is not a loss wardex caused: nothing
+        that belongs on a span went missing."""
+        for sid in reset:
+            self._latch.pop(sid, None)
+            self._model_paths.pop(sid, None)
+            self._evicted_calls.pop(sid, None)
+
+    @staticmethod
+    def _count_unanswered(path: str | None) -> None:
+        if path is not None:  # its usage stays on the unit, promoted; no wire span has it
+            counters.bump("protocol.http2.evicted_call_unanswered")
+        else:
+            counters.bump("protocol.http2.evicted_unanswered")
+
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
         # server push (PUSH_PROMISE) unsupported — response-side stream_id ignored
-        _opened, txns = self._conn.feed(False, data)
+        _opened, txns, reset = self._conn.feed(False, data)
+        self._forget_reset(reset)
         return self._ship(txns)
 
     def _ship(self, txns: list[Any]) -> list[_Txn]:
@@ -447,39 +488,51 @@ class _Http2Tracker:
     def on_connection_close(self, marker: Limitation, *, still_open: bool = False) -> list[_Txn]:
         """Release the per-stream latch — the eviction the entries were waiting for.
 
-        A latch entry is two references and two scalars, so this is small
-        money per connection and, without the cap in `__init__`, unbounded money
-        over a process: an h2 client that resets a stream per cancelled request
-        accumulates one entry per cancellation for the life of the connection,
-        and a keep-alive h2 connection to a model provider lives as long as the
-        process does. This is the release that costs nothing, where it is
+        A latch entry is two references and two scalars, so this is small money per connection and,
+        without the cap in `__init__`, unbounded money over a process: an h2 server that stops
+        answering mid-response strands one entry per stream for the life of the connection (a reset
+        stream no longer does: `_forget_reset`), and a keep-alive h2 connection to a model provider
+        lives as long as the process does. This is the release that costs nothing, where it is
         reachable; the cap bounds the paths where it is not.
 
-        No transactions come back. A stream that never produced a response
-        produced no status either, and the seam has nothing to say about it that
-        would not be invented.
+        At a real close (not `still_open`), a stream whose response status arrived and whose end
+        never did ships as what arrived, marked `FRAME_PARSE_FAILED` and `response_cut` (`_mk`), as
+        HTTP/1's response in flight does: a client that stops reading a stream at its last event
+        never waits for the empty DATA frame carrying END_STREAM, and the usage that stream carried
+        belongs on the wire record. A stream with no status ships nothing; the seam has nothing to
+        say about it that would not be invented.
 
-        The eviction bookkeeping goes with the entries, and it has to: h2 stream
-        ids restart at 1 on the next connection, so a mark or a floor taken on
-        the last one names a different set of streams here. No caller reuses a
-        tracker across a close today — every `_retire` in `_seam.py` discards
-        the `_ConnectionState` and the tracker inside it — but nothing declares
-        that, and the cost of a stale mark is every unlatched stream on the new
-        connection reporting a parent wardex never lost.
+        The eviction bookkeeping goes with the entries, and it has to: h2 stream ids restart at 1 on
+        the next connection, so a mark or a floor taken on the last one names a different set of
+        streams here. No caller reuses a tracker across a close today — every `_retire` in
+        `_seam.py` discards the `_ConnectionState` and the tracker inside it — but nothing declares
+        that, and the cost of a stale mark is every unlatched stream on the new connection reporting
+        a parent wardex never lost.
         """
+        out = [] if still_open else self._ship(self._conn.finish())
+        for _parent, path in self._evicted_calls.values():
+            self._count_unanswered(path)
+        self._evicted_calls.clear()
+        self._model_paths.clear()
         self._latch.clear()
         self._issuers.clear()
         self._evicted_admitting.clear()
         self._latch_evicted_below = 0
         self._latch_first = 0
-        return []
+        return out
 
     def _mk(self, t: Any) -> _Txn:
         now = time.time_ns()
         entry = self._latch.pop(t.stream_id, None)
+        model_path = self._model_paths.pop(t.stream_id, None)
+        witness = None
         if entry is None:
             parent, parent_closed, conversation, proven, start = None, False, None, False, now
             unseen = None
+            call = self._evicted_calls.pop(t.stream_id, None)
+            if call is not None and call[1] is not None:
+                witness, model_path = call  # the seal witnesses the call it evicted the parent of
+                counters.bump("protocol.http2.evicted_witnessed")
             scope = UNKNOWN_ISSUER  # whoever issued it, nothing here says who
             # The DECISION the cap owes the span. An absent latch entry has two causes that look
             # identical here and mean opposite things: nothing was ambient when the request went out
@@ -528,14 +581,17 @@ class _Http2Tracker:
         request_evicted = bool(t.request_evicted)
         if request_evicted:
             counters.bump("protocol.http2.stream_evicted")
+        cut = not t.response_ended  # handed back at close (`on_connection_close`): a partial body
+        target = t.path or model_path or "/"  # a request the native table evicted: path kept here
         return _Txn(
             method=t.method or "?",
-            path=_name_path(t.path or "/"),
-            target=t.path or "/",
+            path=_name_path(target),
+            target=target,
             status=t.status,
             request_body=t.request_body,
             response_body=t.response_body,
             parent=parent,
+            evicted_parent=witness,
             parent_closed=parent_closed,
             parent_evicted=parent_evicted,
             parent_lost=parent_lost,
@@ -551,6 +607,7 @@ class _Http2Tracker:
             # sent so far (an upload refused part-way): like HTTP/1's unfinished request, no size.
             request_counted=t.request_ended and not (t.request_truncated or request_evicted),
             response_counted=not t.response_truncated,
+            response_cut=cut,
             stream_id=t.stream_id,
             # A body past its cap carries the marker HTTP/1 gives the same cut (`append_capped`), so
             # one query finds every capped body whatever version carried it. HTTP/2 reports the cut
@@ -558,6 +615,7 @@ class _Http2Tracker:
             limitations=_merge_markers(
                 (Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
                 (Limitation.BODY_CAP_EXCEEDED,) if t.truncated else (),
+                (Limitation.FRAME_PARSE_FAILED,) if cut else (),
             ),
             version="2",
             ttft_ms=None,  # per-h2-stream first-body-byte not tracked: not measured
@@ -566,210 +624,4 @@ class _Http2Tracker:
             content_encoding=t.content_encoding,
             grpc_status=getattr(t, "grpc_status", None),
             grpc_message=getattr(t, "grpc_message", None),
-        )
-
-
-class _WebSocketTracker:
-    """One WS connection — per-direction frame parser + aggregation + 64KB content sample.
-    Emits 1 span once both Close frames have crossed, or on flush."""
-
-    def __init__(
-        self,
-        path: str,
-        deflate: bool,
-        parent: SpanContext | None,
-        start_ns: int,
-        parent_closed: bool = False,
-        limits: object | None = None,
-        sample_cap: int | None = None,
-        llm_upgrade: str | None = None,
-        conversation: ConversationContext | None = None,
-        scope: ScopeSnapshot | None = None,
-    ) -> None:
-        # "known_provider" | "unknown_host" | None: the endpoint table's answer about the upgrade
-        # path (`classify_ws_upgrade`), decided by the seam at the swap site. The tracker only
-        # confirms it — once: `_decide_llm` nulls this, so "already decided" and "nothing to
-        # decide" are the same state and there is no second flag to keep in step with it.
-        self._llm_upgrade = llm_upgrade
-        self._llm_call = False
-        self._llm_unconfirmed = False
-        self._sent = WsParser(limits)  # client -> server
-        self._recv = WsParser(limits)  # server -> client
-        self._path = _name_path(path)
-        self._target = path
-        self._deflate = deflate
-        self._parent = parent
-        # Inherited from the UPGRADE transaction rather than re-latched: a WS
-        # session's parent is the scope that issued the handshake, and so is the
-        # question of whether that scope's unit had already died.
-        self._parent_closed = parent_closed
-        # The handshake's conversation, kept only while every message the client sends is issued in
-        # it too: the session is ONE span, so a socket reused across conversations names none of
-        # them rather than whichever one happened to open it.
-        self._conversation = conversation
-        # The handshake's identity, kept by the same rule as the conversation: only while every
-        # message the client sends is issued under it too (`same_issuer`: every tag and user
-        # field the handshake carried, unchanged; fields added later do not count). A socket one
-        # tenant opened and another writes to would otherwise ship the second tenant's payload
-        # under the first one's name.
-        self._scope = scope
-        self._start_ns = start_ns
-        # None means "use the core default" — resolved here (rather than hardcoded)
-        # so this can never silently drift from crates/wardex-limits.
-        self._sample_cap = (
-            sample_cap
-            if sample_cap is not None
-            else _wardex_native.limits_defaults()["ws_sample_bytes"]
-        )
-        self._sent_msgs = 0
-        self._recv_msgs = 0
-        self._sent_bytes = 0
-        self._recv_bytes = 0
-        self._sample_in = bytearray()
-        self._sample_out = bytearray()
-        self._in_trunc = False
-        self._out_trunc = False
-        self._close_code: int | None = None
-        #: The directions ("sent", "received") a Close frame crossed in. The session ends when both
-        #: have: the peer may still send data after the first Close (RFC 6455 5.5.1), and its own
-        #: Close is part of the session too, so a span built at the first one undercounted both.
-        self._close_from: set[str] = set()
-        self._emitted = False
-
-    def on_request_bytes(self, data: bytes) -> list[_Txn]:
-        r = self._sent.feed(data)
-        self._sent_bytes += self._count(r.frames, "sent")
-        self._sent_msgs += len(r.messages)
-        # A parser that died can no longer tell a message from a frame, so every write counts then.
-        if r.messages or self._sent.is_disabled():
-            if self._conversation is not None:
-                if _hub.get_current_scope().conversation != self._conversation:
-                    self._conversation = None
-            if self._scope is not None and self._scope != UNKNOWN_ISSUER:
-                if not same_issuer(self._scope, issued_scope()):
-                    self._scope = UNKNOWN_ISSUER  # issued under more than one: names no one
-        if self._llm_upgrade is not None:
-            if r.messages:
-                self._decide_llm(r.messages[0])
-            elif self._sent.is_disabled():
-                # The parser died on the first client frame (oversize, desync) and will never yield
-                # a message. Bytes crossed all the same, so decide now on nothing readable: a
-                # decision that waited for a message would be starved by the parse failure and the
-                # connection would vanish without a counter.
-                self._decide_llm(None)
-        self._in_trunc = self._append_sample(self._sample_in, r.messages) or self._in_trunc
-        return self._maybe_emit()
-
-    def _decide_llm(self, first: bytes | None) -> None:
-        # Decided once, on the first client message — the moment "a call crossed" becomes true — or,
-        # when the client-direction parser disables before yielding one, on the bytes that killed it
-        # (`first` is None then). The path alone is a suffix match; it is corroborated by the
-        # provider's own host or, when nothing hides the payload (no permessage-deflate, a readable
-        # message), by the Responses envelope itself. The tracker only records the answer on the
-        # `_Txn` it emits at close; the seam reads it there and counts — so the two counters move
-        # when the connection closes, not at this first message, and a span the capture gate then
-        # refuses is still counted.
-        if self._llm_upgrade == "known_provider" or (
-            first is not None and not self._deflate and _RESPONSES_CREATE.search(first) is not None
-        ):
-            self._llm_call = True
-        else:
-            self._llm_unconfirmed = True
-        self._llm_upgrade = None
-
-    def on_response_bytes(self, data: bytes) -> list[_Txn]:
-        r = self._recv.feed(data)
-        self._recv_bytes += self._count(r.frames, "received")
-        self._recv_msgs += len(r.messages)
-        self._out_trunc = self._append_sample(self._sample_out, r.messages) or self._out_trunc
-        return self._maybe_emit()
-
-    def _append_sample(self, buf: bytearray, messages: list[bytes]) -> bool:
-        """Accumulate messages into buf (up to a total of self._sample_cap).
-        Returns True if truncated."""
-        truncated = False
-        for m in messages:
-            room = self._sample_cap - len(buf)
-            if room <= 0:
-                truncated = True
-                break
-            if len(m) > room:
-                buf += m[:room]
-                truncated = True
-            else:
-                buf += m
-        return truncated
-
-    def _count(self, frames: list[Any], side: str) -> int:
-        """The payload bytes in `frames`, noting a Close frame from `side`. The session's close
-        code is the first Close frame's: the one that began the closing handshake."""
-        for f in frames:
-            if f.opcode == "close":
-                if not self._close_from:
-                    self._close_code = f.close_code
-                self._close_from.add(side)
-        return sum(f.payload_len for f in frames)
-
-    def _maybe_emit(self) -> list[_Txn]:
-        if len(self._close_from) == 2 and not self._emitted:
-            return [self._build_txn(())]
-        return []
-
-    def flush(self, marker: Limitation, *, still_open: bool = False) -> list[_Txn]:
-        """The socket closed or the seam let go before the closing handshake completed.
-        `WS_NO_CLOSE` says no Close frame crossed at all, so a session that saw one does not take
-        it; the seam decides from the ending whether the counts are whole."""
-        if self._emitted:
-            return []
-        drop = marker is Limitation.WS_NO_CLOSE and bool(self._close_from)
-        return [self._build_txn(() if drop else (marker,))]
-
-    #: The connection-close verb every tracker answers to. For a WS session it IS `flush`, and an
-    #: ALIAS rather than a delegating wrapper: this is the one tracker with something to save at
-    #: close — its span exists only once the session ends — so the two names must never be able to
-    #: drift apart. Before the close hook, that span waited for `uninstall()` and was lost whenever
-    #: the process never reached one.
-    on_connection_close = flush
-
-    def _build_txn(self, extra_markers: tuple[Limitation, ...]) -> _Txn:
-        self._emitted = True
-        markers = list(extra_markers)
-        if self._in_trunc or self._out_trunc:
-            markers.append(Limitation.WS_PAYLOAD_TRUNCATED)
-        if self._deflate:
-            # Census merge (§6.5.1): `ws_compressed` folded into PAYLOAD_COMPRESSED. What is lost is
-            # which protocol it was, and `TransportAttributes.protocol` already carries that.
-            markers.append(Limitation.PAYLOAD_COMPRESSED)
-        if self._sent.is_disabled() or self._recv.is_disabled():
-            # Census merge: `ws_parse_failed` and `grpc_parse_failed` are one fact — the framing
-            # layer failed, so the transport fields on this span are partial or synthesized.
-            markers.append(Limitation.FRAME_PARSE_FAILED)
-        if self._llm_call:
-            markers.append(Limitation.WS_LLM_SEMANTICS_UNREAD)
-        now = time.time_ns()
-        return _Txn(
-            method="GET",
-            path=self._path,
-            target=self._target,
-            status=101,
-            request_body=bytes(self._sample_in),
-            response_body=bytes(self._sample_out),
-            parent=self._parent,
-            parent_closed=self._parent_closed,
-            conversation=self._conversation,
-            scope=self._scope,
-            start_ns=self._start_ns,
-            end_ns=now,
-            ttfb_ms=None,
-            version="websocket",
-            ws_close_code=self._close_code,
-            ws_messages_sent=self._sent_msgs,
-            ws_messages_received=self._recv_msgs,
-            ws_bytes_sent=self._sent_bytes,
-            ws_bytes_received=self._recv_bytes,
-            request_counted=not self._sent.is_disabled(),
-            response_counted=not self._recv.is_disabled(),
-            ws_markers=tuple(markers),
-            ws_llm_call=self._llm_call,
-            ws_llm_unconfirmed=self._llm_unconfirmed,
         )

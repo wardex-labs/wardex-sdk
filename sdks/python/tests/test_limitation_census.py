@@ -240,7 +240,12 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # The Codex adapter, both: the payloads on its spans are the host's stdin
     # and stdout, never the model's wire bytes, and the --json stream it reads
     # names neither the model nor where one model call ends.
-    "NO_WIRE_EVIDENCE": frozenset({"_adapters/_codex_exec.py"}),
+    # The usage hold: a bridge CHAT unit no wire request was issued under ships the
+    # framework's usage, promoted, and says so. The pydantic-ai bridge's chat span that
+    # ended before it named its model is opened at its end, with nothing sent under it.
+    "NO_WIRE_EVIDENCE": frozenset(
+        {"_adapters/_codex_exec.py", "_adapters/_pydantic_ai.py", "_assembly/_usage_hold.py"}
+    ),
     "SUBPROCESS_MODEL_CALLS_UNOBSERVED": frozenset({"_adapters/_codex_exec.py"}),
     # --- caps ---
     # HTTP/2's half of the body cap: the h2 tracker's `_mk` turns the native
@@ -249,7 +254,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # span that ships, to count the cut in the drop ledger (`body_cap`).
     "BODY_CAP_EXCEEDED": frozenset({"_interceptors/_trackers.py", "_interceptors/_seam.py"}),
     "GRPC_MESSAGE_TRUNCATED": frozenset({"_semantics/_grpc.py"}),
-    "WS_PAYLOAD_TRUNCATED": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
+    "WS_PAYLOAD_TRUNCATED": frozenset({"_interceptors/_seam.py", "_interceptors/_ws_tracker.py"}),
     "CONNECTION_EVICTED": frozenset({"_interceptors/_seam.py"}),
     # The native stream table's bound, read off `request_evicted` by the h2
     # tracker's `_mk` — the one place the native transaction becomes a `_Txn`.
@@ -257,13 +262,18 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "H2_REQUEST_EVICTED": frozenset({"_interceptors/_trackers.py"}),
     # --- parsing / interpretation ---
     "FRAME_PARSE_FAILED": frozenset(
-        {"_interceptors/_seam.py", "_interceptors/_trackers.py", "_semantics/_grpc.py"}
+        {
+            "_interceptors/_seam.py",
+            "_interceptors/_trackers.py",
+            "_interceptors/_ws_tracker.py",
+            "_semantics/_grpc.py",
+        }
     ),
     # Framing succeeded and the meaning did not: an LLM body the semantic parser
     # read nothing from (the seam), or an MCP tool result whose shape the stdio
     # seam cannot vouch for (`_mcp_result.read_tool_result` decides it).
     "SEMANTIC_PARSE_FAILED": frozenset({"_interceptors/_mcp_stdio.py", "_interceptors/_seam.py"}),
-    "PAYLOAD_COMPRESSED": frozenset({"_interceptors/_trackers.py", "_semantics/_grpc.py"}),
+    "PAYLOAD_COMPRESSED": frozenset({"_interceptors/_ws_tracker.py", "_semantics/_grpc.py"}),
     "TOOL_ARGS_UNPARSED": frozenset({"_interceptors/_seam.py"}),
     "OUTPUT_MESSAGES_UNMAPPED_PART": frozenset({"_interceptors/_seam.py"}),
     "INPUT_MESSAGES_UNMAPPED_PART": frozenset({"_interceptors/_seam.py"}),
@@ -287,10 +297,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # installed-flag gate on the uninstall the other had outgrown. The tracker
     # names it only to decline it: a session one Close frame crossed has a
     # close code, which is what the marker says is missing.
-    "WS_NO_CLOSE": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
+    "WS_NO_CLOSE": frozenset({"_interceptors/_seam.py", "_interceptors/_ws_tracker.py"}),
     # The tracker names the member (confirmed on the first client message);
     # the seam re-attaches `txn.ws_markers` by variable, not by site.
-    "WS_LLM_SEMANTICS_UNREAD": frozenset({"_interceptors/_trackers.py"}),
+    "WS_LLM_SEMANTICS_UNREAD": frozenset({"_interceptors/_ws_tracker.py"}),
     # --- identity ambiguity ---
     # The LangGraph join trigger whose `+`-joined sources have more than one
     # reading against the graph's node set: no link, this marker instead.
@@ -397,6 +407,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             "_adapters/_codex_exec.py",
             "_adapters/_langgraph.py",
             "_adapters/_openai_agents.py",
+            "_adapters/_pydantic_ai.py",
             "testing/conformance.py",
         }
     ),
@@ -445,6 +456,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             # A bridge session the deadline reaper ended before the CLI's last
             # export could be awaited: its bridge data may be incomplete.
             "_adapters/_session_end.py",
+            # A pydantic-ai bridge callback whose own step failed: the nearest
+            # live unit says part of the run's tree is missing.
+            "_adapters/_pydantic_ai.py",
         }
     ),
 }
@@ -1357,6 +1371,8 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_langgraph.py", "Name:marker"),
         # `close_units(*, marker)` again, the openai-agents adapter's copy.
         ("_adapters/_openai_agents.py", "Name:marker"),
+        # And the pydantic-ai bridge's: `close_units(*, marker)` passing it on whole.
+        ("_adapters/_pydantic_ai.py", "Name:marker"),
         # And the Codex adapter's: `close_units(*, marker)` passing it on whole.
         ("_adapters/_codex_exec.py", "Name:marker"),
         ("_adapters/_registry.py", "Name:marker"),
@@ -1412,9 +1428,9 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_interceptors/_socket.py", "Tuple"),
         ("_interceptors/_ssl.py", "Tuple"),
         ("_interceptors/_trackers.py", "Attribute:limitations"),
-        ("_interceptors/_trackers.py", "Call:list"),
-        ("_interceptors/_trackers.py", "Call:tuple"),
-        ("_interceptors/_trackers.py", "Tuple"),
+        ("_interceptors/_ws_tracker.py", "Call:list"),
+        ("_interceptors/_ws_tracker.py", "Call:tuple"),
+        ("_interceptors/_ws_tracker.py", "Tuple"),
         # `_Txn`'s two marker fields default to the empty tuple
         # (`limitations: ... = ()`, `ws_markers: ... = ()`): no marker value.
         ("_interceptors/_txn.py", "Tuple"),

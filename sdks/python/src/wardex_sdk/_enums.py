@@ -50,7 +50,8 @@ class AdapterName(Enum):
     at all, in silence. They were removed rather than answered with None — a
     name that cannot be spelled needs no validation — and each returns as a
     member when its adapter ships. `OPENAI_AGENTS` has returned; only
-    `LANGCHAIN` remains absent. The value is `adapter.name()` verbatim and
+    `LANGCHAIN` remains absent. `PYDANTIC_AI` was added with its adapter, never
+    ahead of it. The value is `adapter.name()` verbatim and
     doubles as the per-adapter field name on `AdaptersConfig`: one identifier
     per adapter, held to the registration table by a registry test.
     """
@@ -59,6 +60,7 @@ class AdapterName(Enum):
     CODEX_EXEC = "codex_exec"
     LANGGRAPH = "langgraph"
     OPENAI_AGENTS = "openai_agents"
+    PYDANTIC_AI = "pydantic_ai"
 
 
 class AdapterState(Enum):

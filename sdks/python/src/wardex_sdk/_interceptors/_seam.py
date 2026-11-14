@@ -24,12 +24,14 @@ from .._assembly import (
     TransportLabel,
     capture_mode_of,
     counters,
+    demote_late_usage,
     guard,
     in_degraded_run,
     record,
     report_connection_parser_disabled,
     resolve_observed,
     should_capture,
+    witness_request,
 )
 from .._enums import (
     CaptureMode,
@@ -55,19 +57,16 @@ from .._semantics import (
     ws_close_name,
 )
 from .._suppress import is_suppressed
-from .._types import (
-    HttpMeta,
-    TransportAttributes,
-    TransportTiming,
-)
+from .._types import HttpMeta, TransportAttributes, TransportTiming
 from ._admission import _accepted_prefix as _accepted_prefix
 from ._admission import could_be_model_call, count_refusal, keeps_bodies, named_in
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
-from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
-from ._trackers import _Http1Tracker, _WebSocketTracker
+from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, _url_host, peer_address, placeholder_host
+from ._trackers import _Http1Tracker
 from ._txn import _Txn, _url_target
+from ._ws_tracker import _WebSocketTracker
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -153,36 +152,32 @@ class ByteSeamInterceptor(InterceptorInterface):
         self._client: Client | None = None
         self._allow: set[str] = {h.lower() for h in intercept_hosts or ()}  # hosts: no case
         self._conns: dict[int, _ConnectionState] = {}
-        # ids of connections that were being tracked when an os.fork() reset
-        # this seam in the child — consumed one id at a time by `_state`, so
-        # the first span on an INHERITED socket can say its tracking restarted
-        # mid-stream (`TRACKING_RESET_AT_FORK`). Bounded by max_connections at
-        # the only site that fills it (`_at_fork_reinit`).
+        # ids of connections that were being tracked when an os.fork() reset this seam in the child
+        # — consumed one id at a time by `_state`, so the first span on an INHERITED socket can say
+        # its tracking restarted mid-stream (`TRACKING_RESET_AT_FORK`). Bounded by max_connections
+        # at the only site that fills it (`_at_fork_reinit`).
         self._reset_at_fork_ids: set[int] = set()
         self._patches = PatchSet(f"interceptors.{self.name()}")
         self._installed = False
-        # Does THIS seam hold a reference on the shared timing probe? A second
-        # field rather than a reading of `_installed`, because `uninstall()` is
-        # now total: it runs after an `install()` that raised, where the two
-        # answers differ. Releasing a reference this seam never took decrements
-        # the shared refcount to zero underneath the OTHER seam and rips
-        # `socket.connect` back out from under a live installation.
+        # Does THIS seam hold a reference on the shared timing probe? A second field rather than a
+        # reading of `_installed`, because `uninstall()` is now total: it runs after an `install()`
+        # that raised, where the two answers differ. Releasing a reference this seam never took
+        # decrements the shared refcount to zero underneath the OTHER seam and rips `socket.connect`
+        # back out from under a live installation.
         self._timing_held = False
-        # The same bookkeeping for the shared close probe, and a SECOND flag for
-        # the same reason: the two probes are refcounted independently, so a
-        # single "did I acquire anything" answer would release one of them on
-        # behalf of a seam that only ever took the other.
+        # The same bookkeeping for the shared close probe, and a SECOND flag for the same reason:
+        # the two probes are refcounted independently, so a single "did I acquire anything" answer
+        # would release one of them on behalf of a seam that only ever took the other.
         self._close_hook_held = False
         # Defaults match the core's, so behavior is unchanged until _load_limits
         # resolves an actual config at install() time.
         self._limits: dict[str, int] = LimitsConfig().resolved()
-        # The WS tracker's projected keywords, built ONCE per limits load rather
-        # than per upgrade: a tracker is constructed on every WebSocket
-        # handshake, and this is the one projection on a path whose rate is set
-        # by the host's traffic. Initialized HERE as well as in `_load_limits`
-        # because a seam driven without `install()` is a real shape in this
-        # suite, and an attribute missing there would raise inside the host's
-        # own socket call rather than anywhere a test looks.
+        # The WS tracker's projected keywords, built ONCE per limits load rather than per upgrade: a
+        # tracker is constructed on every WebSocket handshake, and this is the one projection on a
+        # path whose rate is set by the host's traffic. Initialized HERE as well as in
+        # `_load_limits` because a seam driven without `install()` is a real shape in this suite,
+        # and an attribute missing there would raise inside the host's own socket call rather than
+        # anywhere a test looks.
         self._ws_kwargs: dict[str, int] = limits_kwargs(LimitsConsumer.WS_TRACKER, self._limits)
         self._native_limits: Any = None
 
@@ -475,6 +470,8 @@ class ByteSeamInterceptor(InterceptorInterface):
                 if reason is not None:
                     st.disabled_logged = True
                     report_connection_parser_disabled(reason, st.server_address, self._client)
+        except RecursionError:  # at the limit: C calls only; the host's read already returned
+            counters.tally.append("interceptors.seam.disabled_report.recursion_limit")
         except Exception:  # noqa: BLE001 — off-span reporting must never break capture
             pass
         for txn in txns:
@@ -528,12 +525,11 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _prefilter_of(self, st: _ConnectionState) -> Prefilter:
         """This seam's transport prefilter, evaluated NOW and fail-open.
 
-        `ALLOW` on an exception, deliberately (review M2-4): the old
-        `_should_capture` swallowed a raising prefilter into `return True` —
-        capture — and any narrower default here (`DEFER`, say) would turn
-        today's captured traffic into a policy drop under AGENT with no
-        parent, which is a new silent loss wearing an error handler. The
-        guard makes the swallow counted instead of invisible.
+        `ALLOW` on an exception, deliberately (review M2-4): the old `_should_capture` swallowed a
+        raising prefilter into `return True` — capture — and any narrower default here (`DEFER`,
+        say) would turn today's captured traffic into a policy drop under AGENT with no parent,
+        which is a new silent loss wearing an error handler. The guard makes the swallow counted
+        instead of invisible.
         """
         pre = Prefilter.ALLOW
         with self._guard("interceptors.seam.prefilter"):
@@ -579,9 +575,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         if txn.stream_id is not None:  # HTTP/2 streams finish out of order: see `opening_timing`
             got = opening_timing(got, partial(self._resolve_timing, obj, st), st, txn.stream_id)
             connect_ms, handshake_ms, reused, timing_markers = got
-        # Classified once here and carried on the job: `_assemble` reads the
-        # same answer for the provider-state count instead of asking again.
+        # Classified once, carried on the job: `_assemble` reuses it for the provider-state count.
         treatment = classify_path(txn.path)
+        # A model call, witnessed before any policy return; the answer may demote its usage.
+        late = treatment == "llm_call" and witness_request(txn.witness) == "promoted"
         if st.server_port == UNRESOLVED_PORT:  # counted even if excluded; see `_peer.py`
             timing_markers = (*timing_markers, Limitation.PEER_UNRESOLVED)
             counters.bump("interceptors.seam.peer_unresolved")
@@ -628,17 +625,17 @@ class ByteSeamInterceptor(InterceptorInterface):
             ctx=contextvars.copy_context(),
             scope=txn.scope,
             size=len(txn.request_body) + len(txn.response_body),
+            usage_already_promoted=late,
         )
 
     def _stamp_fork_reset(self, st: _ConnectionState, draft: Any) -> None:
-        """Put `TRACKING_RESET_AT_FORK` on the FIRST span of a fork-crossing
-        connection, and only that one.
+        """Put `TRACKING_RESET_AT_FORK` on the FIRST span of a fork-crossing connection, and only
+        that one.
 
-        One helper for both build paths (HTTP and WS), because the fact is the
-        connection's, not the transaction kind's. The flag clears on the first
-        stamp: later spans on the same connection are parsed by a tracker that
-        saw their whole exchange, and a marker repeated forever would read as
-        a per-span defect rather than the one-time event it is.
+        One helper for both build paths (HTTP and WS), because the fact is the connection's, not the
+        transaction kind's. The flag clears on the first stamp: later spans on the same connection
+        are parsed by a tracker that saw their whole exchange, and a marker repeated forever would
+        read as a per-span defect rather than the one-time event it is.
         """
         if st.reset_at_fork:
             st.reset_at_fork = False
@@ -809,6 +806,7 @@ class _PendingTxn:
     ctx: contextvars.Context
     scope: Any  # `_issue_scope.ScopeSnapshot`, or None for a hand-built `_Txn`
     size: int
+    usage_already_promoted: bool  # the seal's witness: its unit already shipped this call's usage
 
     def run(self) -> Any:
         return _assemble(self, parse=True, extra=())
@@ -1001,7 +999,10 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             # agent traffic and then shipped with `gen_ai=None`.
             identified = _is_llm_traffic(txn, sem)
             if identified:
-                draft.set_gen_ai(build_gen_ai(sem))
+                gen_ai = build_gen_ai(sem)
+                if p.usage_already_promoted:  # counted once: on the unit (`_usage_hold`)
+                    gen_ai = demote_late_usage(draft, gen_ai)
+                draft.set_gen_ai(gen_ai)
                 if status_code is not StatusCode.ERROR and (declared := declared_error_type(sem)):
                     status_code, error_type = StatusCode.ERROR, declared  # failed in-stream
                 known = txn.issuer_proven and not txn.parent_closed  # closed: refused at the edge
@@ -1143,11 +1144,3 @@ def _latched(txn: _Txn) -> Ambient:
     (design §3.3).
     """
     return Ambient(txn.parent, txn.conversation, None, txn.unseen_parent)
-
-
-def _url_host(obj: Any | None, st: _ConnectionState) -> str:
-    """The host a URL on this connection names: the TLS server name when
-    there is one, else the peer address `peer_address` recorded on `st`. One
-    expression for the WS swap site and `_seal`, so the WebSocket-transport
-    question and the HTTP span's URL are asked about the same host."""
-    return getattr(obj, "server_hostname", None) or st.server_hostname or st.server_address

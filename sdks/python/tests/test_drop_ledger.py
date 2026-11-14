@@ -1559,6 +1559,27 @@ def test_a_swallowed_internal_error_is_a_loss_with_its_label_kept_locally():
     assert snap.where[(DropReason.INTERNAL_SDK_ERROR, "test.ledger.where")] == 1
 
 
+def test_a_recursion_error_passes_through_a_guard_uncounted_and_unchained():
+    """A RecursionError is the host's stack reaching the interpreter's limit, not
+    a wardex failure: the guard neither swallows nor counts it, and adds nothing
+    to it. A plain exception at the same site is still swallowed and counted."""
+    raised = RecursionError("maximum recursion depth exceeded")
+    with pytest.raises(RecursionError) as caught:
+        with guard("test.ledger.recursion_passes"):
+            raise raised
+    assert caught.value is raised
+    assert raised.__context__ is None and raised.__cause__ is None
+    assert counters.get("test.ledger.recursion_passes") == 0
+    snap = _ledger.snapshot()
+    assert snap.total(DropReason.INTERNAL_SDK_ERROR) == 0
+    assert (DropReason.INTERNAL_SDK_ERROR, "test.ledger.recursion_passes") not in snap.where
+
+    with guard("test.ledger.recursion_passes"):
+        raise ValueError("an ordinary failure")
+    assert counters.get("test.ledger.recursion_passes") == 1
+    assert _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR) == 1
+
+
 def test_lose_records_and_says_it_once(capsys):
     for _ in range(2):
         lose(DropReason.TABLE_FULL, 3, unit=DropUnit.STREAM, line="a table was full", key="t.k")
@@ -1622,14 +1643,15 @@ def test_a_guard_swallows_at_the_recursion_limit_however_full_the_inboxes_are():
     bookkeeping folds an inbox on every `_FOLD_AT`th call. A fold that pushed a
     frame let a `RecursionError` escape into the host on that call only. Swept
     across the limit, the guard does the same at every depth whether both
-    inboxes are empty or one short of a fold."""
+    inboxes are empty or one short of a fold.
 
-    def deeper(n: int) -> None:
-        return deeper(n - 1) if n else None
+    The block raises an ordinary error right at the guard's own frame, so the
+    bookkeeping is what meets the limit. (A `RecursionError` from the block
+    itself is never swallowed; the test above covers that.)"""
 
     def guarded() -> None:
         with guard("test.ledger.recursion"):
-            deeper(3)
+            raise ValueError("a failure at the deepest frame")
 
     def descend(k: int) -> None:
         return guarded() if k == 0 else descend(k - 1)

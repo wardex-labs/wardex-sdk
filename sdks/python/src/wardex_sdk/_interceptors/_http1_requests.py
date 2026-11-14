@@ -28,11 +28,33 @@ import time
 from dataclasses import dataclass
 
 from .. import _hub
-from .._assembly import counters, parent_is_closed_unit
+from .._assembly import counters, latch_parent, parent_is_closed_unit
 from .._protocol import REQUEST_METHODS
 from .._protocol._http1 import Http1RequestParser
 from .._types import ConversationContext, ParsedMessage, SpanContext
 from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
+
+
+def header_get(headers: object, name: str) -> str | None:
+    """Looks up the value for name (case-insensitive) in ParsedMessage.headers
+    (a sequence of tuples)."""
+    target = name.lower()
+    for h in headers:  # type: ignore[union-attr]
+        if h[0].lower() == target:
+            return h[1]
+    return None
+
+
+def is_ws_upgrade_request(headers: object) -> bool:
+    """Does this request header block ask to upgrade the connection to a WebSocket?"""
+    up = header_get(headers, "upgrade")
+    conn = header_get(headers, "connection")
+    return (
+        up is not None
+        and "websocket" in up.lower()
+        and conn is not None
+        and "upgrade" in conn.lower()
+    )
 
 
 @dataclass(frozen=True)
@@ -74,10 +96,10 @@ def _sent_by_a_client(method: str | None) -> bool:
 
 def _issued_here() -> Issue:
     scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
-    parent = scope.active_span_context
+    parent, conversation = latch_parent(scope.active_span_context, scope.conversation)
     closed = parent_is_closed_unit(parent)
     unseen = None if parent is not None else _hub.unseen_parent(scope)
-    return Issue(time.time_ns(), parent, closed, scope.conversation, issued_scope(), unseen)
+    return Issue(time.time_ns(), parent, closed, conversation, issued_scope(), unseen)
 
 
 class _Reading:

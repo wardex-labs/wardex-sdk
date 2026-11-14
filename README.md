@@ -5,8 +5,8 @@
 
 Open-source observability SDK for AI agents. Install it, call `init()`, and
 your agent's model calls are recorded as OpenTelemetry traces, with no changes
-to your agent code. On the OpenAI Agents SDK, LangGraph or the Claude Agent
-SDK, its agents, tool calls and handoffs are recorded as well.
+to your agent code. On the OpenAI Agents SDK, LangGraph, Pydantic AI or the
+Claude Agent SDK, its agents, tool calls and handoffs are recorded as well.
 
 > **Beta.** Interfaces may change between 0.x releases; the rules are in
 > [VERSIONING.md](https://github.com/wardex-labs/wardex-sdk/blob/main/VERSIONING.md).
@@ -48,13 +48,14 @@ wardex-sdk is built to produce that record.
   the SDK observes the traffic your code produces over HTTP/1.1, HTTP/2,
   WebSocket, gRPC (grpclib) and MCP stdio. Calls to recognised model providers
   are always recorded; other traffic is recorded while it runs inside a wardex
-  span. For OpenAI Chat Completions, Responses and Embeddings and for Anthropic
-  Messages, model, messages, parameters and token usage come from the bytes
-  the provider actually received and returned, streaming included. Two cases
-  are read another way: the Claude Agent SDK makes its model calls from a CLI
-  subprocess, so its adapter rebuilds them from that process's output, and
-  Responses over WebSocket is recorded as a marked connection whose calls are
-  left unread.
+  span. For OpenAI Chat Completions, Responses and Embeddings, for Anthropic
+  Messages and for Amazon Bedrock Converse and ConverseStream, model,
+  messages, parameters and token usage come from the bytes the provider
+  actually received and returned, streaming included. Bedrock's older
+  InvokeModel API is not read as a model call. Two cases are read another
+  way: the Claude Agent SDK makes its model calls from a CLI subprocess, so
+  its adapter rebuilds them from that process's output, and Responses over
+  WebSocket is recorded as a marked connection whose calls are left unread.
 - **It rebuilds the run tree from in-process context.** Parent links come from
   context propagation inside your process, so a model call made deep inside a
   tool lands under that tool even when no framework hook reports it. Each
@@ -91,8 +92,9 @@ how the data is collected.
 **LangGraph and other agent frameworks.** wardex records LangGraph runs
 without callbacks or `LangChainTracer`: one span per graph run, one per node,
 one per tool call a `ToolNode` dispatches, with every model and HTTP call
-underneath placed by context. The OpenAI Agents SDK and the Claude Agent SDK have adapters as well,
-and each installs itself when your application imports its framework. On a
+underneath placed by context. The OpenAI Agents SDK, Pydantic AI and the
+Claude Agent SDK have adapters as well, and each installs itself when your
+application imports its framework. On a
 framework with no adapter, model calls to recognised providers are still
 captured with their token usage and model ids, and a few decorators add the
 structure.
@@ -215,6 +217,7 @@ tree.
 |---|---|
 | OpenAI Agents SDK (tested on `openai-agents` 0.22.x, 0.23.x) | each run, agent, function tool, handoff and guardrail; model calls read from the wire |
 | LangGraph (tested on `langgraph` 1.2.x) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
+| Pydantic AI (tested on `pydantic-ai-slim` 2.x) | each agent run, model call and tool call, read from pydantic-ai's own OpenTelemetry spans; the model call's messages and token usage come from the wire |
 | Claude Agent SDK (tested on `claude-agent-sdk` 0.2.x) | agent turns and model calls, with tool calls correlated |
 | Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |
 | Any other framework, or your own loop | model calls with model, messages and token usage; decorators add the structure |
@@ -278,6 +281,104 @@ unwrapped function, and so does a client constructed before it. Such a session
 is still recorded, from the CLI's output alone: its root span carries
 `instrumentation_degraded`, and a warning on stderr says so once. Call `init()`
 before that import, or call `claude_agent_sdk.query(...)` through the module.
+
+The Pydantic AI adapter reads the OpenTelemetry spans pydantic-ai already
+emits (`invoke_agent`, `chat`, `execute_tool`, instrumentation schema version
+5, the default across 2.x; another schema version is said once when the
+adapter installs and `wardex.diagnostics()` reports the adapter
+`measured=False`). It installs when your application imports pydantic-ai, or
+at `init()` if it already has.
+It is tested on `pydantic-ai-slim` 2.x as a range, last on 2.66:
+
+```bash
+pip install wardex-sdk "pydantic-ai-slim[openai]>=2,<3"
+```
+
+```python
+import wardex_sdk as wardex
+
+wardex.init()
+
+from pydantic_ai import Agent
+
+Agent("openai:gpt-4o-mini").run_sync("hi")
+```
+
+When pydantic-ai's instrumentation is off, the adapter turns it on with wardex's
+own tracer provider (`Agent.instrument_all`) and turns it back off at
+`close()`. wardex never sets the global OpenTelemetry tracer or meter
+provider, so a later `logfire.configure()` still works. When instrumentation
+is already on (Logfire, or your own `InstrumentationSettings`), wardex adds a
+span processor to that setup and removes it at `close()`; a provider that
+offers no way to remove one keeps it registered but inert, and says so once
+on stderr, and a provider that accepts no span processor at all is not
+recorded, also said once. Calling `Agent.instrument_all(...)` or
+`logfire.instrument_pydantic_ai()` after `wardex.init()` replaces wardex's
+setup, and your setup stays in place after `close()`; wardex attaches its span
+processor to the new setup and keeps recording, and says so once on stderr.
+`Agent.instrument_all(True)` with no OpenTelemetry provider configured sends
+pydantic-ai's spans nowhere, so wardex keeps its own setup in place, as it does
+at `init()`, and `True` is what `close()` leaves in place.
+Turning instrumentation off after `init()`, or moving it to a setup that
+accepts no span processor, stops the adapter's recording (wire-level model
+calls are still captured), also said once. Assigning
+`Agent._instrument_default` directly bypasses this, and wardex says at
+`close()` that it could not follow. When wardex turned instrumentation on
+itself, pydantic-ai's spans are OpenTelemetry current spans that carry the ids
+of the spans wardex exports, so a span your own tracer opens inside a run or a
+tool names wardex's run or tool span as its parent (one exception: a model's
+`prepare_request` hook runs before the model call's span takes its exported id,
+so a span id read there is not one wardex exports): your backend receives that
+parent when it also receives wardex's export, and with a different backend the
+parent is in wardex's. An agent given its own instrumentation
+(`agent.instrument = ...`, an `Instrumentation` capability, an
+`InstrumentedModel`, `logfire.instrument_pydantic_ai(agent)`) bypasses that
+setup and is not recorded by the adapter; its model calls are still captured
+from the wire.
+
+The model call wardex reads on the wire lands under pydantic-ai's `chat` span,
+streamed responses included: a request sent while `run_stream` is read is
+placed by the OpenTelemetry span that is current at that moment. Token usage
+comes from the wire span, and the framework's own numbers are kept under
+`wardex.pydantic_ai.otel.*` (`gen_ai.usage.*` on the `chat` span,
+`gen_ai.aggregated_usage.*` on the run), so one call is never counted twice.
+A pydantic-ai agent on Amazon Bedrock (`BedrockConverseModel`) gets its model
+call from the wire the same way as on OpenAI or Anthropic, streamed or not:
+the Converse span names `aws.bedrock` and the model id, and carries the token
+usage, cache reads included.
+When no HTTP request went out under a model call (`TestModel`, a
+`FunctionModel` that sends nothing), that span carries pydantic-ai's numbers
+as its token usage and is marked `no_wire_evidence`. When a request did go out
+but to an API wardex does not read as a model call (Bedrock InvokeModel, a
+custom model's own endpoint), the request's span sits under the `chat` span
+with no token usage, and the `chat` span carries pydantic-ai's numbers as its
+token usage, marked `no_wire_evidence`, so the call is still counted once. The
+same holds for a model call whose response never completed (a timeout, a
+cancellation) and for one sent over a WebSocket connection: its numbers are
+pydantic-ai's, marked `no_wire_evidence`. If the request's span still ships
+later, at connection close (an HTTP/2 stream whose end arrived after the
+client stopped reading), it carries no token usage: its numbers are kept under
+`wardex.usage_late.*` with `wardex.usage_late.demoted` set, so the call is
+counted once.
+An MCP tool call appears as the framework's `execute_tool` span under its run,
+and the stdio interceptor's span for the JSON-RPC `tools/call` (named
+`MCP tools/call`, carrying the request and response) nests under it, in either
+connect order and under a toolset several agents share. The two are matched by
+tool name and arguments (a prefixed toolset, `.prefixed("srv")` or
+`MCP(tool_prefix="srv")`, whose tools the framework names `<prefix>_<tool>`,
+nests too, matched by its arguments only), so two calls of one tool in flight at
+once each nest under their own span, and a call another MCP client makes with
+other arguments never lands under the agent's (one made with exactly the same
+arguments at the same moment does). The interceptor's span keeps its own
+placement (an `execute_tool` span under the run when the toolset connected
+inside the run, or a separate trace when the agent was entered with
+`async with agent` beforehand) when two calls with the same arguments are in
+flight at once, or when
+`include_content=False` leaves pydantic-ai's span without arguments and the
+call was written from outside the run. Retries of a
+`FallbackModel` appear as attempt spans under the model call on the releases
+that emit them (2.66 does, 2.54 does not). Pydantic AI 2.x has no
+`Agent(instrument=...)` argument.
 
 ## Adding structure to your own code
 
@@ -407,12 +508,13 @@ export nothing and say why: it speaks OTLP over HTTP only.
 ### Model providers
 
 Model calls are read from the bytes for OpenAI Chat Completions, Responses
-and Embeddings and for Anthropic Messages, on any host, and for a streamed
-reply on any path. `gen_ai.provider.name` comes from the host (`openai`,
-`anthropic`, `azure.ai.openai`, `groq`, `deepseek`, `mistral_ai`, `x_ai`,
-`perplexity`, `cohere`, `gcp.gemini`, `gcp.vertex_ai`, `aws.bedrock`); any
-other host gets none and the `provider_inferred` marker. Gemini and Vertex
-AI `generateContent`, Bedrock Runtime, Ollama's `/api/chat` and
+and Embeddings, for Anthropic Messages and for Amazon Bedrock Converse and
+ConverseStream, on any host, and for a streamed reply on any path.
+`gen_ai.provider.name` comes from the host (`openai`, `anthropic`,
+`azure.ai.openai`, `groq`, `deepseek`, `mistral_ai`, `x_ai`, `perplexity`,
+`cohere`, `gcp.gemini`, `gcp.vertex_ai`, `aws.bedrock`); any other host gets
+none and the `provider_inferred` marker. Gemini and Vertex AI
+`generateContent`, Bedrock's InvokeModel, Ollama's `/api/chat` and
 `/api/generate`, and Cohere and Mistral calls on other paths are not parsed
 yet. Outside a span they are counted under `mode_refused` and said once per
 API; record them inside `wardex.span(...)` or with
@@ -439,7 +541,7 @@ decorated call costs about 23 µs. To measure on your machine, run
 
 ## Status
 
-Available today: the Python SDK, the three framework adapters above, OTLP
+Available today: the Python SDK, the framework adapters above, OTLP
 export to any OpenTelemetry backend, and masking on by default. Not yet: an
 adapter for plain LangChain LCEL chains, and SDKs for Node/TypeScript and Java.
 

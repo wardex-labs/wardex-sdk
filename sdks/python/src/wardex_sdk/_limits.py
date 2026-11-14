@@ -203,7 +203,7 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
         passthrough=frozenset({"owner"}),
     ),
     LimitsConsumer.WS_TRACKER: _Delivery(
-        target="wardex_sdk._interceptors._trackers:_WebSocketTracker",
+        target="wardex_sdk._interceptors._ws_tracker:_WebSocketTracker",
         delivers={"sample_cap": "ws_sample_bytes"},
         native=frozenset({"limits"}),
         # `llm_upgrade` is the endpoint table's answer about the upgrade

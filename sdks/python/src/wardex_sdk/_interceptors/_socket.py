@@ -37,7 +37,16 @@ import socket
 import sys
 from typing import TYPE_CHECKING, Any
 
-from .._assembly import DropReason, DropUnit, Limitation, Prefilter, guard, record, report_once
+from .._assembly import (
+    DropReason,
+    DropUnit,
+    Limitation,
+    Prefilter,
+    counters,
+    guard,
+    record,
+    report_once,
+)
 from .._enums import CaptureSource
 from .._protocol import REQUEST_METHODS as _HTTP_METHODS
 from ._conn_timing import shared_timing_store
@@ -363,6 +372,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
                 if self._capture_possible(this):
                     sent = _accepted_prefix(data, ret) if isinstance(ret, int) else data
                     self._on_request_bytes(this, bytes(sent))
+            except RecursionError:  # at the limit: C calls only; the host's call returned
+                counters.tally.append("interceptors.socket.send.recursion_limit")
             except Exception:
                 pass
             return ret
@@ -375,6 +386,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             try:
                 if self._capture_possible(this):
                     self._on_request_bytes(this, bytes(data))
+            except RecursionError:  # at the limit: C calls only; the host's call returned
+                counters.tally.append("interceptors.socket.sendall.recursion_limit")
             except Exception:
                 pass
             return ret
@@ -428,6 +441,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
                         self._on_response_bytes(this, bytes(ret))
                     elif _asked_for_bytes(args[0] if args else 0):
                         self._on_response_eof(this)
+            except RecursionError:  # at the limit: C calls only; the host's call returned
+                counters.tally.append("interceptors.socket.recv.recursion_limit")
             except Exception:
                 pass
             return ret
@@ -442,6 +457,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
                     self._on_response_view(this, buffer, n)
                 elif n == 0 and _asked_for_bytes(args[0] if args else kwargs.get("nbytes"), buffer):
                     self._on_response_eof(this)
+            except RecursionError:  # at the limit: C calls only; the host's call returned
+                counters.tally.append("interceptors.socket.recv_into.recursion_limit")
             except Exception:
                 pass
             return n

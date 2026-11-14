@@ -22,6 +22,10 @@ pub(crate) enum Api {
     OpenAiResponses,
     OpenAiEmbeddings,
     AnthropicMessages,
+    /// Amazon Bedrock Converse and ConverseStream: one request shape, the
+    /// streaming one answered in the AWS event stream encoding rather than
+    /// SSE.
+    BedrockConverse,
 }
 
 impl Api {
@@ -32,6 +36,7 @@ impl Api {
         match self {
             Api::OpenAiChatCompletions | Api::OpenAiResponses | Api::OpenAiEmbeddings => "openai",
             Api::AnthropicMessages => "anthropic",
+            Api::BedrockConverse => "aws.bedrock",
         }
     }
 }
@@ -126,11 +131,34 @@ const ENDPOINTS: &[(&[Seg], Endpoint)] = &[
             ws_transport: false,
         },
     ),
+    // Bedrock Converse: the model id is the path segment before the action
+    // (`bedrock::model_id_from_path` reads it). The legacy InvokeModel API
+    // (`/model/{id}/invoke`, `/invoke-with-response-stream`) is deliberately
+    // absent: its bodies are each model family's native shape, not one
+    // Bedrock shape, so no parser here could read them honestly.
+    (
+        &[Lit("model"), Any, Lit("converse")],
+        Endpoint {
+            api: Api::BedrockConverse,
+            operation: "chat",
+            api_type: None,
+            ws_transport: false,
+        },
+    ),
+    (
+        &[Lit("model"), Any, Lit("converse-stream")],
+        Endpoint {
+            api: Api::BedrockConverse,
+            operation: "chat",
+            api_type: None,
+            ws_transport: false,
+        },
+    ),
 ];
 
 /// The path's segments: query, fragment and trailing `/` stripped, split on
 /// `/`, empties dropped.
-fn segments_of(path: &str) -> Vec<&str> {
+pub(super) fn segments_of(path: &str) -> Vec<&str> {
     let path = path.split(['?', '#']).next().unwrap_or("");
     let path = path.trim_end_matches('/');
     path.split('/').filter(|s| !s.is_empty()).collect()
@@ -247,11 +275,9 @@ enum HostRule {
     /// `groq.com`), never a host that merely ends in the same letters
     /// (`notgroq.com`).
     Domain(&'static str),
-    /// A host whose first label is the given one, or it with `-fips`, under
-    /// the domain: Bedrock's per-region runtime hosts
-    /// (`bedrock-runtime.us-east-1.amazonaws.com`). The whole label, because
-    /// other `amazonaws.com` hosts (an S3 bucket's) take a name anyone picks.
-    FirstLabel(&'static str, &'static str),
+    /// Bedrock's runtime hosts, matched by their whole shape
+    /// (`is_bedrock_runtime_host`).
+    BedrockRuntime,
     /// A host ending in `-` or `.` plus the domain: Vertex AI's per-region
     /// hosts (`us-central1-aiplatform.googleapis.com`) beside its global one.
     RegionalDomain(&'static str),
@@ -283,10 +309,7 @@ const PROVIDER_HOSTS: &[(HostRule, &str)] = &[
         HostRule::RegionalDomain("aiplatform.googleapis.com"),
         "gcp.vertex_ai",
     ),
-    (
-        HostRule::FirstLabel("bedrock-runtime", "amazonaws.com"),
-        "aws.bedrock",
-    ),
+    (HostRule::BedrockRuntime, "aws.bedrock"),
 ];
 
 /// `host` as a bare lowercase DNS name: a `:port` suffix and a trailing root
@@ -319,13 +342,7 @@ impl HostRule {
     fn matches(self, host: &str) -> bool {
         match self {
             HostRule::Domain(domain) => under_domain(host, domain),
-            HostRule::FirstLabel(label, domain) => {
-                let first = host.split('.').next().unwrap_or_default();
-                let named = first
-                    .strip_prefix(label)
-                    .is_some_and(|rest| rest.is_empty() || rest == "-fips");
-                named && under_domain(host, domain)
-            }
+            HostRule::BedrockRuntime => is_bedrock_runtime_host(host),
             HostRule::RegionalDomain(domain) => {
                 under_domain(host, domain)
                     || host
@@ -345,6 +362,38 @@ pub(super) fn provider_for_host(host: &str) -> Option<&'static str> {
         .iter()
         .find(|(rule, _)| rule.matches(&host))
         .map(|(_, name)| *name)
+}
+
+/// Bedrock's runtime hosts, by exact shape rather than by suffix: anyone can
+/// own a label under `amazonaws.com` (an S3 bucket named `bedrock-runtime`
+/// is `bedrock-runtime.s3.amazonaws.com`), so "contains bedrock-runtime and
+/// ends in amazonaws.com" would prove a label it should only suggest.
+///
+/// * `bedrock-runtime[-fips].<region>.amazonaws.com[.cn]`: the public
+///   regional endpoint.
+/// * `vpce-<id>.bedrock-runtime.<region>.vpce.amazonaws.com`: an interface
+///   VPC endpoint's DNS name. AWS issues these names and they route to the
+///   one service the endpoint was created for, so they are Bedrock's own as
+///   much as the public name is. A private DNS alias the customer chose
+///   instead is not provable from the name and gets no label.
+fn is_bedrock_runtime_host(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let runtime = |l: &str| l == "bedrock-runtime" || l == "bedrock-runtime-fips";
+    let region = |l: &str| {
+        l.contains('-')
+            && l.ends_with(|c: char| c.is_ascii_digit())
+            && l.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    match labels.as_slice() {
+        [svc, reg, "amazonaws", "com"] | [svc, reg, "amazonaws", "com", "cn"] => {
+            runtime(svc) && region(reg)
+        }
+        [vpce, "bedrock-runtime", reg, "vpce", "amazonaws", "com"] => {
+            vpce.starts_with("vpce-") && region(reg)
+        }
+        _ => false,
+    }
 }
 
 /// None unless the upgrade path matches a `ws_transport` row (the one
@@ -407,6 +456,16 @@ pub(crate) fn from_body_shape(body: &serde_json::Value) -> Option<Endpoint> {
     {
         return lookup(Api::AnthropicMessages);
     }
+    // 5. Bedrock Converse: `output` is an OBJECT holding the message (step 1
+    //    wants an array), and the stop reason and usage are camelCase, which
+    //    no step above reads.
+    if obj
+        .get("output")
+        .is_some_and(|o| o.get("message").is_some())
+        || obj.contains_key("stopReason")
+    {
+        return lookup(Api::BedrockConverse);
+    }
     None
 }
 
@@ -468,6 +527,11 @@ mod tests {
             ("/v1/embeddings", Api::OpenAiEmbeddings),
             ("/v1/messages", Api::AnthropicMessages),
             ("/proxy/v1/messages", Api::AnthropicMessages),
+            ("/model/m/converse", Api::BedrockConverse),
+            (
+                "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse-stream",
+                Api::BedrockConverse,
+            ),
         ];
         for (path, want) in positive {
             assert_eq!(from_path(path).map(|e| e.api), Some(want), "{path}");
@@ -480,6 +544,13 @@ mod tests {
             "/v1/models",
             "/",
             "",
+            // Bedrock's legacy InvokeModel API is not read (model-native
+            // bodies), nor is anything below or beside a Converse action.
+            "/model/m/invoke",
+            "/model/m/invoke-with-response-stream",
+            "/model/m/converse/extra",
+            "/converse",
+            "/model/converse",
         ];
         for path in negative {
             assert_eq!(from_path(path), None, "{path}");
@@ -503,6 +574,9 @@ mod tests {
             ),
             ("/v1/conversations/conv_1/items/msg_1", Some(ProviderState)),
             ("/openai/v1/conversations/conv_1/items", Some(ProviderState)),
+            ("/model/x/converse", Some(LlmCall)),
+            ("/model/x/converse-stream", Some(LlmCall)),
+            ("/model/x/invoke", None),
             ("/v1/traces/ingest", Some(Excluded)),
             ("/proxy/v1/traces/ingest", Some(Excluded)),
             ("/conversations/conv_1", None),
@@ -652,6 +726,47 @@ mod tests {
             from_body_shape(&body).map(|e| e.api),
             Some(Api::OpenAiResponses)
         );
+    }
+
+    /// A Converse body has an `output` (an object, not Responses' array) and
+    /// no `status`, `object`, `choices` or snake_case usage: it must not be
+    /// read as any OpenAI or Anthropic shape, and is read as its own.
+    #[test]
+    fn converse_shaped_body_is_neither_openai_nor_anthropic() {
+        let body = serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 3, "outputTokens": 1, "totalTokens": 4},
+            "metrics": {"latencyMs": 10}
+        });
+        assert_eq!(
+            from_body_shape(&body).map(|e| e.api),
+            Some(Api::BedrockConverse)
+        );
+    }
+
+    #[test]
+    fn bedrock_runtime_hosts_name_bedrock_by_shape() {
+        for host in [
+            "bedrock-runtime.us-east-1.amazonaws.com",
+            "bedrock-runtime-fips.us-gov-west-1.amazonaws.com",
+            "BEDROCK-RUNTIME.eu-central-1.amazonaws.com",
+            "bedrock-runtime.eu-central-1.amazonaws.com:443",
+            "bedrock-runtime.cn-north-1.amazonaws.com.cn",
+            "vpce-0abc123-xyz.bedrock-runtime.us-east-1.vpce.amazonaws.com",
+        ] {
+            assert_eq!(provider_for_host(host), Some("aws.bedrock"), "{host}");
+        }
+        for host in [
+            "bedrock-runtime.s3.amazonaws.com",
+            "bedrock-runtime.us-east-1.amazonaws.com.evil.example",
+            "my-bedrock-proxy.corp",
+            "bedrock.us-east-1.amazonaws.com",
+            "vpce-0abc.s3.us-east-1.vpce.amazonaws.com",
+            "127.0.0.1",
+        ] {
+            assert_eq!(provider_for_host(host), None, "{host}");
+        }
     }
 
     #[test]

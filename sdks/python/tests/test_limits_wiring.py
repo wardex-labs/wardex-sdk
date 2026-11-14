@@ -479,7 +479,8 @@ _DEFAULT_RESOLUTION_ALLOWED: dict[str, int] = {
     "_interceptors/_mcp_stdio.py": 2,
     # `_max_streams`' fallback when there is no native object, and
     # `_WebSocketTracker`'s `sample_cap=None` fallback.
-    "_interceptors/_trackers.py": 2,
+    "_interceptors/_trackers.py": 1,
+    "_interceptors/_ws_tracker.py": 1,
     # The byte seam's pre-install defaults, whose own comment says why.
     "_interceptors/_seam.py": 1,
 }
@@ -797,7 +798,7 @@ def _nat(site: str, field: str):
 
 def _ws_tracker(s: _Sites) -> Any:
     """A WebSocket tracker built the way the seam builds one, per upgrade."""
-    from wardex_sdk._interceptors._trackers import _WebSocketTracker
+    from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 
     return _WebSocketTracker(
         path="/",
