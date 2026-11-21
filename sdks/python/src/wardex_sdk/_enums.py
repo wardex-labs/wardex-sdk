@@ -76,7 +76,9 @@ class AdapterState(Enum):
     # The framework is installed and the application has not imported it yet;
     # the adapter installs right after that import finishes.
     WAITING_FOR_IMPORT = "waiting_for_import"
-    UNSUPPORTED = "unsupported"  # the framework is here; its surface is not one this wardex knows
+    # The framework is here; its surface is not one this wardex knows, or its host has not
+    # attached the adapter.
+    UNSUPPORTED = "unsupported"
     FAILED = "failed"  # the adapter raised while installing
     SHADOWED = "shadowed"  # a local package answers the framework's import name
     ABSENT = "absent"  # the framework is not installed

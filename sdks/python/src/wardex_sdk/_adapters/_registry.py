@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import sys
 import threading
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
 
 from .._assembly import Limitation, UnitRegistry, counters, guard
 from .._config import AdaptersConfig
 from .._diagnostics import AdapterStatus
+from .._enums import AdapterState
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from ._base import AdapterInterface
 from ._context import AdapterContext
@@ -286,8 +288,32 @@ class AdapterRegistry:
         self._statuses.clear()
 
     def statuses(self) -> tuple[AdapterStatus, ...]:
-        """Every adapter's status, by name. A snapshot: later installs do not change it."""
-        return tuple(self._statuses[name] for name in sorted(self._statuses))
+        """Every adapter's status, by name, as filed and then restated by its adapter if that
+        adapter is still installed. A snapshot: later installs do not change it."""
+        return tuple(self._restated(name) for name in sorted(self._statuses))
+
+    def _restated(self, name: str) -> AdapterStatus:
+        """`name`'s filed row, passed through its adapter's `restate` when the row is the one
+        that adapter's install filed. Any other row beside a registered adapter belongs to an
+        install still running on another thread, which has not filed its own row yet.
+        A `restate` that raises costs the restatement and is counted; the filed row is answered.
+        """
+        filed = self._statuses[name]
+        adapter = self._installed.get(name)
+        if adapter is None or filed.state is not AdapterState.INSTALLED:
+            return filed
+        said = None
+        with guard(f"adapters.{name}.restate"):
+            said = adapter.restate(filed)
+        if said is None or said is filed:
+            return filed
+        return replace(
+            filed,
+            state=said.state,
+            measured=said.measured,
+            measured_versions=said.measured_versions,
+            detail=said.detail,
+        )
 
     def uninstall_all(self) -> None:
         """Uninstall every adapter. Total: one failure cannot stop the rest.
@@ -313,6 +339,11 @@ class AdapterRegistry:
         when it finishes, so nothing stays installed after this returns.
         """
         self.stop_waiting()
+        # Refiled while each adapter can still answer, so `diagnostics()` after `close()`
+        # reads the last thing it knew and not only what its install filed.
+        self._statuses.update(
+            {name: self._restated(name) for name in self._installed if name in self._statuses}
+        )
         self._drain(lambda name, adapter: adapter.uninstall(), "uninstall")
 
     def close_units_all(self, *, marker: Limitation) -> None:
