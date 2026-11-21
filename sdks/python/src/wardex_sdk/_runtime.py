@@ -477,6 +477,7 @@ class Runtime:
             # transport may implement; ours are stateless and don't.
             with guard("adapters.fork_reinit_failed"):
                 _fork_reinit_module("_assembly._usage_hold")  # first: an adapter raise skips none
+                _fork_reinit_module("_assembly._bridge_latch")  # work declared on parent threads
                 if self._adapters is not None:
                     self._adapters._at_fork_reinit()
             if client is not None:

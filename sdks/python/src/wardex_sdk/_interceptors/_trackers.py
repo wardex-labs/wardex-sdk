@@ -390,7 +390,7 @@ class _Http2Tracker:
         if opened:  # latched only for the streams this write opens
             parent, _ = latch_parent(parent, None)
         parent_closed = parent_is_closed_unit(parent) if opened else False
-        unseen = _hub.unseen_parent(scope) if opened and parent is None else None
+        unseen = _hub.unseen_parent(scope, observed=True) if opened and parent is None else None
         for sid, path in opened:
             self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed, unseen), now)
             if path is not None and classify_path(path) == "llm_call":

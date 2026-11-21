@@ -33,6 +33,7 @@ from types import SimpleNamespace
 import pytest
 
 from wardex_sdk import _hub, _runtime
+from wardex_sdk._adapters._base import AdapterInterface
 from wardex_sdk._adapters._context import AdapterContext, Placement, RunHandle
 from wardex_sdk._assembly import (
     EMPTY_AMBIENT,
@@ -40,6 +41,7 @@ from wardex_sdk._assembly import (
     Ambient,
     GenAIAttributes,
     Limitation,
+    ParentSource,
     SpanIntent,
     UnitKind,
     UnitRegistry,
@@ -60,6 +62,7 @@ from wardex_sdk._interceptors._http1_requests import _issued_here
 from wardex_sdk._interceptors._mcp_stdio import _ProcState
 from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
 from wardex_sdk._interceptors._txn import _Txn
+from wardex_sdk._tracing import span as wardex_span
 from wardex_sdk._types import AgentAttributes, ConversationContext, ToolAttributes
 
 PREFIX = "wardex.test.otel."
@@ -85,6 +88,7 @@ def _clean(monkeypatch):
     reset_reports_for_test()
     monkeypatch.setattr(_bridge_latch, "_RESOLVERS", ())
     monkeypatch.setattr(_bridge_latch, "_TOOL_RESOLVERS", ())
+    monkeypatch.setattr(_bridge_latch, "_UNREACHED", set())
     _usage_hold._HOLDERS.clear()
     _usage_hold._PROMOTED_RECENTLY.clear()
     yield
@@ -1026,6 +1030,117 @@ def test_the_mcp_seam_nests_its_tools_call_under_the_tool_unit_and_does_not_prom
 
 
 # ==========================================================================
+# Work an adapter declared it could not reach
+# ==========================================================================
+
+
+def _http1_reason():
+    return _issued_here().unseen_parent
+
+
+def _h2_issuer_reason():
+    issuers = StreamIssuers(8)
+    assert issuers.record(1) is True
+    return issuers.take(1)[4]
+
+
+def _h2_writer_reason():
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+
+    tracker = _Http2Tracker()
+    tracker.on_request_bytes(_h2_headers(1))
+    return tracker._latch[1][4]
+
+
+@pytest.mark.parametrize(
+    "latched", [_http1_reason, _h2_issuer_reason, _h2_writer_reason], ids=["http1", "h2", "writer"]
+)
+def test_every_http_request_latch_reads_a_declaration_for_a_parentless_request(latched):
+    ctx, _ = context()
+    assert latched() is None
+    ctx.expect_unreached_carriers("title")
+    assert latched() == _hub.ADAPTER_UNREACHED
+    ctx.release_unreached_carriers("title")
+    assert latched() is None
+
+
+def test_the_mcp_seam_records_a_parentless_tool_call_unresolved_while_a_declaration_stands():
+    ctx, _ = context()
+    state = _ProcState()
+    ctx.expect_unreached_carriers("title")
+    state.feed_request(_CALL)
+    [(span, _)] = state.feed_response(_RESULT)
+    assert (span.parent_span_id, span.correlation.strategy) == (None, ParentSource.UNRESOLVED)
+    assert span.correlation.confidence == 0.0
+    assert Limitation.PARENT_UNRESOLVED in _limitations(span)
+
+    ctx.release_unreached_carriers(None)
+    state.feed_request(_CALL)
+    [(span, _)] = state.feed_response(_RESULT)
+    assert span.correlation.strategy is ParentSource.TRACE_ROOT
+    assert Limitation.PARENT_UNRESOLVED not in _limitations(span)
+
+
+class _HostClient(_Recording):
+    """The hub's client for a hand-opened span; the runtime's reset closes it."""
+
+    def close(self, timeout: float | None = None) -> None:
+        pass
+
+
+def test_an_adapter_root_and_a_hand_opened_span_ignore_the_declaration():
+    """An adapter's own root and a host's own span are roots the code asked for, so a declaration
+    standing elsewhere leaves both alone."""
+    ctx, sink = context()
+    client = _HostClient()
+    _hub.set_client(client)
+    ctx.expect_unreached_carriers("title")
+
+    run = ctx.open_run(
+        UnitKind.SESSION,
+        intent=SpanIntent.INVOKE_AGENT,
+        placement=Placement.ROOT,
+        describe=_describe_run,
+    )
+    run.close()
+    with wardex_span("host"):
+        pass
+
+    for root in (sink.drafts[-1].finish(), client.spans[-1]):
+        assert root.parent_span_id is None
+        assert root.correlation.strategy is ParentSource.TRACE_ROOT
+        assert Limitation.PARENT_UNRESOLVED not in _limitations(root)
+
+
+class _Declares(AdapterInterface):
+    """An adapter whose hooks declared two pieces of work and whose uninstall forgot them."""
+
+    def name(self) -> str:
+        return "declares"
+
+    def install(self, client, ctx=None) -> None:  # noqa: ANN001
+        ctx.expect_unreached_carriers("title")
+        ctx.expect_unreached_carriers("compress")
+
+    def uninstall(self) -> None:
+        pass
+
+
+def test_an_uninstall_leaves_no_declaration_of_that_adapter_and_keeps_another_adapters():
+    from wardex_sdk._adapters._registry import get_registry
+
+    other, _ = context("other")
+    get_registry().install(_Declares(), None)
+    assert _issued_here().unseen_parent == _hub.ADAPTER_UNREACHED
+
+    other.expect_unreached_carriers("title")
+    get_registry().uninstall_all()
+    assert _issued_here().unseen_parent == _hub.ADAPTER_UNREACHED, "the other adapter's stands"
+    other.release_unreached_carriers(None)
+    assert _issued_here().unseen_parent is None
+
+
+# ==========================================================================
 # Cost and process lifecycle
 # ==========================================================================
 
@@ -1075,6 +1190,17 @@ def test_a_fork_child_starts_with_no_usage_holds():
     source = open(_runtime.__file__, encoding="utf-8").read()
     assert '_fork_reinit_module("_assembly._usage_hold")' in source
     chat.close()
+
+
+def test_a_fork_child_starts_with_no_declared_unreached_carriers():
+    """The declared work runs on the parent's threads, which the child does not have."""
+    ctx, _ = context()
+    ctx.expect_unreached_carriers("title")
+    assert _issued_here().unseen_parent == _hub.ADAPTER_UNREACHED
+    _runtime._fork_reinit_module("_assembly._bridge_latch")
+    assert _issued_here().unseen_parent is None
+    source = open(_runtime.__file__, encoding="utf-8").read()
+    assert '_fork_reinit_module("_assembly._bridge_latch")' in source
 
 
 # --------------------------------------------------------------------------

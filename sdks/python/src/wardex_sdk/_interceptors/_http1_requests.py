@@ -98,7 +98,7 @@ def _issued_here() -> Issue:
     scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
     parent, conversation = latch_parent(scope.active_span_context, scope.conversation)
     closed = parent_is_closed_unit(parent)
-    unseen = None if parent is not None else _hub.unseen_parent(scope)
+    unseen = None if parent is not None else _hub.unseen_parent(scope, observed=True)
     return Issue(time.time_ns(), parent, closed, conversation, issued_scope(), unseen)
 
 

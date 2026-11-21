@@ -8,7 +8,7 @@ from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
 
-from .._assembly import Limitation, UnitRegistry, counters, guard
+from .._assembly import Limitation, UnitRegistry, counters, guard, release_unreached
 from .._config import AdaptersConfig
 from .._diagnostics import AdapterStatus
 from .._enums import AdapterState
@@ -156,10 +156,12 @@ class AdapterRegistry:
         # `close()` ran while this installed, so its teardown may have missed
         # it, or undone it before the install was done: undo it now.
         name = adapter.name()
+        ctx = None
         if self._installed.get(name) is adapter:
             self._installed.pop(name, None)
-            self._contexts.pop(name, None)
+            ctx = self._contexts.pop(name, None)
         self._sweep([(name, adapter)], lambda _, late: late.uninstall(), "uninstall")
+        release_unreached(ctx, None)
 
     def stop_waiting(self) -> None:
         """Forget every install still waiting for its framework; unhook from `sys.meta_path`."""
@@ -271,6 +273,7 @@ class AdapterRegistry:
         with guard(f"adapters.{name}.install_rollback"):
             adapter.uninstall()
         ctx.patches.restore_all()
+        release_unreached(ctx, None)
         self._installed.pop(name, None)
         self._contexts.pop(name, None)
         self._statuses[name] = (
@@ -362,13 +365,21 @@ class AdapterRegistry:
         )
 
     def _drain(self, act, where: str) -> None:  # noqa: ANN001
-        """Pop every adapter newest-first and act on it. Nothing survives a failure."""
-        ordered = []
+        """Pop every adapter newest-first and act on it. Nothing survives a failure.
+
+        Each context's unreached-carrier declarations are withdrawn after its adapter was acted
+        on, so a hook that declared while the uninstall ran leaves no window open behind it.
+        """
+        ordered, dropped = [], []
         while self._installed:
             name = next(reversed(self._installed))
             ordered.append((name, self._installed.pop(name)))
-            self._contexts.pop(name, None)
-        self._sweep(ordered, act, where)
+            dropped.append(self._contexts.pop(name, None))
+        try:
+            self._sweep(ordered, act, where)
+        finally:
+            for ctx in dropped:
+                release_unreached(ctx, None)
 
     @staticmethod
     def _sweep(items, act, where: str) -> None:  # noqa: ANN001

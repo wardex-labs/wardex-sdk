@@ -74,8 +74,10 @@ from .._types import (
 )
 from ._bridge_latch import (
     canonical_arguments,
+    expect_unreached,
     latch_parent,
     latch_tool_call,
+    release_unreached,
     set_span_resolver,
     set_tool_call_resolver,
 )
@@ -196,6 +198,7 @@ __all__ = [
     "demote_late_usage",
     "diag_info",
     "diag_warning",
+    "expect_unreached",
     "guard",
     "hold_framework_usage",
     "in_degraded_run",
@@ -206,6 +209,7 @@ __all__ = [
     "lose",
     "parent_is_closed_unit",
     "record",
+    "release_unreached",
     "report_buffer_evicted",
     "report_connection_parser_disabled",
     "report_export_failed",
