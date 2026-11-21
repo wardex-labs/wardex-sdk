@@ -497,6 +497,30 @@ def test_set_account_takes_the_ids_a_host_forwards_and_clears_on_none(rec):
     assert _extra(spans["user-uuid"])["user.id"] == str(key)
 
 
+def test_set_tag_takes_an_id_a_time_or_a_state_as_its_text(rec):
+    """A tag follows the span attribute's rule, so a UUID primary key, a
+    timestamp or an Enum state is a tag, not a TypeError in the request."""
+    import datetime
+    import enum
+    import uuid
+
+    class Tier(enum.Enum):
+        GOLD = "gold"
+
+    key = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    wardex.set_tag("order_id", key)
+    wardex.set_tag("placed", datetime.date(2026, 1, 2))
+    wardex.set_tag("tier", Tier.GOLD)
+    with wardex.span("tagged"):
+        pass
+    extra = _extra(_spans(rec)["tagged"])
+    assert extra["order_id"] == str(key)
+    assert extra["placed"] == "2026-01-02"
+    assert extra["tier"] == "gold"
+    with pytest.raises(TypeError, match="set_tag"):
+        wardex.set_tag("raw", b"bytes")
+
+
 def test_the_account_id_survives_masking_on_the_wire(rec):
     from wardex_sdk.transport._codec import decode, encode
 

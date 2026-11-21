@@ -76,7 +76,8 @@ wardex-sdk is built to produce that record.
   Python dependencies, parsing runs on the SDK's own worker threads, and
   nothing the SDK does on its own raises into your code. A call you make
   with a value wardex cannot record (`set_tag("k", object())`) raises at
-  that call, with the accepted forms. The measured cost is under
+  that call, with the accepted forms; a UUID, a date or time, an Enum member
+  or a path is recorded as its text. The measured cost is under
   [Overhead](#overhead).
 
 ## Next to the tools you are evaluating

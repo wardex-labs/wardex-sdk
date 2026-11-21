@@ -719,6 +719,13 @@ All notable changes to this project are documented here. The format follows
   counted as `unmarshallable`.
 - **`Span.set_attribute` sends a list, tuple or dict as compact JSON text.**
   `None` removes the attribute.
+- **`set_attribute` and `set_tag` record an id, a time, a state or a path as
+  its text.** A `uuid.UUID` is sent as `str(value)`, a `datetime`, `date` or
+  `time` as `isoformat()`, an `Enum` member as its value (its name when the
+  value is not a str, a float, a bool or an int of at most 64 bits) and a
+  path as the path. The same
+  holds for an element of a list, tuple or dict. Any other type still raises
+  `TypeError` at the call.
 - **A bare `@wardex.span` fails where it is written**, with a message that
   points at `@wardex.workflow`, `@wardex.agent`, `@wardex.step` and
   `@wardex.tool`.

@@ -15,7 +15,7 @@ from ._runtime import runtime
 from ._scope import Scope, UserInfo, merge_scopes, merged_tags_and_user, merged_trace_fields
 from ._suppress import suppress_capture
 from ._types import SpanContext
-from ._values import AttributeValue
+from ._values import AttributeInput
 
 _R = TypeVar("_R")
 
@@ -390,7 +390,7 @@ class BlockScope(Scope):
             return apply(self._ended[trace], *args)
         return write_scope(self._vars[trace], apply, *args)
 
-    def set_tag(self, key: str, value: AttributeValue | list | tuple | dict | None) -> None:
+    def set_tag(self, key: str, value: AttributeInput) -> None:
         self._write(False, Scope.set_tag, key, value)
 
     def set_user(self, user: UserInfo | str | int | None) -> None:

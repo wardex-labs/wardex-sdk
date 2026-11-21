@@ -12,8 +12,8 @@ line does (raise, return), never the SDK's internals. The cases:
   (`gen_ai.agent.name`, `gen_ai.tool.name`, ...) under the same name shape,
   `invoke_agent researcher`, from the qualified function name when no name is
   given; `@tool` says the body ran in-process;
-* attribute values: lists and dicts as JSON text, None removes, a non-str key
-  raises;
+* attribute values: a UUID, date, time, Enum member or path as its text,
+  lists and dicts as JSON text, None removes, a non-str key raises;
 * the code inside a span reaches it (`wardex.current_span()`), records its
   input, output and events, and the decorators can capture arguments and the
   return value;
@@ -26,9 +26,13 @@ line does (raise, return), never the SDK's internals. The cases:
 from __future__ import annotations
 
 import asyncio
+import datetime
+import enum
 import inspect
 import json
+import pathlib
 import typing
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
 
@@ -425,6 +429,101 @@ def test_lists_and_dicts_are_sent_as_their_json_text(wire):
     assert attributes["filters"] == '{"a":["x"],"b":1}'
     assert attributes["price"] == 1.5
     assert "wardex.codec.unmarshalled" not in attributes
+
+
+class _Plan(enum.Enum):
+    PRO = "pro"
+    SEATS = 5
+
+
+class _Shape(enum.Enum):
+    SQUARE = (4, "sides")
+
+
+class _Wide(enum.Enum):
+    ID = 2**70
+
+
+class _FailingPath:
+    def __fspath__(self) -> str:
+        raise RuntimeError("no path")
+
+
+class _NoOffset(datetime.tzinfo):
+    """A tzinfo that does not say its offset: `isoformat()` raises on it."""
+
+
+class _BytesStamp(datetime.datetime):
+    def isoformat(self, *args: object, **kwargs: object) -> bytes:  # type: ignore[override]
+        return b"2026"
+
+
+def test_ids_times_states_and_paths_are_sent_in_their_stated_text(wire):
+    """The types a host keeps an id, a timestamp, a state or a file in are
+    recorded as the text everybody writes them as, alone or inside a container,
+    instead of failing the host's own line."""
+    key = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    when = datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
+    with wardex.span("s") as s:
+        s.set_attribute("id", key)
+        s.set_attribute("at", when)
+        s.set_attribute("day", when.date())
+        s.set_attribute("clock", datetime.time(3, 4, 5))
+        s.set_attribute("plan", _Plan.PRO)
+        s.set_attribute("seats", _Plan.SEATS)
+        s.set_attribute("shape", _Shape.SQUARE)
+        s.set_attribute("wide", _Wide.ID)
+        s.set_attribute("wides", [_Wide.ID])
+        s.set_attribute("file", pathlib.PurePosixPath("/srv/data.csv"))
+        s.set_attribute("batch", {"id": key, "at": [when], "plan": _Plan.PRO, "n": Decimal("2")})
+        s.add_event("stored", {"id": key, "day": when.date()})
+    attributes = _shipped(wire)["s"]["attributes"]
+    assert attributes["id"] == "12345678-1234-5678-1234-567812345678"
+    assert attributes["at"] == "2026-01-02T03:04:05+00:00"
+    assert attributes["day"] == "2026-01-02"
+    assert attributes["clock"] == "03:04:05"
+    assert attributes["plan"] == "pro"
+    assert attributes["seats"] == 5
+    assert attributes["shape"] == "SQUARE"
+    assert attributes["wide"] == "ID"
+    assert attributes["wides"] == '["ID"]'
+    assert attributes["file"] == "/srv/data.csv"
+    assert json.loads(attributes["batch"]) == {
+        "id": "12345678-1234-5678-1234-567812345678",
+        "at": ["2026-01-02T03:04:05+00:00"],
+        "plan": "pro",
+        "n": 2.0,
+    }
+    assert "wardex.codec.unmarshalled" not in attributes
+
+
+@pytest.mark.parametrize(
+    ("value", "names"),
+    [
+        (datetime.timedelta(seconds=1), "got a timedelta"),
+        ({1, 2}, "got a set"),
+        (_FailingPath(), "got a _FailingPath"),
+        (datetime.datetime(2026, 1, 1, tzinfo=_NoOffset()), "got a datetime"),
+        (_BytesStamp(2026, 1, 1), "got a _BytesStamp"),
+        ({"ids": {1, 2}}, "JSON-serialisable"),
+        ({uuid.UUID(int=1): "x"}, "JSON-serialisable"),
+        ([datetime.time(1, tzinfo=_NoOffset())], "JSON-serialisable"),
+    ],
+    ids=[
+        "timedelta",
+        "set",
+        "failing-path",
+        "failing-tzinfo",
+        "isoformat-not-text",
+        "set-in-a-dict",
+        "uuid-key",
+        "failing-tzinfo-in-a-list",
+    ],
+)
+def test_a_type_with_no_stated_text_still_raises_at_the_call(wire, value, names):
+    with wardex.span("s") as s:
+        with pytest.raises(TypeError, match=names):
+            s.set_attribute("k", value)
 
 
 def test_none_removes_an_attribute(wire):

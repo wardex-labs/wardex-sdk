@@ -179,13 +179,11 @@ class Span:
             _values.block("Span.set_gen_ai()", GenAIAttributes, attrs, optional=False)
         )
 
-    def set_attribute(
-        self, key: str, value: _values.AttributeValue | list | tuple | dict | None
-    ) -> None:
+    def set_attribute(self, key: str, value: _values.AttributeInput) -> None:
         """Set one attribute on this span. Accepted values: see `attribute_value`.
 
-        A list, tuple or dict is sent as its JSON text; None removes what was
-        set under `key` on this span.
+        A UUID, date, time, Enum member or path is sent as its text, a list,
+        tuple or dict as its JSON text; None removes what was set under `key`.
         """
         stored = _values.attribute_value("Span.set_attribute", key, value)
         if stored is None:

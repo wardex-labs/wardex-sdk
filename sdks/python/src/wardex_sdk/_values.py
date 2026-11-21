@@ -14,11 +14,14 @@ attribute rule with the span API.
 
 from __future__ import annotations
 
+import datetime
 import json
 import operator
+import os
 from collections.abc import Mapping
 from enum import Enum
 from typing import Any, TypeVar
+from uuid import UUID
 
 from ._enums import AgentType, OperationName, SpanKind, StatusCode, ToolExecutionType
 
@@ -27,13 +30,97 @@ EnumT = TypeVar("EnumT", bound=Enum)
 #: What an attribute value is once `attribute_value` accepted it.
 AttributeValue = str | int | float | bool
 
+#: What `set_attribute` and `set_tag` take: a stored value, a value with a
+#: stated text form (`_text_form`), a container of either, or None to remove.
+AttributeInput = (
+    AttributeValue
+    | UUID
+    | datetime.date
+    | datetime.time
+    | Enum
+    | os.PathLike  # type: ignore[type-arg]
+    | list  # type: ignore[type-arg]
+    | tuple  # type: ignore[type-arg]
+    | dict  # type: ignore[type-arg]
+    | None
+)
+
 #: The wire's attribute integers are signed 64-bit.
 _INT_MIN, _INT_MAX = -(2**63), 2**63 - 1
 
 _ATTRIBUTE_ACCEPTS = (
-    "a str, int, float or bool, a list, tuple or dict of JSON values "
-    "(sent as its JSON text), or None to remove the attribute"
+    "a str, int, float or bool, a UUID, date, time, Enum member or path (sent as "
+    "text), a list, tuple or dict of such values (sent as its JSON text), or None "
+    "to remove the attribute"
 )
+
+#: `_text_form`'s answer for a type with no stated text form.
+_NO_TEXT_FORM: Any = object()
+
+
+def _text_form(value: object) -> Any:
+    """`value` in its one stated form, or `_NO_TEXT_FORM` for any other type.
+
+    These are the types a host holds an id, a timestamp, a state or a file in,
+    and each has one text everybody writes it as, so it is recorded as that
+    text rather than refused:
+
+    * a `uuid.UUID` as `str(value)`;
+    * a `datetime`, `date` or `time` as `isoformat()`;
+    * an `Enum` member as its value when that is exactly a str, float or bool,
+      or an int the wire's 64 bits hold, else as its name;
+    * a path (`os.PathLike`) as `os.fsdecode(value)`.
+
+    Nothing else is given a text: `str()` of an arbitrary object is a repr
+    with an address in it, which is not a value anybody can search for. The
+    conversion runs the host's own code (a `tzinfo`, an overridden
+    `isoformat`, a `__fspath__`): one that raises, or answers with anything
+    but a str, has no text form either, so the caller refuses the value with
+    the one error it refuses every other type with.
+    """
+    # The real type, never `isinstance`: that reads `__class__`, which a lazy
+    # proxy (Werkzeug's `LocalProxy`, Django's `SimpleLazyObject`) answers by
+    # evaluating what it wraps, on the host's line.
+    kind = type(value)
+    try:
+        if issubclass(kind, UUID):
+            text = str(value)
+        elif issubclass(kind, (datetime.date, datetime.time)):  # a datetime is a date
+            text = value.isoformat()  # type: ignore[attr-defined]
+        elif issubclass(kind, Enum):
+            inner = value.value  # type: ignore[attr-defined]
+            if type(inner) in (str, float, bool):
+                return inner
+            if type(inner) is int and _INT_MIN <= inner <= _INT_MAX:
+                return inner
+            text = value.name  # type: ignore[attr-defined]
+        elif issubclass(kind, os.PathLike):
+            text = os.fsdecode(value)  # type: ignore[arg-type]
+        else:
+            return _NO_TEXT_FORM
+    except Exception:  # noqa: BLE001 — host code in the conversion; see the docstring
+        return _NO_TEXT_FORM
+    return text if type(text) is str else _NO_TEXT_FORM
+
+
+def _json_element(value: object) -> Any:
+    """`json.dumps`'s `default`: an element JSON has no form for, by the rule
+    its container's own value would follow, in the same order: a number read
+    as the int or float it converts to, then `_text_form`. A `TypeError` in
+    `json`'s own words for anything else, which the caller reports with the
+    accepted forms."""
+    kind = type(value)
+    if not issubclass(kind, (bytes, bytearray)):
+        for name, read in (("__index__", operator.index), ("__float__", float)):
+            if hasattr(kind, name):
+                try:
+                    return read(value)
+                except Exception:  # noqa: BLE001, S112 — the next reading, or the refusal below
+                    continue
+    converted = _text_form(value)
+    if converted is not _NO_TEXT_FORM:
+        return converted
+    raise TypeError(f"Object of type {kind.__name__} is not JSON serializable")
 
 
 def attribute_value(api: str, key: object, value: object) -> AttributeValue | None:
@@ -45,10 +132,14 @@ def attribute_value(api: str, key: object, value: object) -> AttributeValue | No
       `str(value)`); any other number (an object with `__index__` or
       `__float__`, such as a numpy scalar) is stored as the int or float it
       converts to, read here so a conversion that fails fails on this line;
+    * a UUID, a datetime, date or time, an Enum member or a path is stored in
+      its one stated form (`_text_form`);
     * a list, tuple or dict is sent as its JSON text, compact and with sorted
       keys, so the same value always produces the same string: the wire has no
-      list type for a host attribute. Its size is bounded where every
-      attribute's is, at export (`LimitsConfig.max_otlp_attribute_bytes`);
+      list type for a host attribute. An element JSON has no form for follows
+      the rules above; a key does not, and must be one JSON takes. Its size is
+      bounded where every attribute's is, at export
+      (`LimitsConfig.max_otlp_attribute_bytes`);
     * None means "remove the attribute": the caller drops what was set under
       `key` instead of sending a null.
 
@@ -75,7 +166,13 @@ def attribute_value(api: str, key: object, value: object) -> AttributeValue | No
     if issubclass(kind, (list, tuple, dict)):
         try:
             return wire_text(
-                json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    default=_json_element,
+                )
             )
         except (TypeError, ValueError) as exc:
             raise TypeError(
@@ -89,6 +186,9 @@ def attribute_value(api: str, key: object, value: object) -> AttributeValue | No
     ):
         number = _read_number(api, key, kind, value)
         return number if type(number) is float else _wire_int(api, key, number)
+    converted = _text_form(value)
+    if converted is not _NO_TEXT_FORM:
+        return wire_text(converted) if type(converted) is str else converted
     raise TypeError(
         f"{api}({key!r}, ...): got a {kind.__name__}; the value must be "
         f"{_ATTRIBUTE_ACCEPTS}. Convert it first, e.g. str(value)"

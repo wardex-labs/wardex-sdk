@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from ._types import ConversationContext, SpanContext
-from ._values import AttributeValue, attribute_value, wire_text
+from ._values import AttributeInput, AttributeValue, attribute_value, wire_text
 
 #: The tag key `wardex.set_account()` writes: the customer's own customer, the
 #: unit a dashboard compares behaviour across.
@@ -154,7 +154,7 @@ class Scope:
     #: parsed: a root started under it had a caller wardex could not read.
     _parent_unreadable: bool = field(default=False, init=False, repr=False, compare=False)
 
-    def set_tag(self, key: str, value: AttributeValue | list | tuple | dict | None) -> None:
+    def set_tag(self, key: str, value: AttributeInput) -> None:
         """Set `key` under `Span.set_attribute`'s rule: None removes it, and a key or
         value the wire cannot hold raises here, at the caller's line."""
         stored = attribute_value("set_tag", key, value)
