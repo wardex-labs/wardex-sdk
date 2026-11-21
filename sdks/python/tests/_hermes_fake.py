@@ -12,7 +12,7 @@ newer Hermes. "Source" means read, not run; "measured" means a lab run of the re
 * `ScriptedProvider`: a loopback chat-completions server answering each attempt from a script,
   reached with real sockets from the thread the caller runs on.
 
-Two drivers play turns through a context: `FakeHermes` in `_hermes_turns.py`, a scripted turn
+Two drivers play turns through a context: `FakeHermes` in `_hermes_scripted.py`, a scripted turn
 loop for cases no fixture recorded, and `Replay` in `_hermes_replay.py`, which plays the recorded
 fixtures (`tests/fixtures/hermes/`).
 """

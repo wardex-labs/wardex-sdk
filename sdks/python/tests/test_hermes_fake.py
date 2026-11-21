@@ -35,7 +35,7 @@ from _hermes_fake import (
     lane_of,
 )
 from _hermes_replay import SCENARIOS, Replay, load_fixture
-from _hermes_turns import FakeHermes
+from _hermes_scripted import FakeHermes
 from wardex_sdk import _hub
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk.testing import RecordingTransport

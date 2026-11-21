@@ -44,7 +44,7 @@ from _hermes_fake import (
     ScriptedProvider,
     Usage,
 )
-from _hermes_turns import TOOL_RESULT
+from _hermes_scripted import TOOL_RESULT
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hermes"
 FORMAT_VERSION = 1
