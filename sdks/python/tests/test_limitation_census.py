@@ -1850,6 +1850,12 @@ _VOCABULARY: dict[str, str] = {
     #     from INSTRUMENTATION_DEGRADED (there the capture was incomplete;
     #     here it was whole and was emptied on its way out) ---
     "PII_FILTER_FAILED": "pii_filter_failed",
+    # --- added after the census, ahead of its emitter (1). A tool call the
+    #     model asked for and the framework never ran, so the run has no tool
+    #     span for it. The Hermes Agent adapter is its first emitter. Kept apart
+    #     from CHILD_SPAN_UNCLOSED (a tool began and never ended) and from
+    #     TOOL_ARGS_UNPARSED (a call's arguments could not be read) ---
+    "TOOL_CALL_NOT_DISPATCHED": "tool_call_not_dispatched",
 }
 
 
@@ -1864,7 +1870,8 @@ def test_the_vocabulary_is_exactly_the_recorded_table() -> None:
     id + 1 for the OTel bridge's tolerant chat join + 1 for the h2 stream
     table's evicted request half + 1 for the inferred provider label + 1 for
     a CLI agent's unobserved model calls + 1 for a stream event no
-    reassembler could read + 1 for masking's own failure, name by name.
+    reassembler could read + 1 for masking's own failure + 1 for a tool call
+    the framework never ran, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

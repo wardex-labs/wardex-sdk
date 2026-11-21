@@ -78,13 +78,11 @@ class Limitation(Enum):
         the member directly; a string-to-member lookup used as a general entry point is the drift
         this enum exists to end.
 
-        Returns `None` rather than raising for an unrecognized string: the
-        alternative on that path is deleting the span (`finish()` rejects a
-        marker it cannot type) over a marker wardex itself produced. Not a
-        silent hole: `tests/test_limitation_census.py` scans `crates/` and
-        `bindings/` on every run and fails the build if the Rust side starts
-        emitting a string with no member here, so an unknown value is
-        unreachable rather than merely tolerated.
+        Returns `None` rather than raising for an unrecognized string: the alternative on that path
+        is deleting the span (`finish()` rejects a marker it cannot type) over a marker wardex
+        itself produced. Not a silent hole: `tests/test_limitation_census.py` scans `crates/` and
+        `bindings/` on every run and fails the build if the Rust side starts emitting a string with
+        no member here, so an unknown value is unreachable rather than merely tolerated.
 
         A dict lookup rather than `cls(value)` in a `try`: `_assembly/` is held
         to zero silent swallows (C-S4), and `except ValueError: return None`
@@ -102,22 +100,20 @@ class Limitation(Enum):
     """A parent was expected and no scope, unit or header supplied one.
 
 Two emit sites, and the first is the mechanism the second restates.
-    ``_assembly/_parentage.py``'s ``_MARKER`` table attaches it to every edge
-    ``resolve_parentage`` builds for ``ParentSource.UNRESOLVED``, so no caller
-    can name that source and omit the marker — I4 as a mechanism rather than as
-    caller discipline. The second names the member at the slot where that
-    source is CHOSEN, which is where a reader greps for it, and both are
-    idempotent: ``Parentage.with_limitation`` and ``IntegrityBuilder.limitation``
-    each no-op on a marker already present.
+    ``_assembly/_parentage.py``'s ``_MARKER`` table attaches it to every edge ``resolve_parentage``
+    builds for ``ParentSource.UNRESOLVED``, so no caller can name that source and omit the marker
+    (I4 as a mechanism rather than as caller discipline). The second names the member at the slot
+    where that source is CHOSEN, which is where a reader greps for it, and both are idempotent:
+    ``Parentage.with_limitation`` and ``IntegrityBuilder.limitation`` each no-op on a marker already
+    present.
 
     * ``_assembly/_units.py::UnitRegistry._edge`` — ``resolve()``'s last tier,
       via ``Parentage.with_limitation``. No alias resolved to a unit, no live
       scope reached us and no single session was live, so the span roots its own
       trace and says the parent it expected was never found.
     The in-process tool span reaches it through that same table now, because
-    ``_adapters/_context.py`` declares the site's placement and the registry
-    decides. It used to be a third site here, stamping this by hand at the end
-    of a tier ladder the adapter walked itself.
+    ``_adapters/_context.py`` declares the site's placement and the registry decides. It used to be
+    a third site here, stamping this by hand at the end of a tier ladder the adapter walked itself.
 
     The path that puts it on the most records is neither: ``__init__.py``'s
     ``capture_state_snapshot`` passes ``ParentSource.UNRESOLVED`` for a snapshot taken outside any
@@ -133,17 +129,16 @@ Two emit sites, and the first is the mechanism the second restates.
     UNIT_INFERRED_SOLE = "unit_inferred_sole"
     """Exactly one logical unit was live, so it was taken as the parent.
 
-    The ``_MARKER`` table in ``_assembly/_parentage.py`` attaches it to every
-    edge built for ``ParentSource.UNIT_SOLE``. Two sole-live tiers choose it.
-    ``_assembly/_units.py::UnitRegistry._edge`` names it at ``resolve()``'s,
-    reached by an ADAPTER declaring ``Fallback.SOLE_LIVE_RUN``; the candidate is
-    that adapter's one live run in the registry's own table. The Agent SDK
-    assembler's is ``_adapters/_assembler.py::SessionAssembler._session_for_hook``
-    (the one session in its own ``_by_key``), whose hook's spans parent through
-    ``Evidence(ParentSource.UNIT_SOLE)`` — tool, sub-agent and chat drafts.
-    Both replaced dropping an unattributable call outright, with no marker; a
-    marked 0.5 edge beats unmarked data loss, and beats a call that becomes its
-    own trace root.
+    The ``_MARKER`` table in ``_assembly/_parentage.py`` attaches it to every edge built for
+    ``ParentSource.UNIT_SOLE``. Two sole-live tiers choose it.
+    ``_assembly/_units.py::UnitRegistry._edge`` names it at ``resolve()``'s, reached by an ADAPTER
+    declaring ``Fallback.SOLE_LIVE_RUN``; the candidate is that adapter's one live run in the
+    registry's own table. The Agent SDK assembler's is
+    ``_adapters/_assembler.py::SessionAssembler._session_for_hook`` (the one session in its own
+    ``_by_key``), whose hook's spans parent through ``Evidence(ParentSource.UNIT_SOLE)`` (tool,
+    sub-agent and chat drafts). Both replaced dropping an unattributable call outright, with no
+    marker; a marked 0.5 edge beats unmarked data loss, and beats a call that becomes its own trace
+    root.
     """
 
     CORRELATION_CONFLICT = "correlation_conflict"
@@ -204,8 +199,7 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     CONTEXT_PROPAGATION_UNAVAILABLE = "context_propagation_unavailable"
-    """The seam cannot propagate context at all on this runtime, so every span
-    below it is a root.
+    """The seam cannot propagate context at all on this runtime, so every span below it is a root.
 
     Declared; no emitter yet. Every runtime the SDK supports today propagates
     a ContextVar across the seams it patches.
@@ -272,11 +266,10 @@ Two emit sites, and the first is the mechanism the second restates.
     census rewired the assembler's sites it was the free string
     ``"tool_span_unclosed"``.
 
-    ``SessionAssembler._open_tool``'s eviction was a second assembler site and
-    is NOT one any more: a full ``open_tools`` table is a BOUND, and it names
-    ``max_session_entries`` through ``SESSION_ENTRY_TABLE_FULL`` (43). This
-    member kept it only until that site was decided on its own evidence, which
-    is what the paragraph in ``UNIT_TABLE_FULL`` used to ask for.
+    ``SessionAssembler._open_tool``'s eviction was a second assembler site and is NOT one any more:
+    a full ``open_tools`` table is a BOUND, and it names ``max_session_entries`` through
+    ``SESSION_ENTRY_TABLE_FULL`` (43). This member kept it only until that site was decided on its
+    own evidence, which is what the paragraph in ``UNIT_TABLE_FULL`` used to ask for.
 
     NOTE (census): the four-way merge that loses nothing. ``tool_span_unclosed`` folded into this
     already-declared member because the marker rides the tool span itself, where
@@ -771,9 +764,8 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     EXTRA_KEYS_DROPPED = "extra_keys_dropped"
-    """An open dynamic key family crossed ``max_extra_keys`` and whole leaves
-    were dropped; how many rides beside the marker as
-    ``wardex.usage_leaves.dropped_count``.
+    """An open dynamic key family crossed ``max_extra_keys`` and whole leaves were dropped; how many
+    rides beside the marker as ``wardex.usage_leaves.dropped_count``.
 
     Emitted from ``_interceptors/_seam.py``, off the native parser's ``usage_dropped_count`` — today
     the bound has exactly one enforcement site, the provider-usage mirror (``wardex.usage.*``):
@@ -989,7 +981,15 @@ Two emit sites, and the first is the mechanism the second restates.
     teardown arrived with no result message at all.
 
     Emitted from ``_adapters/_assembler.py::SessionAssembler._stamp_root``, on all three of its
-    terminal branches (result present but errored, no result and an error, no result and no error).
+    # Adapter session (census + one since)
+    """
+
+    TOOL_CALL_NOT_DISPATCHED = "tool_call_not_dispatched"
+    """The model asked for this tool call and the framework never ran it, so no ``execute_tool``
+    span exists for it. Declared; no emitter yet. The first arrives with the Hermes Agent adapter
+    (``_adapters/_hermes_agent.py``) on the turn's ``invoke_agent`` span, from tool call ids asked
+    for minus those run. By id, as a framework may run another name under one id. Names NO knob. Not
+    ``TOOL_ARGS_UNPARSED`` (unreadable arguments) nor ``CHILD_SPAN_UNCLOSED`` (a tool left open).
     """
 
     # ------------------------------------------------------------------

@@ -387,6 +387,12 @@ MARKERS: Mapping[Limitation, MarkerText] = MappingProxyType(
             "The run did not complete normally.",
             "Look at the run's own error; there is nothing to configure in wardex.",
         ),
+        _L.TOOL_CALL_NOT_DISPATCHED: MarkerText(
+            _RESERVED,
+            "It would mean the model asked for a tool call that the framework never ran, so "
+            "the run has no tool span for that call.",
+            _NOTHING,
+        ),
         _L.OTEL_BRIDGE_NO_DATA: MarkerText(
             "The OTel bridge configured the agent CLI's telemetry, confirmed the setting "
             "reached the subprocess, and still received nothing before the session ended.",
