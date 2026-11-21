@@ -307,7 +307,7 @@ def test_a_span_sent_without_its_payload_names_the_request_cap_and_is_counted_on
         assert counters.get("transport.otlp.span_payload_dropped") == 0
         lines = _report_lines(lambda: t.export(env))
         assert counters.get("transport.otlp.span_payload_dropped") == 1
-        (report,) = [line for line in lines if "span_payload_dropped" in line]
+        (report,) = [line for line in lines if "without their payload" in line]
         assert "max_otlp_request_bytes" in report
         by_name = {
             sp["name"]: sp["attributes"]
@@ -328,11 +328,11 @@ def test_a_span_sent_without_its_payload_names_the_request_cap_and_is_counted_on
 
 @pytest.mark.usefixtures("fresh_counters")
 def test_a_non_str_attribute_key_costs_that_attribute_not_the_batch():
-    """Through the public path: `set_attribute(123, ...)` used to raise inside
-    the encoder, and the client's drain then dropped the whole batch -- every
-    span in it -- counted only as an export that raised. The attribute is left
-    out now, named by a placeholder rather than by the key's own text, and the
-    batch ships."""
+    """A non-str key used to raise inside the encoder, and the client's drain
+    then dropped the whole batch -- every span in it -- counted only as an
+    export that raised. The attribute is left out now, named by a placeholder
+    rather than by the key's own text, and the batch ships. `set_attribute`
+    refuses such a key at the call, so it is written to the span's draft."""
     import wardex_sdk
     from wardex_sdk._assembly import counters
 
@@ -346,7 +346,9 @@ def test_a_non_str_attribute_key_costs_that_attribute_not_the_batch():
         with wardex_sdk.span("first"):
             pass
         with wardex_sdk.span("odd-key") as span:
-            span.set_attribute(123, "x")  # type: ignore[arg-type]
+            with pytest.raises(TypeError, match="key must be a str"):
+                span.set_attribute(123, "x")  # type: ignore[arg-type]
+            span._draft.set_extra(123, "x")  # type: ignore[arg-type]
             span.set_attribute("kept", "yes")
         with wardex_sdk.span("last"):
             pass
@@ -443,7 +445,6 @@ def test_a_split_export_that_runs_out_of_budget_says_how_far_it_got(monkeypatch,
     split can run out partway. The spans in the unsent chunks cannot be handed
     back (the earlier chunks are already at the backend and a retry would
     duplicate them), which leaves this line as their only channel."""
-    import urllib.request
 
     from wardex_sdk._assembly._diag import reset_reports_for_test
 
@@ -456,16 +457,19 @@ def test_a_split_export_that_runs_out_of_budget_says_how_far_it_got(monkeypatch,
 
     posted = {"n": 0}
 
-    def slow_urlopen(req, timeout=None):
+    def slow_post(url, body, headers, timeout):
         # Long relative to the encode on purpose: the budget below has to land
         # between two POSTs and three, and the slack in between is what keeps
-        # this from turning into a timing flake on a loaded machine.
+        # this from turning into a timing flake on a loaded machine. The
+        # transport's own `post` would cut the second request at the deadline;
+        # this one returns late, which is what leaves no budget for the third.
         posted["n"] += 1
         time.sleep(0.2)
-        return _Resp()
+
+    from wardex_sdk.transport import _otlp_http
 
     reset_reports_for_test()
-    monkeypatch.setattr(urllib.request, "urlopen", slow_urlopen)
+    monkeypatch.setattr(_otlp_http, "post", slow_post)
     spans = tuple(
         _span(
             name=f"chat model-{i}",
@@ -857,14 +861,15 @@ def test_the_report_says_delivery_is_unconfirmed_and_never_that_spans_were_lost(
     assert "10.0s timeout" in line, line
 
 
-def test_a_connect_phase_timeout_wrapped_by_urllib_is_recognized(monkeypatch, capsys):
-    """urllib reports a timeout during connect as `URLError(reason=TimeoutError)`
-    rather than raising `TimeoutError` itself, so a check that only looked at
-    the exception's own type would miss the commonest shape of this event."""
+def test_a_connect_phase_timeout_is_held_for_a_retry_not_reported_as_cut_short(monkeypatch, capsys):
+    """urllib reports a timeout during connect as `URLError(reason=TimeoutError)`.
+    The connection never opened, so nothing arrived: the batch is held for a
+    retry, and "cannot confirm whether it arrived" would be a false line."""
     import urllib.error
 
     err = _export_and_read(monkeypatch, capsys, urllib.error.URLError(TimeoutError("timed out")))
-    assert _cut_short_lines(err), f"a wrapped connect timeout went unreported: {err!r}"
+    assert not _cut_short_lines(err), err
+    assert "retries after" in err, f"the batch was not held for a retry: {err!r}"
 
 
 def test_an_ordinary_refusal_during_a_short_budget_is_not_reported(monkeypatch, capsys):
@@ -947,12 +952,16 @@ def test_the_cut_short_report_is_bounded_to_one_line_per_process(monkeypatch, ca
     reset_reports_for_test()
 
 
-def test_a_delivered_export_under_a_short_budget_reports_nothing(monkeypatch, capsys):
+def test_a_delivered_export_under_a_short_budget_reports_nothing_but_the_first_delivery(
+    monkeypatch, capsys
+):
     """The control: the report is scoped to a FAILED attempt. A short budget the
-    backend answered inside of is an ordinary success."""
+    backend answered inside of is an ordinary success, so the only line is the
+    once-per-process news that exports arrive."""
     import urllib.request
 
     from wardex_sdk._assembly._diag import reset_reports_for_test
+    from wardex_sdk.transport import _delivery
 
     class _Resp:
         def __enter__(self):
@@ -962,11 +971,15 @@ def test_a_delivered_export_under_a_short_budget_reports_nothing(monkeypatch, ca
             return False
 
     reset_reports_for_test()
+    monkeypatch.setattr(_delivery, "_FIRST_SUCCESS_PID", [])
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
     capsys.readouterr()
     t.export(_envelope_with_span(), timeout=NAMED_1S)
-    assert capsys.readouterr().err == "", "a successful export reported a delivery it made"
+    t.export(_envelope_with_span(), timeout=NAMED_1S)
+    assert capsys.readouterr().err.splitlines() == [
+        "[wardex] first export delivered: 1 span(s) accepted by http://127.0.0.1:1/v1/traces"
+    ]
     reset_reports_for_test()
 
 
@@ -999,11 +1012,14 @@ def test_the_missing_wheel_is_named_off_debug_even_with_a_spent_deadline(monkeyp
 
 def _bad_span_envelope(*names_ok: str) -> Envelope:
     """Spans named in `names_ok`, plus one whose tool block holds an int for a
-    name -- a value the marshaller cannot read, so the export skips it."""
+    name -- a value the marshaller cannot read, so the export skips it. The
+    constructor refuses that int, so it is written past it."""
     from wardex_sdk._types import ToolAttributes
 
     spans = tuple(_span(name=n) for n in names_ok)
-    bad = _span(name="SKIPPED-SPAN", tool=ToolAttributes(name=1))  # type: ignore[arg-type]
+    tool = ToolAttributes(name="placeholder")
+    object.__setattr__(tool, "name", 1)
+    bad = _span(name="SKIPPED-SPAN", tool=tool)
     return Envelope(header=_header(), spans=(*spans, bad))
 
 
@@ -1144,7 +1160,7 @@ def test_a_host_value_under_a_reserved_transport_name_is_replaced_and_counted_on
         assert counters.get("transport.otlp.reserved_attribute_overwritten") == 0
         lines = _report_lines(lambda: t.export(env))
         assert counters.get("transport.otlp.reserved_attribute_overwritten") == 3
-        assert any("reserved_attribute_overwritten" in line for line in lines)
+        assert any("under attribute_dropped" in line for line in lines)
         (request,) = _Handler.requests
         assert _transport_attributes(request) == {
             "host-step": {},

@@ -144,8 +144,8 @@ the first run rather than after it; it is not a troubleshooting step.
 `WARDEX_ENDPOINT` is the full OTLP traces URL; Phoenix listens on
 `/v1/traces`. (A bare `http://127.0.0.1:6006` also works — an endpoint
 with no path gets `/v1/traces` appended.) Nothing else is configured: the
-openai-agents adapter is auto-detected because the `openai-agents`
-distribution is installed, and PII masking is on by default, so a real run
+openai-agents adapter installs because the script imports `agents`, and
+PII masking is on by default, so a real run
 never sends an email address or an API key to the backend.
 
 The script prints the two final answers and then where to click. If the
@@ -263,10 +263,10 @@ python examples/openai_agents_quickstart.py
 
 The `unset` is not decoration: if you ran the Phoenix path in this same
 shell, `WARDEX_ENDPOINT` is still exported, and an explicit `transport=`
-next to it makes `wardex.init()` warn `WardexConfigWarning: backend
-endpoint ignored: transport= carries its own address`. The export still
-goes to Langfuse — the transport wins — but the warning is telling you a
-setting was dropped, and the leftover variable is the whole reason.
+next to it makes `wardex.init()` print `[wardex] WARDEX_ENDPOINT ignored:
+transport= carries its own address` on stderr. The export still goes to
+Langfuse — the transport wins — but the line is telling you a setting was
+dropped, and the leftover variable is the whole reason.
 
 What the script does with them, if you want the same thing in your own
 `wardex.init()`:
@@ -319,10 +319,11 @@ what wardex says in each case:
   `agents.set_tracing_disabled(True)`). The adapter hooks the framework's own
   tracing, so with it off there are no `invoke_workflow`, `invoke_agent`,
   `execute_tool` or `handoff` spans — only the `chat` spans read from the
-  wire, unparented. wardex emits one INFO log line at `wardex.init()` —
-  on stderr under default logging, and through the `wardex_sdk` logger, so
-  a host that raises that logger to WARNING or attaches its own handler
-  sees it wherever it sends INFO, or not at all:
+  wire, unparented. wardex emits one INFO log line when the adapter
+  installs, which for this script is at `wardex.init()`. The line goes to
+  stderr when the app configures no logging, and otherwise through the
+  `wardex_sdk` logger to the app's handlers, so a host whose logging hides
+  INFO does not see it:
 
   ```
   [wardex] openai-agents tracing is disabled, so wardex will show only the LLM calls its interceptor captures: no agent, handoff, tool or guardrail spans. To get them without sending anything to OpenAI, put these two lines BEFORE wardex.init(): agents.set_tracing_disabled(False); agents.set_trace_processors([]). Calling set_trace_processors after wardex.init() removes wardex's processor as well.

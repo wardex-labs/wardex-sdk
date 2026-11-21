@@ -191,7 +191,7 @@ class FinalizeQueue:
         size = int(job.size)
         if size > self._max_bytes:
             counters.bump("client.finalize.backlog_evicted")
-            self._report_backlog(1)
+            self._report_backlog()
             self._fallback_now(_Entry(job, scope), Limitation.PARSE_BACKLOG_FULL)
             return
         evicted: list[_Entry] = []
@@ -207,15 +207,20 @@ class FinalizeQueue:
         for _ in evicted:
             counters.bump("client.finalize.backlog_evicted")
         if evicted:
-            self._report_backlog(len(evicted))
+            self._report_backlog()
         for old in evicted:
             self._fallback_now(old, Limitation.PARSE_BACKLOG_FULL)
         self._worker.wake()
 
-    def _report_backlog(self, count: int) -> None:
+    def _report_backlog(self) -> None:
+        # No count in the line: it is said once, at the first eviction, and a number there would
+        # stay the first one's however many follow. The running count is the ledger's.
         report_once(
-            f"deferred-parse backlog full; {count} transaction(s) shipped without "
-            "gen_ai semantics. Raise max_parse_backlog / max_parse_backlog_bytes.",
+            "deferred-parse backlog full: HTTP spans are shipping unparsed and marked "
+            "parse_backlog_full. A model call among them ships without its gen_ai fields "
+            "(model, tokens, messages), and wardex.diagnostics() counts each such call under "
+            "backpressure. Raise LimitsConfig(max_parse_backlog=..., "
+            "max_parse_backlog_bytes=...) or spread the burst of traffic.",
             key="wardex.finalize.backlog",
         )
 

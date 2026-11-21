@@ -26,6 +26,7 @@ module outside this package, and only when the flag is given.
 from .conformance import AdapterConformanceSuite
 from .harness import (
     AdapterSubject,
+    EventNode,
     LiveAdapter,
     RecordingClient,
     RecordingTransport,
@@ -48,6 +49,7 @@ __all__ = [
     "AdapterSubject",
     "CaptureGap",
     "CaptureGapError",
+    "EventNode",
     "LiveAdapter",
     "RecordingClient",
     "RecordingTransport",

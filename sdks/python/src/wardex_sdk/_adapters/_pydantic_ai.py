@@ -666,7 +666,8 @@ class _Bridge:
         """Say once that wardex's own step failed, and mark the nearest live unit."""
         report_once(
             f"pydantic_ai adapter: wardex's own {where} step failed; the run's tree is incomplete "
-            f"here (counted under adapters.pydantic_ai.{where})",
+            "here (wardex.diagnostics().losses counts it under internal_sdk_error; re-run with "
+            "debug=True for the error)",
             key=f"adapters.pydantic_ai.degraded.{where}",
         )
         holder = slot

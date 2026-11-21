@@ -3,11 +3,11 @@
 When the SSL interceptor (_ssl.py) streams plaintext bytes into a tracker, the tracker
 parses and correlates them according to the protocol (HTTP/1 or HTTP/2) and returns a
 list of _Txn (`_txn.py`). Span assembly is performed based solely on _Txn (protocol-agnostic).
+The WebSocket tracker an HTTP/1 upgrade swaps in is `_ws_tracker.py`.
 """
 
 from __future__ import annotations
 
-import re
 import time
 from typing import Any
 
@@ -20,13 +20,13 @@ from .._assembly import (
     should_capture,
 )
 from .._enums import CaptureMode
-from .._protocol import WsParser, classify_path
+from .._protocol import classify_path
 from .._protocol._http1 import Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, ParsedMessage, SpanContext
 from ._h2_issuer import IssuerLink
 from ._http1_requests import RequestSide, header_get, is_ws_upgrade_request
-from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope, same_issuer
+from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot
 from ._txn import _name_path, _Txn
 
 
@@ -77,13 +77,11 @@ def _merge_markers(*groups: tuple[Limitation, ...]) -> tuple[Limitation, ...]:
     return tuple(out)
 
 
-#: The `type` of the one client message the Responses WebSocket transport sends per call, searched
-#: for anywhere in the first client message rather than matched as a prefix: key order
-#: (`sort_keys`), a BOM or leading whitespace must not decide the connection's fate. The search is
-#: bounded by the message, which the frame parser already caps. Consulted only when nothing hides
-#: the payload.
-_RESPONSES_CREATE = re.compile(rb'"type"\s*:\s*"response\.create"')
-_StreamLatch = tuple[SpanContext | None, bool, ConversationContext | None, ScopeSnapshot, bool, int]
+#: A stream's latch entry: (parent, parent closed, conversation, scope, unseen parent, issuer
+#: proven, request start ns).
+_StreamLatch = tuple[
+    SpanContext | None, bool, ConversationContext | None, ScopeSnapshot, str | None, bool, int
+]
 
 
 class _Http1Tracker:
@@ -103,10 +101,34 @@ class _Http1Tracker:
         request = self._requests.request
         return request is not None and is_ws_upgrade_request(request.headers)
 
+    def keep_bodies(self, keep_all: bool) -> None:
+        """The seam's answer, for the request bytes it feeds next, to "could the capture policy use
+        this exchange whatever its response says?". False stores a request body only for an LLM
+        endpoint path, or until its reply decides for a JSON POST elsewhere; and the reply's only
+        when it is an event stream (`_reply_policy`)."""
+        self._requests.keep_bodies(keep_all)
+
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         self._requests.feed(data)
         self._expect_ws = self._upgrade_requested()
         return []
+
+    def _reply_policy(self) -> str:
+        """The body policy for the reply about to open, from what its request's body was stored for:
+        a model call's makes the reply one too (first claim on the in-flight budget); a body kept
+        under "keep" keeps the reply's; a provisional or skipped one stores the reply's only if it
+        is an event stream. No complete request waiting (one still arriving, or none seen) keeps
+        it: nothing says the policy can do without it."""
+        request = self._requests.request
+        if request is None or request.body_use == "kept":
+            return "keep"
+        return "model_call" if request.body_use == "model_call" else "model_calls_only"
+
+    def pass_unseen(self, n: int) -> bool:
+        """Take `n` response bytes without seeing them, when they can only be a body this tracker
+        is not storing and they do not end it (`Http1Parser.pass_unseen_body`). They leave no byte
+        mark, so such a response has no TTFT (`_response_txn`)."""
+        return self._resp.pass_unseen_body(n)
 
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
         if self._requests.decide():
@@ -115,6 +137,7 @@ class _Http1Tracker:
             # These bytes open a response, so its request is settled: HEAD and CONNECT frame their
             # answers, and only the request side knows which one this reply answers.
             self._resp.expect_response_to(self._requests.method)
+            self._resp.set_body_policy(self._reply_policy())
         now = time.time_ns()
         if self._resp_first_ns == 0:
             self._resp_first_ns = now
@@ -140,6 +163,7 @@ class _Http1Tracker:
                         response_body=b"",
                         parent=issue.parent,
                         parent_closed=issue.parent_closed,
+                        unseen_parent=issue.unseen_parent,
                         conversation=issue.conversation,
                         scope=issue.scope,
                         start_ns=issue.start_ns or now,
@@ -214,9 +238,16 @@ class _Http1Tracker:
             if issue.start_ns and self._resp_first_ns
             else None
         )
-        ttft = _ttft_from_marks(self._resp_marks, msg.header_len, issue.start_ns)
+        # Reads inside a body left unstored may have gone by unseen (`pass_unseen`): not measured.
+        response_kept = msg.body_use != "skipped"
+        ttft = (
+            _ttft_from_marks(self._resp_marks, msg.header_len, issue.start_ns)
+            if response_kept
+            else None
+        )
         path = (request.url if request is not None else None) or "/"
         cut = (Limitation.FRAME_PARSE_FAILED,) if msg.incomplete else ()
+        request_kept = request is None or request.body_use != "skipped"
         return _Txn(
             method=(request.method if request is not None else None) or "?",
             path=_name_path(path),
@@ -226,14 +257,17 @@ class _Http1Tracker:
             response_body=msg.body,
             parent=issue.parent,
             parent_closed=issue.parent_closed,
+            unseen_parent=issue.unseen_parent,
             conversation=issue.conversation,
             scope=issue.scope,
             start_ns=issue.start_ns or now,
             end_ns=now,
             ttfb_ms=ttfb,
             truncated=(request is not None and request.truncated) or msg.truncated,
-            request_counted=request is not None and not request.truncated,
-            response_counted=not msg.truncated,
+            request_counted=request is not None and not request.truncated and request_kept,
+            response_counted=not msg.truncated and response_kept,
+            request_body_kept=request_kept,
+            response_body_kept=response_kept,
             response_cut=msg.incomplete,
             limitations=_merge_markers(
                 request.limitations if request is not None else (), msg.limitations, cut
@@ -343,12 +377,14 @@ class _Http2Tracker:
         # The WRITER's scope, which on a shared connection may be any task's: any of them flushes
         # the others' queued frames. So it is the parent only of a stream with no proven issuer, and
         # never anyone's conversation or identity (`IssuerLink.latch`).
-        parent = _hub.get_current_scope().active_span_context
+        scope = _hub.get_current_scope()
+        parent = scope.active_span_context
         if opened:  # latched only for the streams this write opens
             parent, _ = latch_parent(parent, None)
         parent_closed = parent_is_closed_unit(parent) if opened else False
+        unseen = _hub.unseen_parent(scope) if opened and parent is None else None
         for sid, path in opened:
-            self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed), now)
+            self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed, unseen), now)
             if path is not None and classify_path(path) == "llm_call":
                 self._model_paths[sid] = path
         if opened:
@@ -492,6 +528,7 @@ class _Http2Tracker:
         witness = None
         if entry is None:
             parent, parent_closed, conversation, proven, start = None, False, None, False, now
+            unseen = None
             call = self._evicted_calls.pop(t.stream_id, None)
             if call is not None and call[1] is not None:
                 witness, model_path = call  # the seal witnesses the call it evicted the parent of
@@ -531,7 +568,7 @@ class _Http2Tracker:
             parent_lost = t.stream_id in self._evicted_admitting
             self._evicted_admitting.discard(t.stream_id)
         else:
-            parent, parent_closed, conversation, scope, proven, start = entry
+            parent, parent_closed, conversation, scope, unseen, proven, start = entry
             parent_evicted = parent_lost = False
         # The OTHER half of the same bound: the native stream table evicted this stream's request
         # before its response completed. The response is a real observation — a status, an end — so
@@ -558,6 +595,7 @@ class _Http2Tracker:
             parent_closed=parent_closed,
             parent_evicted=parent_evicted,
             parent_lost=parent_lost,
+            unseen_parent=unseen,
             conversation=conversation,
             scope=scope,
             issuer_proven=proven,
@@ -586,210 +624,4 @@ class _Http2Tracker:
             content_encoding=t.content_encoding,
             grpc_status=getattr(t, "grpc_status", None),
             grpc_message=getattr(t, "grpc_message", None),
-        )
-
-
-class _WebSocketTracker:
-    """One WS connection — per-direction frame parser + aggregation + 64KB content sample.
-    Emits 1 span once both Close frames have crossed, or on flush."""
-
-    def __init__(
-        self,
-        path: str,
-        deflate: bool,
-        parent: SpanContext | None,
-        start_ns: int,
-        parent_closed: bool = False,
-        limits: object | None = None,
-        sample_cap: int | None = None,
-        llm_upgrade: str | None = None,
-        conversation: ConversationContext | None = None,
-        scope: ScopeSnapshot | None = None,
-    ) -> None:
-        # "known_provider" | "unknown_host" | None: the endpoint table's answer about the upgrade
-        # path (`classify_ws_upgrade`), decided by the seam at the swap site. The tracker only
-        # confirms it — once: `_decide_llm` nulls this, so "already decided" and "nothing to
-        # decide" are the same state and there is no second flag to keep in step with it.
-        self._llm_upgrade = llm_upgrade
-        self._llm_call = False
-        self._llm_unconfirmed = False
-        self._sent = WsParser(limits)  # client -> server
-        self._recv = WsParser(limits)  # server -> client
-        self._path = _name_path(path)
-        self._target = path
-        self._deflate = deflate
-        self._parent = parent
-        # Inherited from the UPGRADE transaction rather than re-latched: a WS
-        # session's parent is the scope that issued the handshake, and so is the
-        # question of whether that scope's unit had already died.
-        self._parent_closed = parent_closed
-        # The handshake's conversation, kept only while every message the client sends is issued in
-        # it too: the session is ONE span, so a socket reused across conversations names none of
-        # them rather than whichever one happened to open it.
-        self._conversation = conversation
-        # The handshake's identity, kept by the same rule as the conversation: only while every
-        # message the client sends is issued under it too (`same_issuer`: every tag and user
-        # field the handshake carried, unchanged; fields added later do not count). A socket one
-        # tenant opened and another writes to would otherwise ship the second tenant's payload
-        # under the first one's name.
-        self._scope = scope
-        self._start_ns = start_ns
-        # None means "use the core default" — resolved here (rather than hardcoded)
-        # so this can never silently drift from crates/wardex-limits.
-        self._sample_cap = (
-            sample_cap
-            if sample_cap is not None
-            else _wardex_native.limits_defaults()["ws_sample_bytes"]
-        )
-        self._sent_msgs = 0
-        self._recv_msgs = 0
-        self._sent_bytes = 0
-        self._recv_bytes = 0
-        self._sample_in = bytearray()
-        self._sample_out = bytearray()
-        self._in_trunc = False
-        self._out_trunc = False
-        self._close_code: int | None = None
-        #: The directions ("sent", "received") a Close frame crossed in. The session ends when both
-        #: have: the peer may still send data after the first Close (RFC 6455 5.5.1), and its own
-        #: Close is part of the session too, so a span built at the first one undercounted both.
-        self._close_from: set[str] = set()
-        self._emitted = False
-
-    def on_request_bytes(self, data: bytes) -> list[_Txn]:
-        r = self._sent.feed(data)
-        self._sent_bytes += self._count(r.frames, "sent")
-        self._sent_msgs += len(r.messages)
-        # A parser that died can no longer tell a message from a frame, so every write counts then.
-        if r.messages or self._sent.is_disabled():
-            if self._conversation is not None:
-                if _hub.get_current_scope().conversation != self._conversation:
-                    self._conversation = None
-            if self._scope is not None and self._scope != UNKNOWN_ISSUER:
-                if not same_issuer(self._scope, issued_scope()):
-                    self._scope = UNKNOWN_ISSUER  # issued under more than one: names no one
-        if self._llm_upgrade is not None:
-            if r.messages:
-                self._decide_llm(r.messages[0])
-            elif self._sent.is_disabled():
-                # The parser died on the first client frame (oversize, desync) and will never yield
-                # a message. Bytes crossed all the same, so decide now on nothing readable: a
-                # decision that waited for a message would be starved by the parse failure and the
-                # connection would vanish without a counter.
-                self._decide_llm(None)
-        self._in_trunc = self._append_sample(self._sample_in, r.messages) or self._in_trunc
-        return self._maybe_emit()
-
-    def _decide_llm(self, first: bytes | None) -> None:
-        # Decided once, on the first client message — the moment "a call crossed" becomes true — or,
-        # when the client-direction parser disables before yielding one, on the bytes that killed it
-        # (`first` is None then). The path alone is a suffix match; it is corroborated by the
-        # provider's own host or, when nothing hides the payload (no permessage-deflate, a readable
-        # message), by the Responses envelope itself. The tracker only records the answer on the
-        # `_Txn` it emits at close; the seam reads it there and counts — so the two counters move
-        # when the connection closes, not at this first message, and a span the capture gate then
-        # refuses is still counted.
-        if self._llm_upgrade == "known_provider" or (
-            first is not None and not self._deflate and _RESPONSES_CREATE.search(first) is not None
-        ):
-            self._llm_call = True
-        else:
-            self._llm_unconfirmed = True
-        self._llm_upgrade = None
-
-    def on_response_bytes(self, data: bytes) -> list[_Txn]:
-        r = self._recv.feed(data)
-        self._recv_bytes += self._count(r.frames, "received")
-        self._recv_msgs += len(r.messages)
-        self._out_trunc = self._append_sample(self._sample_out, r.messages) or self._out_trunc
-        return self._maybe_emit()
-
-    def _append_sample(self, buf: bytearray, messages: list[bytes]) -> bool:
-        """Accumulate messages into buf (up to a total of self._sample_cap).
-        Returns True if truncated."""
-        truncated = False
-        for m in messages:
-            room = self._sample_cap - len(buf)
-            if room <= 0:
-                truncated = True
-                break
-            if len(m) > room:
-                buf += m[:room]
-                truncated = True
-            else:
-                buf += m
-        return truncated
-
-    def _count(self, frames: list[Any], side: str) -> int:
-        """The payload bytes in `frames`, noting a Close frame from `side`. The session's close
-        code is the first Close frame's: the one that began the closing handshake."""
-        for f in frames:
-            if f.opcode == "close":
-                if not self._close_from:
-                    self._close_code = f.close_code
-                self._close_from.add(side)
-        return sum(f.payload_len for f in frames)
-
-    def _maybe_emit(self) -> list[_Txn]:
-        if len(self._close_from) == 2 and not self._emitted:
-            return [self._build_txn(())]
-        return []
-
-    def flush(self, marker: Limitation, *, still_open: bool = False) -> list[_Txn]:
-        """The socket closed or the seam let go before the closing handshake completed.
-        `WS_NO_CLOSE` says no Close frame crossed at all, so a session that saw one does not take
-        it; the seam decides from the ending whether the counts are whole."""
-        if self._emitted:
-            return []
-        drop = marker is Limitation.WS_NO_CLOSE and bool(self._close_from)
-        return [self._build_txn(() if drop else (marker,))]
-
-    #: The connection-close verb every tracker answers to. For a WS session it IS `flush`, and an
-    #: ALIAS rather than a delegating wrapper: this is the one tracker with something to save at
-    #: close — its span exists only once the session ends — so the two names must never be able to
-    #: drift apart. Before the close hook, that span waited for `uninstall()` and was lost whenever
-    #: the process never reached one.
-    on_connection_close = flush
-
-    def _build_txn(self, extra_markers: tuple[Limitation, ...]) -> _Txn:
-        self._emitted = True
-        markers = list(extra_markers)
-        if self._in_trunc or self._out_trunc:
-            markers.append(Limitation.WS_PAYLOAD_TRUNCATED)
-        if self._deflate:
-            # Census merge (§6.5.1): `ws_compressed` folded into PAYLOAD_COMPRESSED. What is lost is
-            # which protocol it was, and `TransportAttributes.protocol` already carries that.
-            markers.append(Limitation.PAYLOAD_COMPRESSED)
-        if self._sent.is_disabled() or self._recv.is_disabled():
-            # Census merge: `ws_parse_failed` and `grpc_parse_failed` are one fact — the framing
-            # layer failed, so the transport fields on this span are partial or synthesized.
-            markers.append(Limitation.FRAME_PARSE_FAILED)
-        if self._llm_call:
-            markers.append(Limitation.WS_LLM_SEMANTICS_UNREAD)
-        now = time.time_ns()
-        return _Txn(
-            method="GET",
-            path=self._path,
-            target=self._target,
-            status=101,
-            request_body=bytes(self._sample_in),
-            response_body=bytes(self._sample_out),
-            parent=self._parent,
-            parent_closed=self._parent_closed,
-            conversation=self._conversation,
-            scope=self._scope,
-            start_ns=self._start_ns,
-            end_ns=now,
-            ttfb_ms=None,
-            version="websocket",
-            ws_close_code=self._close_code,
-            ws_messages_sent=self._sent_msgs,
-            ws_messages_received=self._recv_msgs,
-            ws_bytes_sent=self._sent_bytes,
-            ws_bytes_received=self._recv_bytes,
-            request_counted=not self._sent.is_disabled(),
-            response_counted=not self._recv.is_disabled(),
-            ws_markers=tuple(markers),
-            ws_llm_call=self._llm_call,
-            ws_llm_unconfirmed=self._llm_unconfirmed,
         )

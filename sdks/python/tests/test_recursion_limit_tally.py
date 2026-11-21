@@ -301,6 +301,7 @@ def test_a_span_close_that_runs_out_of_room_is_counted_at_some_depth(recording):
                 sys.setrecursionlimit(_lowest_recursion_limit() + headroom)
         finally:
             sys.setrecursionlimit(limit)
+        assert wardex.current_span() is None, "a close given up leaves no span current"
         _hub.get_client().flush()
         shipped = sum(sp.name == "closing" for env in recording.envelopes for sp in env.spans)
         recording.envelopes.clear()

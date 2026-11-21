@@ -22,12 +22,26 @@ def test_new_scope_is_forked_and_restored():
     assert _hub.get_current_scope().tags.get("base") == "1"
 
 
-def test_isolation_scope_resets_current():
-    _hub.get_current_scope().set_tag("outer", "1")
+def test_isolation_scope_leaves_the_trace_position_alone():
+    """Isolating identity must not cut the tree: the current scope, which holds
+    the active span and the conversation, is the same object inside the block."""
+    outer = _hub.get_current_scope()
     with _hub.isolation_scope():
-        assert _hub.get_current_scope().tags.get("outer") is None
-        _hub.get_current_scope().set_tag("req", "r1")
-    assert _hub.get_current_scope().tags.get("req") is None
+        assert _hub.get_current_scope() is outer
+    assert _hub.get_current_scope() is outer
+
+
+def test_continuation_restarts_the_trace_but_keeps_the_conversation():
+    from wardex_sdk._types import ConversationContext
+
+    outer = _hub.get_current_scope()
+    outer.conversation = ConversationContext(conversation_id="c")
+    with _hub.isolation_scope(restart_trace=True):
+        inner = _hub.get_current_scope()
+        assert inner is not outer
+        assert inner.active_span_context is None
+        assert inner.conversation is outer.conversation
+    assert _hub.get_current_scope() is outer
 
 
 def test_isolation_scope_forks_the_enclosing_isolation_scope():

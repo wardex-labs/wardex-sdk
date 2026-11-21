@@ -40,7 +40,7 @@ def test_workflow_decorator_sync():
     with conversation("s"):
         assert run() == 42
     spans = _all_spans(t)
-    sp = spans["research-graph"]
+    sp = spans["invoke_workflow research-graph"]
     assert sp.workflow_name == "research-graph"
     assert ("gen_ai.operation.name", "invoke_workflow") in sp.extra
     assert sp.call_site is not None and sp.call_site.function == "run"
@@ -55,7 +55,7 @@ def test_tool_decorator_sets_attrs():
 
     with conversation("s"):
         search()
-    sp = _all_spans(t)["web_search"]
+    sp = _all_spans(t)["execute_tool web_search"]
     assert sp.tool is not None and sp.tool.name == "web_search"
     assert ("gen_ai.operation.name", "execute_tool") in sp.extra
 
@@ -63,8 +63,8 @@ def test_tool_decorator_sets_attrs():
 def test_step_decorator_maps_execute_step():
     """`@step` spans carry an operation like every other decorator's — the old
     `task()` mapped none, and its spans vanished from any dashboard keyed on
-    `gen_ai.operation.name`. The span NAME stays the given name, exactly as
-    workflow/agent/tool names come out."""
+    `gen_ai.operation.name`. The span is named `execute_step {name}` and carries
+    `wardex.step.name`, as an adapter names a graph node."""
     t = _setup()
 
     @step(name="summarize")
@@ -73,8 +73,9 @@ def test_step_decorator_maps_execute_step():
 
     with conversation("s"):
         do()
-    sp = _all_spans(t)["summarize"]
+    sp = _all_spans(t)["execute_step summarize"]
     assert ("gen_ai.operation.name", "execute_step") in sp.extra
+    assert ("wardex.step.name", "summarize") in sp.extra
 
 
 def test_agent_decorator_async():
@@ -89,13 +90,13 @@ def test_agent_decorator_async():
             return await run_agent()
 
     assert asyncio.run(main()) == "done"
-    sp = _all_spans(t)["researcher"]
+    sp = _all_spans(t)["invoke_agent researcher"]
     assert sp.agent is not None and sp.agent.name == "researcher"
     assert ("gen_ai.operation.name", "invoke_agent") in sp.extra
 
 
 # ==========================================================================
-# bare form: @wardex.tool with no parentheses, name defaults to fn.__name__
+# bare form: @wardex.tool with no parentheses, name defaults to the function
 # ==========================================================================
 
 
@@ -122,11 +123,12 @@ def test_bare_decorators_default_the_name_to_the_function():
         assert research_graph() == "ok"
         assert researcher() == 1
     spans = _all_spans(t)
-    assert ("gen_ai.operation.name", "execute_tool") in spans["web_search"].extra
-    assert ("gen_ai.operation.name", "invoke_workflow") in spans["research_graph"].extra
-    assert spans["research_graph"].workflow_name == "research_graph"
-    assert ("gen_ai.operation.name", "execute_step") in spans["summarize"].extra
-    assert ("gen_ai.operation.name", "invoke_agent") in spans["researcher"].extra
+    assert ("gen_ai.operation.name", "execute_tool") in spans["execute_tool web_search"].extra
+    workflow_span = spans["invoke_workflow research_graph"]
+    assert ("gen_ai.operation.name", "invoke_workflow") in workflow_span.extra
+    assert workflow_span.workflow_name == "research_graph"
+    assert ("gen_ai.operation.name", "execute_step") in spans["execute_step summarize"].extra
+    assert ("gen_ai.operation.name", "invoke_agent") in spans["invoke_agent researcher"].extra
 
 
 def test_keyword_form_name_defaults_to_the_function_when_omitted():
@@ -138,7 +140,7 @@ def test_keyword_form_name_defaults_to_the_function_when_omitted():
 
     with conversation("s"):
         lookup()
-    sp = _all_spans(t)["lookup"]
+    sp = _all_spans(t)["execute_tool lookup"]
     assert sp.tool is not None and sp.tool.name == "lookup"
 
 
@@ -154,5 +156,5 @@ def test_bare_decorator_on_an_async_function():
             return await fetch()
 
     assert asyncio.run(main()) == "ok"
-    sp = _all_spans(t)["fetch"]
+    sp = _all_spans(t)["execute_tool fetch"]
     assert ("gen_ai.operation.name", "execute_tool") in sp.extra

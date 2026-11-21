@@ -20,7 +20,8 @@ own read side an empty read is not that close.
 Bytes written below those methods are not seen: `os.sendfile` (what
 `loop.sendfile`/`sock_sendfile` and `socket.sendfile` use where the OS has it),
 `os.write` on the descriptor, uvloop (libuv writes and reads the descriptor
-itself) and the Windows proactor loop (overlapped `WSASend`/`WSARecv`). A
+itself; said once, and counted once a plaintext response is seen, see
+`note_uvloop`) and the Windows proactor loop (overlapped `WSASend`/`WSARecv`). A
 response that arrives for a request the tracker did not see whole is counted,
 never paired with another request — see `_http1_requests`.
 SSLSocket is a subclass of socket.socket but implements its own send/recv, and
@@ -30,11 +31,22 @@ not double-capture TLS application data (regression-safe).
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
+import sys
 from typing import TYPE_CHECKING, Any
 
-from .._assembly import Limitation, Prefilter, counters
+from .._assembly import (
+    DropReason,
+    DropUnit,
+    Limitation,
+    Prefilter,
+    counters,
+    guard,
+    record,
+    report_once,
+)
 from .._enums import CaptureSource
 from .._protocol import REQUEST_METHODS as _HTTP_METHODS
 from ._conn_timing import shared_timing_store
@@ -79,6 +91,120 @@ def _asked_for_bytes(size: Any, buffer: Any = None) -> bool:
     if buffer is not None and not size:
         size = memoryview(buffer).nbytes
     return bool(size) and size > 0
+
+
+_UVLOOP_LINE = (
+    "plaintext http:// requests made on a uvloop event loop are not captured: uvloop reads "
+    "and writes its sockets in C, below the socket methods wardex observes. https:// requests "
+    "are captured. To capture an http:// endpoint (a local model server, for example), serve "
+    "it over TLS, or run that client on the standard asyncio event loop (for uvicorn: "
+    "--loop asyncio)"
+)
+
+#: Holds an entry once the uvloop line has been said in this process.
+_UVLOOP_SAID: dict[str, object] = {}
+#: Holds an entry once a plaintext HTTP response on a uvloop loop has been
+#: counted; from then on no connection is watched.
+_UVLOOP_COUNTED: dict[str, object] = {}
+
+
+def _is_uvloop(loop: Any) -> bool:
+    # Never imports uvloop: a loop can only be uvloop's once uvloop is imported.
+    loop_class = getattr(sys.modules.get("uvloop"), "Loop", None)
+    return isinstance(loop_class, type) and isinstance(loop, loop_class)
+
+
+def note_uvloop(loop: Any, args: tuple, kwargs: dict[str, Any]) -> tuple:
+    """On a uvloop loop, say the plaintext blind spot once, and watch a
+    connection opened without `ssl=` for a plaintext HTTP response.
+
+    Returns the `create_connection` positional arguments to call with; a
+    keyword `protocol_factory` is replaced in `kwargs`. Opened without `ssl=`
+    is not plaintext: httpx (through anyio) opens every connection that way
+    and starts TLS on it afterwards, which is captured. So the loss is
+    counted only once the first bytes back on such a connection are an HTTP
+    response, which TLS bytes never are.
+    """
+    if not _is_uvloop(loop):
+        return args
+    _say_uvloop()
+    if _UVLOOP_COUNTED or kwargs.get("ssl"):
+        return args
+    if args:
+        return (_watching(args[0]), *args[1:])
+    if "protocol_factory" in kwargs:
+        kwargs["protocol_factory"] = _watching(kwargs["protocol_factory"])
+    return args
+
+
+def _say_uvloop() -> None:
+    mine = object()
+    if _UVLOOP_SAID.setdefault("said", mine) is mine:
+        report_once(_UVLOOP_LINE, key="interceptors.socket.uvloop")
+
+
+def _count_uvloop() -> None:
+    # `setdefault` picks the one caller that counts, as `report_once` picks its line.
+    mine = object()
+    if _UVLOOP_COUNTED.setdefault("counted", mine) is mine:
+        record(
+            DropReason.INSTRUMENTATION_UNAVAILABLE,
+            unit=DropUnit.SEAM,
+            where="interceptors.socket.uvloop",
+        )
+
+
+def _watching(factory: Any) -> Any:
+    def make_protocol() -> Any:
+        protocol = factory()  # the host's own: what it raises is the host's
+        with guard("interceptors.socket.uvloop_watch"):
+            _watch_first_bytes(protocol)
+        return protocol
+
+    return make_protocol
+
+
+def _watch_first_bytes(protocol: Any) -> None:
+    """Shadow `protocol.data_received` on the instance, before uvloop binds it.
+
+    A buffered protocol (fed through `get_buffer`) and one without an
+    instance `__dict__` (a C protocol such as asyncpg's) are not watched:
+    their plaintext responses are said, not counted. After the first chunk
+    the cost is one flag test per chunk.
+    """
+    if _UVLOOP_COUNTED or not hasattr(protocol, "__dict__"):
+        return
+    if hasattr(protocol, "get_buffer") and not isinstance(protocol, asyncio.Protocol):
+        return
+    real = protocol.data_received
+    first = [True]
+
+    def data_received(data: Any) -> Any:
+        if first[0]:
+            first[0] = False
+            if data[:5] == b"HTTP/":
+                _count_uvloop()
+        return real(data)
+
+    protocol.data_received = data_received
+
+
+def _at_fork_reinit() -> None:
+    """Fork-child reset: the child's loss ledger starts from zero, so a
+    plaintext response it sees on uvloop is its own to count. The line, said
+    by the parent on the same stderr, is not said again."""
+    _UVLOOP_COUNTED.clear()
+
+
+def _note_uvloop_at_install() -> None:
+    """The cheap look at install time: `init()` inside a running uvloop loop
+    (uvicorn imports the application there), or uvloop's policy installed.
+    Said, not counted: nothing has been missed yet."""
+    policy = getattr(asyncio.events, "_event_loop_policy", None)
+    if _is_uvloop(asyncio._get_running_loop()) or (
+        type(policy).__module__.partition(".")[0] == "uvloop"
+    ):
+        _say_uvloop()
 
 
 def _is_link_local(addr: str) -> bool:
@@ -132,6 +258,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "shutdown", self._mk_shutdown(sock.shutdown))
         self._acquire_probes()
         self._installed = True
+        with self._guard("interceptors.socket.uvloop_check"):
+            _note_uvloop_at_install()
 
     # `uninstall` is the base's — see `ByteSeamInterceptor.uninstall`.
 
@@ -326,7 +454,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             n = real(this, buffer, *args, **kwargs)
             try:
                 if n and self._capture_possible(this):
-                    self._on_response_bytes(this, bytes(buffer[:n]))
+                    self._on_response_view(this, buffer, n)
                 elif n == 0 and _asked_for_bytes(args[0] if args else kwargs.get("nbytes"), buffer):
                     self._on_response_eof(this)
             except RecursionError:  # at the limit: C calls only; the host's call returned

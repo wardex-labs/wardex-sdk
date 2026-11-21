@@ -1,5 +1,6 @@
 """Adapter registry + config-driven activation tests."""
 
+import importlib
 import json
 import logging
 import os
@@ -24,6 +25,14 @@ from wardex_sdk._assembly import SpanIntent, UnitKind, counters
 from wardex_sdk._config import AdaptersConfig, AnthropicAgentSdkConfig, WardexConfig
 from wardex_sdk._enums import AdapterName, AgentType, StatusCode
 from wardex_sdk._types import AgentAttributes
+
+
+@pytest.fixture(autouse=True)
+def _frameworks_imported() -> None:
+    """The application has imported every framework, so the adapters these
+    tests select install at init() rather than waiting for that import."""
+    for module in ("agents", "claude_agent_sdk", "langgraph.graph"):
+        importlib.import_module(module)
 
 
 class _FakeAdapter(AdapterInterface):
@@ -177,9 +186,14 @@ _BARE_INIT_SCRIPT = textwrap.dedent(
     assert "agents" not in sys.modules
     wardex.init(transport=RecordingTransport())
     try:
-        print(json.dumps({
+        at_init = {
             "installed": get_registry().is_installed(AdapterName.OPENAI_AGENTS.value),
             "imported": "agents" in sys.modules,
+        }
+        import agents
+        print(json.dumps({
+            "at_init": at_init,
+            "after_import": get_registry().is_installed(AdapterName.OPENAI_AGENTS.value),
         }))
     finally:
         wardex.close()
@@ -191,9 +205,10 @@ def test_a_bare_init_installs_the_adapter_of_a_framework_that_is_installed():
     """Adapters install with no code change and are auto-detected. The positive half
     of auto-detection, against the real `openai-agents` distribution this
     suite has, in a process that has not imported it yet: `wardex.init()`
-    with no adapter named installs the adapter, and importing the framework
-    is part of that. The tests above patch detection to say yes or no; the
-    decline paths run in `test_openai_agents_adapter.py`; this is the one
+    with no adapter named does not import the framework, and the
+    application's own import of it installs the adapter. The tests above
+    patch detection to say yes or no; the decline paths run in
+    `test_openai_agents_adapter.py`; this is the one
     test that says a bare init actually does something with a real package.
     A subprocess because this suite imported `agents` at collection, and the
     claim is about a process that did not."""
@@ -206,7 +221,10 @@ def test_a_bare_init_installs_the_adapter_of_a_framework_that_is_installed():
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout.strip().splitlines()[-1]) == {"installed": True, "imported": True}
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) == {
+        "at_init": {"installed": False, "imported": False},
+        "after_import": True,
+    }
 
 
 def test_auto_detection_skips_when_package_absent():
@@ -503,6 +521,7 @@ def test_options_for_an_adapter_excluded_by_enabled_warn_unconditionally():
     try:
         with pytest.warns(WardexConfigWarning, match="excluded by adapters.enabled"):
             wardex_sdk.init(
+                transport=wardex_sdk.NoOpTransport(),
                 intercept=False,
                 adapters=AdaptersConfig(
                     enabled=(),
@@ -525,7 +544,11 @@ def test_default_options_under_an_excluding_enabled_are_not_a_contradiction():
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            wardex_sdk.init(intercept=False, adapters=AdaptersConfig(enabled=()))
+            wardex_sdk.init(
+                transport=wardex_sdk.NoOpTransport(),
+                intercept=False,
+                adapters=AdaptersConfig(enabled=()),
+            )
         assert not [w for w in caught if issubclass(w.category, WardexConfigWarning)]
     finally:
         wardex_sdk.close()

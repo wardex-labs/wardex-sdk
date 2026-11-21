@@ -80,6 +80,7 @@ from ._assembly import (
 from ._assembly._diag import diag_reset_for_new_process
 from ._client import Client, _sanitize_timeout, _UnnamedTimeout
 from ._types import InternalSpan
+from .transport._delivery import posts_inline
 
 if TYPE_CHECKING:
     from ._adapters._registry import AdapterRegistry
@@ -454,19 +455,18 @@ class Runtime:
             if client is not None:
                 with guard("client.fork_reinit_failed"):
                     client._at_fork_reinit()
-            # step 3 — interceptors: per-connection tracking through the
-            # registry (patches stay installed), then the shared module
-            # singletons — the timing store's parent filenos, the close
-            # registry's parent object ids, and the propagation module's own
-            # lock (`uninstall_propagation()` is unconditionally on the
-            # child's teardown path, so that lock inherited held would hang
-            # atexit). All three module holders are reached through
-            # `sys.modules`: never imported means nothing to reset.
+            # step 3 — interceptors: per-connection tracking through the registry (patches stay
+            # installed), then the shared module singletons — the timing store's parent filenos,
+            # the close registry's parent object ids, the uvloop loss already counted, and the
+            # propagation module's own lock (`uninstall_propagation()` is unconditionally on the
+            # child's teardown path, so that lock inherited held would hang atexit). Each module
+            # holder is reached through `sys.modules`: never imported means nothing to reset.
             with guard("interceptors.fork_reinit_failed"):
                 if self._interceptors is not None:
                     self._interceptors._at_fork_reinit()
                 _fork_reinit_module("_interceptors._conn_timing")
                 _fork_reinit_module("_interceptors._close_hook")
+                _fork_reinit_module("_interceptors._socket")
                 _fork_reinit_module("context._inject")
             # step 4 — adapters: sessions/units dropped without emitting, the
             # inherited bridge receiver torn down the child-safe way. Then the
@@ -498,11 +498,9 @@ class Runtime:
     def reset(self) -> None:
         """Undo everything and forget it. TEST-ONLY.
 
-        Every state this object owns, not one of them. The predecessor reset the
-        client slot alone, so an interceptor, an adapter, a chained signal
-        handler or a raised timing refcount left behind by one test was charged
-        to whichever test ran next — the failure landing in a file that had done
-        nothing wrong.
+        Every state this object owns, so an interceptor, an adapter, a chained
+        signal handler or a raised timing refcount one test leaves behind is
+        never charged to the test that runs next.
         """
         with self._lock:
             self._teardown(self._client)
@@ -624,6 +622,10 @@ class Runtime:
         if _ledger.hold_signal(_handler, signum, frame):
             return  # it landed inside a ledger fold on this thread: it runs as the fold ends
         client, prev, close_units = self._signal_state(signum)
+        # A SIGINT the program may survive (a REPL, a caught KeyboardInterrupt) reaches it at
+        # once, with no export on its thread; if it does end, the atexit close() flushes.
+        if signum == signal.SIGINT and prev != signal.SIG_DFL:
+            client = None
         if client is not None:
             # Nothing here may wake the batch worker: the wake takes the plain
             # lock under its `Event`, which the interrupted frame may hold (any
@@ -650,16 +652,10 @@ class Runtime:
         ending = prev is signal.SIG_DFL  # the process ends in this handler, via `os.kill`
         if ending and close_units is not None:
             # Close live units BEFORE the flush, or the flush has nothing of them to send. Gated on
-            # SIG_DFL because that is exactly the disposition where the process ends in this
-            # handler, via `os.kill`, and atexit does NOT run — measured for SIGTERM. Any other
-            # disposition either exits through the interpreter (atexit runs, and the adapter
-            # uninstall closes the units there) or keeps the program running, and closing every
-            # live unit under a program that carries on would truncate sessions still being driven.
-            #
-            # No `try` around it, and that is not an oversight: `close_units_all` guards every
-            # adapter individually with the one sanctioned swallow (I6), so a failing adapter is
-            # already counted and already cannot reach the flush below. Adding a second net here
-            # would add an unsanctioned one and hide nothing that is not already caught.
+            # SIG_DFL, the one disposition where the process ends here and atexit does NOT run
+            # (measured for SIGTERM); under any other, atexit closes them or the program carries
+            # on, and closing its live units would truncate sessions still being driven. No `try`:
+            # `close_units_all` already guards each adapter with the one sanctioned swallow.
             close_units(marker=Limitation.UNIT_INTERRUPTED)
         if ending:
             # The same disposition and the same reason, for the spans the host opened by hand
@@ -678,16 +674,19 @@ class Runtime:
             # (SIG_DFL is re-raised below), so pending deferred parses are drained in FALLBACK —
             # parsed inside half the budget, shipped as PARSE_SKIPPED_AT_SHUTDOWN after — and the
             # export keeps a floor of the other half. A plain flush() would KEEP the leftover, and
-            # a kept job here is a job the process takes down with it.
-            client._shutdown_flush(budget)
+            # a kept job here is a job the process takes down with it. Posted inline: a helper
+            # thread could wait on a `threading` lock the interrupted frame holds.
+            with posts_inline():
+                client._shutdown_flush(budget)
         except Exception:
-            # A failed flush must never block the chain to the app's handler -- and must not
-            # vanish either: under SIG_DFL this is the last thing the process does, so the line is
-            # the only record that the buffered tail went down with it.
+            # A failed flush must never block the chain to the app's handler, nor vanish: under
+            # SIG_DFL this line is the only record that the buffered tail went down with it.
             report_signal_flush_raised()
         if ending:
-            # And the counts of what was lost that the flush could not deliver: stderr is the
-            # only channel left to a process about to die on the signal.
+            # What the flush could not send dies with the process: count it, then say it all.
+            with guard("_runtime.signal_abandon_retries"):
+                client._abandon(signalled=True)
+                client._transport._abandon_retries("because the process is ending on a signal.")
             report_undelivered_drops(client, who="a shutdown signal's flush")
 
     def _signal_state(self, signum: int) -> tuple[Client | None, Any, Any]:

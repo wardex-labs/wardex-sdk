@@ -1311,7 +1311,9 @@ fn strip_any(v: &mut otlp_pb::common::AnyValue) -> Option<bool> {
 // the units the receiver uses, and say so on the span when it has to cut.
 
 /// Truncate every attribute value over `limits.max_otlp_attribute_bytes`,
-/// marking each span whose content was cut.
+/// marking each span whose content was cut. Returns how many spans were cut:
+/// the marker reaches only whoever opens the span, so the caller counts them
+/// where the host can read the count.
 ///
 /// Runs after masking and before [`strip_bytes_values`], and neither half of
 /// that is arbitrary. Before masking, a truncation could cut a PII match in two
@@ -1327,8 +1329,9 @@ fn strip_any(v: &mut otlp_pb::common::AnyValue) -> Option<bool> {
 pub fn cap_attribute_values(
     req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
     limits: Limits,
-) {
+) -> usize {
     let cap = limits.max_otlp_attribute_bytes;
+    let mut cut_spans = 0;
     for rs in &mut req.resource_spans {
         for ss in &mut rs.scope_spans {
             for sp in &mut ss.spans {
@@ -1344,10 +1347,12 @@ pub fn cap_attribute_values(
                 // owns it — an event has no `wardex.limitations` of its own.
                 if cut {
                     mark_truncated(&mut sp.attributes);
+                    cut_spans += 1;
                 }
             }
         }
     }
+    cut_spans
 }
 
 /// The attribute that names the knob behind a payload removed whole.
@@ -2179,6 +2184,33 @@ mod tests {
         assert!(s.len() <= 100, "{} characters on the wire", s.len());
         assert_eq!(BASE64.decode(s).unwrap().len(), 100 / 4 * 3);
         assert_eq!(markers(&sp), vec!["otlp_attribute_truncated"]);
+    }
+
+    #[test]
+    fn the_cap_pass_counts_each_span_it_cut_once() {
+        // Two attributes cut on one span is one span cut; a span inside the
+        // bound is not counted at all.
+        let long = pb::Span {
+            input_data: vec![b'a'; 300],
+            output_data: vec![b'b'; 300],
+            ..Default::default()
+        };
+        let short = pb::Span {
+            input_data: vec![b'c'; 10],
+            ..Default::default()
+        };
+        let mut env = envelope(long.clone());
+        for sp in [short, long] {
+            env.items.push(pb::EnvelopeItem {
+                header: None,
+                payload: Some(pb::envelope_item::Payload::Span(sp)),
+            });
+        }
+        let mut req = envelope_to_traces(env, PRODUCER);
+        assert_eq!(
+            cap_attribute_values(&mut req, limits_with_attribute_cap(100)),
+            2
+        );
     }
 
     #[test]

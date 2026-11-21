@@ -29,8 +29,9 @@ pub(crate) enum Api {
 }
 
 impl Api {
-    /// The provider label this API shape implies (used when the host says
-    /// nothing — the shapes are provider-specific).
+    /// The provider whose own hosts make a WebSocket on this API shape a
+    /// known provider's (`ws_upgrade`). Never a span label: other vendors
+    /// serve the same shapes (`provider_for_host` is the label).
     pub(super) fn provider(self) -> &'static str {
         match self {
             Api::OpenAiChatCompletions | Api::OpenAiResponses | Api::OpenAiEmbeddings => "openai",
@@ -248,27 +249,119 @@ pub enum WsUpgrade {
 }
 
 /// The provider's own API hosts: the apex API host or any subdomain of the
-/// provider's domain. Deliberately not the substring test the provider
-/// label uses (`provider_from_host`): a label is a hint on a span, but this
-/// answer makes a bare WebSocket ship under the default mode with payload
-/// samples, and `openai-mock.corp` speaking its own protocol on
-/// `/v1/responses` must not earn that on the strength of its hostname. The
-/// HTTP path refuses the same claim (the seam wants parsed semantics, not a
-/// hostname) and this keeps the two transports honest to the same degree.
-/// The provider label asks it too, afterwards: a label this does not confirm
-/// ships with `provider_inferred` set, so the hint is marked as one.
+/// provider's domain. Deliberately not a substring test: this answer makes a
+/// bare WebSocket ship under the default mode with payload samples, and
+/// `openai-mock.corp` speaking its own protocol on `/v1/responses` must not
+/// earn that on the strength of its hostname. The HTTP path refuses the same
+/// claim (the seam wants parsed semantics, not a hostname) and this keeps the
+/// two transports honest to the same degree.
 pub(super) fn is_official_host(provider: &str, host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let domain = match provider {
         "openai" => "openai.com",
         "anthropic" => "anthropic.com",
-        "aws.bedrock" => return is_bedrock_runtime_host(&host),
         _ => return false,
     };
     host == format!("api.{domain}")
         || host
             .strip_suffix(domain)
             .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// How a row of `PROVIDER_HOSTS` matches a host name.
+#[derive(Clone, Copy, Debug)]
+enum HostRule {
+    /// The domain itself or any subdomain of it (`api.groq.com` under
+    /// `groq.com`), never a host that merely ends in the same letters
+    /// (`notgroq.com`).
+    Domain(&'static str),
+    /// Bedrock's runtime hosts, matched by their whole shape
+    /// (`is_bedrock_runtime_host`).
+    BedrockRuntime,
+    /// A host ending in `-` or `.` plus the domain: Vertex AI's per-region
+    /// hosts (`us-central1-aiplatform.googleapis.com`) beside its global one.
+    RegionalDomain(&'static str),
+}
+
+/// Hosts a gen_ai provider operates, and the OpenTelemetry
+/// `gen_ai.provider.name` each one proves. A path's API shape does not name a
+/// provider: Groq, DeepSeek, xAI, Mistral, Gemini, Azure OpenAI, gateways and
+/// local servers all serve the OpenAI-shaped paths. So the label comes only
+/// from this table, and only names the OpenTelemetry registry defines are
+/// used; a host that is not here (OpenRouter, Together, Fireworks, a gateway,
+/// a local server) gets no label.
+const PROVIDER_HOSTS: &[(HostRule, &str)] = &[
+    (HostRule::Domain("openai.azure.com"), "azure.ai.openai"),
+    (HostRule::Domain("openai.com"), "openai"),
+    (HostRule::Domain("anthropic.com"), "anthropic"),
+    (HostRule::Domain("groq.com"), "groq"),
+    (HostRule::Domain("deepseek.com"), "deepseek"),
+    (HostRule::Domain("mistral.ai"), "mistral_ai"),
+    (HostRule::Domain("x.ai"), "x_ai"),
+    (HostRule::Domain("perplexity.ai"), "perplexity"),
+    (HostRule::Domain("cohere.ai"), "cohere"),
+    (HostRule::Domain("cohere.com"), "cohere"),
+    (
+        HostRule::Domain("generativelanguage.googleapis.com"),
+        "gcp.gemini",
+    ),
+    (
+        HostRule::RegionalDomain("aiplatform.googleapis.com"),
+        "gcp.vertex_ai",
+    ),
+    (HostRule::BedrockRuntime, "aws.bedrock"),
+];
+
+/// `host` as a bare lowercase DNS name: a `:port` suffix and a trailing root
+/// dot removed. An IPv6 literal (bracketed or not) is returned unchanged
+/// apart from case; it matches no row.
+fn bare_host(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    let name = match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host.as_str(),
+    };
+    name.trim_end_matches('.').to_string()
+}
+
+/// Is `host` the domain itself or one of its subdomains?
+fn under_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+impl HostRule {
+    fn matches(self, host: &str) -> bool {
+        match self {
+            HostRule::Domain(domain) => under_domain(host, domain),
+            HostRule::BedrockRuntime => is_bedrock_runtime_host(host),
+            HostRule::RegionalDomain(domain) => {
+                under_domain(host, domain)
+                    || host
+                        .strip_suffix(domain)
+                        .is_some_and(|prefix| prefix.ends_with('-') && prefix.len() > 1)
+            }
+        }
+    }
+}
+
+/// The `gen_ai.provider.name` the host proves, or None when the host is not
+/// one a known provider operates (an IP, `localhost`, a gateway, a mock
+/// whose name merely contains a provider's).
+pub(super) fn provider_for_host(host: &str) -> Option<&'static str> {
+    let host = bare_host(host);
+    PROVIDER_HOSTS
+        .iter()
+        .find(|(rule, _)| rule.matches(&host))
+        .map(|(_, name)| *name)
 }
 
 /// Bedrock's runtime hosts, by exact shape rather than by suffix: anyone can
@@ -282,7 +375,7 @@ pub(super) fn is_official_host(provider: &str, host: &str) -> bool {
 ///   VPC endpoint's DNS name. AWS issues these names and they route to the
 ///   one service the endpoint was created for, so they are Bedrock's own as
 ///   much as the public name is. A private DNS alias the customer chose
-///   instead is not provable from the name and stays inferred.
+///   instead is not provable from the name and gets no label.
 fn is_bedrock_runtime_host(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').collect();
     let runtime = |l: &str| l == "bedrock-runtime" || l == "bedrock-runtime-fips";
@@ -536,6 +629,60 @@ mod tests {
         }
     }
 
+    /// A provider's own hosts name it by its OpenTelemetry provider name; a
+    /// host that merely contains a provider's name, a gateway, a local
+    /// server or an address names nobody.
+    #[test]
+    fn provider_hosts_name_the_registry_provider() {
+        let named = [
+            ("api.openai.com", "openai"),
+            ("eu.api.openai.com", "openai"),
+            ("API.OpenAI.com:443", "openai"),
+            ("api.openai.com.", "openai"),
+            ("api.anthropic.com", "anthropic"),
+            ("my-resource.openai.azure.com", "azure.ai.openai"),
+            ("api.groq.com", "groq"),
+            ("api.deepseek.com", "deepseek"),
+            ("api.mistral.ai", "mistral_ai"),
+            ("api.x.ai", "x_ai"),
+            ("api.perplexity.ai", "perplexity"),
+            ("api.cohere.ai", "cohere"),
+            ("api.cohere.com", "cohere"),
+            ("generativelanguage.googleapis.com", "gcp.gemini"),
+            ("aiplatform.googleapis.com", "gcp.vertex_ai"),
+            ("us-central1-aiplatform.googleapis.com", "gcp.vertex_ai"),
+            ("bedrock-runtime.us-east-1.amazonaws.com", "aws.bedrock"),
+            (
+                "bedrock-runtime-fips.us-east-1.amazonaws.com",
+                "aws.bedrock",
+            ),
+        ];
+        for (host, want) in named {
+            assert_eq!(provider_for_host(host), Some(want), "{host}");
+        }
+        for host in [
+            "openrouter.ai",
+            "api.together.xyz",
+            "api.fireworks.ai",
+            "localhost",
+            "localhost:8000",
+            "127.0.0.1",
+            "127.0.0.1:11434",
+            "10.0.0.5",
+            "[::1]:8080",
+            "llm-gw.corp.internal",
+            "openai-mock.corp",
+            "myopenai-proxy.internal",
+            "api.openai.com.evil.example",
+            "notopenai.com",
+            "notx.ai",
+            "bedrock-runtime-bucket.s3.amazonaws.com",
+            "",
+        ] {
+            assert_eq!(provider_for_host(host), None, "{host}");
+        }
+    }
+
     #[test]
     fn endpoint_rows_carry_operation_and_api_type() {
         let e = from_path("/v1/responses").unwrap();
@@ -599,15 +746,16 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_runtime_hosts_are_official_by_shape() {
+    fn bedrock_runtime_hosts_name_bedrock_by_shape() {
         for host in [
             "bedrock-runtime.us-east-1.amazonaws.com",
             "bedrock-runtime-fips.us-gov-west-1.amazonaws.com",
             "BEDROCK-RUNTIME.eu-central-1.amazonaws.com",
+            "bedrock-runtime.eu-central-1.amazonaws.com:443",
             "bedrock-runtime.cn-north-1.amazonaws.com.cn",
             "vpce-0abc123-xyz.bedrock-runtime.us-east-1.vpce.amazonaws.com",
         ] {
-            assert!(is_official_host("aws.bedrock", host), "{host}");
+            assert_eq!(provider_for_host(host), Some("aws.bedrock"), "{host}");
         }
         for host in [
             "bedrock-runtime.s3.amazonaws.com",
@@ -617,7 +765,7 @@ mod tests {
             "vpce-0abc.s3.us-east-1.vpce.amazonaws.com",
             "127.0.0.1",
         ] {
-            assert!(!is_official_host("aws.bedrock", host), "{host}");
+            assert_eq!(provider_for_host(host), None, "{host}");
         }
     }
 

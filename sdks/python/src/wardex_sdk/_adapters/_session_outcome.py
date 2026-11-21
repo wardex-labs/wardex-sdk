@@ -15,7 +15,7 @@ import asyncio
 import sys
 from typing import Any
 
-from .._assembly import counters
+from .._assembly import DropReason, counters, record
 from .._enums import StatusCode
 from .._protocol._claude_stream import AgentStreamEvent
 from ._session_state import _OpenTool
@@ -56,6 +56,7 @@ def note_unparsed_line(msg: Any) -> None:
     kind = msg.get("type") if isinstance(msg, dict) else None
     if kind not in PARSED_STREAM_TYPES and kind not in IGNORED_STREAM_TYPES:
         counters.bump("adapters.assembler.stream_line_unrecognized")
+        record(DropReason.STREAM_LINE_UNRECOGNIZED, where="adapters.anthropic_agent_sdk")
 
 
 def reader_stopped(exc: BaseException) -> bool:

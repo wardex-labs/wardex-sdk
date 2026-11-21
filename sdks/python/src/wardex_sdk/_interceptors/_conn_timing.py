@@ -23,7 +23,7 @@ from functools import partial
 from typing import Any
 
 from .. import _wardex_native
-from .._assembly import PatchSet
+from .._assembly import PatchSet, guard
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 
 # ContextVar that carries the timing record the async probe stamps onto the SSLObject
@@ -317,6 +317,14 @@ class ConnTimingProbe:
 
     def _mk_create_connection(self, orig: Any):  # noqa: ANN202
         def wrapper(this: Any, *a: Any, **k: Any):  # async method
+            if not isinstance(this, asyncio.base_events.BaseEventLoop):
+                # The first connection a uvloop loop opens is where its plaintext blind
+                # spot is said. Imported here: `_socket` imports this module.
+                from ._socket import note_uvloop
+
+                with guard("interceptors.socket.uvloop_check"):
+                    a = note_uvloop(this, a, k)
+
             async def run() -> Any:
                 rec = _TimingRecord()
                 token = _establishing.set(rec)

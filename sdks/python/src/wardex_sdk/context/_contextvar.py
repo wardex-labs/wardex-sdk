@@ -184,17 +184,16 @@ def bind_context(fn: Callable[..., Any]) -> Callable[..., Any]:
 
         thread = threading.Thread(target=wardex.bind_context(work))
 
-    NOT the mechanism `Unit.bind()` uses, and the difference is load-bearing:
-    this replays ONE captured `contextvars.Context`, and entering the same
-    Context twice concurrently raises ``RuntimeError: cannot enter context ...
-    is already entered``. For a framework callback invoked from two tasks that
-    error surfaces into USER CODE. `Unit.bind` enters a fresh fork per
-    invocation instead.
+    Each call runs in its own copy of what was captured, so one wrapper can
+    be handed to `executor.map` or submitted many times: calls may run at
+    once, and what one call sets (`set_user`, a tag) does not reach the next.
     """
     ctx = contextvars.copy_context()
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        return ctx.run(fn, *args, **kwargs)
+        # A Context can be entered by one thread at a time, and a shared one
+        # would carry one call's writes into the next.
+        return ctx.copy().run(fn, *args, **kwargs)
 
     return wrapper

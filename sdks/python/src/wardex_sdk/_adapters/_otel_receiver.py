@@ -67,7 +67,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .._assembly import counters, report_once
+from .._assembly import DropReason, DropUnit, counters, record, report_once
 from .._native import native
 
 #: The token header the injected `OTEL_EXPORTER_OTLP_HEADERS` carries.
@@ -242,6 +242,7 @@ class _OtelBridgeReceiver:
         length = self._declared_length(handler)
         if length < 0 or length > self._max_body_bytes:
             counters.bump(f"adapters.{self._owner}.otel_bridge.body_rejected")
+            record(DropReason.BRIDGE_REQUEST_REJECTED, where=f"adapters.{self._owner}.otel_bridge")
             self._refuse(handler, 413)
             return
         body = handler.rfile.read(length)
@@ -249,6 +250,9 @@ class _OtelBridgeReceiver:
             body = self._gunzip_bounded(body)
             if body is None:
                 counters.bump(f"adapters.{self._owner}.otel_bridge.body_rejected")
+                record(
+                    DropReason.BRIDGE_REQUEST_REJECTED, where=f"adapters.{self._owner}.otel_bridge"
+                )
                 self._refuse(handler, 413)
                 return
         decoded: dict | None = None
@@ -260,6 +264,7 @@ class _OtelBridgeReceiver:
             # 200 on purpose: an error status would put the CLI's exporter
             # into retry against a receiver that will never accept the bytes.
             counters.bump(f"adapters.{self._owner}.otel_bridge.undecodable")
+            record(DropReason.BRIDGE_REQUEST_REJECTED, where=f"adapters.{self._owner}.otel_bridge")
             label = "anthropic_agent_sdk" if self._owner == "anthropic" else self._owner
             report_once(
                 f"{label} otel bridge: a telemetry POST did not decode "
@@ -369,12 +374,17 @@ class _OtelBridgeReceiver:
                     # injection could not be read back still converges here.
                     if len(self._by_session_id) >= self._max_sessions:
                         counters.bump(f"adapters.{self._owner}.otel_bridge.span_unroutable")
+                        record(
+                            DropReason.BRIDGE_UNROUTABLE,
+                            where=f"adapters.{self._owner}.otel_bridge",
+                        )
                         return
                     slot = _BridgeSlot()
                     slot.session_key = session_id
                     self._by_session_id[session_id] = slot
             if slot is None:
                 counters.bump(f"adapters.{self._owner}.otel_bridge.span_unroutable")
+                record(DropReason.BRIDGE_UNROUTABLE, where=f"adapters.{self._owner}.otel_bridge")
                 return
             if isinstance(session_id, str) and session_id and slot.session_key is None:
                 # Index a trace-routed slot by its session id too, so the two
@@ -385,6 +395,11 @@ class _OtelBridgeReceiver:
             if len(slot.spans) >= self._max_spans_per_session:
                 slot.dropped += 1
                 counters.bump(f"adapters.{self._owner}.otel_bridge.span_dropped")
+                record(
+                    DropReason.TABLE_FULL,
+                    unit=DropUnit.BRIDGE_SPAN,
+                    where=f"adapters.{self._owner}.otel_bridge",
+                )
                 return
             slot.resource = resource_attrs
             slot.spans.append(span)

@@ -105,6 +105,7 @@ class DropReason(str, Enum):
     FRAMEWORK_SPAN_KIND_UNMAPPED = "framework_span_kind_unmapped"
     HOOKS_ABSENT = "hooks_absent"
     STREAM_LINE_UNRECOGNIZED = "stream_line_unrecognized"
+    STREAM_LINE_OVER_CAP = "stream_line_over_cap"
     PAYLOAD_UNSERIALIZABLE = "payload_unserializable"
     USAGE_WITHHELD = "usage_withheld"
     LAUNCH_UNRECOGNIZED = "launch_unrecognized"
@@ -129,8 +130,10 @@ class ReasonInfo:
 _R = DropReason
 _U = DropUnit
 
-#: Every reason's data, in one place. Diagnostics, strict mode and the close
-#: summary print these sentences as they are.
+#: Every reason's data, in one place. `wardex.diagnostics()`, strict mode and
+#: `wardex.explain()` print these sentences as they are. A next step names a
+#: setting by the spelling a host writes (`LimitsConfig(max_units=...)`), or
+#: says that there is none: a test holds every name to the real config classes.
 REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
     {
         _R.NETWORK_ERROR: ReasonInfo(
@@ -152,7 +155,8 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             "loss",
             "The receiver asked wardex to back off (HTTP 429, or a wardex receiver's 503) and "
             "the batch was not sent.",
-            "Export less often (raise batching.flush_interval) or ask for a higher limit.",
+            "Export less often (raise BatchingConfig(flush_interval=...)) or ask the receiver "
+            "for a higher limit.",
         ),
         _R.SEND_UNCONFIRMED: ReasonInfo(
             _U.SPAN,
@@ -166,13 +170,13 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             "loss",
             "Too large to send: a request over the receiver's size limit, or a single span "
             "over max_otlp_request_bytes even without its payload.",
-            "Raise max_otlp_request_bytes if the receiver accepts more.",
+            "Raise LimitsConfig(max_otlp_request_bytes=...) if the receiver accepts more.",
         ),
         _R.BUDGET_EXHAUSTED: ReasonInfo(
             _U.REQUEST,
             "loss",
             "A batch split into several requests ran out of time before the rest were sent.",
-            "Give flush()/close() a larger timeout, or lower limits.max_buffer_spans.",
+            "Give flush()/close() a larger timeout, or lower LimitsConfig(max_buffer_spans=...).",
         ),
         _R.PARTIAL_SUCCESS: ReasonInfo(
             _U.SPAN,
@@ -197,13 +201,16 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             _U.SPAN,
             "loss",
             "The buffer was full, so the oldest items were evicted before they were exported.",
-            "Raise limits.max_buffer_spans / limits.max_buffer_bytes, or export more often.",
+            "Raise LimitsConfig(max_buffer_spans=...) or LimitsConfig(max_buffer_bytes=...), or "
+            "export more often (lower BatchingConfig(flush_interval=...)).",
         ),
         _R.CACHE_OVERFLOW: ReasonInfo(
             _U.REQUEST,
             "loss",
-            "The queue holding batches for a retry was full, so a held batch was dropped.",
-            "Raise the retry queue's bound, or restore the receiver sooner.",
+            "The queue holding batches for a retry was full, so a held batch was dropped "
+            "(counted in spans, or in requests for part of a split batch).",
+            "Restore the receiver, or check that its address is the right one; the retry "
+            "queue's size has no setting.",
         ),
         _R.BEFORE_SEND: ReasonInfo(
             _U.SPAN,
@@ -227,13 +234,15 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             _U.SPAN,
             "loss",
             "Still buffered when close() or a shutdown signal ran out of time to send it.",
-            "Give close() a larger budget (batching.shutdown_timeout), or flush() before exit.",
+            "Give close() a larger budget (BatchingConfig(shutdown_timeout=...)), or flush() "
+            "before exit.",
         ),
         _R.BACKPRESSURE: ReasonInfo(
             _U.SPAN,
             "partial",
             "The span shipped without its parsed gen_ai fields: the parse queue was full.",
-            "Raise the parse queue's bound, or reduce the burst of model calls.",
+            "Raise LimitsConfig(max_parse_backlog=...) or "
+            "LimitsConfig(max_parse_backlog_bytes=...), or reduce the burst of model calls.",
         ),
         _R.INTERNAL_SDK_ERROR: ReasonInfo(
             _U.FAILURE,
@@ -256,9 +265,10 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
         _R.MODE_REFUSED: ReasonInfo(
             _U.REQUEST,
             "loss",
-            "capture_mode=AGENT declined an exchange outside any span that it did not "
-            "recognize as a model call.",
-            "Open a span around the work, or use capture_mode=ALL.",
+            "capture_mode=AGENT declined an exchange outside any span that it keeps only "
+            "inside a span: one it did not recognize as a model call, or a call to a model API "
+            "it does not parse yet (Gemini, Bedrock InvokeModel, Cohere, Ollama).",
+            "Open a span around the work, or pass init(capture_mode=CaptureMode.ALL).",
         ),
         _R.EXCLUDED_BY_POLICY: ReasonInfo(
             _U.REQUEST,
@@ -289,7 +299,7 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             _U.REQUEST,
             "loss",
             "The connection table was full, so an exchange in progress was evicted.",
-            "Raise limits.max_connections.",
+            "Raise LimitsConfig(max_connections=...).",
         ),
         _R.IN_FLIGHT_AT_CLOSE: ReasonInfo(
             _U.REQUEST,
@@ -307,13 +317,16 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             _U.ENTRY,
             "loss",
             "A bounded table was full and evicted an entry; the unit says which table.",
-            "Raise the bound for that table.",
+            "The `where` of this loss names the table. LimitsConfig(max_entries_per_unit=...), "
+            "max_session_entries, max_sessions, max_streams, max_link_targets and "
+            "max_otel_bridge_spans_per_session size the tables that have a setting; any other "
+            "table's size is fixed.",
         ),
         _R.LATE_TO_CLOSED_UNIT: ReasonInfo(
             _U.PAYLOAD,
             "loss",
             "Data arrived for a unit that had already closed or been evicted.",
-            "Raise limits.max_units if units are evicted; otherwise close later.",
+            "Raise LimitsConfig(max_units=...) if units are evicted; otherwise close later.",
         ),
         _R.MARKER_LOST: ReasonInfo(
             _U.MARKER,
@@ -355,31 +368,34 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             _U.SPAN,
             "partial",
             "An attribute was cut at max_otlp_attribute_bytes.",
-            "Raise max_otlp_attribute_bytes if the backend accepts more.",
+            "Raise LimitsConfig(max_otlp_attribute_bytes=...) if the backend accepts more.",
         ),
         _R.BODY_CAP: ReasonInfo(
             _U.SPAN,
             "partial",
-            "A body was cut at its capture limit.",
-            "Raise the body capture limit.",
+            "A body was cut at its capture limit (max_body_bytes, max_opaque_body_bytes, which "
+            "also bounds a JSON request outside any span until its reply showed a model call, "
+            "or the shared max_in_flight_body_bytes).",
+            "Raise LimitsConfig(max_body_bytes=...), max_opaque_body_bytes for a content type "
+            "wardex does not parse, or max_in_flight_body_bytes when many bodies arrive at once.",
         ),
         _R.WS_SAMPLE_CAP: ReasonInfo(
             _U.SPAN,
             "partial",
-            "A WebSocket message was cut at the sample limit.",
-            "Raise the WebSocket sample limit.",
+            "A WebSocket message was cut at ws_sample_bytes.",
+            "Raise LimitsConfig(ws_sample_bytes=...).",
         ),
         _R.WS_FRAME_CAP: ReasonInfo(
             _U.SPAN,
             "partial",
-            "A WebSocket frame over the frame limit stopped the parser for that direction.",
-            "Raise the WebSocket frame limit.",
+            "A WebSocket frame over max_ws_frame_bytes stopped the parser for that direction.",
+            "Raise LimitsConfig(max_ws_frame_bytes=...).",
         ),
         _R.DECODED_CAP: ReasonInfo(
             _U.SPAN,
             "partial",
-            "A compressed body was cut at the decoded-size limit.",
-            "Raise the decoded body limit.",
+            "A compressed body was cut at max_decoded_bytes once decompressed.",
+            "Raise LimitsConfig(max_decoded_bytes=...).",
         ),
         _R.BRIDGE_LATE: ReasonInfo(
             _U.BRIDGE_SPAN,
@@ -397,7 +413,9 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             _U.REQUEST,
             "loss",
             "The OTel bridge receiver refused or could not decode a POST.",
-            "Re-run with debug=True to see why.",
+            "A body over the bridge's size limit is refused: raise "
+            "LimitsConfig(max_otel_bridge_body_bytes=...). For a body that did not decode, "
+            "re-run with debug=True to see why.",
         ),
         _R.BRIDGE_UNRECOGNIZED: ReasonInfo(
             _U.BRIDGE_SPAN,
@@ -415,13 +433,13 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             _U.SESSION,
             "loss",
             "A session's OTel bridge slot was dropped when its root was evicted.",
-            "Raise limits.max_units.",
+            "Raise LimitsConfig(max_units=...).",
         ),
         _R.BRIDGE_MERGE_SKIPPED: ReasonInfo(
             _U.SPAN,
             "partial",
             "A chat span shipped without its OTel bridge data: the merge queue was full.",
-            "Raise the bridge's pending bound.",
+            "Raise LimitsConfig(max_session_entries=...).",
         ),
         _R.BRIDGE_UNAVAILABLE: ReasonInfo(
             _U.ADAPTER,
@@ -449,8 +467,9 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
         ),
         _R.HOOKS_ABSENT: ReasonInfo(
             _U.SESSION,
-            "loss",
-            "The adapter's hooks never reached the session, so what they observe is absent.",
+            "partial",
+            "The adapter's hooks never reached the session, so it was recorded from the CLI's "
+            "output alone, without what the hooks observe (sub-agent spans, hook inputs).",
             "Call init() before importing the framework's entry point.",
         ),
         _R.STREAM_LINE_UNRECOGNIZED: ReasonInfo(
@@ -458,6 +477,15 @@ REASONS: Mapping[DropReason, ReasonInfo] = MappingProxyType(
             "loss",
             "A CLI agent's output line could not be read.",
             "Upgrade wardex-sdk; the CLI's output format may have changed.",
+        ),
+        _R.STREAM_LINE_OVER_CAP: ReasonInfo(
+            _U.MESSAGE,
+            "loss",
+            "A line on an MCP subprocess's stdio pipe was longer than max_stream_buffer_bytes "
+            "and was skipped unparsed; if it held a JSON-RPC message, that message and the "
+            "call it belonged to were not recorded.",
+            "Raise LimitsConfig(max_stream_buffer_bytes=...) above the largest message the "
+            "server sends.",
         ),
         _R.PAYLOAD_UNSERIALIZABLE: ReasonInfo(
             _U.PAYLOAD,

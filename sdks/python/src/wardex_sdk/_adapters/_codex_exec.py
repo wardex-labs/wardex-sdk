@@ -51,12 +51,15 @@ from typing import Any
 
 from .._assembly import (
     AgentAttributes,
+    DropReason,
+    DropUnit,
     GenAIAttributes,
     Limitation,
     SpanIntent,
     ToolAttributes,
     UnitKind,
     counters,
+    record,
     report_once,
 )
 from .._config import CodexExecConfig
@@ -462,6 +465,11 @@ class CodexExecAdapter(AdapterInterface):
                 )
             if self._bridge is None:
                 self._bridge_failed = True
+                record(
+                    DropReason.BRIDGE_UNAVAILABLE,
+                    unit=DropUnit.ADAPTER,
+                    where="adapters.codex_exec",
+                )
                 report_once(
                     "codex_exec otel bridge: the loopback receiver could not start, so the "
                     "bridge is off for this process (fail-open)",

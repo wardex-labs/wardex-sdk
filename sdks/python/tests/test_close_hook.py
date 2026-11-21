@@ -26,7 +26,8 @@ from wardex_sdk._interceptors._close_hook import (
     install_shared_close_hook,
     uninstall_shared_close_hook,
 )
-from wardex_sdk._interceptors._trackers import _Http2Tracker, _WebSocketTracker
+from wardex_sdk._interceptors._trackers import _Http2Tracker
+from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import SpanContext, SpanId, TraceId
 

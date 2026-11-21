@@ -79,7 +79,7 @@ def _client_span():
 def test_openai_chat_semantics_filled():
     httpd, url = _make_server(OPENAI_RESP)
     try:
-        wardex.init(intercept=True)
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True)
         httpx.post(
             f"{url}/v1/chat/completions", json={"model": "gpt-4o-mini"}, verify=_verify_ctx()
         )
@@ -96,7 +96,7 @@ def test_openai_chat_semantics_filled():
 def test_gzip_response_decoded_into_output_data():
     httpd, url = _make_server(OPENAI_RESP, gzip_body=True)
     try:
-        wardex.init(intercept=True)
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True)
         httpx.post(
             f"{url}/v1/chat/completions", json={"model": "gpt-4o-mini"}, verify=_verify_ctx()
         )
@@ -114,7 +114,7 @@ def test_non_llm_call_no_semantics_no_marker():
         # capture_mode=ALL: this test targets the body parser (no gen_ai marker
         # on non-LLM bodies), not the capture-policy gate, and there is no
         # active local span for the AGENT-mode default to latch onto.
-        wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
         httpx.post(f"{url}/v1/widgets", json={}, verify=_verify_ctx())
     finally:
         httpd.shutdown()
@@ -130,7 +130,7 @@ def test_unrecognized_host_broken_body_no_gen_ai():
     try:
         # capture_mode=ALL: same rationale — testing gen_ai==None on an
         # unidentifiable body, not the AGENT-mode policy gate.
-        wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True, capture_mode=CaptureMode.ALL)
         httpx.post(f"{url}/v1/chat/completions", json={}, verify=_verify_ctx())
     finally:
         httpd.shutdown()

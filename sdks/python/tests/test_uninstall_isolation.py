@@ -637,7 +637,7 @@ def test_a_broken_interceptor_does_not_take_the_whole_intercept_option_down():
     original = _ssl.SSLInterceptor
     _ssl.SSLInterceptor = _BrokenSSL
     try:
-        wardex.init(intercept=True)  # must not raise
+        wardex.init(transport=wardex.NoOpTransport(), intercept=True)  # must not raise
 
         assert not interceptor_registry().is_installed("ssl")
         assert interceptor_registry().is_installed("mcp_stdio"), (

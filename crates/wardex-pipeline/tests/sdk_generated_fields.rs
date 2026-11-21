@@ -3,8 +3,8 @@
 //! Masking exists for what the host application and its traffic put on a
 //! span. A value the SDK minted is neither, and the rules cannot tell the
 //! two apart: `str(id(socket))` is fifteen digits on 64-bit Linux, about
-//! one in ten of those passes the card checksum, and the card rule then
-//! rewrote the id and wrote `credit_card` into the span's record of what
+//! one in ten of those passes the card checksum, and the card rule would
+//! rewrite the id and write `credit_card` into the span's record of what
 //! it had masked. These tests pin which fields are the SDK's own, prove a
 //! value every rule fires on passes through each of them untouched and
 //! unrecorded, and prove every other text field still loses it.
@@ -894,14 +894,17 @@ fn no_closed_vocabulary_name_is_something_a_rule_fires_on() {
 /// fires on it wherever it can.
 const MINTED_CONVERSATION_IDS: &[(&str, &str)] = &[
     // `wardex.conversation(name)` with no id: `str(uuid.uuid4())`. Groups
-    // one to three are all decimal and pass the card checksum.
+    // one to three are all decimal and pass the card checksum, and group
+    // four holds no decimal digit to join them into the id.
     (
         "str(uuid.uuid4()), card in groups 1-3",
-        "48620579-8682-4828-a0e5-0454f31af317",
+        "48620579-8682-4828-abcd-0454f31af317",
     ),
     // The same producer, with groups four and five the run that passes.
+    // Group three opens with the version digit `4`, which joins them into
+    // the id, so no rule fires on this one; the row pins that.
     (
-        "str(uuid.uuid4()), card in groups 4-5",
+        "str(uuid.uuid4()), groups 4-5 joined",
         "9f1c2ab7-5e0d-4c3a-8013-123456891959",
     ),
     // The Agent SDK adapter, for a session the CLI has not named yet:
@@ -914,12 +917,12 @@ const MINTED_CONVERSATION_IDS: &[(&str, &str)] = &[
 /// Host conversation ids the card rule fires on that are not a minted form:
 /// close to one, and judged as host text all the same.
 const HOST_CONVERSATION_IDS: &[&str] = &[
-    "48620579-8682-4828-A0E5-0454F31AF317",
-    "48620579-8682-1006-a0e5-0454f31af317",
-    "48620579-8682-4828-c0e5-0454f31af317",
-    "{48620579-8682-4828-a0e5-0454f31af317}",
-    "urn:uuid:48620579-8682-4828-a0e5-0454f31af317",
-    "48620579-8682-4828-a0e5-0454f31af317 john.doe@acme.com",
+    "48620579-8682-4828-ABCD-0454F31AF317",
+    "48620579-8682-1006-abcd-0454f31af317",
+    "48620579-8682-4828-cbcd-0454f31af317",
+    "{48620579-8682-4828-abcd-0454f31af317}",
+    "urn:uuid:48620579-8682-4828-abcd-0454f31af317",
+    "48620579-8682-4828-abcd-0454f31af317 john.doe@acme.com",
     "4111 1111 1111 1111",
 ];
 
@@ -958,8 +961,8 @@ fn otlp_redacted(req: &otlp_pb::trace_service::ExportTraceServiceRequest) -> boo
 fn a_minted_conversation_id_is_shipped_as_written_and_unrecorded() {
     let engine = engine();
     for (form, id) in MINTED_CONVERSATION_IDS {
-        // The canonical ids are ones the card rule rewrites on its own.
-        let reachable = !form.starts_with("uuid.uuid4().hex");
+        // The first id is one the card rule rewrites on its own.
+        let reachable = form.ends_with("card in groups 1-3");
         assert_eq!(engine.mask_text(id).is_some(), reachable, "{form}");
         let env = envelope_with(id, |path| path == "ConversationContext.conversation_id");
         let mut masked = env.clone();
@@ -1104,7 +1107,9 @@ fn a_hand_spelled_conversation_id_attribute_agrees_on_both_wires() {
 /// Over many version-4 UUIDs in both forms, drawn so nearly every hex digit
 /// is decimal (the case that reaches the digit rules), the card rule is the
 /// only rule that ever fires, and it fires only because a run of the UUID's
-/// own groups happens to pass its checksum.
+/// own groups happens to pass its checksum with no decimal digit in the
+/// group beside it, which this draw makes rare (the first minted id above
+/// is such a case).
 #[test]
 fn nothing_but_the_card_rule_can_match_inside_a_minted_id() {
     // SplitMix64: deterministic, so a failure names a reproducible id.
@@ -1151,13 +1156,7 @@ fn nothing_but_the_card_rule_can_match_inside_a_minted_id() {
             }
         }
     }
-    // The draw does reach the card rule in the canonical form; the simple
-    // form has no break in it for a card to end at.
-    assert!(
-        card[0] > 100,
-        "only {} canonical ids hit the card rule",
-        card[0]
-    );
+    // The simple form has no break in it for a card to end at.
     assert_eq!(card[1], 0);
 }
 
@@ -1184,12 +1183,13 @@ const SDK_COMPUTED_ATTRS: &[(&str, &str, &str)] = &[(
 /// not compute them.
 const FRAMEWORK_ID_ATTRS: &[(&str, &str, &str)] = &[(
     "wardex.step.task_id",
-    // LangGraph's `_xxhash_str(checkpoint id, "agent", "27026", "agent",
+    // LangGraph's `_xxhash_str(checkpoint id, "agent", "503548", "agent",
     // "__pregel_pull", "branch:to:agent")` with the checkpoint id
     // `bytes(range(16))`: a pull task's id, xxh3 laid out as a UUID. The
-    // 8-4-4 groups are decimal and pass the card checksum.
+    // 8-4-4 groups are decimal and pass the card checksum, and group four
+    // holds no decimal digit to join them into the id.
     "LangGraph _xxhash_str for a pull task",
-    "21085070-2022-5109-e53a-53cc476ce164",
+    "29789779-1380-0358-aadc-0e60d8deb4ab",
 )];
 
 /// Every attribute the walk leaves alone by key and form.
@@ -1377,7 +1377,8 @@ fn nothing_but_the_card_rule_can_match_inside_a_tool_list_digest() {
 /// for. Unlike a minted UUID the form fixes no version or variant digit, so
 /// all thirty-two digits are drawn, nearly all decimal (the case that
 /// reaches the digit rules), and the card rule is the only rule that ever
-/// fires, and only on the id's own 8-4-4 or 4-12 groups.
+/// fires, and only on the id's own 8-4-4 or 4-12 groups when the group
+/// beside them holds no decimal digit, which this draw makes rare.
 #[test]
 fn nothing_but_the_card_rule_can_match_inside_a_langgraph_task_id() {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1390,7 +1391,6 @@ fn nothing_but_the_card_rule_can_match_inside_a_langgraph_task_id() {
         z ^ (z >> 31)
     };
     let engine = engine();
-    let mut card = 0usize;
     for _ in 0..20_000 {
         let hex: String = (0..32)
             .map(|_| {
@@ -1414,10 +1414,8 @@ fn nothing_but_the_card_rule_can_match_inside_a_langgraph_task_id() {
         let mut report = Report::default();
         if engine.mask_text_into(&id, &mut report).is_some() {
             assert_eq!(report.rules, vec![Rule::CreditCard], "{id}");
-            card += 1;
         }
     }
-    assert!(card > 100, "only {card} task ids hit the card rule");
 }
 
 /// The checkpoint namespace LangGraph writes beside the task id holds the

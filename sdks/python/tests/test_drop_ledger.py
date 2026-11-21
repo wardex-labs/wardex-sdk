@@ -48,6 +48,7 @@ from types import SimpleNamespace
 import pytest
 
 import wardex_sdk
+from conftest import project_key
 from test_batching_integration import posix_signals  # the suite's signal marker, shared
 from test_fork_semantics import fork_only  # the suite's POSIX-only marker, shared
 from wardex_sdk import _hub, _wardex_native
@@ -64,7 +65,7 @@ from wardex_sdk.transport._base import Transport
 
 pytestmark = pytest.mark.usefixtures("fresh_counters")
 
-KEY = "wdx_us_ledger_test"
+KEY = project_key(secret="LedgerTest")
 CLOSED = "http://127.0.0.1:1"  # nothing listens: the connection is refused at once
 
 
@@ -262,11 +263,23 @@ def test_a_receiver_500_is_counted_as_send_error_on_the_next_envelope(receiver):
     assert report["failed_sends"] == 1
 
 
+@pytest.mark.parametrize("status", [429, 503])
+def test_a_retry_later_status_is_retried_and_nothing_is_counted_lost(receiver, status):
+    receiver.script = [("status", status), ("status", 202), ("status", 202)]
+    client = _client(receiver.url)
+    client.capture_span(_span("first"))
+    client.flush(5.0)
+    client.capture_span(_span("second"))
+    client.flush(5.0)  # inside the backoff: queued behind the first
+    client.close(1.0)  # one last try for what is held
+    stored = [d for status, d in receiver.decoded() if status == 202]
+    assert sorted(name for d in stored for name in _span_names(d)) == ["first", "second"]
+    assert _ledger.undelivered() == {}
+
+
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
-        (429, "ratelimit_backoff"),
-        (503, "ratelimit_backoff"),
         (401, "send_error"),
         (413, "request_too_large"),
     ],
@@ -447,6 +460,7 @@ def test_a_report_whose_post_timed_out_is_resent_with_the_same_timestamp(receive
     client.capture_span(_span())
     client.capture_span(_span())  # one eviction, so the first POST carries a report
     client.flush(5.0)  # read timeout
+    client._transport._delivery._not_before = 0.0  # the silence's backoff has run out
     client.capture_span(_span())
     client.flush(5.0)
     client.close(1.0)
@@ -1428,9 +1442,12 @@ def test_a_signal_flush_does_not_spend_its_budget_behind_a_recording(held):
     finally:
         drain.join(5.0)
     failed = counters.get("transport.wardex.export_failed")
+    queued = client._transport.export_state.retry_queued
     client.close(0.5)
     assert elapsed < 0.5, f"the signal flush waited {elapsed:.2f}s"
-    assert failed == 2, "both drains reached their POST"
+    # Both drains reached the transport: the first POST was refused, and the
+    # second batch queued behind its backoff instead of posting again.
+    assert (failed, queued) == (1, 2)
 
 
 # -- the ledger's own rules -----------------------------------------------------
@@ -1681,6 +1698,7 @@ def test_close_says_what_its_final_send_could_not_deliver(capsys):
         err = capsys.readouterr().err
         [line] = [ln for ln in err.splitlines() if "no receiver has confirmed" in ln]
         assert "network_error:span=2" in line
+        assert f"bound for {CLOSED}/v1/envelope" in line
         wardex_sdk.close()  # nothing new: nothing said again
         assert "no receiver has confirmed" not in capsys.readouterr().err
     finally:

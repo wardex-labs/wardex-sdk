@@ -151,7 +151,7 @@ def parse_spy(monkeypatch):
     """Counts `parse_llm_semantics` calls; answers None, as a parser that found nothing does."""
     calls: list[tuple[Any, ...]] = []
 
-    def spy(*args: Any) -> None:
+    def spy(*args: Any, **kwargs: Any) -> None:
         calls.append(args)
         return None
 

@@ -57,7 +57,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .._assembly import counters
+from .._assembly import DropReason, counters, record
 
 #: The SECOND-pass tolerance around a chat's window when locating an
 #: `llm_request`'s START. The two clocks are one machine's unix-epoch
@@ -246,6 +246,7 @@ def classify(spans: list[dict]) -> _BridgeView:
                 # guess is the join this design refuses. Counted, not kept.
                 view.unknown += 1
                 counters.bump("adapters.anthropic.otel_bridge.tool_without_id")
+                record(DropReason.BRIDGE_UNRECOGNIZED, where="adapters.anthropic.otel_bridge")
                 continue
             tool = view.tools.setdefault(tid, _OtelTool())
             tool.span_ids.append(span.span_id)
@@ -264,6 +265,7 @@ def classify(spans: list[dict]) -> _BridgeView:
         else:
             view.unknown += 1
             counters.bump("adapters.anthropic.otel_bridge.span_unrecognized")
+            record(DropReason.BRIDGE_UNRECOGNIZED, where="adapters.anthropic.otel_bridge")
     for llm in view.llm:
         llm.agent_id = _agent_scope(llm.span, view)
     return view

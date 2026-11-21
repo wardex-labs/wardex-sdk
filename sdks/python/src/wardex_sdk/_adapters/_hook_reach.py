@@ -28,7 +28,7 @@ import threading
 from collections.abc import Iterable
 from typing import Any
 
-from .._assembly import Limitation, counters, report_once
+from .._assembly import DropReason, Limitation, counters, record, report_once
 
 #: Handshakes waiting for their root. One waits only from the `initialize`
 #: write to the transport's next write (the user message that opens the
@@ -85,6 +85,7 @@ class HookReach:
                     if len(self._waiting) >= _MAX_WAITING:
                         del self._waiting[next(iter(self._waiting))]
                         counters.bump("adapters.anthropic.hooks_absent_unmarked")
+                        record(DropReason.HOOKS_ABSENT, where="adapters.anthropic_agent_sdk")
                     self._waiting[key] = None
                 return
             if key not in self._waiting:
@@ -95,6 +96,7 @@ class HookReach:
             del self._waiting[key]
         unit.note(Limitation.INSTRUMENTATION_DEGRADED)
         counters.bump("adapters.anthropic.hooks_absent")
+        record(DropReason.HOOKS_ABSENT, where="adapters.anthropic_agent_sdk")
         report_once(_NOTICE, key="adapters.anthropic_agent_sdk.hooks_absent")
 
     def forget(self, key: int) -> None:

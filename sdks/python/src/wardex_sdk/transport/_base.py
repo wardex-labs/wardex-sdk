@@ -9,6 +9,7 @@ from .._types import Envelope
 
 if TYPE_CHECKING:
     from .._config import PIIConfig
+    from ._delivery import ExportState
 
 DEFAULT_TIMEOUT = 5.0
 """The one 5.0 in this SDK's timeout story, and the single place to change it.
@@ -184,7 +185,7 @@ def _report_unmarshalled(unmarshalled: list[str], *, debug: bool) -> None:
     report_once(
         f"{len(unmarshalled)} span(s) could not be marshalled for export and "
         "were left out; the other spans in their batch were not affected "
-        "(counted under transport.otlp.span_unmarshalled; re-run with "
+        "(wardex.diagnostics().losses counts them under unmarshallable; re-run with "
         "debug=True to see which)",
         key="transport.otlp.span_unmarshalled",
     )
@@ -211,8 +212,8 @@ def _report_reserved_overwritten(overwritten: int) -> None:
         f"{overwritten} span attribute(s) set under a reserved wardex.transport.* name "
         "were not exported as set: those names carry the transport values the SDK "
         "observed, so the SDK's value replaced yours, or the attribute was left out "
-        "where it observed none. Rename the attribute to keep it (counted under "
-        "transport.otlp.reserved_attribute_overwritten)",
+        "where it observed none. Rename the attribute to keep it "
+        "(wardex.diagnostics().losses counts them under attribute_dropped)",
         key="transport.otlp.reserved_attribute_overwritten",
     )
 
@@ -259,9 +260,26 @@ def _report_payload_dropped(dropped: int) -> None:
         f"{dropped} span(s) exceeded max_otlp_request_bytes on their own and were "
         "exported without their payload (input, output, tool arguments and "
         "results), marked with wardex.payload_dropped.reason. Raise "
-        "max_otlp_request_bytes if your collector accepts more (counted under "
-        "transport.otlp.span_payload_dropped)",
+        "max_otlp_request_bytes if your collector accepts more.",
         key="transport.otlp.span_payload_dropped",
+    )
+
+
+def _report_attribute_capped(capped: int) -> None:
+    """Record and say the spans exported with an attribute value cut short.
+
+    The span carries `otlp_attribute_truncated`, but only to whoever opens it;
+    recorded as a partial loss, so `wardex.diagnostics().losses` and strict
+    mode see degraded data as well as missing data.
+    """
+    if not capped:
+        return
+    record(DropReason.ATTRIBUTE_CAP, capped)
+    report_once(
+        f"{capped} span(s) had an attribute value longer than max_otlp_attribute_bytes and "
+        "were exported with it cut short, marked otlp_attribute_truncated. Raise "
+        "LimitsConfig(max_otlp_attribute_bytes=...) if your collector accepts more.",
+        key="transport.otlp.attribute_capped",
     )
 
 
@@ -284,7 +302,8 @@ def _report_pii_scrubbed(scrubbed: int, *, wire: str) -> None:
     report_once(
         f"PII masking failed on {scrubbed} record(s), which were exported without "
         "their content (ids, kind and times only, marked pii_filter_failed) rather "
-        f"than unmasked. This is a wardex bug; please report it (counted under {key})",
+        "than unmasked. This is a wardex bug; please report it (wardex.diagnostics().losses "
+        "counts them under internal_sdk_error)",
         key=key,
     )
 
@@ -307,6 +326,8 @@ class _EncodeReports(NamedTuple):
     """Spans masking itself failed on, exported emptied and marked `pii_filter_failed`."""
     over_cap: int = 0
     """Spans dropped whole, too large for a request even without their payload."""
+    attribute_capped: int = 0
+    """Spans with an attribute value cut at `max_otlp_attribute_bytes`."""
 
 
 def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
@@ -316,6 +337,7 @@ def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
     _report_payload_dropped(reports.payload_dropped)
     _report_pii_scrubbed(reports.pii_scrubbed, wire="otlp")
     _report_over_cap(reports.over_cap)
+    _report_attribute_capped(reports.attribute_capped)
 
 
 class Transport(abc.ABC):
@@ -373,7 +395,8 @@ class Transport(abc.ABC):
     holding a pooled `requests.Session`/`httpx.Client` shares live TCP
     sockets with the parent after a fork -- that library's classic fork
     hazard -- and only the transport knows how to rebuild its pool. wardex's
-    built-in transports hold no per-request state and do not implement it.
+    built-in transports implement it to drop their retry queue in the child:
+    the parent still holds those requests and sends them itself.
     """
 
     # PII policy applied by the native encoders on wire paths (design §4.2).
@@ -482,7 +505,9 @@ class Transport(abc.ABC):
         # more -- it skips that one span and names it, for the caller to
         # count and report. A raise here is still a raise: a corrupt envelope
         # or an absent native module is not a per-span loss.
-        bodies, dropped, unmarshalled, overwritten, payload_dropped, scrubbed = (
+        # A seventh count, the spans the attribute cap cut, is read when the
+        # native module is new enough to return it.
+        bodies, dropped, unmarshalled, overwritten, payload_dropped, scrubbed, *capped = (
             native.codec.encode_otlp_requests(
                 envelope,
                 self._pii_mode,
@@ -495,7 +520,7 @@ class Transport(abc.ABC):
         # `dropped`, the spans too large for a request even without their
         # payload, rides back with the other reports (`_report_over_cap`).
         return tuple(bodies), _EncodeReports(
-            unmarshalled, overwritten, payload_dropped, scrubbed, dropped
+            unmarshalled, overwritten, payload_dropped, scrubbed, dropped, sum(capped[:1])
         )
 
     def _set_pii_policy(self, policy: PIIConfig) -> None:
@@ -570,3 +595,21 @@ class Transport(abc.ABC):
 
     def close(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         return None
+
+    @property
+    def export_state(self) -> ExportState | None:
+        """What this transport knows about its own deliveries -- destination,
+        last success, last error, retry queue -- or None for a transport that
+        does not track them. The built-in network transports do."""
+        return None
+
+    def _abandon_retries(self, why: str) -> None:
+        """Drop and account whatever is held for a retry or still in flight on
+        another thread: the process is ending without a `close()`. Plumbing for
+        the built-in transports, not a hook."""
+        return None
+
+    def _receiver_unreachable(self) -> bool:
+        """Whether the last attempt could not connect, so that `close()` need
+        not wait on another. Plumbing for the built-in transports, not a hook."""
+        return False

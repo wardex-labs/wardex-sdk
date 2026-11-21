@@ -10,6 +10,7 @@ installed on a framework release this wardex was not tested against.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import re
 import sys
@@ -59,6 +60,14 @@ def lines() -> Iterator[_Lines]:
     finally:
         logger.removeHandler(handler)
         get_registry().uninstall_all()
+
+
+@pytest.fixture
+def imported() -> None:
+    """The application has imported every framework here, so each adapter
+    installs at init() instead of waiting for that import."""
+    for module in ("agents", "claude_agent_sdk", "langgraph.graph"):
+        importlib.import_module(module)
 
 
 def _config(enabled):  # noqa: ANN001, ANN202
@@ -168,7 +177,7 @@ def test_the_traceback_the_failure_line_points_to_is_there_under_debug(lines):
     assert any("RuntimeError: boom" in m for m in lines.messages), lines.messages
 
 
-def test_an_adapter_that_cannot_even_be_built_is_failed_counted_and_said_once(lines):
+def test_an_adapter_that_cannot_even_be_built_is_failed_counted_and_said_once(lines, imported):
     with mock.patch("wardex_sdk._adapters._make_adapter", side_effect=ImportError("x")):
         install_configured_adapters(None, _config((AdapterName.OPENAI_AGENTS,)))
     assert _status("openai_agents").state is AdapterState.FAILED
@@ -207,7 +216,7 @@ def test_left_out_by_enabled_is_disabled_and_not_detected_is_absent(lines):
     assert lines.messages == [], "an absent or disabled adapter is nothing to look at"
 
 
-def test_a_langgraph_whose_private_runner_moved_is_unsupported_not_installed(lines):
+def test_a_langgraph_whose_private_runner_moved_is_unsupported_not_installed(lines, imported):
     """The release this used to hide behind: `langgraph.pregel._runner` stops
     importing, the adapter returns from `install()` without a word, and the
     registry said installed."""
@@ -225,7 +234,7 @@ def test_a_langgraph_whose_private_runner_moved_is_unsupported_not_installed(lin
     assert f"langgraph {status.version}" in lines.messages[0]
 
 
-def test_an_untested_framework_version_installs_and_says_which_once(lines, monkeypatch):
+def test_an_untested_framework_version_installs_and_says_which_once(lines, imported, monkeypatch):
     """Installed and recording, because most of the tree is usually still
     right; said once, with the installed version, the tested range and the
     pin that gets back to it."""
@@ -250,7 +259,7 @@ def test_an_untested_framework_version_installs_and_says_which_once(lines, monke
     assert counters.get("adapters.openai_agents.unmeasured_version") == 1
 
 
-def test_every_framework_installed_here_is_one_this_release_was_tested_on(lines):
+def test_every_framework_installed_here_is_one_this_release_was_tested_on(lines, imported):
     """The suite's own environment resolves inside the test pins, and the pins
     are the table (see below), so every adapter whose framework is here must
     install, measured, and say nothing."""
@@ -266,7 +275,7 @@ def test_every_framework_installed_here_is_one_this_release_was_tested_on(lines)
 # --- the public read ---------------------------------------------------------
 
 
-def test_diagnostics_keeps_the_last_inits_account_after_close(lines):
+def test_diagnostics_keeps_the_last_inits_account_after_close(lines, imported):
     """A check made once the run is over — after `close()`, the common place
     for one — still reads what happened to each adapter; the next `init()`
     writes a fresh account rather than adding to the old one."""
@@ -294,7 +303,7 @@ def test_diagnostics_keeps_the_last_inits_account_after_close(lines):
     assert states["openai_agents"] is AdapterState.DISABLED
 
 
-def test_an_account_kept_after_close_is_not_read_as_an_adapter_still_installed(lines):
+def test_an_account_kept_after_close_is_not_read_as_an_adapter_still_installed(lines, imported):
     """The MCP stdio seam cedes a tool call to an installed framework adapter,
     and asks which ones are installed. Read off the kept account, an adapter
     that `close()` uninstalled went on claiming every later raw MCP tool call."""

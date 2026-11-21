@@ -1,6 +1,7 @@
 //! LLM request/response body → semantic (gen_ai) extraction. framework-agnostic body parser.
-//! endpoint = the path's last segments (`endpoint::ENDPOINTS`); provider = host
-//! priority + body/SSE shape fallback. fail-safe (parse failure = partial/empty result).
+//! endpoint = the path's last segments (`endpoint::ENDPOINTS`); provider = the
+//! host alone (`endpoint::provider_for_host`), absent when the host is not a
+//! known provider's. fail-safe (parse failure = partial/empty result).
 
 mod anthropic;
 mod bedrock;
@@ -40,13 +41,19 @@ use wardex_limits::Limits;
 /// unless the field's own doc says so.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct LlmSemantics {
-    /// The provider label: `"openai"`, `"anthropic"` or `"aws.bedrock"`. Empty
-    /// when no host, path or body shape named one (an unrecognized stream).
+    /// The OpenTelemetry `gen_ai.provider.name` the host proves (`"openai"`,
+    /// `"anthropic"`, `"groq"`, `"azure.ai.openai"`, ...; see
+    /// `endpoint::PROVIDER_HOSTS`). Empty when the host is not one a known
+    /// provider operates: the path's API shape says which parser reads the
+    /// body, not who served it, so an OpenAI-shaped call to a gateway, a
+    /// local server or an unlisted vendor carries no label rather than a
+    /// guessed `"openai"`.
     pub provider: String,
-    /// `provider` is a guess: it was not read off one of that provider's own
-    /// hosts (`endpoint::is_official_host`) but off a hostname that merely
-    /// contains a provider's name, the response body's shape, or the API
-    /// shape of the path. False when `provider` is empty (nothing labelled).
+    /// The call was recognized as an LLM call (by its path, and by its host
+    /// name or body shape; a Converse path needs no more) but the host did
+    /// not prove who served it, so `provider` is empty. False when `provider`
+    /// is set, and for a stream no reassembler recognized (nothing was
+    /// recognized to be unlabelled).
     pub provider_inferred: bool,
     /// The operation, `"chat"` or `"embeddings"`, decided by the endpoint. An
     /// unrecognized stream reports `"chat"`.
@@ -195,26 +202,13 @@ impl StringOrVec {
     }
 }
 
-/// The provider label a hostname suggests, by substring. A hint, not proof:
-/// `myopenai-proxy.internal` and `prod.openai.azure.com` both answer
-/// `openai`. Whether a label is proven is `label_inferred`'s question.
-fn provider_from_host(host: &str) -> Option<&'static str> {
-    if host.contains("openai") {
-        Some("openai")
-    } else if host.contains("anthropic") {
-        Some("anthropic")
-    } else if host.contains("bedrock") {
-        Some(bedrock::PROVIDER)
-    } else {
-        None
-    }
-}
-
-/// A label is proven only when the host is that provider's own; every other
-/// route to it (host substring, body shape, API shape) is an inference the
-/// span must mark.
-fn label_inferred(provider: &str, host: &str) -> bool {
-    !provider.is_empty() && !endpoint::is_official_host(provider, host)
+/// A host name that mentions a provider (`openai-proxy.corp`). Evidence that
+/// a non-streaming call on an LLM path is an LLM call even when its body has
+/// no provider shape (an error envelope), never a label: who serves behind
+/// such a name is not on the wire.
+fn host_mentions_a_provider(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host.contains("openai") || host.contains("anthropic")
 }
 
 /// If the body is SSE, reassemble it for semantic extraction. Otherwise None (falls through to the existing path).
@@ -234,13 +228,12 @@ fn try_parse_sse(
     // fabricate an empty chat body out of a Responses stream on
     // api.openai.com.
     let matched = endpoint::from_path(path).or_else(|| endpoint::from_sse_shape(&events));
-    // ... and the host names the provider label when it can: an Anthropic
-    // host serving its OpenAI-compat Chat endpoint is still Anthropic. The
-    // Api's implied provider is the fallback for a host that names none —
-    // a gateway serving a provider-shaped API. Same split as the
-    // non-streaming dispatch below: shape picks the parser, host picks the
-    // label, so the two halves of one endpoint cannot disagree.
-    let provider = provider_from_host(host);
+    // ... and only the host names the provider label: an Anthropic host
+    // serving its OpenAI-compat Chat endpoint is still Anthropic, and a
+    // gateway serving the Chat shape is nobody the wire names. Same split as
+    // the non-streaming dispatch below: shape picks the parser, host picks
+    // the label, so the two halves of one endpoint cannot disagree.
+    let provider = endpoint::provider_for_host(host);
     match matched {
         Some(
             endpoint @ Endpoint {
@@ -250,7 +243,7 @@ fn try_parse_sse(
         ) => {
             let reassembled = reassemble_openai(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(endpoint, host, provider, reassembled);
+            let mut out = sse_semantics(endpoint, provider, reassembled);
             fill_openai_chat(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -262,7 +255,7 @@ fn try_parse_sse(
         ) => {
             let reassembled = reassemble_anthropic(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(endpoint, host, provider, reassembled);
+            let mut out = sse_semantics(endpoint, provider, reassembled);
             fill_anthropic(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -274,7 +267,7 @@ fn try_parse_sse(
         ) => {
             let reassembled = reassemble_responses(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(endpoint, host, provider, reassembled);
+            let mut out = sse_semantics(endpoint, provider, reassembled);
             fill_openai_responses(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -302,19 +295,16 @@ fn try_parse_sse(
 }
 
 /// The shared SSE scaffold: operation/api_type from the endpoint, the
-/// provider label from the host when it names one (the endpoint's implied
-/// provider otherwise) and whether that label was inferred, the synthetic
-/// body, and the terminal verdict.
+/// provider label the host proves (empty and marked otherwise), the
+/// synthetic body, and the terminal verdict.
 fn sse_semantics(
     endpoint: Endpoint,
-    host: &str,
     provider: Option<&'static str>,
     reassembled: parts::Reassembled,
 ) -> LlmSemantics {
-    let provider = provider.unwrap_or_else(|| endpoint.api.provider());
     LlmSemantics {
-        provider: provider.to_string(),
-        provider_inferred: label_inferred(provider, host),
+        provider: provider.unwrap_or_default().to_string(),
+        provider_inferred: provider.is_none(),
         operation: endpoint.operation.to_string(),
         api_type: endpoint.api_type,
         reassembled_from_stream: true,
@@ -368,6 +358,31 @@ pub fn parse_llm(
     resp: &[u8],
     limits: Limits,
 ) -> Option<LlmSemantics> {
+    parse_llm_by(host, path, req, resp, limits, false)
+}
+
+/// `parse_llm` for an exchange with a host the app named as an LLM endpoint
+/// (`intercept_hosts`): a non-streaming response on a path no endpoint table
+/// knows is read by its body's shape instead of refused, so a gateway serving
+/// an API shape on a path of its own is still a model call.
+pub fn parse_llm_declared(
+    host: &str,
+    path: &str,
+    req: &[u8],
+    resp: &[u8],
+    limits: Limits,
+) -> Option<LlmSemantics> {
+    parse_llm_by(host, path, req, resp, limits, true)
+}
+
+fn parse_llm_by(
+    host: &str,
+    path: &str,
+    req: &[u8],
+    resp: &[u8],
+    limits: Limits,
+    declared: bool,
+) -> Option<LlmSemantics> {
     let decoded = decode_body(resp, limits);
     let bounds = UsageBounds::from_limits(&limits);
     // Bedrock Converse before the SSE sniff: a ConverseStream body is
@@ -380,18 +395,28 @@ pub fn parse_llm(
         return Some(s);
     }
     // Non-streaming: the endpoint is decided by the path alone (conservative:
-    // a path that matches no endpoint is not an LLM call). The body shape
-    // decides only the provider, when the host names none.
-    let matched = endpoint::from_path(path)?;
-    let provider = provider_from_host(host).or_else(|| {
+    // a path that matches no endpoint is not an LLM call), except on a host the
+    // app declared, where the body's shape decides an unknown path. On a host that
+    // proves no provider, the call still has to show it is an LLM call — a
+    // host name that mentions a provider, or a provider-shaped body — and
+    // then ships unlabelled and marked rather than as a guessed vendor.
+    let shape = || {
         serde_json::from_slice::<serde_json::Value>(&decoded)
             .ok()
             .and_then(|v| endpoint::from_body_shape(&v))
-            .map(|e| e.api.provider())
-    })?;
+    };
+    let matched = match endpoint::from_path(path) {
+        Some(matched) => matched,
+        None if declared => shape()?,
+        None => return None,
+    };
+    let provider = endpoint::provider_for_host(host);
+    if provider.is_none() && !host_mentions_a_provider(host) && shape().is_none() {
+        return None;
+    }
     let mut out = LlmSemantics {
-        provider: provider.to_string(),
-        provider_inferred: label_inferred(provider, host),
+        provider: provider.unwrap_or_default().to_string(),
+        provider_inferred: provider.is_none(),
         operation: matched.operation.to_string(),
         api_type: matched.api_type,
         decoded_response: Some(decoded.clone()),
@@ -414,7 +439,8 @@ pub fn parse_llm(
         Api::OpenAiResponses => fill_openai_responses(&mut out, req, &decoded, bounds),
         Api::OpenAiEmbeddings => fill_openai_embeddings(&mut out, req, &decoded, bounds),
         Api::AnthropicMessages => fill_anthropic(&mut out, req, &decoded, bounds),
-        // Dispatched above, before the SSE sniff; never reaches here.
+        // A Converse path is dispatched above, before the SSE sniff; this arm
+        // is a Converse-shaped body on a declared host's path of its own.
         Api::BedrockConverse => fill_bedrock_converse(&mut out, req, &decoded, bounds),
     }
     Some(out)
@@ -422,10 +448,11 @@ pub fn parse_llm(
 
 /// A Converse or ConverseStream call. The stream is told by its path, or by
 /// a body that opens with a CRC-valid event-stream message (a caller that
-/// read a stream from the plain path, or a gateway that rewrote it). The
-/// label comes from the host when it names a provider and from the API shape
-/// otherwise, as on the SSE path: the path alone already says "Converse",
-/// which only Bedrock speaks.
+/// read a stream from the plain path, or a gateway that rewrote it). The path
+/// alone says "Converse", which only Bedrock speaks, so it picks the parser
+/// on any host; the label still comes from the host alone, as on every other
+/// path, so a private alias or a gateway in front of Bedrock ships
+/// unlabelled and marked.
 fn parse_bedrock_converse(
     endpoint: Endpoint,
     host: &str,
@@ -443,14 +470,14 @@ fn parse_bedrock_converse(
     // was meant to be.
     let streamed_body = aws_eventstream::starts_with_message(&decoded)
         || (streaming_path && !decoded.is_empty() && !decoded.trim_ascii_start().starts_with(b"{"));
+    let provider = endpoint::provider_for_host(host);
     let mut out = if streamed_body {
         let reassembled = reassemble_converse_stream(&decoded);
-        sse_semantics(endpoint, host, provider_from_host(host), reassembled)
+        sse_semantics(endpoint, provider, reassembled)
     } else {
-        let provider = provider_from_host(host).unwrap_or_else(|| endpoint.api.provider());
         LlmSemantics {
-            provider: provider.to_string(),
-            provider_inferred: label_inferred(provider, host),
+            provider: provider.unwrap_or_default().to_string(),
+            provider_inferred: provider.is_none(),
             operation: endpoint.operation.to_string(),
             api_type: endpoint.api_type,
             decoded_response: Some(decoded),

@@ -59,7 +59,8 @@ from wardex_sdk._interceptors._conn_timing import (
 )
 from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
 from wardex_sdk._interceptors._ssl import SSLInterceptor
-from wardex_sdk._interceptors._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
+from wardex_sdk._interceptors._trackers import _Http1Tracker, _Http2Tracker
+from wardex_sdk._interceptors._ws_tracker import _WebSocketTracker
 from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import Envelope
 from wardex_sdk.testing import RecordingTransport

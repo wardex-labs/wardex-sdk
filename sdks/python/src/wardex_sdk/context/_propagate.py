@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from typing import Any
 
 from .. import _hub
 from .._types import SpanContext
@@ -17,50 +18,100 @@ from ._w3c import format_traceparent, parse_traceparent, sanitize_tracestate
 from ._with_only import WithOrSyncDecorator
 
 
-def continue_trace(headers: Mapping[str, str]) -> AbstractContextManager[None]:
+def continue_trace(headers: Mapping[str, str] | str | None) -> AbstractContextManager[None]:
     """Join the distributed trace described by W3C headers.
 
+    `headers` is the incoming request's header mapping (anything `dict()`
+    accepts: `request.headers`, a list of `(name, value)` pairs such as gRPC
+    metadata), a bare `traceparent` string, or `None` for "no headers". Any
+    other type raises `TypeError` here, at the call: it is a mistake in the
+    calling code, and swallowing it would silently start a new trace.
+
     Always enters an isolation scope (per-request state isolation). A valid
-    traceparent installs a remote parent; a missing/malformed one starts a
-    fresh trace (W3C restart rule) — never raises. As a decorator it serves a
-    plain function only (see `WithOrSyncDecorator`), with the headers read once.
+    traceparent installs a remote parent; a missing one starts a fresh trace,
+    and so does a malformed one (W3C restart rule), which is said once on the
+    `wardex_sdk` logger because that value came from the network and the
+    request must go on. As a decorator it serves a plain function only (see
+    `WithOrSyncDecorator`), with the headers read once.
 
     The ambient `wardex.conversation(...)` is KEPT: the trace starts over, the
     conversation does not, so a request continued inside a conversation is
-    still in it. Work started inside a block inherits the block, and this no
-    longer clears it: a long-lived worker started inside one request's block
-    carries that conversation into every trace it continues. Enter
-    `wardex.isolation_scope()` to step out of a conversation.
+    still in it. Work started inside a block inherits the block, and this does
+    not clear it: a long-lived worker started inside one request's block
+    carries that conversation into every trace it continues. Start such a
+    worker outside the `wardex.conversation(...)` block.
     """
     return WithOrSyncDecorator(
         "continue_trace",
-        _continue_trace(headers),
+        _continue_trace(_carrier(headers)),
         "Open it inside the function, where the request's headers are in hand: "
         "`with wardex.continue_trace(headers):`.",
     )
 
 
+_CARRIER_TYPES = (
+    "wardex.continue_trace() takes the incoming request's headers (a mapping such as "
+    "request.headers, or (name, value) pairs), a traceparent string, or None"
+)
+
+
+def _carrier(headers: object) -> Mapping[Any, Any] | Any:
+    """The header carrier `continue_trace` reads, or a TypeError for a wrong type.
+
+    A mapping is passed through unread (`dict()` runs inside the block, where a
+    failure caused by the network's bytes is contained); a sequence of pairs is
+    read here, because a sequence that is not pairs is the caller's mistake.
+    """
+    if headers is None:
+        return {}
+    if isinstance(headers, (str, bytes, bytearray)):
+        return {"traceparent": headers}
+    if hasattr(headers, "keys"):
+        return headers
+    if not hasattr(headers, "__iter__"):
+        raise TypeError(f"{_CARRIER_TYPES}; got {type(headers).__name__}")
+    try:
+        return dict(headers)
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"{_CARRIER_TYPES}; got {type(headers).__name__} that is not pairs"
+        ) from None
+
+
+def _norm_str(x: object) -> str:
+    return x.decode("latin-1") if isinstance(x, (bytes, bytearray)) else str(x)
+
+
 @contextmanager
-def _continue_trace(headers: Mapping[str, str]) -> Iterator[None]:
+def _continue_trace(headers: Mapping[Any, Any]) -> Iterator[None]:
     parsed = None
     tracestate: str | None = None
+    raw = None
     try:
-
-        def _norm_str(x: object) -> str:
-            return x.decode("latin-1") if isinstance(x, (bytes, bytearray)) else str(x)
-
         norm = {_norm_str(k).lower(): _norm_str(v) for k, v in dict(headers).items()}
         raw = norm.get("traceparent")
         if raw:
             parsed = parse_traceparent(raw)
         tracestate = sanitize_tracestate(norm.get("tracestate"))
-    except Exception:
+    except Exception:  # noqa: BLE001 - header bytes are the network's, never the host's fault
         parsed = None
         tracestate = None
-    with _hub.isolation_scope(keep_conversation=True):
+        raw = raw or "unreadable"
+    unreadable = bool(raw) and parsed is None
+    if unreadable:
+        _hub.say_once(
+            "continue_trace.malformed",
+            "wardex.continue_trace(): an incoming traceparent header could not be parsed, "
+            "so the request starts a new trace instead of joining its caller's, and its "
+            "root spans are marked parent_unresolved. The value came from the network: "
+            "check what the calling service sends as traceparent.",
+        )
+    with _hub.isolation_scope(restart_trace=True):
+        # The block's fresh scope, which nothing has copied yet: written in place.
+        scope = _hub.get_current_scope()
+        scope._parent_unreadable = unreadable
         if parsed is not None:
             tid, sid, flags = parsed
-            scope = _hub.get_current_scope()
             scope.active_span_context = SpanContext(
                 trace_id=tid, span_id=sid, trace_flags=flags, is_remote=True
             )
@@ -119,8 +170,8 @@ def continue_from_otel() -> AbstractContextManager[None]:
     """Adopt the current OpenTelemetry span (if any) as a remote parent.
 
     Entry semantics match continue_trace (isolation + remote parent), the
-    ambient conversation kept as there: `wardex.isolation_scope()` steps out
-    of one. No opentelemetry installed, or no active/valid span -> isolation alone.
+    ambient conversation kept as there. No opentelemetry installed, or no
+    active/valid span -> isolation alone.
     As a decorator it serves a plain function only (see `WithOrSyncDecorator`).
     """
     return WithOrSyncDecorator(
@@ -148,7 +199,7 @@ def _continue_from_otel() -> Iterator[None]:
             )
     except Exception:
         ctx = None
-    with _hub.isolation_scope(keep_conversation=True):
+    with _hub.isolation_scope(restart_trace=True):
         if ctx is not None:
             _hub.get_current_scope().active_span_context = ctx
         yield

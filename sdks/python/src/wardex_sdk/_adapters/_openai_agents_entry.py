@@ -64,7 +64,8 @@ from collections.abc import Callable, Mapping
 from inspect import iscoroutinefunction, signature
 from typing import Any
 
-from .._assembly import ConversationContext, report_once
+from .._assembly import ConversationContext, DropReason, report_once
+from .._assembly import record as ledger_record
 from ._context import AdapterContext
 from ._conversation import framework_conversation
 
@@ -298,6 +299,7 @@ def note_tracing_off(
     if switch:
         if said:
             ctx.count("tracing_disabled_run")
+            ledger_record(DropReason.FRAMEWORK_TRACING_DISABLED, where="adapters.openai_agents")
         else:
             _off(ctx, "switch", "tracing_disabled_run")
         return "switch"
@@ -310,6 +312,7 @@ def note_tracing_off(
     if getattr(current, "trace_id", None) == "no-op":
         if RUN_CALL.get() is not None:
             ctx.count("tracing_disabled_run")
+            ledger_record(DropReason.FRAMEWORK_TRACING_DISABLED, where="adapters.openai_agents")
         else:
             _off(ctx, "trace_disabled", "tracing_disabled_run")
         return "trace_disabled"
@@ -369,9 +372,10 @@ def _config_flag(config: Any, name: str) -> bool:
 
 def _off(ctx: AdapterContext, reason: str, counter: str) -> None:
     ctx.count(counter)
+    ledger_record(DropReason.FRAMEWORK_TRACING_DISABLED, where="adapters.openai_agents")
     report_once(
-        f"openai-agents adapter: {_OFF_LINES[reason]}; the counter "
-        f"adapters.openai_agents.{counter} counts such runs",
+        f"openai-agents adapter: {_OFF_LINES[reason]}; wardex.diagnostics().losses counts "
+        "such runs under framework_tracing_disabled",
         key=f"adapters.openai_agents.tracing_off.{reason}",
     )
 

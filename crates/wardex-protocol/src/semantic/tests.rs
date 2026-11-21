@@ -124,8 +124,10 @@ fn openai_embeddings_extracts_input_tokens() {
 }
 
 #[test]
-fn body_shape_fallback_detects_provider_on_localhost() {
-    // even when the host is unsupported (127.0.0.1), infer the provider from the response shape
+fn body_shape_recognizes_a_call_on_localhost_without_naming_a_provider() {
+    // The host (127.0.0.1) proves no provider: the response shape still
+    // makes it an LLM call and picks nothing but the parser, so the label is
+    // absent and marked rather than a guessed vendor.
     let oa = parse_llm(
         "127.0.0.1",
         "/v1/chat/completions",
@@ -134,7 +136,8 @@ fn body_shape_fallback_detects_provider_on_localhost() {
         Limits::default(),
     )
     .unwrap();
-    assert_eq!(oa.provider, "openai");
+    assert_eq!(oa.provider, "");
+    assert!(oa.provider_inferred);
     assert_eq!(oa.usage.input_tokens(), Some(12));
     let an = parse_llm(
         "127.0.0.1",
@@ -144,9 +147,45 @@ fn body_shape_fallback_detects_provider_on_localhost() {
         Limits::default(),
     )
     .unwrap();
-    assert_eq!(an.provider, "anthropic");
+    assert_eq!(an.provider, "");
+    assert!(an.provider_inferred);
     // ANTHROPIC_MSG reports raw 12 + cache_read 4 — inclusive total 16.
     assert_eq!(an.usage.input_tokens(), Some(16));
+}
+
+#[test]
+fn a_declared_host_on_a_path_of_its_own_is_read_by_its_body_shape() {
+    // A gateway the app named in `intercept_hosts`, serving the Chat shape on
+    // a path no endpoint table knows: the shape picks the parser.
+    let s = parse_llm_declared(
+        "llm.corp.internal",
+        "/corp/llm/chat",
+        OPENAI_REQ,
+        OPENAI_CHAT,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.operation, "chat");
+    assert_eq!(s.usage.input_tokens(), Some(12));
+    assert!(s.provider_inferred);
+    // Undeclared, the same exchange is refused, and a declared host's body
+    // with no model-call shape is no model call.
+    assert!(parse_llm(
+        "llm.corp.internal",
+        "/corp/llm/chat",
+        OPENAI_REQ,
+        OPENAI_CHAT,
+        Limits::default()
+    )
+    .is_none());
+    assert!(parse_llm_declared(
+        "llm.corp.internal",
+        "/corp/search",
+        b"{}",
+        br#"{"ok":true}"#,
+        Limits::default()
+    )
+    .is_none());
 }
 
 #[test]
@@ -1990,7 +2029,7 @@ fn responses_body_on_localhost_is_not_mistaken_for_anthropic() {
         Limits::default(),
     )
     .unwrap();
-    assert_eq!(s.provider, "openai");
+    assert_eq!(s.provider, "");
     assert_eq!(s.api_type, Some("responses"));
     assert_eq!(s.usage.input_tokens(), Some(52));
 }
@@ -2098,100 +2137,179 @@ fn parsed(host: &str, path: &str, req: &[u8], resp: &[u8]) -> LlmSemantics {
     }
 }
 
-/// The provider label is proven only by the provider's own host. Every other
-/// way to arrive at it — a hostname that merely contains a provider's name, a
-/// response body's shape, or the API shape of the path when the host names
-/// nothing — is a guess, and `provider_inferred` says so, so the span can
-/// carry a marker instead of presenting the guess as a fact.
+/// The provider label is read off the host alone. The path's API shape
+/// picks the parser, and an OpenAI-shaped call to Groq is Groq's; one to a
+/// host no known provider operates — a gateway, a local server, a hostname
+/// that merely contains a provider's name — carries no label, and
+/// `provider_inferred` marks the gap so the span says the vendor was not
+/// observed instead of naming one.
 #[test]
-fn provider_label_is_inferred_unless_the_host_is_the_providers_own() {
-    let official = [
+fn provider_label_comes_from_the_host_and_is_absent_otherwise() {
+    let named = [
         (
             "api.openai.com",
             "/v1/chat/completions",
             OPENAI_REQ,
             OPENAI_CHAT,
+            "openai",
         ),
         (
             "api.anthropic.com",
             "/v1/messages",
             b"{}" as &[u8],
             ANTHROPIC_MSG,
+            "anthropic",
         ),
-        // The Anthropic-owned host serving the OpenAI-compatible Chat shape:
-        // the label is still the host's, and the host is the provider's own.
+        // The Anthropic-owned host serving the OpenAI-compatible Chat shape.
         (
             "api.anthropic.com",
             "/v1/chat/completions",
             OPENAI_REQ,
             OPENAI_CHAT,
+            "anthropic",
+        ),
+        (
+            "api.groq.com",
+            "/openai/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            "groq",
+        ),
+        (
+            "api.deepseek.com",
+            "/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            "deepseek",
+        ),
+        (
+            "api.x.ai",
+            "/v1/chat/completions",
+            b"{}" as &[u8],
+            OPENAI_SSE,
+            "x_ai",
+        ),
+        (
+            "api.mistral.ai",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            "mistral_ai",
+        ),
+        (
+            "generativelanguage.googleapis.com",
+            "/v1beta/openai/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            "gcp.gemini",
+        ),
+        (
+            "prod-east.openai.azure.com",
+            "/openai/deployments/d/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            "azure.ai.openai",
         ),
     ];
-    for (host, path, req, resp) in official {
+    for (host, path, req, resp, want) in named {
         let s = parsed(host, path, req, resp);
-        assert!(
-            !s.provider_inferred,
-            "{host}{path}: official host marked inferred"
-        );
+        assert_eq!(s.provider, want, "{host}{path}");
+        assert!(!s.provider_inferred, "{host}{path}: proven label marked");
     }
-    let inferred = [
-        // host substring on a host the provider does not own
+    let unnamed = [
         (
             "myopenai-proxy.internal",
             "/v1/chat/completions",
             OPENAI_REQ,
             OPENAI_CHAT,
-            "openai",
         ),
         (
             "openai.com.example.net",
             "/v1/chat/completions",
             OPENAI_REQ,
             OPENAI_CHAT,
-            "openai",
         ),
         (
             "anthropic-proxy.corp",
             "/v1/messages",
             b"{}" as &[u8],
             ANTHROPIC_MSG,
-            "anthropic",
         ),
-        // body shape, the host names nothing
         (
-            "127.0.0.1",
+            "openrouter.ai",
+            "/api/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+        ),
+        (
+            "api.together.xyz",
             "/v1/chat/completions",
             OPENAI_REQ,
             OPENAI_CHAT,
-            "openai",
         ),
         (
-            "127.0.0.1",
-            "/v1/messages",
-            b"{}" as &[u8],
-            ANTHROPIC_MSG,
-            "anthropic",
+            "localhost:11434",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
         ),
-        // API shape of a stream, the host names nothing
+        ("127.0.0.1", "/v1/chat/completions", OPENAI_REQ, OPENAI_CHAT),
+        ("10.0.0.5", "/v1/messages", b"{}" as &[u8], ANTHROPIC_MSG),
         (
             "127.0.0.1",
             "/v1/chat/completions",
             b"{}" as &[u8],
             OPENAI_SSE,
-            "openai",
         ),
     ];
-    for (host, path, req, resp, want) in inferred {
+    for (host, path, req, resp) in unnamed {
         let s = parsed(host, path, req, resp);
-        assert_eq!(s.provider, want, "{host}{path}");
-        assert!(
-            s.provider_inferred,
-            "{host}{path}: inferred label not marked"
+        assert_eq!(s.provider, "", "{host}{path}: label without a proving host");
+        assert!(s.provider_inferred, "{host}{path}: absent label not marked");
+        assert_eq!(
+            s.operation, "chat",
+            "{host}{path}: the call is still parsed"
         );
     }
-    // An official host's stream is not a guess either.
     let s = parsed("api.openai.com", "/v1/chat/completions", b"{}", OPENAI_SSE);
+    assert_eq!(s.provider, "openai");
     assert!(!s.provider_inferred);
+}
+
+/// A non-streaming body on an LLM path still has to show it is an LLM call
+/// when the host proves no provider: a host name that mentions one, or a
+/// provider-shaped body. A known provider's host is evidence by itself.
+#[test]
+fn an_unshaped_body_is_an_llm_call_only_on_a_host_that_says_so() {
+    let error = br#"{"error":{"message":"rate limited","type":"rate_limit"}}"#;
+    assert!(parse_llm(
+        "127.0.0.1",
+        "/v1/chat/completions",
+        OPENAI_REQ,
+        error,
+        Limits::default()
+    )
+    .is_none());
+    let gateway = parse_llm(
+        "openai-proxy.corp",
+        "/v1/chat/completions",
+        OPENAI_REQ,
+        error,
+        Limits::default(),
+    )
+    .expect("a host naming a provider marks the call");
+    assert_eq!(gateway.provider, "");
+    assert!(gateway.provider_inferred);
+    let groq = parse_llm(
+        "api.groq.com",
+        "/openai/v1/chat/completions",
+        OPENAI_REQ,
+        error,
+        Limits::default(),
+    )
+    .expect("a known provider's host marks the call");
+    assert_eq!(groq.provider, "groq");
+    assert!(!groq.provider_inferred);
 }
 
 /// The negative corpus (`fixtures/llm/negatives/`), read by the Python rate

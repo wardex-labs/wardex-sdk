@@ -6,6 +6,7 @@
 //! request/response pair into provider-neutral message parts.
 
 pub mod aws_eventstream;
+pub mod budget;
 pub mod claude_stream_json;
 pub mod codex_exec_json;
 pub mod grpc;

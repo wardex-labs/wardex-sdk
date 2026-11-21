@@ -260,8 +260,8 @@ def test_follows_shutdown_config_is_the_shutdown_sentinels_fact_alone():
 
 
 def _closing_budgets(client: Client) -> list[float]:
-    """Record every budget `close()` hands the worker's stop — the first of
-    the three per-step spends, and the one cheapest to observe."""
+    """Record every budget `close()` hands the worker's stop — the first spend
+    of close()'s one deadline, so a hair under the budget, and the cheapest to observe."""
     budgets: list[float] = []
     original_stop = client._worker.stop
 
@@ -289,7 +289,7 @@ def test_a_bare_close_follows_batching_shutdown_timeout():
 
     client.close()
 
-    assert budgets == [1.25]
+    assert budgets == [pytest.approx(1.25, abs=0.05)] and budgets[0] <= 1.25
 
 
 def test_an_explicit_close_budget_ignores_the_config():
@@ -306,7 +306,7 @@ def test_an_explicit_close_budget_ignores_the_config():
 
     client.close(9.0)
 
-    assert budgets == [9.0]
+    assert budgets == [pytest.approx(9.0, abs=0.05)] and budgets[0] <= 9.0
 
 
 def test_a_bare_public_close_reaches_the_configured_shutdown_budget():
@@ -329,7 +329,7 @@ def test_a_bare_public_close_reaches_the_configured_shutdown_budget():
     finally:
         _hub.set_client(None)
 
-    assert budgets == [1.25]
+    assert budgets == [pytest.approx(1.25, abs=0.05)] and budgets[0] <= 1.25
 
 
 # -- 4. `Transport.export_timeout` is a declared contract ---------------------

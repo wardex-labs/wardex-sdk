@@ -37,11 +37,12 @@ use wardex_core::protocol::grpc::{
     grpc_status_name as core_grpc_status_name, parse_grpc_frames as core_parse_grpc_frames,
     GrpcFrames as CoreGrpcFrames, GrpcMessage as CoreGrpcMessage,
 };
-use wardex_core::protocol::http1::{Http1Stream, ParsedHttp};
+use wardex_core::protocol::http1::{BodyPolicy, BodyUse, Http1Stream, ParsedHttp};
 use wardex_core::protocol::http2::{Http2Connection, Http2Transaction as CoreHttp2Txn};
 use wardex_core::protocol::json_rpc::{JsonRpcKind, JsonRpcMessage as CoreJsonRpc, JsonRpcStream};
 use wardex_core::protocol::semantic::{
-    parse_llm, treatment, ws_upgrade, LlmSemantics as CoreLlmSemantics, Treatment, WsUpgrade,
+    parse_llm, parse_llm_declared, treatment, ws_upgrade, LlmSemantics as CoreLlmSemantics,
+    Treatment, WsUpgrade,
 };
 use wardex_core::protocol::websocket::{
     WsFeedResult as CoreWsFeedResult, WsFrame as CoreWsFrame, WsParser as CoreWsParser,
@@ -106,6 +107,19 @@ impl RawHttpMessage {
     #[getter]
     fn limitations(&self) -> Vec<&'static str> {
         self.inner.limitations.clone()
+    }
+    /// What the stream's body policy stored this body for
+    /// (`Http1Parser.set_body_policy`): "kept", "model_call", "provisional",
+    /// "stream", or "skipped" (`body` is empty and is not the body's size).
+    #[getter]
+    fn body_use(&self) -> &'static str {
+        match self.inner.body_use {
+            BodyUse::Kept => "kept",
+            BodyUse::ModelCall => "model_call",
+            BodyUse::Provisional => "provisional",
+            BodyUse::Stream => "stream",
+            BodyUse::Skipped => "skipped",
+        }
     }
 }
 
@@ -291,6 +305,29 @@ impl Http1Parser {
                 .map(|inner| RawHttpMessage { inner })
                 .collect())
         })
+    }
+
+    /// Which bodies to store from the next header block on: "keep" every
+    /// body; "model_call" every body, as a model call's (a response whose
+    /// request went to an LLM endpoint); "model_calls_only" only a body that
+    /// can still prove a model call (see `RawHttpMessage.body_use`). Any other
+    /// value keeps every body: storing too much is the safe direction.
+    fn set_body_policy(&mut self, policy: &str) -> PyResult<()> {
+        shielded(|| {
+            self.inner.set_body_policy(match policy {
+                "model_call" => BodyPolicy::ModelCall,
+                "model_calls_only" => BodyPolicy::ModelCallsOnly,
+                _ => BodyPolicy::Keep,
+            });
+            Ok(())
+        })
+    }
+
+    /// Accounts for `n` bytes not handed over when they can only be unstored
+    /// body that does not end the message in flight; False (nothing changed)
+    /// means the caller must `feed` them.
+    fn pass_unseen_body(&mut self, n: usize) -> PyResult<bool> {
+        shielded(|| Ok(self.inner.pass_unseen_body(n)))
     }
 
     /// The request the next final response answers used `method`: a response
@@ -552,9 +589,8 @@ impl LlmSemantics {
     fn output_messages(&self) -> Option<String> {
         self.inner.output_messages.clone()
     }
-    /// The provider label is a guess (host substring, body shape or API
-    /// shape), not read off the provider's own host. Python marks the span
-    /// `provider_inferred` and counts it.
+    /// A recognized LLM call whose host proves no provider, so `provider` is
+    /// empty. Python marks the span `provider_inferred` and counts it.
     #[getter]
     fn provider_inferred(&self) -> bool {
         self.inner.provider_inferred
@@ -1095,8 +1131,11 @@ fn normalize_finish_reason(provider: &str, raw: &str) -> PyResult<String> {
 /// parse is pure Rust (inflate + SSE + JSON + reassembly); the `LlmSemantics`
 /// pyclass wrapping happens after the GIL is re-acquired. No size threshold —
 /// release/re-acquire is µs, two orders under the smallest measured parse.
+///
+/// `declared`: the host is one the app named in `intercept_hosts`, so a path
+/// no endpoint table knows is read by the body's shape (`parse_llm_declared`).
 #[pyfunction]
-#[pyo3(signature = (host, path, req, resp, limits=None))]
+#[pyo3(signature = (host, path, req, resp, limits=None, declared=false))]
 fn parse_llm_semantics(
     py: Python<'_>,
     host: PyBackedStr,
@@ -1104,10 +1143,16 @@ fn parse_llm_semantics(
     req: PyBackedBytes,
     resp: PyBackedBytes,
     limits: Option<PyLimits>,
+    declared: bool,
 ) -> PyResult<Option<LlmSemantics>> {
     shielded(|| {
         let l = limits.map(|p| p.inner).unwrap_or_default();
-        let inner = py.allow_threads(move || parse_llm(&host, &path, &req, &resp, l));
+        let parse = if declared {
+            parse_llm_declared
+        } else {
+            parse_llm
+        };
+        let inner = py.allow_threads(move || parse(&host, &path, &req, &resp, l));
         Ok(inner.map(|inner| LlmSemantics { inner }))
     })
 }
@@ -1132,6 +1177,21 @@ fn classify_path(path: &str) -> PyResult<Option<&'static str>> {
             Treatment::Excluded => "excluded",
         }))
     })
+}
+
+/// Do a body's first bytes open an event stream (`sse::opens_event_stream`
+/// says so)? The question a "model_calls_only" HTTP/1 parser asked of a
+/// reply it kept without its declaring one, asked again over the same bytes.
+#[pyfunction]
+fn opens_event_stream(body: &[u8]) -> PyResult<bool> {
+    shielded(|| Ok(wardex_core::protocol::sse::opens_event_stream(body) == Some(true)))
+}
+
+/// Body bytes the HTTP parsers in this process hold for messages still
+/// arriving: what `max_in_flight_body_bytes` bounds.
+#[pyfunction]
+fn in_flight_body_bytes() -> PyResult<usize> {
+    shielded(|| Ok(wardex_core::protocol::budget::held()))
 }
 
 /// "known_provider" | "unknown_host" | None — the WS-transport question, see
@@ -1164,6 +1224,8 @@ fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     protocol.add_function(wrap_pyfunction!(sniff_event_stream, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(classify_path, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(classify_ws_upgrade, &protocol)?)?;
+    protocol.add_function(wrap_pyfunction!(in_flight_body_bytes, &protocol)?)?;
+    protocol.add_function(wrap_pyfunction!(opens_event_stream, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(normalize_finish_reason, &protocol)?)?;
     protocol.add_class::<WsParser>()?;
     protocol.add_class::<WsFeedResult>()?;

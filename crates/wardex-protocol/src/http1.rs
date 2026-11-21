@@ -7,6 +7,10 @@
 
 use wardex_limits::Limits;
 
+use crate::budget::{self, Claim, Reservation};
+use crate::semantic::{treatment, Treatment};
+use crate::sse;
+
 /// A single parsed HTTP message (request or response).
 #[derive(Debug, Clone)]
 pub struct ParsedHttp {
@@ -46,7 +50,57 @@ pub struct ParsedHttp {
     pub header_len: usize,
     /// Capture-limitation markers surfaced on the span.
     pub limitations: Vec<&'static str>,
+    /// What the stream's `BodyPolicy` stored this body for. Decided at the
+    /// header block (a response that may be an event stream: within its
+    /// first body bytes), so a message with no body carries it too.
+    pub body_use: BodyUse,
 }
+
+/// Which message bodies a stream stores. The caller holds the capture policy
+/// and sets this; the stream applies it at each header block, before a byte
+/// of that message's body is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyPolicy {
+    /// Every body, up to the cap its Content-Type selects.
+    Keep,
+    /// Every body, as a model call's (`BodyUse::ModelCall`): the caller knows
+    /// the exchange is with an LLM endpoint. For a response stream, which
+    /// cannot see the target of the request it answers; a request stream
+    /// reads its own.
+    ModelCall,
+    /// Only a body that can still prove a model call; any other is consumed
+    /// for framing and not stored (`BodyUse` names each case).
+    ModelCallsOnly,
+}
+
+/// What a stream stored a message's body for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyUse {
+    /// Stored: the policy keeps every body. Second claim on
+    /// `max_in_flight_body_bytes` (`budget::Claim::Recorded`), after a model
+    /// call's: the app asked for this exchange.
+    Kept,
+    /// Stored, with first claim on `max_in_flight_body_bytes`: a request
+    /// whose target is an LLM endpoint (`semantic::treatment`), or a response
+    /// the caller said answers one (`BodyPolicy::ModelCall`).
+    ModelCall,
+    /// Stored under `ModelCallsOnly` only until the reply is known, and at
+    /// most `max_opaque_body_bytes` of it: a JSON POST to a path the endpoint
+    /// table does not know. Only a reply that is an event stream, whose
+    /// grammar names its API on any path, makes it a model call; the caller
+    /// drops it otherwise.
+    Provisional,
+    /// Stored under `ModelCallsOnly`: a response that declares an event
+    /// stream, or whose first bytes open one (`sse::opens_event_stream`).
+    Stream,
+    /// Not stored: `body` is empty and says nothing about the body's size,
+    /// and `truncated` stays false (no cap cut it).
+    Skipped,
+}
+
+/// The buffer capacity a stream keeps between feeds; more is given back once
+/// the bytes that needed it are consumed.
+const RETAINED_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Incremental parser for one direction of a connection (request or response). Accumulates bytes and carves off completed messages.
 ///
@@ -66,6 +120,15 @@ pub struct Http1Stream {
     /// What the request the next final response answers says about that
     /// response's framing; see `expect_response_to`.
     answering: Answering,
+    /// Applied at the next header block; see `set_body_policy`.
+    body_policy: BodyPolicy,
+    /// The in-flight response is a `BodyUse::Stream` only if its first body
+    /// bytes open an event stream: stored until they decide, then kept or
+    /// dropped (`store_body`). A message that completes undecided is skipped.
+    sniffing: bool,
+    /// The in-flight message's share of `max_in_flight_body_bytes`, given
+    /// back whenever that message leaves the stream.
+    held: Reservation,
 }
 
 /// The request methods whose responses frame differently (RFC 9112 §6.3).
@@ -191,7 +254,16 @@ impl Http1Stream {
             state: State::Headers,
             bytes_scanned: 0,
             answering: Answering::Other,
+            body_policy: BodyPolicy::Keep,
+            sniffing: false,
+            held: Reservation::default(),
         }
+    }
+
+    /// Which bodies to store from the next header block on, until set again.
+    /// A message whose header block already parsed keeps the decision it got.
+    pub fn set_body_policy(&mut self, policy: BodyPolicy) {
+        self.body_policy = policy;
     }
 
     /// The request the next final response answers used `method`. The
@@ -247,13 +319,16 @@ impl Http1Stream {
         if matches!(self.state, State::Disabled(_) | State::Tunnel) {
             return Vec::new();
         }
+        let data = self.pass_unstored_body(data);
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
         loop {
             match self.step() {
-                Step::Done(msg) => {
+                Step::Done(mut msg) => {
                     // The step left the next state: `Headers`, or `Tunnel`
-                    // after a 2xx to CONNECT.
+                    // after a 2xx to CONNECT. The body leaves the stream.
+                    self.settle_sniff(&mut msg);
+                    self.held.release();
                     out.push(msg);
                     if self.avail().is_empty() {
                         break;
@@ -264,6 +339,7 @@ impl Http1Stream {
                     self.state = State::Disabled(reason);
                     self.buf = Vec::new();
                     self.pos = 0;
+                    self.held.release();
                     break;
                 }
             }
@@ -290,8 +366,165 @@ impl Http1Stream {
             self.state = State::Disabled("stream_buffer_exceeded");
             self.buf = Vec::new();
             self.pos = 0;
+            self.held.release();
         }
         out
+    }
+
+    /// Consumes the leading bytes of `data` that belong to a body this stream
+    /// is not storing (`BodyUse::Skipped`), and returns the rest. The
+    /// framing counts them; nothing else needs them, so they are not copied
+    /// into `buf` first. Only while `buf` holds nothing unconsumed, so that
+    /// bytes are still taken in stream order.
+    fn pass_unstored_body<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
+        if self.buffered_len() != 0 {
+            return data;
+        }
+        let skipped = |msg: &ParsedHttp| msg.body_use == BodyUse::Skipped;
+        let passed = match &mut self.state {
+            State::Body { msg, remaining, .. } if skipped(msg) => {
+                let take = (*remaining).min(data.len());
+                *remaining -= take;
+                take
+            }
+            State::UntilClose { msg, .. } if skipped(msg) => data.len(),
+            State::Chunked { msg, dec, .. } if skipped(msg) => match *dec {
+                ChunkState::Data { remaining } => {
+                    let take = remaining.min(data.len());
+                    *dec = if take == remaining {
+                        ChunkState::DataCrlf
+                    } else {
+                        ChunkState::Data {
+                            remaining: remaining - take,
+                        }
+                    };
+                    take
+                }
+                _ => 0,
+            },
+            _ => 0,
+        };
+        self.bytes_scanned += passed as u64;
+        data.get(passed..).unwrap_or_default()
+    }
+
+    /// Accounts for `n` bytes the caller did not hand over, when they can
+    /// only be unstored body of the message in flight and do not end it:
+    /// returns true and the framing has counted them. Returns false and
+    /// changes nothing otherwise (the caller then feeds the bytes), so a
+    /// message only ever completes inside `feed`. Lets a caller skip copying
+    /// a read it would only have counted.
+    pub fn pass_unseen_body(&mut self, n: usize) -> bool {
+        if self.buffered_len() != 0 {
+            return false;
+        }
+        let skipped = |msg: &ParsedHttp| msg.body_use == BodyUse::Skipped;
+        match &mut self.state {
+            State::Body { msg, remaining, .. } if skipped(msg) && n < *remaining => {
+                *remaining -= n;
+            }
+            State::UntilClose { msg, .. } if skipped(msg) => {}
+            State::Chunked { msg, dec, .. } if skipped(msg) => match *dec {
+                ChunkState::Data { remaining } if n < remaining => {
+                    *dec = ChunkState::Data {
+                        remaining: remaining - n,
+                    };
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+        self.bytes_scanned += n as u64;
+        true
+    }
+
+    /// What the body policy stores the body of `msg` for, its header block
+    /// just parsed, and whether that waits on the body's first bytes
+    /// (`sniffing`). A request to an LLM endpoint is a model call's under
+    /// every policy: that is what gives its body first claim on the budget.
+    fn body_use_of(&self, msg: &ParsedHttp) -> (BodyUse, bool) {
+        let content_type = || header_value(&msg.headers, "content-type").map(bare_media_type);
+        if msg.is_request && msg.path.as_deref().and_then(treatment) == Some(Treatment::LlmCall) {
+            return (BodyUse::ModelCall, false);
+        }
+        match self.body_policy {
+            BodyPolicy::Keep => (BodyUse::Kept, false),
+            BodyPolicy::ModelCall => (BodyUse::ModelCall, false),
+            BodyPolicy::ModelCallsOnly if msg.is_request => {
+                let json = content_type()
+                    .is_some_and(|ct| ct == "application/json" || ct.ends_with("+json"));
+                if json && msg.method.as_deref() == Some("POST") {
+                    (BodyUse::Provisional, false)
+                } else {
+                    (BodyUse::Skipped, false)
+                }
+            }
+            BodyPolicy::ModelCallsOnly => {
+                let declared = content_type().is_some_and(|ct| ct == "text/event-stream");
+                (BodyUse::Stream, !declared)
+            }
+        }
+    }
+
+    /// Stores the `take` bytes at the read cursor into `msg`'s body, as its
+    /// `BodyUse`, `cap` and the in-flight budget allow. While `sniffing`, the
+    /// opening bytes decide first, so a reply that is no stream has nothing
+    /// past them copied: the common one, JSON, is decided by its first byte.
+    fn store_body(&mut self, msg: &mut ParsedHttp, take: usize, cap: usize) {
+        let data = self.buf.get(self.pos..self.pos + take).unwrap_or_default();
+        if self.sniffing {
+            let verdict = if msg.body.is_empty() {
+                sse::opens_event_stream(data)
+            } else {
+                // Undecided, so what is stored is shorter than the window.
+                let room = sse::OPENING_BYTES.saturating_sub(msg.body.len());
+                let mut opening = msg.body.clone();
+                opening.extend_from_slice(data.get(..room).unwrap_or(data));
+                sse::opens_event_stream(&opening)
+            };
+            match verdict {
+                Some(true) => self.sniffing = false,
+                Some(false) => {
+                    self.skip_body(msg);
+                    return;
+                }
+                None => {}
+            }
+        }
+        let claim = match msg.body_use {
+            BodyUse::ModelCall => Claim::ModelCall,
+            BodyUse::Kept => Claim::Recorded,
+            _ => Claim::Other,
+        };
+        let ceiling = budget::ceiling(self.limits.max_in_flight_body_bytes, claim);
+        // A provisional body waits for its reply after it has left the
+        // in-flight budget, so only a sample is kept of what is most often
+        // an upload: whole, many of them waiting at once were bounded by nothing.
+        let cap = if msg.body_use == BodyUse::Provisional {
+            cap.min(self.limits.max_opaque_body_bytes)
+        } else {
+            cap
+        };
+        append_capped(msg, data, cap, &mut self.held, ceiling);
+    }
+
+    /// A message leaving the stream while its first bytes were still being
+    /// read (no body at all, or too short to decide) did not open a stream.
+    fn settle_sniff(&mut self, msg: &mut ParsedHttp) {
+        if self.sniffing {
+            self.skip_body(msg);
+        }
+    }
+
+    /// Drops what was stored of `msg`'s body and stores no more of it.
+    fn skip_body(&mut self, msg: &mut ParsedHttp) {
+        self.sniffing = false;
+        self.held.release();
+        msg.body = Vec::new();
+        msg.body_use = BodyUse::Skipped;
+        msg.truncated = false;
+        msg.limitations
+            .retain(|marker| *marker != "body_cap_exceeded");
     }
 
     /// Why the parser latched off, if it did. Surfaced for debug logging: no
@@ -325,27 +558,29 @@ impl Http1Stream {
         if self.is_request {
             return None;
         }
-        let msg = match std::mem::replace(&mut self.state, State::Headers) {
-            State::UntilClose { msg, .. } if peer_closed => msg,
+        let (mut msg, whole) = match std::mem::replace(&mut self.state, State::Headers) {
+            State::UntilClose { msg, .. } if peer_closed => (msg, true),
             State::Chunked {
                 msg,
                 dec: ChunkState::Trailer,
                 ..
-            } => msg,
-            State::Body { mut msg, .. }
-            | State::Chunked { mut msg, .. }
-            | State::UntilClose { mut msg, .. } => {
-                msg.truncated = true;
-                msg.incomplete = true;
-                msg
-            }
+            } => (msg, true),
+            State::Body { msg, .. }
+            | State::Chunked { msg, .. }
+            | State::UntilClose { msg, .. } => (msg, false),
             other => {
                 self.state = other;
                 return None;
             }
         };
+        self.settle_sniff(&mut msg);
+        if !whole {
+            msg.truncated = true;
+            msg.incomplete = true;
+        }
         self.buf = Vec::new();
         self.pos = 0;
+        self.held.release();
         Some(msg)
     }
 
@@ -371,6 +606,13 @@ impl Http1Stream {
             self.buf.drain(..self.pos);
         }
         self.pos = 0;
+        // A body written in one `sendall` arrives as one feed of its whole
+        // size; kept, that capacity would stay with a pooled connection for
+        // as long as it lives, one upload's worth per connection.
+        if self.buf.capacity() > RETAINED_BUFFER_BYTES && self.buf.len() < self.buf.capacity() / 4 {
+            self.buf
+                .shrink_to(self.buf.len().max(RETAINED_BUFFER_BYTES));
+        }
     }
 
     /// Advances the machine as far as the buffered bytes allow.
@@ -422,6 +664,7 @@ impl Http1Stream {
         };
 
         msg.header_len = header_len;
+        (msg.body_use, self.sniffing) = self.body_use_of(&msg);
         self.consume(header_len);
 
         // RFC 7230 §3.3.3: 1xx/204/304 responses have no body → complete immediately from headers alone.
@@ -478,7 +721,7 @@ impl Http1Stream {
     fn step_body(&mut self, mut msg: ParsedHttp, remaining: usize, cap: usize) -> Step {
         let take = remaining.min(self.avail().len());
         if take > 0 {
-            append_capped(&mut msg, &self.buf[self.pos..self.pos + take], cap);
+            self.store_body(&mut msg, take, cap);
             self.bytes_scanned += take as u64;
             self.consume(take);
         }
@@ -500,7 +743,7 @@ impl Http1Stream {
     fn step_until_close(&mut self, mut msg: ParsedHttp, cap: usize) -> Step {
         let take = self.avail().len();
         if take > 0 {
-            append_capped(&mut msg, &self.buf[self.pos..self.pos + take], cap);
+            self.store_body(&mut msg, take, cap);
             self.bytes_scanned += take as u64;
             self.consume(take);
         }
@@ -542,7 +785,7 @@ impl Http1Stream {
                         return Step::NeedMore;
                     }
                     let take = remaining.min(self.avail().len());
-                    append_capped(&mut msg, &self.buf[self.pos..self.pos + take], cap);
+                    self.store_body(&mut msg, take, cap);
                     self.bytes_scanned += take as u64;
                     self.consume(take);
                     let left = remaining - take;
@@ -579,12 +822,24 @@ impl Http1Stream {
     }
 }
 
-/// Appends `data` to the message body, stopping at `cap`. Bytes past the cap are
+/// Appends `data` to the message body, stopping at `cap` or where `held` can
+/// grow no further under `ceiling` (`budget::ceiling`). Bytes past either are
 /// consumed but not stored: framing must keep advancing so the next keep-alive
-/// message on this connection still parses.
-fn append_capped(msg: &mut ParsedHttp, data: &[u8], cap: usize) {
+/// message on this connection still parses. Nothing is stored once the body
+/// was cut, so a budget that frees up later cannot splice a later part onto
+/// the prefix, and nothing at all for a skipped body.
+fn append_capped(
+    msg: &mut ParsedHttp,
+    data: &[u8],
+    cap: usize,
+    held: &mut Reservation,
+    ceiling: usize,
+) {
+    if msg.body_use == BodyUse::Skipped || msg.truncated {
+        return;
+    }
     let room = cap.saturating_sub(msg.body.len());
-    let take = room.min(data.len());
+    let take = held.grow(room.min(data.len()), ceiling);
     msg.body.extend_from_slice(&data[..take]);
     if take < data.len() && !msg.truncated {
         msg.truncated = true;
@@ -637,6 +892,14 @@ pub(crate) fn cap_for_content_type(ct: Option<&str>, limits: &Limits) -> usize {
     }
 }
 
+/// The first value of header `name` (any case), as sent.
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 /// Selects the body cap for a message, based on Content-Type.
 ///
 /// A message with no parseable Content-Type gets the generous cap: being
@@ -664,6 +927,7 @@ fn request_to_parsed(req: &httparse::Request<'_, '_>) -> ParsedHttp {
         incomplete: false,
         header_len: 0,
         limitations: Vec::new(),
+        body_use: BodyUse::Kept,
     }
 }
 
@@ -680,6 +944,7 @@ fn response_to_parsed(resp: &httparse::Response<'_, '_>) -> ParsedHttp {
         incomplete: false,
         header_len: 0,
         limitations: Vec::new(),
+        body_use: BodyUse::Kept,
     }
 }
 
@@ -1597,6 +1862,7 @@ mod tests {
         // decoded body — never enters into it.
         let limits = Limits {
             max_body_bytes: 128 * 1024 * 1024,
+            max_in_flight_body_bytes: 128 * 1024 * 1024,
             ..Default::default()
         };
         let size = 64 * 1024 * 1024;
@@ -1604,7 +1870,9 @@ mod tests {
             .into_bytes();
         raw.extend(std::iter::repeat_n(b'x', size));
         raw.extend_from_slice(b"\r\n0\r\n\r\n");
-        let mut s = Http1Stream::new(false, limits);
+        // Its own pool: a body this size is the whole default in-flight budget,
+        // and the tests beside it run in parallel.
+        let mut s = in_private_pool(false, limits);
         let msgs = feed_chunked(&mut s, &raw, 64 * 1024);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].body.len(), size);
@@ -1691,5 +1959,369 @@ mod tests {
         assert!(!shown.contains("planted-secret-7f3a"), "{shown}");
         assert!(!shown.contains("112, 108, 97"), "{shown}");
         assert!(shown.contains("body_len_in_flight: Some(19)"), "{shown}");
+    }
+
+    /// A stream whose reservations come from a pool no other test shares.
+    fn in_private_pool(is_request: bool, limits: Limits) -> Http1Stream {
+        let mut s = Http1Stream::new(is_request, limits);
+        s.held = Reservation::in_pool(budget::private_pool());
+        s
+    }
+
+    #[test]
+    fn a_request_body_the_policy_refuses_is_framed_but_not_stored() {
+        let mut s = Http1Stream::new(true, Limits::default());
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        let msgs = s.feed(
+            b"POST /internal/upload HTTP/1.1\r\nContent-Length: 10\r\n\r\n0123456789GET /next HTTP/1.1\r\n\r\n",
+        );
+        assert_eq!(msgs.len(), 2, "the framing still found the next request");
+        assert_eq!(msgs[0].body_use, BodyUse::Skipped);
+        assert!(msgs[0].body.is_empty());
+        assert!(!msgs[0].truncated, "no cap cut it");
+        assert!(msgs[0].limitations.is_empty());
+        assert_eq!(
+            msgs[1].body_use,
+            BodyUse::Skipped,
+            "a request with no body carries the decision too"
+        );
+        assert_eq!(msgs[1].path.as_deref(), Some("/next"));
+    }
+
+    #[test]
+    fn an_llm_endpoint_request_keeps_its_body_under_model_calls_only() {
+        let mut s = Http1Stream::new(true, Limits::default());
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        let msgs =
+            s.feed(b"POST /proxy/v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body_use, BodyUse::ModelCall);
+        assert_eq!(msgs[0].body, b"{}");
+    }
+
+    #[test]
+    fn a_response_keeps_its_body_under_model_calls_only_only_when_it_is_a_stream() {
+        let mut s = Http1Stream::new(false, Limits::default());
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        let json = s.feed(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert_eq!(json[0].body_use, BodyUse::Skipped);
+        assert!(json[0].body.is_empty());
+        let stream = s.feed(
+            b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; charset=utf-8\r\nContent-Length: 9\r\n\r\ndata: x\n\n",
+        );
+        assert_eq!(stream[0].body_use, BodyUse::Stream);
+        assert_eq!(stream[0].body, b"data: x\n\n");
+        let no_body = s.feed(b"HTTP/1.1 204 No Content\r\n\r\n");
+        assert_eq!(
+            no_body[0].body_use,
+            BodyUse::Skipped,
+            "a response with no body carries the decision too"
+        );
+    }
+
+    #[test]
+    fn a_skipped_body_is_counted_through_across_reads_in_every_framing() {
+        /// (label, the reads, whether the peer's close ends the body)
+        type Case<'a> = (&'a str, &'a [&'a [u8]], Option<bool>);
+        let cases: [Case<'_>; 3] = [
+            (
+                "content-length",
+                &[
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{123",
+                    b"4567",
+                    b"89ab",
+                ],
+                None,
+            ),
+            (
+                "chunked",
+                &[
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n{12",
+                    b"345\r\n6\r\n6789ab",
+                    b"\r\n0\r\n\r\n",
+                ],
+                None,
+            ),
+            (
+                "until-close",
+                &[b"HTTP/1.1 200 OK\r\n\r\n{123", b"4567", b"89ab"],
+                Some(true),
+            ),
+        ];
+        for (label, reads, peer_closed) in cases {
+            let mut s = Http1Stream::new(false, Limits::default());
+            s.set_body_policy(BodyPolicy::ModelCallsOnly);
+            let mut msgs: Vec<ParsedHttp> = reads.iter().flat_map(|r| s.feed(r)).collect();
+            if let Some(closed) = peer_closed {
+                msgs.extend(s.finish(closed));
+            }
+            assert_eq!(msgs.len(), 1, "{label}");
+            assert_eq!(msgs[0].body_use, BodyUse::Skipped, "{label}");
+            assert!(msgs[0].body.is_empty(), "{label}");
+            assert!(!msgs[0].incomplete, "{label}");
+            assert_eq!(s.buffered_len(), 0, "{label}");
+            assert!(s.disabled_reason().is_none(), "{label}");
+            let next = s.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            if peer_closed.is_none() {
+                assert_eq!(next.len(), 1, "the next response still parses: {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_in_flight_budget_cuts_a_body_where_it_fills_and_frees_at_completion() {
+        let limits = Limits {
+            max_in_flight_body_bytes: 10,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut first = Http1Stream::new(false, limits);
+        first.held = Reservation::in_pool(pool);
+        first.set_body_policy(BodyPolicy::ModelCall);
+        let mut second = Http1Stream::new(false, limits);
+        second.held = Reservation::in_pool(pool);
+        second.set_body_policy(BodyPolicy::ModelCall);
+
+        assert!(first
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n012345")
+            .is_empty());
+        let cut = second.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabcdefgh");
+        assert_eq!(cut[0].body, b"abcd", "only the room the first body left");
+        assert!(cut[0].truncated);
+        assert_eq!(cut[0].limitations, vec!["body_cap_exceeded"]);
+
+        let whole = first.feed(b"67");
+        assert_eq!(whole[0].body, b"01234567", "the first body was never cut");
+        assert!(!whole[0].truncated);
+        assert_eq!(
+            pool.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "both completed bodies left the budget"
+        );
+        let after = second.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789");
+        assert_eq!(after[0].body, b"0123456789");
+        assert!(!after[0].truncated);
+    }
+
+    #[test]
+    fn a_body_cut_by_the_budget_stays_a_prefix_when_room_returns() {
+        let limits = Limits {
+            max_in_flight_body_bytes: 4,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut hog = Http1Stream::new(false, limits);
+        hog.held = Reservation::in_pool(pool);
+        hog.set_body_policy(BodyPolicy::ModelCall);
+        let mut late = Http1Stream::new(false, limits);
+        late.held = Reservation::in_pool(pool);
+        late.set_body_policy(BodyPolicy::ModelCall);
+        assert!(hog
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nwxyz")
+            .is_empty());
+        assert!(late
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+            .is_empty());
+        drop(hog);
+        let msgs = late.feed(b"def");
+        assert!(msgs[0].body.is_empty(), "nothing was stored after the cut");
+        assert!(msgs[0].truncated);
+    }
+
+    #[test]
+    fn a_dropped_stream_gives_its_reservation_back() {
+        let pool = budget::private_pool();
+        {
+            let mut s = Http1Stream::new(true, Limits::default());
+            s.held = Reservation::in_pool(pool);
+            assert!(s
+                .feed(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 100\r\n\r\n0123")
+                .is_empty());
+            assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 4);
+        }
+        assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unseen_bytes_pass_only_as_unstored_body_that_does_not_end_the_message() {
+        let mut s = Http1Stream::new(false, Limits::default());
+        assert!(!s.pass_unseen_body(4), "no message in flight");
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        assert!(s
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{1")
+            .is_empty());
+        assert!(s.pass_unseen_body(4), "body bytes 2..6");
+        assert!(
+            !s.pass_unseen_body(4),
+            "would end the message: the caller feeds it"
+        );
+        let msgs = s.feed(b"6789");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body_use, BodyUse::Skipped);
+        assert_eq!(s.feed(b"HTTP/1.1 204 No Content\r\n\r\n").len(), 1);
+
+        let mut kept = Http1Stream::new(false, Limits::default());
+        assert!(kept
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n01")
+            .is_empty());
+        assert!(
+            !kept.pass_unseen_body(4),
+            "a stored body must see its bytes"
+        );
+    }
+
+    #[test]
+    fn a_reply_that_opens_like_an_event_stream_is_kept_whatever_it_declares() {
+        let mut s = Http1Stream::new(false, Limits::default());
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(s.feed(head).is_empty());
+        assert!(s.feed(b"3\r\nda").is_empty(), "two bytes decide nothing");
+        assert!(s.feed(b"t\r\n").is_empty());
+        assert!(s.feed(b"a\r\na: {\"x\":1}\r\n").is_empty());
+        assert!(!s.pass_unseen_body(1), "a kept body sees every byte");
+        let msgs = s.feed(b"2\r\n\n\n\r\n0\r\n\r\n");
+        assert_eq!(msgs[0].body_use, BodyUse::Stream);
+        assert_eq!(msgs[0].body, b"data: {\"x\":1}\n\n");
+    }
+
+    #[test]
+    fn a_reply_that_opens_like_json_stores_nothing_and_is_counted_through() {
+        let pool = budget::private_pool();
+        let mut s = Http1Stream::new(false, Limits::default());
+        s.held = Reservation::in_pool(pool);
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        assert!(s
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"rows\": [1, 2, 3]")
+            .is_empty());
+        assert_eq!(
+            pool.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing of it was stored"
+        );
+        assert!(s.pass_unseen_body(10), "the rest is only counted");
+    }
+
+    #[test]
+    fn a_reply_whose_opening_bytes_decide_nothing_is_dropped_when_it_ends() {
+        for (label, reply) in [
+            (
+                "plain text",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice(),
+            ),
+            ("no body", b"HTTP/1.1 204 No Content\r\n\r\n".as_slice()),
+        ] {
+            let pool = budget::private_pool();
+            let mut s = Http1Stream::new(false, Limits::default());
+            s.held = Reservation::in_pool(pool);
+            s.set_body_policy(BodyPolicy::ModelCallsOnly);
+            let msgs = s.feed(reply);
+            assert_eq!(msgs[0].body_use, BodyUse::Skipped, "{label}");
+            assert!(msgs[0].body.is_empty() && !msgs[0].truncated, "{label}");
+            assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        let mut s = Http1Stream::new(false, Limits::default());
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        assert!(s.feed(b"HTTP/1.1 200 OK\r\n\r\nda").is_empty());
+        let cut = s.finish(false).expect("the reply in flight");
+        assert_eq!(cut.body_use, BodyUse::Skipped);
+        assert!(cut.incomplete && cut.truncated, "it still ended early");
+    }
+
+    #[test]
+    fn a_json_post_to_an_unknown_path_is_kept_until_its_reply_decides() {
+        let mut s = Http1Stream::new(true, Limits::default());
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        let msgs = s.feed(
+            b"POST /corp/llm/stream HTTP/1.1\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 2\r\n\r\n{}\
+PUT /corp/llm/stream HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}\
+POST /upload HTTP/1.1\r\nContent-Type: application/octet-stream\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        let uses: Vec<_> = msgs.iter().map(|m| m.body_use).collect();
+        assert_eq!(
+            uses,
+            [BodyUse::Provisional, BodyUse::Skipped, BodyUse::Skipped]
+        );
+        assert_eq!(msgs[0].body, b"{}");
+    }
+
+    #[test]
+    fn a_large_write_does_not_leave_its_size_reserved_in_the_stream() {
+        let mut s = Http1Stream::new(true, Limits::default());
+        let mut upload = b"PUT /blob HTTP/1.1\r\nContent-Length: 1000000\r\n\r\n".to_vec();
+        upload.resize(upload.len() + 1_000_000, b'x');
+        assert_eq!(s.feed(&upload).len(), 1);
+        assert!(
+            s.buf.capacity() <= RETAINED_BUFFER_BYTES,
+            "{}",
+            s.buf.capacity()
+        );
+    }
+
+    #[test]
+    fn a_body_the_app_records_is_not_held_to_the_half_others_fill() {
+        // Traffic the app did not ask to record (a download outside every
+        // span) fills its half; a body it did (inside a span) still fits.
+        let limits = Limits {
+            max_in_flight_body_bytes: 20,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut download = Http1Stream::new(false, limits);
+        download.held = Reservation::in_pool(pool);
+        download.set_body_policy(BodyPolicy::ModelCallsOnly);
+        assert!(download
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 40\r\n\r\ndata: 0123456789")
+            .is_empty());
+        assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 10);
+        let mut tool = Http1Stream::new(false, limits);
+        tool.held = Reservation::in_pool(pool);
+        let msgs = tool.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nrows");
+        assert_eq!(msgs[0].body_use, BodyUse::Kept);
+        assert_eq!(msgs[0].body, b"rows");
+        assert!(!msgs[0].truncated);
+    }
+
+    #[test]
+    fn a_json_upload_kept_until_its_reply_decides_keeps_only_an_opaque_sample() {
+        // It waits for its reply after it has left the in-flight budget, so a
+        // whole upload held there would be bounded by nothing.
+        let limits = Limits {
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(true, limits);
+        s.set_body_policy(BodyPolicy::ModelCallsOnly);
+        let msgs = s.feed(
+            b"POST /index/_bulk HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n0123456789",
+        );
+        assert_eq!(msgs[0].body_use, BodyUse::Provisional);
+        assert_eq!(msgs[0].body, b"0123");
+        assert!(msgs[0].truncated);
+        assert_eq!(msgs[0].limitations, ["body_cap_exceeded"]);
+    }
+
+    #[test]
+    fn other_bodies_leave_half_the_in_flight_budget_to_model_calls() {
+        let limits = Limits {
+            max_in_flight_body_bytes: 10,
+            ..Default::default()
+        };
+        let pool = budget::private_pool();
+        let mut download = Http1Stream::new(false, limits);
+        download.held = Reservation::in_pool(pool);
+        download.set_body_policy(BodyPolicy::ModelCallsOnly);
+        let mut call = Http1Stream::new(true, limits);
+        call.held = Reservation::in_pool(pool);
+        assert!(download
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 20\r\n\r\ndata: 0123")
+            .is_empty());
+        assert_eq!(pool.load(std::sync::atomic::Ordering::Relaxed), 5);
+        let msgs = call.feed(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 5\r\n\r\n{\"a\"}");
+        assert_eq!(msgs[0].body_use, BodyUse::ModelCall);
+        assert_eq!(msgs[0].body, b"{\"a\"}");
+        assert!(!msgs[0].truncated);
     }
 }

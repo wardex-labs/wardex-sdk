@@ -265,6 +265,7 @@ def test_a_signal_flush_does_not_burn_the_key_the_real_report_needs(
         signal_handler_only(client)
         assert not _cut_short_lines(capsys.readouterr().err), "the signal flush reported"
 
+        client._transport._delivery._not_before = 0.0  # the silence's backoff has run out
         client.capture_span(_span("second"))
         client.flush(SHORT)  # named by the host: the report it can act on
         lines = _cut_short_lines(capsys.readouterr().err)
@@ -344,6 +345,7 @@ def test_a_bare_flush_does_not_burn_the_key_the_real_report_needs(black_hole, ca
         client.flush()  # bare: derived budget, must stay silent AND spend nothing
         assert not _cut_short_lines(capsys.readouterr().err), "the bare flush() reported"
 
+        client._transport._delivery._not_before = 0.0  # the silence's backoff has run out
         client.capture_span(_span("second"))
         client.flush(SHORT)  # named: the report the caller can act on
         lines = _cut_short_lines(capsys.readouterr().err)

@@ -80,7 +80,15 @@ from ._bridge_latch import (
     set_tool_call_resolver,
 )
 from ._builder import NULL_DRAFT, OTEL_ERROR_TYPE_OTHER, IntegrityBuilder, SpanDraft
-from ._diag import Counters, counters, diag_info, diag_warning, guard, report_once
+from ._diag import (
+    Counters,
+    counters,
+    debug_refused_call,
+    diag_info,
+    diag_warning,
+    guard,
+    report_once,
+)
 from ._drops import (
     count_drain_drop,
     debug_host_error,
@@ -183,6 +191,7 @@ __all__ = [
     "count_drain_drop",
     "counters",
     "debug_host_error",
+    "debug_refused_call",
     "degraded_run",
     "demote_late_usage",
     "diag_info",

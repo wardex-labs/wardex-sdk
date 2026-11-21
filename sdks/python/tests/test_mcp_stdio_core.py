@@ -381,7 +381,7 @@ def test_a_version_that_does_not_read_as_a_revision_is_refused_counted_and_said(
     (sp,) = [sp for sp, _ in st.feed_response(b'{"jsonrpc":"2.0","id":3,"result":{"tools":[]}}\n')]
     assert _version(sp) is None
     assert counters.get("interceptors.mcp_stdio.protocol_version_unreadable") == 2
-    lines = [x for x in capsys.readouterr().err.splitlines() if "protocol_version_unreadable" in x]
+    lines = [x for x in capsys.readouterr().err.splitlines() if "revision identifier" in x]
     assert len(lines) == 1 and lines[0].startswith("[wardex] ")
 
 
@@ -422,7 +422,7 @@ def test_ceding_a_tool_call_to_an_adapter_is_said_once_naming_it(monkeypatch, ca
     for rid in (1, 2):
         (sp,) = _drive(*_call({"content": []}, rid=rid))
         assert sp.name == "MCP tools/call"
-    lines = [x for x in capsys.readouterr().err.splitlines() if "execute_tool_ceded" in x]
+    lines = [x for x in capsys.readouterr().err.splitlines() if "MCP tool calls are" in x]
     assert len(lines) == 1
     assert "langgraph, openai_agents adapter(s)" in lines[0]
     assert "codex_exec" not in lines[0]
@@ -497,7 +497,7 @@ def test_a_request_dropped_at_the_pending_bound_is_counted_and_said_once(monkeyp
     assert len(st._latch) == 2
     assert counters.get("interceptors.mcp_stdio.pending_evicted") == 3
     err = capsys.readouterr().err
-    lines = [line for line in err.splitlines() if "pending_evicted" in line]
+    lines = [line for line in err.splitlines() if "requests awaiting a response" in line]
     assert len(lines) == 1 and lines[0].startswith("[wardex] ")
 
 

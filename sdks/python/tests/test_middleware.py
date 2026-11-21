@@ -119,3 +119,81 @@ def test_wsgi_no_header_starts_fresh():
     mw = wardex_sdk.WardexWsgiMiddleware(app)
     mw({"REQUEST_METHOD": "GET"}, lambda s, h: None)
     assert seen["active"] is None
+
+
+def _serve(mw, environ):
+    """What a thread-pool WSGI server does per request: call, iterate, close."""
+    body = mw(environ, lambda status, headers: None)
+    chunks = list(body)
+    close = getattr(body, "close", None)
+    if close is not None:
+        close()
+    return chunks
+
+
+def _streaming_app(environ, start_response):
+    if environ.get("HTTP_X_USER"):
+        wardex_sdk.set_user(environ["HTTP_X_USER"])
+    with wardex_sdk.span("view"):
+        pass
+    start_response("200 OK", [])
+
+    def body():
+        with wardex_sdk.span("stream"):
+            yield b"chunk"
+        if environ.get("HTTP_X_LATE_USER"):
+            wardex_sdk.set_user(environ["HTTP_X_LATE_USER"])
+
+    return body()
+
+
+def _spans_by_request(t):
+    spans = [s for e in t.envelopes for s in e.spans]
+    return [(s.name, dict(s.extra or ()).get("user.id"), s.context.trace_id, s) for s in spans]
+
+
+def test_wsgi_a_streamed_body_stays_in_its_request():
+    """Work done while the server iterates the body is the request's: same
+    trace, same user, and nothing it writes reaches the next request served
+    on the same worker thread."""
+    import concurrent.futures as cf
+
+    t = _setup()
+    mw = wardex_sdk.WardexWsgiMiddleware(_streaming_app)
+    with cf.ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(_serve, mw, {"HTTP_X_USER": "alice", "HTTP_X_LATE_USER": "late"}).result()
+        pool.submit(_serve, mw, {}).result()
+        pool.submit(_serve, mw, {"HTTP_TRACEPARENT": TP, "HTTP_X_USER": "carol"}).result()
+    _hub.get_client().flush()
+    got = _spans_by_request(t)
+    assert [(n, u) for n, u, _, _ in got] == [
+        ("view", "alice"),
+        ("stream", "alice"),
+        ("view", None),
+        ("stream", None),
+        ("view", "carol"),
+        ("stream", "carol"),
+    ]
+    # The streamed span continues the caller's trace like the view does.
+    assert {got[4][2].hex(), got[5][2].hex()} == {"4bf92f3577b34da6a3ce929d0e0e4736"}
+
+
+def test_wsgi_a_listed_body_and_an_app_error_pass_through_untouched():
+    _setup()
+
+    def listed(environ, start_response):
+        start_response("200 OK", [])
+        return [b"a", b"b"]
+
+    body = wardex_sdk.WardexWsgiMiddleware(listed)({}, lambda s, h: None)
+    assert body == [b"a", b"b"]
+
+    def broken(environ, start_response):
+        raise RuntimeError("app error")
+
+    try:
+        wardex_sdk.WardexWsgiMiddleware(broken)({}, lambda s, h: None)
+        raise AssertionError("should have raised")
+    except RuntimeError:
+        pass
+    assert _hub.get_current_scope().active_span_context is None

@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING, Any
 from .. import _hub, _wardex_native
 from .._assembly import (
     Ambient,
+    DropReason,
+    DropUnit,
     Limitation,
     PatchSet,
     SpanDraft,
@@ -51,6 +53,7 @@ from .._assembly import (
     guard,
     latch_ambient,
     parent_is_closed_unit,
+    record,
     report_once,
     report_stream_parser_disabled,
     resolve_observed,
@@ -88,15 +91,13 @@ from ._mcp_result import (
 )
 
 # OPTIONAL, and it has to be: anyio is a third-party package, this wheel declares no runtime
-# dependencies, and `_backends._asyncio` is anyio's PRIVATE layout on top of that. As a plain
-# top-level import it made this module unimportable in an environment without anyio, and
-# `wardex.init(intercept=True)` imports this module — so the interceptor whose promise is never to
-# alter the host took the host down at startup over a package the user never installed.
-# `except Exception` and not `except ImportError`: importing a third party runs code wardex does not
-# own, and I6 does not exempt the ways that code can fail. Both halves are probed in a real
-# interpreter — an absent anyio and an anyio whose module body raises — because neither is visible
-# to a monkeypatch. Counted rather than silent (C-S4) — `install()` below turns it into one line on
-# stderr for a person, and the seam that needs it declines.
+# dependencies, and `_backends._asyncio` is anyio's PRIVATE layout on top of that. Imported
+# unconditionally, it would make `wardex.init(intercept=True)` fail at startup over a package the
+# user never installed. `except Exception` and not `except ImportError`: importing a third party
+# runs code wardex does not own, and I6 does not exempt the ways that code can fail. Both halves are
+# probed in a real interpreter (an absent anyio, and one whose module body raises), because neither
+# is visible to a monkeypatch. Counted rather than silent: `install()` below turns it into one line
+# on stderr for a person, and the seam that needs it declines.
 try:
     import anyio._backends._asyncio as _aio_backend
 except Exception:  # noqa: BLE001 — an absent optional backend is not a crash
@@ -222,10 +223,11 @@ class _ProcState:
             if len(self._latch) > MAX_PENDING_REQUESTS:
                 self._latch.pop(next(iter(self._latch)))
                 counters.bump("interceptors.mcp_stdio.pending_evicted")
+                record(DropReason.TABLE_FULL, unit=DropUnit.REQUEST, where="interceptors.mcp_stdio")
                 report_once(
                     f"an MCP subprocess had more than {MAX_PENDING_REQUESTS} requests awaiting a "
-                    "response; the oldest was dropped and its call will not become a span. Counted "
-                    "under interceptors.mcp_stdio.pending_evicted.",
+                    "response; the oldest was dropped and its call will not become a span. "
+                    "wardex.diagnostics().losses counts each one under table_full.",
                     key="interceptors.mcp_stdio.pending_evicted",
                 )
         self._count_lines_over_cap()
@@ -238,13 +240,16 @@ class _ProcState:
         seen = self._req.lines_over_cap() + self._resp.lines_over_cap()
         if seen <= self._lines_over_cap:
             return
-        for _ in range(seen - self._lines_over_cap):
+        lost, self._lines_over_cap = seen - self._lines_over_cap, seen
+        for _ in range(lost):
             counters.bump("interceptors.mcp_stdio.line_over_cap")
-        self._lines_over_cap = seen
+        where = "interceptors.mcp_stdio"
+        record(DropReason.STREAM_LINE_OVER_CAP, lost, DropUnit.MESSAGE, where=where)
         report_once(
             "a line on an MCP subprocess's pipe was longer than max_stream_buffer_bytes and was "
-            "skipped unparsed; if it was a JSON-RPC message, its call is not captured. Counted "
-            "under interceptors.mcp_stdio.line_over_cap.",
+            "skipped unparsed; if it was a JSON-RPC message, its call is not captured. Raise "
+            "LimitsConfig(max_stream_buffer_bytes=...); wardex.diagnostics().losses counts "
+            "each one under stream_line_over_cap.",
             key="interceptors.mcp_stdio.line_over_cap",
         )
 
@@ -313,13 +318,10 @@ class _ProcState:
     def should_detach(self) -> bool:
         """Is this subprocess not an MCP server after all?
 
-        SYMMETRIC in the two directions, and it was not. The trigger counted
-        stdin bytes only and was consulted only from the send wrapper, so a
-        subprocess that writes little and STREAMS a lot — a compiler, a log
-        follower, a media encoder, anything a host runs beside its MCP servers
-        — never detached at all: it paid the tee, the copy and a JSON-RPC parse
-        attempt on every read for as long as it lived. The hard buffer cap kept
-        that bounded; it never made it free.
+        SYMMETRIC in the two directions: a subprocess that writes little and
+        STREAMS a lot (a compiler, a log follower, a media encoder, anything a
+        host runs beside its MCP servers) detaches too, or it pays the tee, the
+        copy and a JSON-RPC parse attempt on every read for as long as it lives.
 
         `_msgs == 0` is the claim being made, and it is a strong one: not one
         JSON-RPC request, response or notification has been parsed in EITHER
@@ -370,8 +372,7 @@ def _build_mcp_span(
     output_data = result_bytes
     tool: ToolAttributes | None = None
     status = StatusCode.ERROR if resp.error is not None else StatusCode.OK
-    # `SpanDraft.finish()` refuses `status=ERROR` without an `error_type`, and this span shipped
-    # exactly that pair until now — the same defect the adapter had. The JSON-RPC error object
+    # `SpanDraft.finish()` refuses `status=ERROR` without an `error_type`. The JSON-RPC error object
     # carries the answer (`{"code": -32601, ...}`), so the type is derived from it rather than
     # invented; an unreadable error body degrades to the generic name instead of deleting the span.
     error_type: str | None = _json_rpc_error_type(resp.error) if resp.error is not None else None
@@ -390,10 +391,9 @@ def _build_mcp_span(
             if params is not None:
                 name = params.get("name")
                 if name is not None:
-                    # IPC, not NETWORK. The default was a guess and it was
-                    # wrong: this tool ran behind a subprocess pipe, and design
-                    # §6.2 adds `IPC` precisely so the protocol detail stays an
-                    # attribute instead of becoming a parallel span vocabulary.
+                    # IPC, not NETWORK: this tool ran behind a subprocess pipe,
+                    # and `IPC` keeps the protocol detail an attribute instead of
+                    # a parallel span vocabulary.
                     tool = ToolAttributes(
                         name=str(name),
                         call_id=resp.id,
@@ -461,8 +461,7 @@ def _report_ceded(owners: frozenset[str]) -> None:
         f"{names} adapter(s) are installed, because those record a call made through their "
         "framework as their own execute_tool span. A raw `mcp` client's tool calls in this process "
         "are therefore not counted as execute_tool; leave the adapter(s) out with "
-        "AdaptersConfig(enabled=...) to have them counted. Counted under "
-        "interceptors.mcp_stdio.execute_tool_ceded.",
+        "AdaptersConfig(enabled=...) to have them counted.",
         key="interceptors.mcp_stdio.execute_tool_ceded",
     )
 
@@ -515,10 +514,9 @@ def _maybe_log_disabled(client: Client | None, state: _ProcState, pid: int | Non
     caller can observe that an MCP stream stopped being captured.
 
     Counted once per subprocess stream and said once per process in EVERY
-    mode; the per-stream line naming the pid stays debug's. It used to be
-    debug-only end to end, so in a default process a stream that stopped being
-    captured left no trace at all. The price is asking the parsers for a
-    reason on each read until one latches, as the seam already does.
+    mode, so a stream that stops being captured always leaves a trace; the
+    per-stream line naming the pid stays debug's. The price is asking the
+    parsers for a reason on each read until one latches, as the seam does.
     """
     try:
         if client is None or state.disabled_logged:

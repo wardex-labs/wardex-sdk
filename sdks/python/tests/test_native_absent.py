@@ -66,6 +66,7 @@ _STEPS = (
     "init",
     "conversation",
     "span",
+    "current_span",
     "tool",
     "workflow",
     "step",
@@ -73,6 +74,7 @@ _STEPS = (
     "snapshot",
     "set_tag",
     "set_user",
+    "set_account",
     "set_context",
     "isolation_scope",
     "traceparent",
@@ -93,6 +95,7 @@ _STEPS = (
     "init_intercept",
     "close_again",
     "diagnostics",
+    "explain",
     # Last, and deliberately so: the two scope steps import internal packages,
     # and a package whose import fails half way leaves whatever it already
     # bound in `sys.modules`. Running them after the checklist means nothing
@@ -394,6 +397,7 @@ STEPS = [
     ("init", lambda: wardex_sdk.init(backend=wardex_sdk.BackendConfig(api_key="k"))),
     ("conversation", lambda: wardex_sdk.conversation("t").__enter__()),
     ("span", lambda: wardex_sdk.span("s").__enter__()),
+    ("current_span", lambda: wardex_sdk.current_span()),
     ("tool", lambda: wardex_sdk.tool(name="t")(lambda: 7)()),
     ("workflow", lambda: wardex_sdk.workflow(name="w")(lambda: 7)()),
     ("step", lambda: wardex_sdk.step(name="k")(lambda: 7)()),
@@ -401,6 +405,7 @@ STEPS = [
     ("snapshot", lambda: wardex_sdk.capture_state_snapshot()),
     ("set_tag", lambda: wardex_sdk.set_tag("a", "b")),
     ("set_user", lambda: wardex_sdk.set_user(UserInfo(id="u"))),
+    ("set_account", lambda: wardex_sdk.set_account("acct")),
     ("set_context", lambda: wardex_sdk.set_context("k", {"v": 1})),
     ("isolation_scope", _isolation_scope),
     ("traceparent", lambda: wardex_sdk.get_traceparent()),
@@ -421,6 +426,7 @@ STEPS = [
     ("init_intercept", lambda: wardex_sdk.init(intercept=True)),
     ("close_again", lambda: wardex_sdk.close()),
     ("diagnostics", _diagnostics),
+    ("explain", lambda: wardex_sdk.explain("queue_overflow")),
     ("submodules_that_degrade", _submodules_that_degrade),
     ("submodules_that_still_raise", _submodules_that_still_raise),
 ]
@@ -542,8 +548,10 @@ def test_a_hand_driven_transport_says_why_it_dropped_the_batch(tmp_path, flavour
 _DRIVEN = frozenset(
     {
         "init",
+        "explain",
         "conversation",
         "span",
+        "current_span",
         "workflow",
         "agent",
         "step",
@@ -551,6 +559,7 @@ _DRIVEN = frozenset(
         "capture_state_snapshot",
         "set_tag",
         "set_user",
+        "set_account",
         "set_context",
         "isolation_scope",
         "new_scope",
