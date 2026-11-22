@@ -135,7 +135,8 @@ class Scenario:
     end), `exit` the runner's exit code per mode (0 completed, 1 failed, 130 interrupted).
     `nets` shortens wardex module constants (`"<module>.<NAME>": seconds`) in the Hermes
     process, from this script's own witness plugin, so a net that waits minutes can be watched
-    before the process ends; the adapter reads no setting for them.
+    before the process ends; the adapter reads no setting for them. They travel in
+    `HERMES_SMOKE_NETS`, because wardex reports every `WARDEX_` name it does not read.
     """
 
     surface: str
@@ -1522,7 +1523,7 @@ def _note(**kwargs):
         fh.write(json.dumps(seen) + "\n")
 def register(ctx):
     # `Scenario.nets`: loaded after wardex, so its modules are imported; read at call time.
-    for name, value in json.loads(os.environ.get("WARDEX_SMOKE_NETS") or "{}").items():
+    for name, value in json.loads(os.environ.get("HERMES_SMOKE_NETS") or "{}").items():
         module, constant = name.rsplit(".", 1)
         setattr(importlib.import_module("wardex_sdk._adapters." + module), constant, value)
     ctx.register_hook("on_session_start", _note)
@@ -2020,7 +2021,7 @@ def run(
             "WARDEX_SERVICE_NAME": f"hermes-smoke-{name}",
             "WARDEX_SMOKE_RECORD": str(out / "record.jsonl"),
             "WARDEX_SMOKE_SCHEMAS": str(out / "schemas.jsonl"),
-            "WARDEX_SMOKE_NETS": json.dumps(sc.nets),
+            "HERMES_SMOKE_NETS": json.dumps(sc.nets),
         },
     )
     seen: dict[str, Any] = {"mode": mode}
