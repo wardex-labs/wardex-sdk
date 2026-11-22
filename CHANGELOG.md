@@ -100,7 +100,8 @@ All notable changes to this project are documented here. The format follows
   the session, or after 120 seconds with no event (300 after a failed model
   call). Nothing that runs on that thread after a failed turn sits under it.
   An agent run inside a live turn (from a `step_callback`, or on a thread a
-  tool started) leaves that turn whole. What wardex cannot place is
+  tool started) leaves that turn whole, and a turn an async embedder runs
+  from inside a coroutine is one trace too. What wardex cannot place is
   marked, not guessed: Hermes's background memory review, side questions, the
   session-title call, a tool call Hermes never ran, and model calls made
   outside the process. A prompt another plugin blocked is in no span. wardex

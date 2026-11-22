@@ -13,6 +13,7 @@ runs a wardex verb while a turn, frame or book lock is held.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from collections.abc import Hashable
@@ -93,6 +94,17 @@ def _downstream_name(exc: BaseException) -> str:
 def _chat_block(model: str | None) -> GenAIAttributes:
     """The block a `chat` span needs to export at all, and the core's usage promotion needs."""
     return GenAIAttributes(operation=OperationName.CHAT, request_model=model)
+
+
+def _driver() -> object:
+    """The task (or thread) a pin is put on: the running task when an event loop runs on this
+    thread, else the thread. An embedder that calls Hermes's synchronous `run_conversation`
+    from a coroutine runs the whole loop inside a task, and the core refuses a pin declared
+    for the thread there. Copied from the pydantic-ai adapter rather than imported: the
+    adapters share the rule, not a module."""
+    loop = asyncio._get_running_loop()
+    task = asyncio.current_task(loop) if loop is not None else None
+    return task if task is not None else threading.current_thread()
 
 
 def _aux_key(event: AuxStart | AuxEnd) -> Hashable:
@@ -303,7 +315,7 @@ class FrameEffects:
         )
         if not handle.degraded:
             ctx.hold_framework_usage(handle, prefix=HOLD_PREFIX)
-        handle.pin(driver=threading.current_thread())
+        handle.pin(driver=_driver())
         frame.handle = handle
 
     def _open_tool(self, frame: FrameRecord, event: ToolEnter) -> None:
@@ -347,7 +359,7 @@ class FrameEffects:
         slot["tool_name"] = name
         slot["tool_arguments"] = canonical_arguments(args) if args is not None else None
         slot["handle"] = handle
-        handle.pin(driver=threading.current_thread())
+        handle.pin(driver=_driver())
         frame.handle = handle
         frame.token = _FRAME.set(frame)
 
@@ -455,7 +467,7 @@ def _ensure_lane(record: TurnRecord) -> None:
     _drop_lane()
     handle = record.handle
     if handle is not None:
-        handle.pin(driver=threading.current_thread())
+        handle.pin(driver=_driver())
     _LANE.set(record)
 
 

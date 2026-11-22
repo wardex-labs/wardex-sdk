@@ -8,6 +8,7 @@ per call: the wire span when there were bytes, else the call's own span, marked
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -196,3 +197,47 @@ def test_a_failed_auxiliary_call_has_no_usage_anywhere():
     nodes = exported(transport)
     hook = one(nodes, "chat lab-aux-title")
     assert typed_usage(hook) == {} and _reported(hook) == {}
+
+
+def _child(h: FakeHermes, kid) -> None:
+    h.tool(
+        h.model_call(kid, (Reply.OK,), tool_calls=["read_file"], usage=Usage(300, 3)), "read_file"
+    )
+    h.model_call(kid, (Reply.OK,), usage=Usage(400, 4))
+    h.end(kid)
+
+
+@pytest.mark.parametrize("in_coroutine", [False, True], ids=["sync", "in_coroutine"])
+def test_a_turn_run_from_inside_a_coroutine_is_one_tree_with_usage_counted_once(in_coroutine):
+    """An embedder calls Hermes's synchronous `run_conversation` from an `async def` under
+    `asyncio.run`, so a task is running on the loop thread while every frame of the turn is
+    pinned there. Tools and the joined child run on pool threads, outside any loop. The tree
+    and the usage sum are the same as for a call with no loop running."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def turn() -> None:
+            t = h.turn()
+            asked = ["read_file", "delegate_task"]
+            call = h.model_call(t, (Reply.OK,), tool_calls=asked, usage=Usage(100, 1))
+            h.tool(call, "read_file")
+            h.delegate(call, children=1, child=_child)
+            h.model_call(t, (Reply.OK,), usage=Usage(200, 2))
+            h.end(t)
+
+        async def embedder() -> None:
+            turn()
+
+        on_loop(lambda: asyncio.run(embedder()) if in_coroutine else turn())
+    nodes = exported(transport)
+    assert len({n.trace_id for n in nodes}) == 1, [(n.name, n.parent_id) for n in nodes]
+    turns = [n for n in nodes if n.name == "invoke_agent hermes"]
+    root = next(n for n in turns if n.parent_id is None)
+    assert len(turns) == 2
+    assert not [n.name for n in nodes if Limitation.CORRELATION_CONFLICT in n.limitations]
+    assert not [n.name for n in nodes if Limitation.PARENT_UNRESOLVED in n.limitations]
+    chats = [n for n in nodes if n.name == "chat lab-model"]
+    assert len(chats) == 4
+    assert sum(1 for n in chats if n.parent_id == root.span_id) == 2
+    assert _summed(nodes, "input_tokens") == 100 + 200 + 300 + 400
+    assert not [n.name for n in nodes if Limitation.NO_WIRE_EVIDENCE in n.limitations]

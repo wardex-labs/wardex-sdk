@@ -149,7 +149,8 @@ class Scenario:
     `prelude` is `(narration, tool, args)` Hermes runs as a scripted prelude before the turn's
     first model call (`run_conversation(prelude=...)`, library mode only). `then` is a second
     prompt a new `AIAgent`, a session of its own, runs on the same thread once the first turn
-    returned (library mode only).
+    returned (library mode only). `coroutine` calls `run_conversation` from an `async def`
+    under `asyncio.run`, as an async embedder does (library mode only).
     """
 
     surface: str
@@ -167,6 +168,7 @@ class Scenario:
     nets: dict[str, float] = field(default_factory=dict)
     prelude: tuple[str, str, dict[str, Any]] | None = None
     then: str | None = None
+    coroutine: bool = False
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -186,6 +188,17 @@ SCENARIOS: dict[str, Scenario] = {
         ],
         ("answer", "call-read"),
         modes=("library", "cli"),
+    ),
+    "in_coroutine": Scenario(
+        "Turn",
+        "[smoke:in_coroutine] Read notes.txt.",
+        [
+            _rule([_calls("call-read", _read("notes.txt"))], **_FIRST),
+            _rule([_text("answer", "The token is SMOKE-1.")], **_AFTER_TOOL),
+        ],
+        ("answer", "call-read"),
+        fixture=False,
+        coroutine=True,
     ),
     "prelude_tool": Scenario(
         "Tool calls, sequential and parallel",
@@ -680,6 +693,20 @@ ROWS: tuple[Row, ...] = (
             ),
             Span(CHAT, parent=TURN),
             Span(CHAT, parent=CHAT, source=CTX, confidence=1.0),
+        ),
+    ),
+    Row(
+        # A task runs on the loop thread for the whole turn: every pin is put on that task.
+        "Turn",
+        "in_coroutine",
+        (
+            Traces(1),
+            Span(TURN, parent="", status="OK", no_markers=("correlation_conflict",)),
+            Count(CHAT, 2, parent=TURN),
+            Count(CHAT, 2, parent=CHAT),
+            Count("execute_tool read_file", 1, parent=TURN),
+            Span(CHAT, parent=TURN, no_markers=("no_wire_evidence",)),
+            Span(CHAT, parent=TURN, no_markers=("no_wire_evidence",), nth=1),
         ),
     ),
     Row(
@@ -1535,6 +1562,11 @@ def turn():
         if spec["prelude"]:  # Hermes `send`s each tool result back into it: a generator
             prelude = (step for step in [tuple(spec["prelude"])])
             result["value"] = agent.run_conversation(spec["prompt"], prelude=prelude)
+        elif spec["coroutine"]:
+            import asyncio
+            async def embedder():
+                return agent.run_conversation(spec["prompt"])
+            result["value"] = asyncio.run(embedder())
         else:
             result["value"] = agent.run_conversation(spec["prompt"])
         if spec["then"]:
@@ -2239,6 +2271,7 @@ def run(
                 "prompt": sc.prompt,
                 "prelude": _substitute(list(sc.prelude), values) if sc.prelude else None,
                 "then": sc.then,
+                "coroutine": sc.coroutine,
                 "truth": str(out / "truth.jsonl"),
                 "interrupt_after": sc.interrupt_after,
                 "timeout": 150,
