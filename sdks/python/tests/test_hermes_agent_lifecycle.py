@@ -500,6 +500,25 @@ def test_synchronous_hooks_open_every_turn_as_a_clean_root():
     assert all(r.thread == "hermes-loop" for r in ctx.returns if r.hook == "pre_llm_call")
 
 
+def test_synchronous_hooks_open_another_sessions_turn_as_a_root_beside_a_live_one(monkeypatch):
+    """A turn of one session got no end and is still live; the next session's turn opens on the
+    same loop thread, where the live turn's pin stands, and must not nest under it."""
+    monkeypatch.setattr(turns_module, "IDLE_CLOSE_S", 0.3)
+    monkeypatch.setattr(attach_module, "IDLE_SWEEP_S", 0.05)
+    transport = start_wardex()
+    with plugin(hook_timeout_s=0) as ctx, hermes(ctx) as h:
+
+        def run():
+            h.model_call(h.turn())
+            turn = h.turn()
+            h.model_call(turn)
+            h.end(turn)
+
+        on_loop(run)
+        assert wait_for(lambda: len(_roots(received(transport))) == 2)
+    assert outline(exported(transport)) == render((ABORTED, (CHAT,)), (TURN, (CHAT,)))
+
+
 @pytest.mark.parametrize("review", ["during", "after"])
 def test_hermes_background_review_is_never_a_turn(review):
     """The review fork shares the user's session id and sends no `pre_llm_call` and no end. Its
