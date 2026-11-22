@@ -139,7 +139,9 @@ class Scenario:
     `HERMES_SMOKE_NETS`, as the witness's file paths travel in `HERMES_SMOKE_RECORD` and
     `HERMES_SMOKE_SCHEMAS`, because wardex reports every `WARDEX_` name it does not read.
     `prelude` is `(narration, tool, args)` Hermes runs as a scripted prelude before the turn's
-    first model call (`run_conversation(prelude=...)`, library mode only).
+    first model call (`run_conversation(prelude=...)`, library mode only). `then` is a second
+    prompt a new `AIAgent`, a session of its own, runs on the same thread once the first turn
+    returned (library mode only).
     """
 
     surface: str
@@ -156,6 +158,7 @@ class Scenario:
     fixture: bool = True
     nets: dict[str, float] = field(default_factory=dict)
     prelude: tuple[str, str, dict[str, Any]] | None = None
+    then: str | None = None
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -397,6 +400,23 @@ SCENARIOS: dict[str, Scenario] = {
         exit={"library": 130, "cli": 130},
         modes=("library", "cli"),
         interrupt_after="hold",
+    ),
+    # A failed turn (no end from Hermes), then another session's turn on the same thread.
+    "failed_then_other_session": Scenario(
+        "Turn",
+        "[smoke:failed_then_other_session] SESSION-A say hello.",
+        [
+            _rule([_text("answer-b", "Hello from B.")], user_contains="SESSION-B"),
+            _rule([_error("fail-500", 500, "0.1")], user_contains="SESSION-A", repeat=True),
+        ],
+        ("answer-b", *("fail-500",) * 19),
+        exit={"library": 1, "cli": 1},
+        fixture=False,
+        nets={
+            "_hermes_agent_turns.IDLE_AFTER_ERROR_S": 3.0,
+            "_hermes_agent_attach.IDLE_SWEEP_S": 0.2,
+        },
+        then="[smoke:failed_then_other_session] SESSION-B say hello.",
     ),
     "two_subagents_joined": Scenario(
         "Subagents (delegate_task)",
@@ -642,6 +662,34 @@ ROWS: tuple[Row, ...] = (
             Span(CHAT, parent=TURN, source=UNIT, confidence=1.0, status="ERROR"),
             Count(CHAT, 18, parent=TURN),
             Count("HTTP POST /v1/chat/completions", 19, parent=CHAT),
+        ),
+    ),
+    Row(
+        # Another session's turn after a failed one on the same thread is its own trace: the
+        # failed turn's pin came down when its last model call raised.
+        "Turn",
+        "failed_then_other_session",
+        (
+            Traces(2),
+            Count(TURN, 2),
+            Span(
+                TURN,
+                parent="",
+                status="UNSET",
+                markers=("session_aborted",),
+                attrs={INPUT: "[smoke:failed_then_other_session] SESSION-A say hello."},
+            ),
+            Span(
+                TURN,
+                nth=1,
+                parent="",
+                status="OK",
+                attrs={
+                    A + "close_cause": "end_event",
+                    INPUT: "[smoke:failed_then_other_session] SESSION-B say hello.",
+                    OUTPUT: "Hello from B.",
+                },
+            ),
         ),
     ),
     Row(
@@ -1379,6 +1427,8 @@ def turn():
             result["value"] = agent.run_conversation(spec["prompt"], prelude=prelude)
         else:
             result["value"] = agent.run_conversation(spec["prompt"])
+        if spec["then"]:
+            result["then"] = AIAgent(**kwargs).run_conversation(spec["then"])
     except BaseException as exc:
         result["error"] = type(exc).__name__
 def tags():
@@ -2078,6 +2128,7 @@ def run(
                 "mcp": sc.mcp,
                 "prompt": sc.prompt,
                 "prelude": _substitute(list(sc.prelude), values) if sc.prelude else None,
+                "then": sc.then,
                 "truth": str(out / "truth.jsonl"),
                 "interrupt_after": sc.interrupt_after,
                 "timeout": 150,

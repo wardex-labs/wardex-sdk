@@ -73,6 +73,7 @@ from ._hermes_agent_frames import (
     FrameEffects,
     _downstream_name,
     _drop_lane,
+    _finished_lane,
     _message_text,
     _Out,
 )
@@ -405,8 +406,11 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
           turn of that session, and none for key None. A finalize at shutdown always drains, so
           a turn that closed just before it is not left in the buffer either; any other
           finalize kicks the export thread, so no session boundary waits on export.
-        * pre_llm_call: first the NEXT_TURN net over the session's other live turns, on the
-          hook thread Hermes calls before it builds the turn's title thread, then the turn.
+        * pre_llm_call: first the NEXT_TURN net, on the hook thread Hermes calls before it
+          builds the turn's title thread, then the turn. The net closes the session's other
+          live turns and, for a root turn, the live turn its loop thread is still pinned to
+          (`_finished_lane`): a failed turn sends no end, and the new turn must not open
+          under it. A child turn starts inside its parent's delegation and is never subject.
         * Everything else: the one turn the key names.
 
         A tool event's `conversation_id`, the only place Hermes states one, is kept for the
@@ -427,6 +431,14 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
                 for r in self._book.live_in_session(event.session_id)
                 if r.turn_id != event.turn_id
             ]
+            if event.parent_session_id is None and self._book.tie_for(event.session_id) is None:
+                lane = _finished_lane(event.turn_id)
+                if (
+                    lane is not None
+                    and lane not in others
+                    and self._book.find(lane.turn_id) is lane
+                ):
+                    others.append(lane)
             swept = _merge([self._advance(r, Trigger.NEXT_TURN, event) for r in others])
             return _merge([swept, self._by_key(event, trigger)])
         return self._by_key(event, trigger)
@@ -512,7 +524,8 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         """pre_llm_call, on a hook thread whose context is a copy of the loop thread's. ROOT
         takes whatever is ambient in that copy, which is the measured answer for each case: a
         first turn or a gateway job, a root; the next turn on the same thread, the previous
-        turn's pin, retired when that turn closed, so a clean root; a joined child, the live
+        turn's pin, retired when that turn closed (by its end, or by the NEXT_TURN net just
+        before this when Hermes sent none), so a clean root; a joined child, the live
         delegate_task unit, so nested under it; a background child, the delegate unit already
         closed, which the core refuses, so a root with CORRELATION_CONFLICT.
 

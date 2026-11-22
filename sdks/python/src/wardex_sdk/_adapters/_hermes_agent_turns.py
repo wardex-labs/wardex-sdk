@@ -121,7 +121,10 @@ class Trigger(Enum):
     """The lifecycle's input alphabet: one member per thing that can happen to a turn.
 
     NEXT_TURN, IDLE and UNIT_GONE are derived by the caller, not sent by Hermes. NEXT_TURN comes
-    from a newer `pre_llm_call` of the same session, IDLE from the clock. FINALIZE and SHUTDOWN
+    from the session's next turn (a newer `pre_llm_call` of the same session) or the loop
+    thread's (a root turn's `pre_llm_call` on the thread the turn was pinned on, outside any
+    tool: Hermes's loop is synchronous, so the turn's loop there is over), IDLE from the clock.
+    FINALIZE and SHUTDOWN
     are both `on_session_finalize` for the turn's session, told apart by Hermes's reason.
     UNIT_GONE says that the record's unit is no longer live in the core (closed with its parent,
     evicted, or closed by the signal path): the caller steps it before the event that found the
@@ -139,7 +142,7 @@ class Trigger(Enum):
     CHILD_START = "child_start"  # subagent_start, applied to the parent's turn
     TURN_ANSWER = "turn_answer"  # post_llm_call
     TURN_END = "turn_end"  # on_session_end
-    NEXT_TURN = "next_turn"  # net: a newer pre_llm_call of the same session
+    NEXT_TURN = "next_turn"  # net: the session's or the loop thread's next turn
     CHILD_STOP = "child_stop"  # net: subagent_stop for the child's session
     FINALIZE = "finalize"  # net: on_session_finalize at a session boundary (/new, reset, close)
     SHUTDOWN = "shutdown"  # net: on_session_finalize at process shutdown
@@ -163,7 +166,7 @@ _NETS: frozenset[Trigger] = frozenset(
 class Action(Enum):
     """What the effects module does for a step: one effect per member."""
 
-    OPEN = "open"  # open_run the turn (the session's NEXT_TURN sweep has already run)
+    OPEN = "open"  # open_run the turn (the NEXT_TURN sweep has already run)
     CONTINUE = "continue"  # open the next generation, linked RESUMED_FROM the presumed-closed one
     CONTINUE_CLOSE = "continue_close"  # Hermes ended a presumed-closed turn: say so, then close
     FRAME = "frame"  # open and pin a frame unit; pin the turn on this task first if it is not
@@ -380,7 +383,9 @@ class FrameState(Enum):
     REPORTED -> (its turn closes first) CLOSED with that report, from the closing thread
     PINNED -> (post hook saying Hermes abandoned the worker) CLOSED at once with that report;
               the worker's late exit does nothing
-    PINNED or REPORTED -> (frame raises) CLOSED, ERROR with the downstream exception's type
+    PINNED or REPORTED -> (frame raises) CLOSED, ERROR with the downstream exception's type; a
+              turn's model-call frame also takes the turn's pin down on its task, since a
+              turn that failed for good sends no end, and Hermes's next attempt pins it again
     AWAITING_REPORT -> (its turn closes first) closed by the core with CHILD_SPAN_UNCLOSED
     A frame no report can reach (`reportable()` False) goes PINNED -> CLOSED at frame exit,
     UNSET unless it raised.

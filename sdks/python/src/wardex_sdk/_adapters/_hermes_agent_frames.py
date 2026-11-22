@@ -338,7 +338,12 @@ class FrameEffects:
 
     def _exit(self, frame: FrameRecord, error_type: str | None) -> None:
         """Unpin and reset `_FRAME` on the frame's own task, then close it if this side won the
-        race against its report (`FrameRecord.on_exit`)."""
+        race against its report (`FrameRecord.on_exit`).
+
+        A turn's model-call frame that raised also takes the turn's pin down here: Hermes sends
+        no end for a turn that failed for good, and until its next attempt pins the turn again
+        (`_ensure_lane`) no tool runs, so another session's turn or the embedder's own span on
+        this thread would otherwise nest under a turn that may be over."""
         handle = frame.handle
         if handle is not None:
             handle.unpin()
@@ -346,6 +351,8 @@ class FrameEffects:
         if token is not None:
             frame.token = None
             _FRAME.reset(token)  # type: ignore[arg-type]
+        if error_type is not None and frame.kind is FrameKind.MODEL_CALL and not frame.orphan:
+            _drop_lane()
         if frame.on_exit(error_type):
             self._finish(frame)
 
@@ -434,6 +441,17 @@ def _ensure_lane(record: TurnRecord) -> None:
     if handle is not None:
         handle.pin(driver=threading.current_thread())
     _LANE.set(record)
+
+
+def _finished_lane(turn_id: str) -> TurnRecord | None:
+    """The turn this context's loop thread is still pinned to, when turn `turn_id` starts there
+    outside any tool. Hermes's loop is synchronous, so that turn's loop on this thread is over:
+    a turn started from inside a tool (a delegation, an agent a tool runs) has the tool's frame
+    pinned in its context, and gets None."""
+    lane, frame = _LANE.get(), _FRAME.get()
+    if lane is None or lane.turn_id == turn_id or (frame is not None and frame.pinned()):
+        return None
+    return lane
 
 
 def _drop_lane(only: TurnRecord | None = None) -> None:

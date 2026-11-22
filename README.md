@@ -323,7 +323,8 @@ a failed turn, and a failed model call does not end one, because Hermes
 retries it and may still answer. A turn Hermes never ended is closed unset
 with `session_aborted`, and `wardex.hermes_agent.close_cause` says why:
 
-- `next_turn`: the session's next turn began.
+- `next_turn`: the session's next turn began, or another turn began on the
+  thread that ran it.
 - `finalize`: Hermes closed that session.
 - `idle`: no event of the turn came for 120 seconds. After a failed model
   call the wait is 300 seconds, long enough for Hermes's retry waits and its
