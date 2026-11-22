@@ -469,6 +469,8 @@ class Span:
     markers: tuple[str, ...] = ()
     no_markers: tuple[str, ...] = ()
     attrs: dict[str, Any] = field(default_factory=dict)
+    #: Attribute keys the span must not carry.
+    absent: tuple[str, ...] = ()
     nth: int = 0
 
 
@@ -517,13 +519,23 @@ class Row:
 
 A = "wardex.hermes_agent."
 UNIT, CTX = "unit_active", "contextvar"
+INPUT, OUTPUT = "wardex.input_data", "wardex.output_data"
 ROWS: tuple[Row, ...] = (
     Row(
         "Turn",
         "single_turn",
         (
             Traces(1),
-            Span(TURN, parent="", status="OK", attrs={A + "close_cause": "end_event"}),
+            Span(
+                TURN,
+                parent="",
+                status="OK",
+                attrs={
+                    A + "close_cause": "end_event",
+                    INPUT: "[smoke:single_turn] Say hello.",
+                    OUTPUT: "Hello from the smoke provider.",
+                },
+            ),
             Span(CHAT, parent=TURN),
             Span(CHAT, parent=CHAT, source=CTX, confidence=1.0),
         ),
@@ -538,7 +550,12 @@ ROWS: tuple[Row, ...] = (
                 parent="",
                 status="UNSET",
                 markers=("session_aborted",),
-                attrs={A + "close_cause": "retries_spent", A + "error_reason": "server_error"},
+                attrs={
+                    A + "close_cause": "retries_spent",
+                    A + "error_reason": "server_error",
+                    INPUT: "[smoke:failed_turn] Say hello.",
+                },
+                absent=(OUTPUT,),
             ),
         ),
     ),
@@ -1165,6 +1182,7 @@ def check(tree: Tree, expect: Any) -> str | None:
             wrong.append(f"{key}={got!r}")
     wrong += [f"missing {m}" for m in expect.markers if m not in markers]
     wrong += [f"has {m}" for m in expect.no_markers if m in markers]
+    wrong += [f"has {k}" for k in expect.absent if k in a]
     return ", ".join(wrong) or None
 
 
