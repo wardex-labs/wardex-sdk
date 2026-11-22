@@ -563,9 +563,11 @@ def _default_child(hermes: FakeHermes, kid: Turn) -> None:
 
 
 def _usage(used: Usage) -> dict[str, int]:
-    """Hermes's normalized `usage` block, as recorded in `post_api_request`."""
+    """Hermes's normalized `usage` block, as recorded in `post_api_request`. Hermes's
+    `input_tokens` is the uncached part of the prompt: its `normalize_usage` subtracts the cache
+    buckets from a chat-shaped total, and its `prompt_tokens` adds them back."""
     return {
-        "input_tokens": used.prompt_tokens,
+        "input_tokens": used.prompt_tokens - used.cached_tokens,
         "output_tokens": used.completion_tokens,
         "cache_read_tokens": used.cached_tokens,
         "cache_write_tokens": 0,

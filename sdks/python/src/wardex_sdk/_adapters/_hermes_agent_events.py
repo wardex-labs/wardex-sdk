@@ -66,10 +66,12 @@ KNOWN_SCHEMAS: Mapping[str, str] = {
 }
 
 #: Hermes `usage` keys mapped to the key, after the hold prefix, that the core's promotion table
-#: reads. `request_count`, `prompt_tokens` and `total_tokens` restate other keys, and
-#: `cache_write_by_ttl` has no field to land in, so none of the four is carried.
+#: reads. The core's input count includes cached tokens, and Hermes's `input_tokens` does not: it
+#: is the uncached part, and `prompt_tokens` is it plus both cache buckets. So `prompt_tokens` is
+#: carried as the input count and `input_tokens` is not. `request_count` and `total_tokens`
+#: restate other keys, and `cache_write_by_ttl` has no field to land in.
 USAGE_KEYS: Mapping[str, str] = {
-    "input_tokens": "gen_ai.usage.input_tokens",
+    "prompt_tokens": "gen_ai.usage.input_tokens",
     "output_tokens": "gen_ai.usage.output_tokens",
     "cache_read_tokens": "gen_ai.usage.cache_read.input_tokens",
     "cache_write_tokens": "gen_ai.usage.cache_creation.input_tokens",

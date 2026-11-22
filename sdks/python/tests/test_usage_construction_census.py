@@ -39,6 +39,11 @@ import wardex_sdk
 #:   and failed-attempt block: no usage in the block; the core promotes the
 #:   framework's demoted numbers at close when no wire request was witnessed,
 #:   and pydantic's `input_tokens` already include cache reads.
+#: * `_adapters/_hermes_agent_frames.py` — `_chat_block`, the Hermes model call
+#:   block: no usage in the block either; the core promotes Hermes's demoted
+#:   numbers at close when no wire request was witnessed. Hermes's own
+#:   `input_tokens` leaves the cache out, so the adapter demotes its
+#:   `prompt_tokens`, which adds both cache buckets back, as the input count.
 #:
 #: (`dataclasses.replace` on an existing block is not a construction site:
 #: it can only start from a block one of these two produced.)
@@ -47,6 +52,7 @@ _FROZEN_SITES = {
     "_adapters/_assembler.py": 1,
     "_adapters/_codex_exec.py": 2,
     "_adapters/_pydantic_ai_attrs.py": 1,
+    "_adapters/_hermes_agent_frames.py": 1,
 }
 
 

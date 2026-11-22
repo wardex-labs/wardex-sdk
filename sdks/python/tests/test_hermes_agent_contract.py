@@ -339,13 +339,29 @@ def test_requested_tool_calls_keep_ids_and_names_only() -> None:
 def test_usage_keeps_integer_counts_of_known_keys() -> None:
     row = _ROWS["post_api_request"]
     base = _SAMPLES["post_api_request"][0]
-    usage = {"input_tokens": 5, "output_tokens": True, "reasoning_tokens": "3", "other": 1}
+    usage = {"prompt_tokens": 5, "output_tokens": True, "reasoning_tokens": "3", "other": 1}
     event, _ = parse(row, {**base, "usage": usage})
     assert isinstance(event, CallReport)
     assert event.usage == (("gen_ai.usage.input_tokens", 5),)
     event, _ = parse(row, {**base, "usage": "not a mapping"})
     assert isinstance(event, CallReport)
     assert event.usage == ()
+
+
+def test_the_input_count_is_the_prompt_total_with_its_cached_part() -> None:
+    """Hermes's `input_tokens` is the uncached part of the prompt; wardex's input count includes
+    the cache, as every other source's does, so it is Hermes's `prompt_tokens`."""
+    row = _ROWS["post_api_request"]
+    base = _SAMPLES["post_api_request"][0]
+    usage = {
+        "input_tokens": 700,
+        "cache_read_tokens": 300,
+        "cache_write_tokens": 200,
+        "prompt_tokens": 1200,
+    }
+    event, _ = parse(row, {**base, "usage": usage})
+    assert isinstance(event, CallReport)
+    assert dict(event.usage)["gen_ai.usage.input_tokens"] == 1200
 
 
 # -- what an event routes by -------------------------------------------------------------------
