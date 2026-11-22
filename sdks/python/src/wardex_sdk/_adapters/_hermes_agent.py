@@ -412,8 +412,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         PRESUMED_CLOSED tombstone: a loop event continues the turn, anything else is late."""
         handle = record.handle
         if handle is not None and not handle.degraded and not handle.accepted:
-            if record.advance(Trigger.UNIT_GONE).action is Action.FORGET:
-                self._forget(record, event, Step(TurnState.PRESUMED_CLOSED, Action.FORGET), trigger)
+            gone = record.advance(Trigger.UNIT_GONE)
+            if gone.action is Action.FORGET:
+                self._run(record, event, gone, trigger)
             return self._resolve(record.turn_id, event, trigger)
         s = record.advance(trigger)
         if s.action in CREATES:  # retired by another thread between its find and this step

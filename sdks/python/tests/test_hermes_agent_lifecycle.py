@@ -11,7 +11,9 @@ signal path closing units under a live turn.
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -491,3 +493,68 @@ def test_the_wardex_thread_starts_with_the_first_turn_and_idles_without_a_live_o
         quiet_from = len(sweeps)
         time.sleep(0.3)
         assert len(sweeps) == quiet_from, "no live turn: the thread waits on its event"
+
+
+def _in_child(fn) -> tuple[int, object]:
+    """fork(), run `fn` in the child, and return its exit code and JSON answer. The child leaves
+    through `os._exit`, so neither atexit nor pytest runs there."""
+    read, write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read)
+        code = 0
+        try:
+            answer = json.dumps(fn()).encode()
+        except BaseException as exc:  # handed to the parent through the pipe
+            answer, code = json.dumps({"error": repr(exc)}).encode(), 1
+        try:
+            os.write(write, answer)
+            os.close(write)
+        finally:
+            os._exit(code)
+    os.close(write)
+    chunks = []
+    while chunk := os.read(read, 65536):
+        chunks.append(chunk)
+    os.close(read)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status), json.loads(b"".join(chunks) or b"null")
+
+
+@pytest.mark.filterwarnings(
+    "ignore:This process.*is multi-threaded, use of fork:DeprecationWarning"
+)
+def test_a_forked_child_exports_its_turns_though_the_parent_held_the_export_lock_at_the_fork():
+    """The fork reset is armed by the first attach. Without it, the child inherits the export
+    thread's lock held by a parent thread that does not exist there, and its first turn close
+    waits on it forever. A platform with no fork has nothing to reset and arms nothing."""
+    if not hasattr(os, "fork"):
+        assert attach_module._UNARMED == {}
+        return
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        on_loop(lambda: h.end(h.turn()))
+        assert attach_module._UNARMED == {}, "the first attach armed the reset"
+        held, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with attach_module._EXPORT._lock:
+                held.set()
+                release.wait(20)
+
+        holder = threading.Thread(target=hold, name="parent-holds-the-export-lock")
+        holder.start()
+        assert held.wait(10)
+
+        def child() -> dict[str, object]:
+            transport.envelopes.clear()
+            on_loop(lambda: h.end(h.turn()))  # no frame: the scripted provider is the parent's
+            shipped = wait_for(lambda: bool(_roots(received(transport))), timeout=10)
+            return {"shipped": shipped}
+
+        try:
+            code, answer = _in_child(child)
+        finally:
+            release.set()
+            holder.join(10)
+    assert (code, answer) == (0, {"shipped": True})
