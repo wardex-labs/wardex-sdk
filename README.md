@@ -329,7 +329,9 @@ with `session_aborted`, and `wardex.hermes_agent.close_cause` says why:
 - `idle`: no event of the turn came for 120 seconds. After a failed model
   call the wait is 300 seconds, long enough for Hermes's retry waits and its
   recovery ladder, and `wardex.hermes_agent.error_reason` keeps Hermes's
-  reason.
+  reason. The wait lasts until Hermes's loop goes on (its next attempt, a
+  tool, an answer). An auxiliary call that ends during it does not cut it
+  short.
 
 Two consequences of that wait: a provider `Retry-After` longer than 300
 seconds splits the turn into two spans with one `turn_id`, the second with

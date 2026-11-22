@@ -88,7 +88,7 @@ __all__ = [
 #: the CLI's gateway exports a turn Hermes never ended before it exits. Long work is safe: model
 #: calls and tools hold a frame pinned for as long as they run.
 IDLE_CLOSE_S = 120.0
-#: The same net while the turn's last event is an `api_request_error`, because Hermes now waits
+#: The same net while the turn's loop has done nothing since an `api_request_error`: Hermes waits
 #: before its next attempt (Hermes v0.23.3 source): an ordinary retry at most 90 s (2 s doubling
 #: to 60 s, plus up to half again), a provider overload backoff at most 144 s, a recovery-ladder
 #: cycle at most 120 s (the provider's Retry-After up to 120 s, else 15/30/60/60/60 s plus up to
@@ -150,15 +150,17 @@ class Trigger(Enum):
     UNIT_GONE = "unit_gone"  # derived: the core no longer holds the record's unit
 
 
-#: Triggers that close a turn without being an event of it: they leave its last event standing.
-_NETS: frozenset[Trigger] = frozenset(
+#: Events that prove Hermes's loop went on after a failed model call: its next attempt's frame,
+#: a tool it ran, a call's report, the turn's answer and its end. Only these end the wait after
+#: an error. An auxiliary call, a child's start and a late tool report run on other threads while
+#: the loop sleeps out a Retry-After, and a net is not an event of the turn at all.
+_LOOP_WENT_ON: frozenset[Trigger] = frozenset(
     {
-        Trigger.NEXT_TURN,
-        Trigger.CHILD_STOP,
-        Trigger.FINALIZE,
-        Trigger.SHUTDOWN,
-        Trigger.IDLE,
-        Trigger.UNIT_GONE,
+        Trigger.CALL_ENTER,
+        Trigger.TOOL_ENTER,
+        Trigger.CALL_REPORT,
+        Trigger.TURN_ANSWER,
+        Trigger.TURN_END,
     }
 )
 
@@ -543,9 +545,9 @@ class TurnRecord:
     model_frames: int = 0
     aux: dict[tuple[str, int], AuxAttempt] = field(default_factory=dict)  # in flight
     aux_tasks: list[str] = field(default_factory=list)  # task names Hermes stated, first seen first
-    #: The turn's last event was an api_request_error: Hermes may be waiting to retry, so the
-    #: quiet net waits IDLE_AFTER_ERROR_S. `error_reason` is that event's `reason`. Any later
-    #: event of the turn clears both; a net that closes it does not.
+    #: The turn's last loop event was an api_request_error: Hermes may be waiting to retry, so
+    #: the quiet net waits IDLE_AFTER_ERROR_S. `error_reason` is that event's `reason`. Only an
+    #: event in `_LOOP_WENT_ON` clears both; any other still refreshes `last_event`.
     after_error: bool = False
     error_reason: str | None = None
     #: The user's message from `pre_llm_call`, held until it is known to leave the host: the
@@ -562,7 +564,7 @@ class TurnRecord:
             if s.next is not None:
                 self.state = s.next
             self.last_event = time.monotonic() if now is None else now
-            if trigger is not Trigger.CALL_FAILED and trigger not in _NETS:
+            if trigger in _LOOP_WENT_ON:
                 self.after_error = False
                 self.error_reason = None
             return s

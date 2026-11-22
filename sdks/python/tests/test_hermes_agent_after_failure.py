@@ -13,6 +13,7 @@ loop does (`agent/conversation_loop.py`), and a new `AIAgent` on the same thread
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,8 @@ from _hermes_support import (
     start_wardex,
     typed_usage,
 )
+from wardex_sdk._adapters import _hermes_agent_attach as attach_module
+from wardex_sdk._adapters import _hermes_agent_turns as turns_module
 from wardex_sdk._assembly import Limitation
 
 TURN = "invoke_agent hermes"
@@ -145,3 +148,34 @@ def test_an_auxiliary_call_between_a_failed_attempt_and_the_retry_is_marked_and_
     assert Limitation.PARENT_UNRESOLVED in wire[0].limitations
     typed = [n for n in (*built, *wire) if typed_usage(n)]
     assert len(typed) == 1, [outline((n,)) for n in typed]
+
+
+def test_a_failed_call_s_wait_outlasts_an_auxiliary_call_that_ends_inside_it(monkeypatch):
+    """The turn-start title call ends after the turn's first call failed with a long
+    Retry-After. Its end is no sign that the loop went on, so the quiet net keeps waiting
+    IDLE_AFTER_ERROR_S, and the retry that answers stays in the same span."""
+    monkeypatch.setattr(turns_module, "IDLE_CLOSE_S", 0.3)
+    monkeypatch.setattr(turns_module, "IDLE_AFTER_ERROR_S", 30.0)
+    monkeypatch.setattr(attach_module, "IDLE_SWEEP_S", 0.05)
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run() -> Turn:
+            turn = h.turn(title=True)
+            title = h.aux(turn, answer=Reply.HOLD, wait=False)
+            h.fail(turn, (Reply.UNAVAILABLE,))
+            h.provider.release()
+            assert title is not None
+            title.join(10)
+            time.sleep(1.0)  # Hermes's wait: past IDLE_CLOSE_S, under the other
+            h.model_call(turn, (Reply.OK,), again=True)
+            h.end(turn)
+            return turn
+
+        turn = on_loop(run)
+    nodes = exported(transport)
+    spans = [n for n in nodes if n.name == TURN]
+    assert len(spans) == 1, [outline((n,)) for n in spans]
+    assert extras(spans[0])["close_cause"] == "end_event"
+    assert extras(spans[0])["turn_id"] == turn.turn_id
+    assert "generation" not in extras(spans[0])

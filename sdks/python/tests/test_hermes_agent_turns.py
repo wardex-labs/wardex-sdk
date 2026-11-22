@@ -476,16 +476,19 @@ def test_a_frame_awaiting_its_report_is_quiet() -> None:
     assert r.quiet(0.0)
 
 
-def test_an_error_lengthens_the_quiet_net_until_the_next_event_of_its_turn() -> None:
+def test_an_error_lengthens_the_quiet_net_until_hermes_s_loop_goes_on() -> None:
     r = _record(state=TurnState.AMBIENT, last_event=0.0)
     assert r.quiet_for() == IDLE_CLOSE_S
     r.advance(_T.CALL_FAILED, now=0.0)
     r.after_error, r.error_reason = True, "server_error"  # what NOTE_ERROR writes
     assert r.quiet_for() == IDLE_AFTER_ERROR_S
-    for net in (_T.IDLE, _T.NEXT_TURN, _T.FINALIZE, _T.SHUTDOWN, _T.CHILD_STOP, _T.UNIT_GONE):
+    went_on = {_T.CALL_ENTER, _T.TOOL_ENTER, _T.CALL_REPORT, _T.TURN_ANSWER, _T.TURN_END}
+    for trigger in _T:
         probe = _record(state=TurnState.AMBIENT, after_error=True, error_reason="server_error")
-        probe.advance(net)
-        assert (probe.after_error, probe.error_reason) == (True, "server_error"), net
+        probe.advance(trigger, now=5.0)
+        assert probe.last_event == 5.0, trigger  # every event refreshes the quiet clock
+        cleared = (probe.after_error, probe.error_reason) == (False, None)
+        assert cleared is (trigger in went_on), trigger
     r.advance(_T.CALL_ENTER, now=1.0)
     assert (r.after_error, r.error_reason, r.quiet_for()) == (False, None, IDLE_CLOSE_S)
 
