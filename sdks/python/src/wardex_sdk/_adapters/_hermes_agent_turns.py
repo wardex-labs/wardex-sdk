@@ -573,8 +573,9 @@ class TurnRecord:
         it carries under that tool's own name. If a bridge call and a frame are both left, the
         bridge ran the frames left and every other call left is named; else the frames left ran
         renamed calls (a legacy alias), and the calls left are named in asked order, cut to the
-        shortfall. So an alias beside a bridge call is named though it ran, and an alias in a
-        short batch can name the wrong call."""
+        shortfall. So an alias beside a bridge call is named though it ran, an alias in a short
+        batch can name the wrong call, and a bridge call that never ran beside one that did
+        (Hermes drops the second of two identical calls) is not named."""
         missing: list[str] = []
         for call, asked in self.requested.items():
             left = Counter(self.dispatched.get(call, ()))

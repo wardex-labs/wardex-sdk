@@ -374,7 +374,9 @@ What wardex cannot place is marked and never placed by a guess:
   tools Hermes ran for it under their own names, so a call beside it that no
   tool matches is named. A tool that ran under a legacy alias is matched by
   count, so in a call that also skipped a tool the name can be the wrong one
-  of two, and beside a bridge call the alias itself is named.
+  of two, and beside a bridge call the alias itself is named. Of two identical
+  bridge calls in one model call Hermes runs only the first, and the one it
+  dropped is not named.
 - A turn whose model calls ran outside the process:
   `subprocess_model_calls_unobserved` on the turn.
 - A tool that code in `execute_code` calls sits under the `execute_code`

@@ -455,6 +455,11 @@ def test_undispatched_matches_each_model_calls_frames_to_what_it_asked_for_by_ke
     r.requested["t:api:1"] = _ask("todo", "tool_call")
     r.dispatched["t:api:1"] = ["todo_list", "read_file"]
     assert r.undispatched() == ["todo"]
+    # The stated miss of two bridge calls: Hermes drops the second of two identical calls, and
+    # the dropped one is not named, because only a call with a key is.
+    r.requested["t:api:1"] = _ask("tool_call", "tool_call")
+    r.dispatched["t:api:1"] = ["todo_list"]
+    assert r.undispatched() == []
 
 
 def test_quiet_only_with_nothing_pinned_and_no_auxiliary_attempt_in_flight() -> None:
