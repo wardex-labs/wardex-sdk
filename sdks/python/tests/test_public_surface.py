@@ -17,13 +17,15 @@ import typing
 
 import wardex_sdk
 import wardex_sdk.context
+import wardex_sdk.hermes_agent
 import wardex_sdk.testing
 import wardex_sdk.transport
 
 #: The only non-underscore names allowed in `dir(wardex_sdk)` beyond `__all__`
-#: and the dunders: the public subpackages, which appear as attributes of the
-#: package once imported. Exactly the three with a user story.
-_PUBLIC_SUBMODULES = {"transport", "context", "testing"}
+#: and the dunders: the public submodules, which appear as attributes of the
+#: package once imported. Exactly the four with a user story; `hermes_agent` is
+#: the module a Hermes plugin's `__init__.py` imports `register` from.
+_PUBLIC_SUBMODULES = {"transport", "context", "testing", "hermes_agent"}
 
 
 def test_the_root_namespace_leaks_nothing_beyond_all():

@@ -37,8 +37,6 @@ if TYPE_CHECKING:
 
 __all__ = ["HOST_ISOLATION_LINE", "NOT_ATTACHED_DETAIL", "attach", "attached", "refused"]
 
-#: One flush from the export thread waits at most this long for the transport.
-EXPORT_TIMEOUT_S = 5.0
 #: While a turn is live, the export thread wakes this often to run the idle net. Read at call
 #: time, so a test can shorten it.
 IDLE_SWEEP_S = 30.0
@@ -250,7 +248,10 @@ class _Exporter:
         send = self._flush
         if self._flush_due and send is not None:
             self._flush_due = False
-            send(EXPORT_TIMEOUT_S)
+            # No number: the flush follows the transport's own timeout. A number passed here
+            # would reach the client as a budget the host named, and a cut export would be
+            # blamed on a bound the host never set.
+            send(None)
         adapter = _ROUTE
         if adapter is not None:
             adapter.reap_idle(time.monotonic())

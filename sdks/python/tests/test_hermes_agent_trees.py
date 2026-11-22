@@ -157,15 +157,16 @@ def test_a_failed_turn_is_exported_by_the_wardex_thread_with_no_flush_on_a_herme
     monkeypatch,
 ):
     """Hermes sends no end for a failed turn, and its CLI gateway may exit right after; the
-    close only wakes `wardex-hermes`, which flushes. No Hermes thread waits on export."""
+    close only wakes `wardex-hermes`, which flushes. No Hermes thread waits on export, and the
+    flush names no budget: it follows the transport's, since a number would read as the host's."""
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
-        flushed_on: list[str] = []
+        flushed_on: list[tuple[str, float | None]] = []
         real = attach_module._EXPORT._flush
         assert real is not None
 
         def spy(timeout):
-            flushed_on.append(threading.current_thread().name)
+            flushed_on.append((threading.current_thread().name, timeout))
             real(timeout)
 
         monkeypatch.setattr(attach_module._EXPORT, "_flush", spy)
@@ -173,7 +174,7 @@ def test_a_failed_turn_is_exported_by_the_wardex_thread_with_no_flush_on_a_herme
         assert wait_for(
             lambda: any(n.name == "invoke_agent hermes" for n in received(transport))
         ), "the failed turn reached the transport with no flush from the test"
-    assert flushed_on and set(flushed_on) == {"wardex-hermes"}
+    assert flushed_on and set(flushed_on) == {("wardex-hermes", None)}
 
 
 def test_an_interrupted_turn_closes_unset_aborted_with_the_cut_call_errored():
