@@ -203,14 +203,19 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         self._installed = True
 
     def uninstall(self) -> None:
-        """The route first, so Hermes's callbacks go inert before anything else changes. Hermes
-        keeps the callbacks; they find `_ROUTE` empty and leave its turns alone."""
+        """The route before the turns, so Hermes's callbacks go inert before any turn closes.
+        Hermes keeps the callbacks; they find `_ROUTE` empty and leave its turns alone.
+
+        The tool-call follow is undone BEFORE the installed check: an install that raised at the
+        route patch had registered it with the flag still down, and the registry's rollback is
+        this call."""
         ctx = self._ctx
+        if ctx is not None:
+            ctx.unfollow_tool_calls()
         if not self._installed or ctx is None:
             return
         self._installed = False
         ctx.patches.restore_all()
-        ctx.unfollow_tool_calls()
         ctx.release_unreached_carriers(None)
         with self._lock:
             self._unreached.clear()
