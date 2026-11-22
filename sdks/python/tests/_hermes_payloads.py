@@ -13,6 +13,7 @@ import concurrent.futures
 import contextvars
 import hashlib
 import threading
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -202,6 +203,27 @@ def connector_batch(h: FakeHermes, call: Call, connectors: Sequence[str]) -> Non
     copied = contextvars.copy_context()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         pool.submit(copied.run, h._tool_job, call, tcid, BRIDGE, "ok", None, entries).result()
+
+
+def gave_up(h: FakeHermes, turn: Turn) -> None:
+    """A turn Hermes stops as partial and never ends (`agent/turn_tool_validation.py`): the
+    model names a tool that does not exist three times in a row. Each call answers, its frame
+    returns and `post_api_request` fires; no tool runs; then Hermes returns with no
+    `post_llm_call`, no `on_session_end` and no `api_request_error`, so the turn stays pinned on
+    its loop thread. An answer cut at the output cap (`agent/turn_truncation.py::end_turn`)
+    leaves the same events behind but for the call's finish reason. Measured on a real Hermes
+    for both."""
+    for _ in range(3):
+        h.model_call(turn, tool_calls=["lab_no_such_tool"])
+
+
+def slow_tool(h: FakeHermes, call: Call, name: str, seconds: float) -> None:
+    """`FakeHermes.tool` whose handler takes `seconds`, so its frame stays pinned that long."""
+    tcid = next(i for i, nm in call.tool_calls if nm == name)
+    copied = contextvars.copy_context()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        job = (call, tcid, name, "ok", None, lambda: time.sleep(seconds))
+        pool.submit(copied.run, h._tool_job, *job).result()
 
 
 # -- agents an embedder or a tool runs inside a live turn ---------------------------------------

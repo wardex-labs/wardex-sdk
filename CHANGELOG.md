@@ -95,18 +95,20 @@ All notable changes to this project are documented here. The format follows
   each subagent turn under the `delegate_task` call that started it. A turn
   that Hermes recovers after a provider outage stays one trace. A turn Hermes
   never ended, which is every failed turn, is closed with `session_aborted`
-  and a `wardex.hermes_agent.close_cause`, at the session's next turn or, once
-  its last model call failed, the next turn on its thread, when Hermes closes
-  the session, or after 120 seconds with no event (300 after a failed model
-  call). Nothing that runs on that thread after a failed turn sits under it.
-  An agent run inside a live turn (from a `step_callback`, or on a thread a
-  tool started) leaves that turn whole, and a turn an async embedder runs
-  from inside a coroutine is one trace too. What wardex cannot place is
-  marked, not guessed: Hermes's background memory review, side questions, the
-  session-title call, a tool call Hermes never ran, and model calls made
-  outside the process. A prompt another plugin blocked is in no span. wardex
-  imports and patches nothing of Hermes, and Hermes gets its own results and
-  exceptions back.
+  and a `wardex.hermes_agent.close_cause`, at the session's next turn, when
+  Hermes closes the session, or after 120 seconds with no event (300 after a
+  failed model call). A turn that starts on the thread of an open turn is a
+  trace of its own (or sits under the embedder's span that wraps both), and so
+  is an agent run from a `step_callback` or on a thread a tool left running;
+  the open turn stays whole. When the open turn's last model call answered, a
+  span the embedder opens on that thread before that turn closes, and the
+  HTTP attempt of the new turn's session-title call, still land under it. A
+  turn an async embedder runs from inside a coroutine is one trace too. What
+  wardex cannot place is marked, not guessed: Hermes's background memory
+  review, side questions, the session-title call (but for the case above), a
+  tool call Hermes never ran, and model calls made outside the process. A
+  prompt another plugin blocked is in no span. wardex imports and patches
+  nothing of Hermes, and Hermes gets its own results and exceptions back.
   Measured on Hermes Agent v0.23.3 (`hermes.observer.v1`,
   `hermes.middleware.v1`). The README's adapter section has the details.
 - **`tool_call_not_dispatched` is a new limitation marker.** It is on a run

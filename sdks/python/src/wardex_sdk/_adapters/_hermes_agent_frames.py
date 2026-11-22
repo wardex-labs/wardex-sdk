@@ -17,7 +17,7 @@ import asyncio
 import threading
 import time
 from collections.abc import Hashable
-from contextvars import ContextVar
+from contextvars import Context, ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +30,7 @@ from .._assembly import (
     UnitKey,
     UnitKind,
     canonical_arguments,
+    latch_ambient,
 )
 from .._enums import OperationName, StatusCode
 from . import _hermes_agent_attach as _attach
@@ -245,7 +246,7 @@ class FrameEffects:
                     record.dispatched.setdefault(asked_by, []).append(_tool_key(event.tool_name))
                 if call_id:
                     record.frames[(FrameKind.TOOL, call_id)] = frame
-            self._open_tool(frame, event)
+            self._open_tool(frame, event, _beside(record))
             return frame
         _ensure_lane(record)
         frame = FrameRecord(FrameKind.MODEL_CALL, event.api_request_id)
@@ -318,7 +319,9 @@ class FrameEffects:
         handle.pin(driver=_driver())
         frame.handle = handle
 
-    def _open_tool(self, frame: FrameRecord, event: ToolEnter) -> None:
+    def _open_tool(
+        self, frame: FrameRecord, event: ToolEnter, within: Context | None = None
+    ) -> None:
         """`execute_tool <name>`: CALL, EXECUTE_TOOL, NESTED, linked TRIGGERED_BY the model call
         that asked for it, whether it ran alone, in a round or in a parallel batch. Its input
         goes through the capped payload path only, and its slot is what the MCP seam reads.
@@ -326,9 +329,11 @@ class FrameEffects:
         Placed by context alone, never by an id: a tool that code in `execute_code` called runs
         on a thread Hermes starts with the code tool's context, so it nests under that tool; a
         prelude tool runs before the turn is ambient on any thread, so it is a root the core
-        marks PARENT_UNRESOLVED. With no `api_request_id` there is no link, and the span states
-        the turn id Hermes gave it instead, so a reader can still find its turn. With no
-        `tool_call_id` there is no call id and no alias."""
+        marks PARENT_UNRESOLVED, also on a thread still pinned to an earlier turn, where it
+        opens `within` the context that turn was opened in (`_beside`). It is pinned here all
+        the same. With no `api_request_id` there is no link, and the span states the turn id
+        Hermes gave it instead, so a reader can still find its turn. With no `tool_call_id`
+        there is no call id and no alias."""
         ctx = self._ctx
         assert ctx is not None
         name, call_id, asked_by = event.tool_name, event.tool_call_id, event.api_request_id
@@ -346,13 +351,16 @@ class FrameEffects:
             if call_id:
                 h.alias(UnitKey(TOOL_NS, call_id), remember=True)
 
-        handle = ctx.open_run(
-            UnitKind.CALL,
-            intent=SpanIntent.EXECUTE_TOOL,
-            placement=Placement.NESTED,
-            subject=name,
-            describe=describe,
-        )
+        def opened() -> RunHandle:
+            return ctx.open_run(
+                UnitKind.CALL,
+                intent=SpanIntent.EXECUTE_TOOL,
+                placement=Placement.NESTED,
+                subject=name,
+                describe=describe,
+            )
+
+        handle = opened() if within is None else within.copy().run(opened)
         if args is not None:
             handle.record_input(_shaped_args(args, budget))
         slot = ctx.slot(frame)
@@ -369,8 +377,8 @@ class FrameEffects:
 
         A turn's model-call frame that raised also takes the turn's pin down here: Hermes sends
         no end for a turn that failed for good, and until its next attempt pins the turn again
-        (`_ensure_lane`) no tool runs, so another session's turn or the embedder's own span on
-        this thread would otherwise nest under a turn that may be over."""
+        (`_ensure_lane`) no tool runs, so the embedder's own span or request on this thread
+        would otherwise nest under a turn that may be over."""
         handle = frame.handle
         if handle is not None:
             handle.unpin()
@@ -461,7 +469,8 @@ class FrameEffects:
 
 def _ensure_lane(record: TurnRecord) -> None:
     """Make `record` the turn pinned on this loop thread: where a turn becomes ambient, and how
-    a later turn on the same thread takes the ended turn's pin down on its owning task."""
+    a later turn on the same thread takes the previous turn's pin down on its owning task (that
+    turn's own next frame pins it again)."""
     if _LANE.get() is record:
         return
     _drop_lane()
@@ -471,26 +480,30 @@ def _ensure_lane(record: TurnRecord) -> None:
     _LANE.set(record)
 
 
-def _finished_lane(turn_id: str) -> TurnRecord | None:
-    """The turn this context's loop thread is still pinned to, when turn `turn_id` starts there,
-    only while Hermes's last word on that turn is that its call failed (`after_error`) and none
-    of its frames is pinned here: a refusal is an HTTP 200, so its frame returned and left the
-    pin up, and Hermes sends no end for a turn that failed for good.
+def _beside(record: TurnRecord) -> Context | None:
+    """Where a unit of `record` opens when what is ambient here is another turn's bare pin: the
+    context that turn was opened in (`TurnRecord.birth`). None when anything else is ambient,
+    and the unit opens here.
 
-    Any other live turn here may still be running. An embedder's `step_callback` runs an agent
-    on the loop thread between two model calls of a live turn, and a tool can start an agent on
-    a thread that keeps the tool's context after the tool returned. Both get None, and the new
-    turn opens on whatever is ambient."""
-    lane, frame = _LANE.get(), _FRAME.get()
-    if lane is None or lane.turn_id == turn_id or (frame is not None and frame.pinned()):
+    A turn's pin stands on its loop task between its frames and after its last one, and Hermes
+    sends no end for a turn it stopped. Nothing Hermes sends says whether that turn is over: an
+    embedder's `step_callback` runs an agent on the loop thread between two model calls of a
+    live turn. So another turn's work is never put under that pin and never closes that turn.
+    It opens where that turn was opened, under the embedder's span that wraps both or as a
+    root. The ambient span is the pinned turn's own exactly when nothing was opened above the
+    pin here; a tool frame, a model call or a span of the embedder's is not the bare pin."""
+    lane = _LANE.get()
+    if lane is None or lane is record:
         return None
-    with lane.lock:
-        return lane if lane.after_error else None
+    handle = lane.handle
+    if handle is None or handle.degraded or latch_ambient().span_context != handle.draft.context:
+        return None
+    return lane.birth
 
 
 def _drop_lane(only: TurnRecord | None = None) -> None:
     """Take down the previous lane's pin if this task holds it, so nothing opened next on this
-    thread nests under a turn that is over. With `only`, only when that turn is the lane."""
+    thread nests under a turn that may be over. With `only`, only when that turn is the lane."""
     lane = _LANE.get()
     if lane is None or (only is not None and lane is not only):
         return

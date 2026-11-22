@@ -439,6 +439,28 @@ SCENARIOS: dict[str, Scenario] = {
         },
         then="[smoke:failed_then_other_session] SESSION-B say hello.",
     ),
+    # A turn Hermes stops as partial with no end (the model invents a tool three times in a
+    # row), then another session's turn on the same thread while the first is still open.
+    "gave_up_then_other_session": Scenario(
+        "Turn",
+        "[smoke:gave_up_then_other_session] SESSION-A say hello.",
+        [
+            _rule([_text("answer-b", "Hello from B.")], user_contains="SESSION-B"),
+            _rule(
+                [_calls("invent", ("lab_no_such_tool", {"x": 1}))],
+                user_contains="SESSION-A",
+                repeat=True,
+            ),
+        ],
+        ("answer-b", *("invent",) * 3),
+        exit={"library": 1, "cli": 1},
+        fixture=False,
+        nets={
+            "_hermes_agent_turns.IDLE_CLOSE_S": 3.0,
+            "_hermes_agent_attach.IDLE_SWEEP_S": 0.2,
+        },
+        then="[smoke:gave_up_then_other_session] SESSION-B say hello.",
+    ),
     "two_subagents_joined": Scenario(
         "Subagents (delegate_task)",
         "[smoke:two_subagents] Delegate two lookups.",
@@ -781,6 +803,39 @@ ROWS: tuple[Row, ...] = (
                 attrs={
                     A + "close_cause": "end_event",
                     INPUT: "[smoke:failed_then_other_session] SESSION-B say hello.",
+                    OUTPUT: "Hello from B.",
+                },
+            ),
+        ),
+    ),
+    Row(
+        # A turn Hermes stopped as partial sends no end, and its pin stays on the thread. The
+        # next session's turn there is a trace of its own and leaves it open: the first turn
+        # closes on its own quiet net, with its three model calls and nothing else.
+        "Turn",
+        "gave_up_then_other_session",
+        (
+            Traces(2),
+            Count(TURN, 2),
+            Count(CHAT, 4, parent=TURN),
+            Span(
+                TURN,
+                parent="",
+                status="UNSET",
+                markers=("session_aborted", "tool_call_not_dispatched"),
+                attrs={
+                    A + "close_cause": "idle",
+                    INPUT: "[smoke:gave_up_then_other_session] SESSION-A say hello.",
+                },
+            ),
+            Span(
+                TURN,
+                nth=1,
+                parent="",
+                status="OK",
+                attrs={
+                    A + "close_cause": "end_event",
+                    INPUT: "[smoke:gave_up_then_other_session] SESSION-B say hello.",
                     OUTPUT: "Hello from B.",
                 },
             ),

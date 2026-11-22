@@ -326,9 +326,7 @@ a failed turn, and a failed model call does not end one, because Hermes
 retries it and may still answer. A turn Hermes never ended is closed unset
 with `session_aborted`, and `wardex.hermes_agent.close_cause` says why:
 
-- `next_turn`: the session's next turn began, or another turn began on the
-  thread that ran it while Hermes's last word on the turn was a failed model
-  call.
+- `next_turn`: the session's next turn began.
 - `finalize`: Hermes closed that session.
 - `idle`: no event of the turn came for 120 seconds. After a failed model
   call the wait is 300 seconds, long enough for Hermes's retry waits and its
@@ -344,6 +342,17 @@ and a gateway that stops within 300 seconds of a failed turn, with no session
 closed first, exports that turn's model calls and not the turn span above
 them.
 
+wardex cannot tell a turn Hermes stopped from one still running, so a turn
+that starts on the same thread while another is open is a trace of its own,
+or sits under your span if one wraps both, and leaves the open turn as it
+is. That includes an agent your code runs from a `step_callback`: Hermes
+states no parent for it. When the open turn's last model call answered (a
+turn Hermes stopped, or a refusal), two things still land in its trace: a
+span your code opens on that thread before that turn closes, with all that
+runs inside it, a new turn included; and, when Hermes writes session titles,
+the HTTP attempt of the new turn's title call, unmarked. Both inherit the
+thread's context, where that turn is still current.
+
 What wardex cannot place is marked and never placed by a guess:
 
 - Hermes's background memory review and a side question run with no turn
@@ -353,8 +362,9 @@ What wardex cannot place is marked and never placed by a guess:
   a root too.
 - The session-title call, which Hermes starts on its own thread, and an
   auxiliary call outside any turn (an MCP server's sampling request):
-  `parent_unresolved` on the HTTP attempt. The title call's span built from
-  Hermes's report carries `possible_duplicate_chat`.
+  `parent_unresolved` on the HTTP attempt, except for the title call of a
+  turn that starts while another is open (above). The title call's span
+  built from Hermes's report carries `possible_duplicate_chat`.
 - A tool call the model asked for and Hermes never ran:
   `tool_call_not_dispatched` on the turn, and
   `wardex.hermes_agent.undispatched_tool_calls` names it. It is decided for

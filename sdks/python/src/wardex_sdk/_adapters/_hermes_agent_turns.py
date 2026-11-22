@@ -43,6 +43,7 @@ import threading
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Callable
+from contextvars import Context
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, TypeVar
@@ -121,13 +122,11 @@ class Trigger(Enum):
     """The lifecycle's input alphabet: one member per thing that can happen to a turn.
 
     NEXT_TURN, IDLE and UNIT_GONE are derived by the caller, not sent by Hermes. NEXT_TURN comes
-    from the session's next turn (a newer `pre_llm_call` of the same session) or the loop
-    thread's (a root turn's `pre_llm_call` on the thread the turn is pinned on, while Hermes's
-    last word on it is a failed call), IDLE from the clock. FINALIZE and SHUTDOWN are both
-    `on_session_finalize` for the turn's session, told apart by Hermes's reason. UNIT_GONE says
-    the record's unit is no longer live in the core (closed with its parent, evicted, or closed
-    by the signal path): the caller steps it before the event that found the record, so that
-    event resolves against PRESUMED_CLOSED.
+    from the session's next turn (a newer `pre_llm_call` of the same session), IDLE from the
+    clock. FINALIZE and SHUTDOWN are both `on_session_finalize` for the turn's session, told
+    apart by Hermes's reason. UNIT_GONE says the record's unit is no longer live in the core
+    (closed with its parent, evicted, or closed by the signal path): the caller steps it before
+    the event that found the record, so that event resolves against PRESUMED_CLOSED.
     """
 
     TURN_START = "turn_start"  # pre_llm_call
@@ -141,7 +140,7 @@ class Trigger(Enum):
     CHILD_START = "child_start"  # subagent_start, applied to the parent's turn
     TURN_ANSWER = "turn_answer"  # post_llm_call
     TURN_END = "turn_end"  # on_session_end
-    NEXT_TURN = "next_turn"  # net: the session's or the loop thread's next turn
+    NEXT_TURN = "next_turn"  # net: the session's next turn
     CHILD_STOP = "child_stop"  # net: subagent_stop for the child's session
     FINALIZE = "finalize"  # net: on_session_finalize at a session boundary (/new, reset, close)
     SHUTDOWN = "shutdown"  # net: on_session_finalize at process shutdown
@@ -522,8 +521,7 @@ class TurnRecord:
 
     Mutate the containers only under `lock`; `quiet()` and `undispatched()` iterate them and
     are called under it too. `session_id` is the one field before `lock` that changes: only
-    `TurnBook.rotate` writes it, and only under the book's lock, which `live_in_session`
-    reads it under.
+    `TurnBook.rotate` writes it, under the book's lock, which `live_in_session` reads it under.
     """
 
     session_id: str
@@ -536,6 +534,7 @@ class TurnRecord:
     conversation: str = ""
     lock: threading.RLock = field(default_factory=threading.RLock)
     handle: RunHandle | None = None  # published by the effect that opened the unit
+    birth: Context | None = None  # where the unit opened; a turn opened on its bare pin goes
     frames: dict[tuple[FrameKind, str], FrameRecord] = field(default_factory=dict)
     #: api_request_id -> (name, key) of each tool call that model call asked for, in its order,
     #: and the keys of the tool frames that named that call. A key is None for a bridge call.

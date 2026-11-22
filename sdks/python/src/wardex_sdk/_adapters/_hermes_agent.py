@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Callable, Hashable, Iterable, Mapping
+from contextvars import Context, copy_context
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -71,9 +72,9 @@ from ._hermes_agent_frames import (
     PREFIX,
     TOOL_NS,
     FrameEffects,
+    _beside,
     _downstream_name,
     _drop_lane,
-    _finished_lane,
     _message_text,
     _Out,
 )
@@ -406,13 +407,10 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
           turn of that session, and none for key None. A finalize at shutdown always drains, so
           a turn that closed just before it is not left in the buffer either; any other
           finalize kicks the export thread, so no session boundary waits on export.
-        * pre_llm_call: first the NEXT_TURN net, on the hook thread Hermes calls before it
-          builds the turn's title thread, then the turn. The net closes the session's other
-          live turns and, for a root turn, the live turn its loop thread is still pinned to
-          when Hermes's last word on that turn is a failed call (`_finished_lane`): a failed
-          turn sends no end, and the new turn must not open under it. Any other turn pinned
-          there may still be running (an agent run from a `step_callback`, or from a thread a
-          tool left running), so it stays open. A child turn is never subject.
+        * pre_llm_call: first the NEXT_TURN net over the session's other live turns, on the
+          hook thread Hermes calls before it builds the turn's title thread, then the turn. A
+          turn of another session is never closed here, whatever thread it ran on: nothing
+          Hermes sends says whether it is over (`_beside`).
         * Everything else: the one turn the key names.
 
         A tool event's `conversation_id`, the only place Hermes states one, is kept for the
@@ -433,14 +431,6 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
                 for r in self._book.live_in_session(event.session_id)
                 if r.turn_id != event.turn_id
             ]
-            if event.parent_session_id is None and self._book.tie_for(event.session_id) is None:
-                lane = _finished_lane(event.turn_id)
-                if (
-                    lane is not None
-                    and lane not in others
-                    and self._book.find(lane.turn_id) is lane
-                ):
-                    others.append(lane)
             swept = _merge([self._advance(r, Trigger.NEXT_TURN, event) for r in others])
             return _merge([swept, self._by_key(event, trigger)])
         return self._by_key(event, trigger)
@@ -524,25 +514,27 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
 
     def _open(self, record: TurnRecord, event: TurnStart, s: Step, trigger: Trigger) -> _Out:
         """pre_llm_call, on a hook thread whose context is a copy of the loop thread's. ROOT
-        takes whatever is ambient in that copy, which is the measured answer for each case: a
-        first turn or a gateway job, a root; the next turn on the same thread, the previous
-        turn's pin, retired when that turn closed (by its end, or by the NEXT_TURN net just
-        before this when its last call failed), so a clean root; an agent an embedder's
-        `step_callback` runs inside a live turn, that turn, so nested under it; a joined child,
-        the live delegate_task unit, so nested under it; a background child, or an agent a
-        tool started on a thread it left running, the tool's unit already closed, which the
-        core refuses, so a root with CORRELATION_CONFLICT.
+        takes whatever is ambient in that copy: a first turn or a gateway job, a root; the
+        next turn on the same thread after the previous one closed, a clean root, since a
+        closed turn's pin is retired; a joined child, the live delegate_task unit, so nested
+        under it; a background child, or an agent a tool started on a thread it left running,
+        the tool's unit already closed, which the core refuses, so a root with
+        CORRELATION_CONFLICT. When the ambient is another turn's bare pin (a turn Hermes
+        stopped with no end, or a live turn whose `step_callback` runs this agent) the turn
+        opens where that turn was opened (`_beside`), and that turn is left as it is.
 
         With synchronous hooks (`plugins.hook_callback_timeout: 0`) this runs on the loop
         thread itself, where the previous turn's pin still stands: `_drop_lane` takes it down
-        first, on the task that holds it. On a hook thread it only clears the copy.
+        first, on the task that holds it, and that turn's next frame pins it again. On a hook
+        thread it only clears the copy.
 
         The user's message is held, not recorded: another plugin's `pre_llm_call` may block the
         prompt, and Hermes then keeps it off every store and provider. It becomes the turn's
         input at the turn's first model-call frame or at a non-block end (`_release_input`).
         A continuation has no `pre_llm_call`, so no input."""
+        within = _beside(record)
         _drop_lane()
-        self._open_turn(record, event.platform, resumed=False)
+        self._open_turn(record, event.platform, resumed=False, within=within)
         if event.user_message is not None:
             with record.lock:
                 record.held_input = event.user_message
@@ -560,8 +552,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
     def _continue(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
         """A guess was wrong: the loop is still running a presumed-closed turn. Generation n+1
         opens on this loop thread, linked RESUMED_FROM the closed generation, then the frame."""
+        within = _beside(record)
         _drop_lane()
-        self._open_turn(record, None, resumed=True)
+        self._open_turn(record, None, resumed=True, within=within)
         return self._frame(record, event, s, trigger)
 
     def _continue_close(
@@ -571,19 +564,21 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         longer than its threshold, and no model frame came after). The earlier span cannot be
         reopened, so a short generation n+1 states Hermes's own outcome, linked RESUMED_FROM,
         and closes at once."""
-        self._open_turn(record, None, resumed=True)
+        self._open_turn(record, None, resumed=True, within=_beside(record))
         return self._close(record, event, s, trigger)
 
-    def _open_turn(self, record: TurnRecord, platform: str | None, *, resumed: bool) -> None:
+    def _open_turn(
+        self, record: TurnRecord, platform: str | None, *, resumed: bool, within: Context | None
+    ) -> None:
+        """Open the turn's unit here, or inside a copy of `within` (`_beside`). The context it
+        opened in is kept as the turn's birth, where a turn opened on its bare pin goes."""
         ctx = self._ctx
         assert ctx is not None
         tie = self._book.tie_for(record.session_id) if record.kind is TurnKind.CHILD else None
         delegate = _FRAME.get() if record.kind is TurnKind.CHILD else None
         session_id = record.session_id
-        conversation, shadowed = framework_conversation(
-            ctx, record.conversation, shadowed_counter="conversation_shadowed"
-        )
         unit_kind = _UNIT_KIND[record.kind]
+        shadowed = False
 
         def describe(h: RunHandle) -> None:
             d = h.draft
@@ -608,14 +603,22 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
                 h.link(LinkReason.RESUMED_FROM, UnitKey(TURN_NS, record.turn_id))
             h.alias(UnitKey(TURN_NS, record.turn_id), remember=True)
 
-        record.handle = ctx.open_run(
-            unit_kind,
-            intent=SpanIntent.INVOKE_AGENT,
-            placement=Placement.ROOT,
-            subject=AGENT_NAME,
-            conversation=conversation,
-            describe=describe,
-        )
+        def opened() -> RunHandle:
+            nonlocal shadowed  # the host's conversation is read where the unit opens
+            conversation, shadowed = framework_conversation(
+                ctx, record.conversation, shadowed_counter="conversation_shadowed"
+            )
+            return ctx.open_run(
+                unit_kind,
+                intent=SpanIntent.INVOKE_AGENT,
+                placement=Placement.ROOT,
+                subject=AGENT_NAME,
+                conversation=conversation,
+                describe=describe,
+            )
+
+        record.birth = copy_context() if within is None else within
+        record.handle = opened() if within is None else within.copy().run(opened)
         _attach._EXPORT.start()
 
     def _close(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
@@ -632,6 +635,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         cause = s.cause or event.cause()
         rule = CLOSE_RULES[cause]
         self._book.retire(record, rule.next_state)
+        record.birth = None  # only a live turn's pin is opened beside; let its context go
         ended = isinstance(event, TurnEnd)
         with record.lock:
             record.blocked = ended and event.blocked()

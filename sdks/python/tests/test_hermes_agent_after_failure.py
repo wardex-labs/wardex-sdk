@@ -1,10 +1,12 @@
-"""What runs on Hermes's loop thread after a turn failed, and how long a failed turn waits.
+"""What starts on Hermes's loop thread after a turn Hermes did not end, and how long it waits.
 
-Hermes sends no end for a failed turn, so the turn stays live for minutes. Nothing that runs
-after it on the same thread may sit under it: another session's turn, the embedder's own span,
-an auxiliary call Hermes makes before its next attempt. And a wait Hermes announced after a
-failed call (a Retry-After) keeps the turn one trace even when an auxiliary call ends inside it.
-An agent that starts inside a turn that did not fail leaves that turn whole.
+Hermes sends no end for a failed turn, nor for one it stops as partial (`gave_up`), so the turn
+stays live and pinned on its loop thread until its session's next turn, its finalize or the
+quiet net closes it. Nothing Hermes sends says whether such a turn is over: an embedder's
+`step_callback` runs an agent between two model calls of a live turn. So a turn that starts on
+another turn's bare pin opens where that turn was opened, and leaves it as it is; the
+embedder's own span after a failed call is not under it; and a wait Hermes announced after a
+failed call keeps the turn one trace when an auxiliary call ends or an agent starts inside it.
 
 Each case is driven on the fake Hermes in the order and on the threads Hermes v0.23.3 uses:
 `FakeHermes.fail` raises out of the `llm_execution` frame on the loop thread, as Hermes's retry
@@ -21,7 +23,7 @@ import pytest
 
 import wardex_sdk
 from _hermes_fake import Reply
-from _hermes_payloads import tool_starts_agent
+from _hermes_payloads import gave_up, prelude_tool, slow_tool, tool_starts_agent
 from _hermes_scripted import FakeHermes, Turn
 from _hermes_support import (
     exported,
@@ -30,6 +32,7 @@ from _hermes_support import (
     hermes,
     hermes_installed,
     on_loop,
+    one,
     outline,
     parent_of,
     plugin,
@@ -84,9 +87,10 @@ def test_another_sessions_turn_after_a_failed_turn_on_the_same_thread_is_its_own
     assert _turn_span(nodes, failed).trace_id != span.trace_id
 
 
-def test_a_turn_left_open_by_a_refusal_is_closed_by_the_next_turn_on_its_loop_thread():
+def test_a_turn_left_open_by_a_refusal_is_left_to_its_own_nets_by_another_sessions_turn():
     """A refusal is an HTTP 200: its frame returns, so the turn stays pinned on the loop thread.
-    The next root turn there proves the failed turn's loop is over and closes it first."""
+    Another session's turn there opens beside it and does not close it: its own session's
+    finalize does."""
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
         failed, second = on_loop(
@@ -97,7 +101,7 @@ def test_a_turn_left_open_by_a_refusal_is_closed_by_the_next_turn_on_its_loop_th
     assert parent_of(nodes, span) is None
     closed = _turn_span(nodes, failed)
     assert closed.trace_id != span.trace_id
-    assert extras(closed)["close_cause"] == "next_turn"
+    assert extras(closed)["close_cause"] == "finalize"
     assert extras(closed)["error_reason"] == "content_policy_blocked"
     assert Limitation.SESSION_ABORTED in closed.limitations
 
@@ -187,11 +191,11 @@ def _calls_of(nodes, turn: Turn) -> list:
     return [n for n in nodes if extras(n).get("api_request_id", "").startswith(turn.turn_id)]
 
 
-def test_an_agent_run_from_a_step_callback_nests_under_the_live_turn_and_leaves_it_whole():
+def test_an_agent_run_from_a_step_callback_is_its_own_trace_and_leaves_the_turn_whole():
     """Hermes calls an embedder's `step_callback` on the loop thread before a model call
-    (`agent/turn_iteration_prep.py`). An agent run there starts its turn inside a live turn
-    whose calls all answered: that turn is still running, so it is one span that Hermes ends,
-    and the callback's agent nests under it."""
+    (`agent/turn_iteration_prep.py`). An agent run there starts its turn on the live turn's
+    bare pin, which looks the same as a turn Hermes stopped: it opens where that turn opened, a
+    trace of its own (Hermes states no parent for it), and the live turn stays one span."""
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
 
@@ -210,7 +214,9 @@ def test_an_agent_run_from_a_step_callback_nests_under_the_live_turn_and_leaves_
     span = _turn_span(nodes, main)
     assert extras(span)["close_cause"] == "end_event"
     assert Limitation.SESSION_ABORTED not in span.limitations
-    assert parent_of(nodes, _turn_span(nodes, judge)) is span
+    other = _turn_span(nodes, judge)
+    assert parent_of(nodes, other) is None
+    assert other.trace_id != span.trace_id
     calls = _calls_of(nodes, main)
     assert len(calls) == 2
     assert all(parent_of(nodes, n) is span for n in calls)
@@ -251,3 +257,135 @@ def test_an_agent_on_a_thread_a_tool_left_running_is_its_own_trace_and_leaves_th
     assert parent_of(nodes, other) is None
     assert other.trace_id != span.trace_id
     assert Limitation.CORRELATION_CONFLICT in other.limitations
+
+
+# -- a turn Hermes stopped with no end -------------------------------------------------------------
+
+
+def test_another_sessions_turn_after_a_turn_hermes_gave_up_on_is_its_own_root():
+    """The stopped turn's pin still stands on the loop thread. The next session's turn there
+    opens where the stopped turn opened, a root, and ends whole; the stopped turn keeps only
+    its own calls and closes at its own session's finalize."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        stopped, second = on_loop(_after_failed_turn, h, lambda turn: gave_up(h, turn))
+    nodes = exported(transport)
+    span = _turn_span(nodes, second)
+    assert parent_of(nodes, span) is None
+    assert outline((span,)) == "invoke_agent hermes | trace_root 1.0 | OK"
+    assert extras(span)["close_cause"] == "end_event"
+    assert _in_trace(nodes, span) == sorted([TURN, "chat lab-model", WIRE])
+    left = _turn_span(nodes, stopped)
+    assert extras(left)["close_cause"] == "finalize"
+    assert _in_trace(nodes, left) == sorted([TURN, *["chat lab-model", WIRE] * 3])
+
+
+def test_the_quiet_net_of_a_turn_hermes_gave_up_on_closes_that_turn_alone(monkeypatch):
+    """The next session's turn is still running a long tool when the stopped turn's quiet net
+    fires. The net closes the stopped turn only; the running turn stays one span that Hermes
+    ends."""
+    monkeypatch.setattr(turns_module, "IDLE_CLOSE_S", 0.5)
+    monkeypatch.setattr(attach_module, "IDLE_SWEEP_S", 0.05)
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run() -> tuple[Turn, Turn]:
+            stopped = h.turn()
+            gave_up(h, stopped)
+            second = h.turn()
+            slow = h.model_call(second, tool_calls=["lab_slow"])
+            slow_tool(h, slow, "lab_slow", 2.0)  # the stopped turn's net fires inside this tool
+            h.model_call(second)
+            h.end(second)
+            return stopped, second
+
+        stopped, second = on_loop(run)
+    nodes = exported(transport)
+    assert extras(_turn_span(nodes, stopped))["close_cause"] == "idle"
+    span = _turn_span(nodes, second)
+    assert parent_of(nodes, span) is None
+    assert extras(span)["close_cause"] == "end_event"
+    assert "generation" not in extras(span)
+    assert Limitation.SESSION_ABORTED not in span.limitations
+
+
+def test_an_embedder_span_around_two_turns_holds_the_turn_after_one_hermes_never_ended():
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run() -> tuple[Turn, Turn]:
+            with wardex_sdk.span("lab_batch"):
+                stopped = h.turn()
+                gave_up(h, stopped)
+                second = h.turn()
+                h.model_call(second)
+                h.end(second)
+            h.finalize(stopped.session_id, reason="session_close")
+            return stopped, second
+
+        stopped, second = on_loop(run)
+    nodes = exported(transport)
+    batch = one(nodes, "lab_batch")
+    assert parent_of(nodes, _turn_span(nodes, stopped)) is batch
+    span = _turn_span(nodes, second)
+    assert parent_of(nodes, span) is batch
+    assert extras(span)["close_cause"] == "end_event"
+
+
+def test_a_prelude_tool_on_a_thread_still_pinned_to_another_turn_is_a_root_of_its_own_turn():
+    """A tool a turn runs before its first model call, on a worker copied from a loop thread
+    whose lane is still the stopped turn: what a prelude tool always is, a marked root that
+    states its own turn."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run() -> Turn:
+            stopped = h.turn()
+            gave_up(h, stopped)
+            second = h.turn()
+            prelude_tool(h, second)
+            h.model_call(second)
+            h.end(second)
+            h.finalize(stopped.session_id, reason="session_close")
+            return second
+
+        second = on_loop(run)
+    nodes = exported(transport)
+    tool = one(nodes, "execute_tool read_file")
+    assert outline((tool,)) == "execute_tool read_file | unresolved 0.0 | OK | parent_unresolved"
+    assert extras(tool)["turn_id"] == second.turn_id
+
+
+def test_an_agent_a_tool_started_whose_turn_begins_in_a_retry_wait_leaves_the_turn_whole():
+    """The tool's thread still carries the calling turn's lane. That turn's next call failed and
+    Hermes waits before its retry; the agent's turn starts in that wait. The calling turn stays
+    one span that Hermes ends, and the agent's turn is a trace of its own."""
+    transport = start_wardex()
+    helper: list[Turn] = []
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def agent() -> None:
+            turn = h.turn()
+            h.model_call(turn)
+            h.end(turn)
+            helper.append(turn)
+
+        def run() -> Turn:
+            main = h.turn()
+            spawn = h.model_call(main, tool_calls=["lab_spawn"])
+            thread = tool_starts_agent(h, spawn, "lab_spawn", agent)
+            h.fail(main, (Reply.UNAVAILABLE,))
+            thread.start()  # Hermes's wait before its retry
+            thread.join(30)
+            h.model_call(main, (Reply.OK,), again=True)
+            h.end(main)
+            return main
+
+        main = on_loop(run)
+    nodes = exported(transport)
+    span = _turn_span(nodes, main)
+    assert extras(span)["close_cause"] == "end_event"
+    assert "generation" not in extras(span)
+    other = _turn_span(nodes, helper[0])
+    assert parent_of(nodes, other) is None
+    assert other.trace_id != span.trace_id
