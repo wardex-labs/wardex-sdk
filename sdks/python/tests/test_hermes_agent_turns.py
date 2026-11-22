@@ -352,6 +352,20 @@ def test_completed_turn_with_no_model_frame_says_its_calls_were_unobserved() -> 
         assert marker not in _applying(_record(), cause), cause
 
 
+def test_turn_that_asked_for_a_tool_call_that_never_ran_says_so_whatever_closed_it() -> None:
+    marker = Limitation.TOOL_CALL_NOT_DISPATCHED
+    asked = _record()
+    asked.requested.update({"call_1": "read_file", "call_2": "lab_no_such_tool"})
+    asked.dispatched.add("call_1")
+    ran_all = _record()
+    ran_all.requested["call_1"] = "read_file"
+    ran_all.dispatched.add("call_1")
+    for cause in CloseCause:
+        assert marker in _applying(asked, cause), cause
+        assert marker not in _applying(ran_all, cause), cause
+        assert marker not in _applying(_record(), cause), cause
+
+
 # -- records -----------------------------------------------------------------------------------
 
 

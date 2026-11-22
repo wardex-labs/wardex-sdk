@@ -503,12 +503,23 @@ def _completed_without_a_seen_call(r: TurnRecord, cause: CloseCause) -> bool:
     return cause is CloseCause.ENDED_COMPLETED and r.model_frames == 0
 
 
+def _asked_for_a_tool_call_that_never_ran(r: TurnRecord, cause: CloseCause) -> bool:
+    # True for any cause: an invented tool name, a call another plugin vetoed and a call an
+    # interrupt cut before dispatch all leave the same trace, an id asked for and never run.
+    return bool(r.undispatched())
+
+
 #: Close-time observations, in the order their markers are noted.
 OBSERVATIONS: tuple[Observation, ...] = (
     Observation(
         "model_calls_unobserved",
         Limitation.SUBPROCESS_MODEL_CALLS_UNOBSERVED,
         _completed_without_a_seen_call,
+    ),
+    Observation(
+        "tool_calls_not_dispatched",
+        Limitation.TOOL_CALL_NOT_DISPATCHED,
+        _asked_for_a_tool_call_that_never_ran,
     ),
 )
 
