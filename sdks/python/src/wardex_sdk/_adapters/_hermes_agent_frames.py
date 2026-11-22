@@ -113,6 +113,10 @@ class FrameEffects:
             duplicate = key in record.aux
             if not duplicate:
                 record.aux[key] = AuxAttempt(event.aux_task)
+                # A call in the turn's lane gets no span of ours, and its wire span cannot say
+                # which task it served, so the turn names the tasks it ran.
+                if event.aux_task and event.aux_task not in record.aux_tasks:
+                    record.aux_tasks.append(event.aux_task)
         handle = record.handle
         if duplicate or handle is None or _LANE.get() is record:
             if duplicate:

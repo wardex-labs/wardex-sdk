@@ -198,6 +198,7 @@ _SITES: list[tuple[str, str, str, str]] = [
         "','.join(undispatched[:UNDISPATCHED_NAMES])",
         HOST,
     ),
+    (_HA, "PREFIX + 'aux_tasks'", "','.join(aux_tasks)", HOST),
     (_HF, "PREFIX + 'aux_request_id'", "event.aux_request_id", HOST),
     (_HF, "PREFIX + 'aux_task'", "event.aux_task", HOST),
     (_HF, "PREFIX + 'api_request_id'", "request_id", HOST),

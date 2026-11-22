@@ -476,6 +476,7 @@ class TurnRecord:
     dispatched: set[str] = field(default_factory=set)  # tool_call_ids that entered a frame
     model_frames: int = 0
     aux: dict[tuple[str, int], AuxAttempt] = field(default_factory=dict)  # in flight
+    aux_tasks: list[str] = field(default_factory=list)  # task names Hermes stated, first seen first
     error_reason: str | None = None  # Hermes's `reason` from the api_request_error that closed it
     exit_reason: str | None = None  # Hermes's `turn_exit_reason`, verbatim
     last_event: float = field(default_factory=time.monotonic)

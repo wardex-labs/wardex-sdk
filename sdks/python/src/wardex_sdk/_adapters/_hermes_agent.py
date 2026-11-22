@@ -104,8 +104,9 @@ TURN_NS = "hermes.turn"  # turn_id
 
 #: The flush bound on the `on_session_finalize` caller, inside Hermes's own 10 s bound on it.
 FINALIZE_DRAIN_S = 2.0
-#: How many undispatched tool names a turn states.
+#: How many undispatched tool names, and how many auxiliary task names, a turn states.
 UNDISPATCHED_NAMES = 16
+AUX_TASK_NAMES = 16
 
 _UNIT_KIND: Mapping[TurnKind, UnitKind] = {
     TurnKind.ROOT: UnitKind.SESSION,
@@ -126,6 +127,26 @@ def _tool_call_of(entry: Mapping[str, Any]) -> tuple[str, str | None] | None:
     """
     name = entry.get("tool_name")
     return (name, entry.get("tool_arguments")) if isinstance(name, str) else None
+
+
+def _message_text(value: object) -> object:
+    """A turn's message as its text. Hermes hands a string, or a list of content parts when the
+    message has attachments. Of the parts only the text is kept and any other part (an image, a
+    file) is named by its type, so a base64 image does not fill the record up to its cap. A
+    list that is not content parts is returned as it came, for the general shaper."""
+    if type(value) is not list:
+        return value
+    lines = []
+    for part in value:
+        kind = part.get("type") if type(part) is dict else None
+        text = part.get("text") if kind == "text" else None
+        if type(text) is str:
+            lines.append(text)
+        elif type(kind) is str:
+            lines.append(f"[{kind}]")
+        else:
+            return value
+    return "\n".join(lines)
 
 
 def _merge(modes: Iterable[_Out]) -> ExportMode | None:
@@ -489,7 +510,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         handle = record.handle
         if handle is not None and event.user_message is not None:
             budget = self._ctx.record_budget  # type: ignore[union-attr]
-            handle.record_input(_shaped_payload(event.user_message, budget))
+            handle.record_input(_shaped_payload(_message_text(event.user_message), budget))
         return None
 
     def _answer(self, record: TurnRecord, event: TurnAnswer, s: Step, trigger: Trigger) -> _Out:
@@ -498,7 +519,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         handle = record.handle
         if handle is not None and event.assistant_response is not None:
             budget = self._ctx.record_budget  # type: ignore[union-attr]
-            handle.record_output(_shaped_payload(event.assistant_response, budget))
+            handle.record_output(_shaped_payload(_message_text(event.assistant_response), budget))
         return None
 
     def _open_late(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
@@ -572,8 +593,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
 
         The record is retired first, so an event that races the close resolves against the
         tombstone. Then: the auxiliary declarations still standing are released; extras
-        close_cause, exit_reason (verbatim), error_reason (the api_request_error's `reason`) and
-        undispatched_tool_calls; the rule's marker and each applying observation's; the close.
+        close_cause, exit_reason (verbatim), error_reason (the api_request_error's `reason`),
+        undispatched_tool_calls and aux_tasks (the auxiliary tasks Hermes named for this turn);
+        the rule's marker and each applying observation's; the close.
         """
         cause = s.cause or event.cause()
         rule = CLOSE_RULES[cause]
@@ -581,6 +603,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         with record.lock:
             undispatched = list(record.undispatched().values())
             notes = [o.marker for o in OBSERVATIONS if o.applies(record, cause)]
+            aux_tasks = record.aux_tasks[:AUX_TASK_NAMES]
             pending = list(record.aux.items())
             record.aux.clear()
         ctx = self._ctx
@@ -601,6 +624,8 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             d.set_extra(
                 PREFIX + "undispatched_tool_calls", ",".join(undispatched[:UNDISPATCHED_NAMES])
             )
+        if aux_tasks:
+            d.set_extra(PREFIX + "aux_tasks", ",".join(aux_tasks))
         if rule.marker is not None:
             handle.note(rule.marker)
         for marker in notes:

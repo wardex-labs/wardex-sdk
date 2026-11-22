@@ -135,9 +135,12 @@ def test_an_auxiliary_call_on_the_turns_own_thread_adds_nothing_its_wire_span_is
             h.end(turn)
 
         on_loop(run)
-    assert outline(exported(transport)) == render(
+    nodes = exported(transport)
+    assert outline(nodes) == render(
         (TURN, (CHAT, CHAT, (f"{WIRE} | contextvar 1.0 | OK | provider_inferred", ()))),
     )
+    # The wire span cannot say which task it served, so the turn names the tasks it ran.
+    assert extras(one(nodes, "invoke_agent hermes"))["aux_tasks"] == "compression"
 
 
 def _stray_request(h: FakeHermes) -> None:

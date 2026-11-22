@@ -569,8 +569,11 @@ def test_each_child_turn_carries_its_own_task_and_answer():
     assert _io(parent) == (QUESTION, ANSWER)
 
 
-def test_a_message_of_content_parts_is_the_turns_input_within_the_record_cap():
-    parts = [{"type": "text", "text": "Describe this."}, {"type": "image_url", "image_url": {}}]
+def test_a_message_with_an_attachment_shows_its_text_and_names_the_attachment():
+    """A message with an image arrives as content parts. The turn's input is its text, and the
+    image is named by its type: the image's bytes would only fill the record up to its cap."""
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 4096}}
+    parts = [{"type": "text", "text": "Describe this."}, image]
 
     def script(h: FakeHermes) -> None:
         turn = h.turn(message=parts)
@@ -578,7 +581,19 @@ def test_a_message_of_content_parts_is_the_turns_input_within_the_record_cap():
         h.end(turn)
 
     (turn,) = _turns(script)
-    assert _io(turn) == (repr(parts), ANSWER)
+    assert _io(turn) == ("Describe this.\n[image_url]", ANSWER)
+
+
+def test_a_message_that_is_a_list_but_not_content_parts_is_recorded_as_it_came():
+    odd = ["not", "content", "parts"]
+
+    def script(h: FakeHermes) -> None:
+        turn = h.turn(message=odd)
+        h.model_call(turn)
+        h.end(turn)
+
+    (turn,) = _turns(script)
+    assert _io(turn) == (repr(odd), ANSWER)
 
 
 def test_with_no_record_budget_the_turn_carries_neither_input_nor_output():
