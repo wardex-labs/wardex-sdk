@@ -16,10 +16,10 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Hashable
-from contextvars import Context, ContextVar
+from collections.abc import Callable, Hashable
+from contextvars import ContextVar, copy_context
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from .._assembly import (
     GenAIAttributes,
@@ -30,7 +30,7 @@ from .._assembly import (
     UnitKey,
     UnitKind,
     canonical_arguments,
-    latch_ambient,
+    restore_point_beside,
 )
 from .._enums import OperationName, StatusCode
 from . import _hermes_agent_attach as _attach
@@ -58,7 +58,9 @@ from ._hermes_agent_turns import (
 from ._payload import _shaped_args, _shaped_payload
 
 if TYPE_CHECKING:
-    from .._assembly import SpanDraft
+    from .._assembly import RestorePoint, SpanDraft
+
+_T = TypeVar("_T")
 
 __all__ = ["CALL_NS", "HOLD_PREFIX", "PREFIX", "TOOL_NS", "FrameEffects"]
 
@@ -323,9 +325,7 @@ class FrameEffects:
         handle.pin(driver=_driver())
         frame.handle = handle
 
-    def _open_tool(
-        self, frame: FrameRecord, event: ToolEnter, within: Context | None = None
-    ) -> None:
+    def _open_tool(self, frame: FrameRecord, event: ToolEnter, within: RestorePoint = ()) -> None:
         """`execute_tool <name>`: CALL, EXECUTE_TOOL, NESTED, linked TRIGGERED_BY the model call
         that asked for it, whether it ran alone, in a round or in a parallel batch. Its input
         goes through the capped payload path only, and its slot is what the MCP seam reads.
@@ -334,10 +334,10 @@ class FrameEffects:
         on a thread Hermes starts with the code tool's context, so it nests under that tool; a
         prelude tool runs before the turn is ambient on any thread, so it is a root the core
         marks PARENT_UNRESOLVED, also on a thread still pinned to an earlier turn, where it
-        opens `within` the context that turn was opened in (`_beside`). It is pinned here all
-        the same. With no `api_request_id` there is no link, and the span states the turn id
-        Hermes gave it instead, so a reader can still find its turn. With no `tool_call_id`
-        there is no call id and no alias."""
+        opens on the carriers `within` (`_beside`). It is pinned here all the same. With no
+        `api_request_id` there is no link, and the span states the turn id Hermes gave it
+        instead, so a reader can still find its turn. With no `tool_call_id` there is no call
+        id and no alias."""
         ctx = self._ctx
         assert ctx is not None
         name, call_id, asked_by = event.tool_name, event.tool_call_id, event.api_request_id
@@ -364,7 +364,7 @@ class FrameEffects:
                 describe=describe,
             )
 
-        handle = opened() if within is None else within.copy().run(opened)
+        handle = _opened_on(within, opened)
         if args is not None:
             handle.record_input(_shaped_args(args, budget))
         slot = ctx.slot(frame)
@@ -484,25 +484,41 @@ def _ensure_lane(record: TurnRecord) -> None:
     _LANE.set(record)
 
 
-def _beside(record: TurnRecord) -> Context | None:
-    """Where a unit of `record` opens when what is ambient here is another turn's bare pin: the
-    context that turn was opened in (`TurnRecord.birth`). None when anything else is ambient,
-    and the unit opens here.
+def _beside(record: TurnRecord) -> RestorePoint:
+    """The carriers a unit of `record` opens on (`_opened_on`) when the unit current here is
+    another turn's own: where that turn opened (`TurnRecord.beneath`), with the scope the host
+    has moved to since, if it has. Empty when anything else is current, and the unit opens here.
 
     A turn's pin stands on its loop task between its frames and after its last one, and Hermes
     sends no end for a turn it stopped. Nothing Hermes sends says whether that turn is over: an
     embedder's `step_callback` runs an agent on the loop thread between two model calls of a
-    live turn. So another turn's work is never put under that pin and never closes that turn.
-    It opens where that turn was opened, under the embedder's span that wraps both or as a
-    root. The ambient span is the pinned turn's own exactly when nothing was opened above the
-    pin here; a tool frame, a model call or a span of the embedder's is not the bare pin."""
+    live turn. So another turn's work is never put under that turn and never closes it. It
+    opens under the span the embedder has open here, or where that turn itself opened: under a
+    span that wraps both, or as a root. The core decides which (`restore_point_beside`); it
+    asks whether the ambient UNIT is that turn's, since a span the embedder ended or opened
+    since moves the scope and leaves the unit. A tool frame of that turn pinned here is another
+    unit, so an agent a tool runs and waits for still opens under the tool."""
     lane = _LANE.get()
     if lane is None or lane is record:
-        return None
+        return ()
     handle = lane.handle
-    if handle is None or handle.degraded or latch_ambient().span_context != handle.draft.context:
-        return None
-    return lane.birth
+    if handle is None or handle.degraded:
+        return ()
+    return restore_point_beside(handle.draft.context, lane.beneath)
+
+
+def _opened_on(carriers: RestorePoint, opened: Callable[[], _T]) -> _T:
+    """Run `opened` here, or with `carriers` written onto a copy of this context, which leaves
+    the context Hermes called on as it is."""
+    if not carriers:
+        return opened()
+
+    def run() -> _T:
+        for var, value in carriers:
+            var.set(value)
+        return opened()
+
+    return copy_context().run(run)
 
 
 def _drop_lane(only: TurnRecord | None = None) -> None:

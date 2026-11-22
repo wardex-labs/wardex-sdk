@@ -25,7 +25,6 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Callable, Hashable, Iterable, Mapping
-from contextvars import Context, copy_context
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +37,7 @@ from .._assembly import (
     SpanIntent,
     UnitKey,
     UnitKind,
+    ambient_restore_point,
     report_once,
 )
 from .._assembly import record as ledger_record
@@ -76,6 +76,7 @@ from ._hermes_agent_frames import (
     _downstream_name,
     _drop_lane,
     _message_text,
+    _opened_on,
     _Out,
 )
 from ._hermes_agent_turns import (
@@ -97,6 +98,7 @@ from ._hermes_agent_turns import (
 from ._payload import _shaped_payload
 
 if TYPE_CHECKING:
+    from .._assembly import RestorePoint
     from .._diagnostics import AdapterStatus
 
 __all__ = ["HOLD_PREFIX", "PREFIX", "HermesAgentAdapter"]
@@ -519,9 +521,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         closed turn's pin is retired; a joined child, the live delegate_task unit, so nested
         under it; a background child, or an agent a tool started on a thread it left running,
         the tool's unit already closed, which the core refuses, so a root with
-        CORRELATION_CONFLICT. When the ambient is another turn's bare pin (a turn Hermes
+        CORRELATION_CONFLICT. When the unit current there is another turn's own (a turn Hermes
         stopped with no end, or a live turn whose `step_callback` runs this agent) the turn
-        opens where that turn was opened (`_beside`), and that turn is left as it is.
+        opens beside it (`_beside`), and that turn is left as it is.
 
         With synchronous hooks (`plugins.hook_callback_timeout: 0`) this runs on the loop
         thread itself, where the previous turn's pin still stands: `_drop_lane` takes it down
@@ -568,10 +570,10 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         return self._close(record, event, s, trigger)
 
     def _open_turn(
-        self, record: TurnRecord, platform: str | None, *, resumed: bool, within: Context | None
+        self, record: TurnRecord, platform: str | None, *, resumed: bool, within: RestorePoint
     ) -> None:
-        """Open the turn's unit here, or inside a copy of `within` (`_beside`). The context it
-        opened in is kept as the turn's birth, where a turn opened on its bare pin goes."""
+        """Open the turn's unit here, or on the carriers `within` (`_beside`). The carriers it
+        opened on are kept (`TurnRecord.beneath`): what later opens beside this turn goes there."""
         ctx = self._ctx
         assert ctx is not None
         tie = self._book.tie_for(record.session_id) if record.kind is TurnKind.CHILD else None
@@ -605,6 +607,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
 
         def opened() -> RunHandle:
             nonlocal shadowed  # the host's conversation is read where the unit opens
+            record.beneath = ambient_restore_point()
             conversation, shadowed = framework_conversation(
                 ctx, record.conversation, shadowed_counter="conversation_shadowed"
             )
@@ -617,8 +620,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
                 describe=describe,
             )
 
-        record.birth = copy_context() if within is None else within
-        record.handle = opened() if within is None else within.copy().run(opened)
+        record.handle = _opened_on(within, opened)
         _attach._EXPORT.start()
 
     def _close(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
@@ -635,7 +637,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         cause = s.cause or event.cause()
         rule = CLOSE_RULES[cause]
         self._book.retire(record, rule.next_state)
-        record.birth = None  # only a live turn's pin is opened beside; let its context go
+        record.beneath = ()  # only a live turn is opened beside; let its carriers go
         ended = isinstance(event, TurnEnd)
         with record.lock:
             record.blocked = ended and event.blocked()

@@ -97,8 +97,8 @@ All notable changes to this project are documented here. The format follows
   never ended, which is every failed turn, is closed with `session_aborted`
   and a `wardex.hermes_agent.close_cause`, at the session's next turn, when
   Hermes closes the session, or after 120 seconds with no event (300 after a
-  failed model call). A turn that starts on the thread of an open turn is a
-  trace of its own (or sits under the embedder's span that wraps both), and so
+  failed model call). A turn that starts on the thread of an open turn is
+  under the embedder's span that is open there, or a trace of its own, and so
   is an agent run from a `step_callback` or on a thread a tool left running;
   the open turn stays whole. When the open turn's last model call answered, a
   span the embedder opens on that thread before that turn closes, and the

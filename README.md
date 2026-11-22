@@ -343,10 +343,10 @@ closed first, exports that turn's model calls and not the turn span above
 them.
 
 wardex cannot tell a turn Hermes stopped from one still running, so a turn
-that starts on the same thread while another is open is a trace of its own,
-or sits under your span if one wraps both, and leaves the open turn as it
-is. That includes an agent your code runs from a `step_callback`: Hermes
-states no parent for it. When the open turn's last model call answered (a
+that starts on the same thread while another is open is never put under that
+turn. It sits under your own span if one is open there, and is a trace of
+its own if none is. The open turn is left as it is. That includes an agent
+your code runs from a `step_callback`: Hermes states no parent for it. When the open turn's last model call answered (a
 turn Hermes stopped, or a refusal), two things still land in its trace: a
 span your code opens on that thread before that turn closes, with all that
 runs inside it, a new turn included; and, when Hermes writes session titles,

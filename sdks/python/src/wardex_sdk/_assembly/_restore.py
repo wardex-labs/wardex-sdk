@@ -26,10 +26,13 @@ from contextvars import ContextVar
 from typing import Any
 
 from .. import _hub
+from .._types import SpanContext
 from ._units import _ambient_unit
 
+RestorePoint = tuple[tuple[ContextVar[Any], Any], ...]
 
-def ambient_restore_point() -> tuple[tuple[ContextVar[Any], Any], ...]:
+
+def ambient_restore_point() -> RestorePoint:
     """What `Unit.activate()` will overwrite on this task, as `(var, value)` pairs.
 
     Take it on the task that activates, before the activation; write it back only on that task,
@@ -39,3 +42,22 @@ def ambient_restore_point() -> tuple[tuple[ContextVar[Any], Any], ...]:
         (_hub._current_scope, _hub.get_current_scope()),
         (_ambient_unit, _ambient_unit.get()),
     )
+
+
+def restore_point_beside(span: SpanContext, was: RestorePoint) -> RestorePoint:
+    """The pairs to write onto a COPY of this task's Context so that what opens there is not
+    inside the live unit whose span is `span`. Empty unless that unit is the ambient unit here.
+
+    For a unit that stays ambient on its task with no word on whether its work is over: what the
+    task opens next for other work must not be put inside it. `was` is the restore point taken
+    where that unit opened. Its ambient-unit entry always goes back, because an open hangs off
+    the ambient unit before it reads the scope. Its scope goes back only while the scope here is
+    still the unit's own span. A block the host opened on the unit, or ended since the unit
+    opened, moved this task's scope, and that is where the host put the next work.
+    """
+    entry = _ambient_unit.get()
+    if entry is None or not entry.unit.is_live or entry.unit.context != span or len(was) != 2:
+        return ()
+    if _hub.get_current_scope().active_span_context != span:
+        return was[1:]
+    return was

@@ -43,7 +43,6 @@ import threading
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Callable
-from contextvars import Context
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, TypeVar
@@ -52,7 +51,7 @@ from .._assembly import Limitation
 from .._enums import StatusCode
 
 if TYPE_CHECKING:
-    from .._assembly import SpanDraft
+    from .._assembly import RestorePoint, SpanDraft
     from ._context import RunHandle
 
 __all__ = [
@@ -534,7 +533,7 @@ class TurnRecord:
     conversation: str = ""
     lock: threading.RLock = field(default_factory=threading.RLock)
     handle: RunHandle | None = None  # published by the effect that opened the unit
-    birth: Context | None = None  # where the unit opened; a turn opened on its bare pin goes
+    beneath: RestorePoint = ()  # the carriers where the unit opened: `_beside` opens there
     frames: dict[tuple[FrameKind, str], FrameRecord] = field(default_factory=dict)
     #: api_request_id -> (name, key) of each tool call that model call asked for, in its order,
     #: and the keys of the tool frames that named that call. A key is None for a bridge call.

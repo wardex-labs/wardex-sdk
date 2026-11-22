@@ -16,6 +16,7 @@ loop does (`agent/conversation_loop.py`), and a new `AIAgent` on the same thread
 
 from __future__ import annotations
 
+import contextlib
 import time
 from pathlib import Path
 
@@ -329,6 +330,68 @@ def test_an_embedder_span_around_two_turns_holds_the_turn_after_one_hermes_never
     assert parent_of(nodes, _turn_span(nodes, stopped)) is batch
     span = _turn_span(nodes, second)
     assert parent_of(nodes, span) is batch
+    assert extras(span)["close_cause"] == "end_event"
+
+
+def _stopped_then(h: FakeHermes, around_first, around_second) -> tuple[Turn, Turn]:
+    """A turn Hermes stops with no end, then another session's turn on the same loop thread,
+    each inside the block the embedder opens for it (`None` for no block)."""
+
+    def run() -> tuple[Turn, Turn]:
+        with around_first() if around_first else contextlib.nullcontext():
+            stopped = h.turn()
+            gave_up(h, stopped)
+        with around_second() if around_second else contextlib.nullcontext():
+            second = h.turn()
+            h.model_call(second)
+            h.end(second)
+        h.finalize(stopped.session_id, reason="session_close")
+        return stopped, second
+
+    return on_loop(run)
+
+
+def test_an_embedder_span_around_each_turn_holds_its_own_turn_after_one_hermes_never_ended():
+    """The embedder's first block ends and takes the scope with it, but the stopped turn is
+    still the ambient unit on the thread. The next turn goes under the embedder's second span,
+    not into the stopped turn."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        stopped, second = _stopped_then(
+            h, lambda: wardex_sdk.span("lab_job_1"), lambda: wardex_sdk.span("lab_job_2")
+        )
+    nodes = exported(transport)
+    assert parent_of(nodes, _turn_span(nodes, stopped)) is one(nodes, "lab_job_1")
+    span = _turn_span(nodes, second)
+    assert parent_of(nodes, span) is one(nodes, "lab_job_2")
+    assert outline((span,)).splitlines()[0] == f"{TURN} | contextvar 1.0 | OK"
+    assert [n.name for n in nodes if parent_of(nodes, n) is span] == ["chat lab-model"]
+
+
+def test_a_turn_after_the_embedder_span_that_held_a_stopped_turn_is_its_own_root():
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        stopped, second = _stopped_then(h, lambda: wardex_sdk.span("lab_job_1"), None)
+    nodes = exported(transport)
+    span = _turn_span(nodes, second)
+    assert outline((span,)).splitlines()[0] == f"{TURN} | trace_root 1.0 | OK"
+    assert span.trace_id != _turn_span(nodes, stopped).trace_id
+
+
+def test_a_turn_in_the_embedders_conversation_after_a_stopped_turn_keeps_that_conversation():
+    """The embedder's block opened on the stopped turn's pin, so the core put it under that
+    turn. The next turn is under the embedder's block all the same, and carries its id."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        stopped, second = _stopped_then(
+            h, None, lambda: wardex_sdk.conversation("lab_chat", id="lab-conversation")
+        )
+    nodes = exported(transport)
+    block = one(nodes, "lab_chat")
+    assert parent_of(nodes, block) is _turn_span(nodes, stopped)
+    span = _turn_span(nodes, second)
+    assert parent_of(nodes, span) is block
+    assert span.attributes["gen_ai.conversation.id"] == "lab-conversation"
     assert extras(span)["close_cause"] == "end_event"
 
 

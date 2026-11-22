@@ -125,7 +125,7 @@ from ._parentage import (
 )
 from ._patchset import PatchSet
 from ._policy import Prefilter, capture_mode_of, should_capture
-from ._restore import ambient_restore_point
+from ._restore import RestorePoint, ambient_restore_point, restore_point_beside
 from ._snapshot import SnapshotDraft
 from ._units import (
     PinToken,
@@ -172,6 +172,7 @@ __all__ = [
     "PatchSet",
     "PinToken",
     "Prefilter",
+    "RestorePoint",
     "SnapshotDraft",
     "SnapshotType",
     "SpanDraft",
@@ -223,6 +224,7 @@ __all__ = [
     "report_worker_pass_raised",
     "resolve_observed",
     "resolve_parentage",
+    "restore_point_beside",
     "set_span_resolver",
     "set_tool_call_resolver",
     "should_capture",
