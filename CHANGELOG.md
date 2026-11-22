@@ -92,7 +92,9 @@ All notable changes to this project are documented here. The format follows
   `invoke_agent hermes`, each model call with every HTTP attempt under it
   (failed attempts included), each tool call linked to the model call that
   asked for it, and each subagent turn under the `delegate_task` call that
-  started it. A turn Hermes never ended is closed with `session_aborted` and
+  started it. The turn span carries the user's message as its input and
+  Hermes's final response as its output, capped and masked like tool payloads.
+  A turn Hermes never ended is closed with `session_aborted` and
   `wardex.hermes_agent.close_cause`; the session-title call, a tool call
   Hermes never ran and model calls made outside the process are marked
   (`possible_duplicate_chat`, `tool_call_not_dispatched`,

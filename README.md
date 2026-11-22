@@ -301,8 +301,11 @@ The plugin's `plugin.yaml` lists the hook names in
 then one trace: `invoke_agent hermes`, a `chat` span per model call with every
 HTTP attempt under it (the failed ones too), an `execute_tool` span per tool
 call linked to the model call that asked for it, and a subagent's turn under
-the `delegate_task` call that started it. wardex imports and patches nothing
-of Hermes. Its hooks return nothing, and each middleware call hands Hermes
+the `delegate_task` call that started it. The turn span's input is the
+user's message and its output is Hermes's final response, through the same
+capped, masked payload path as a tool's arguments and result; an interrupted
+turn, or one whose retries ran out, has no output. wardex imports and patches
+nothing of Hermes. Its hooks return nothing, and each middleware call hands Hermes
 back its own result or its own exception.
 
 A turn's status is what Hermes said: `OK` when Hermes reported the turn
