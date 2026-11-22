@@ -297,61 +297,72 @@ from wardex_sdk.hermes_agent import register
 The plugin's `plugin.yaml` lists the hook names in
 `wardex_sdk.hermes_agent.HOOKS` and the middleware kinds in `MIDDLEWARE`.
 `register` calls `init()` from the environment (`WARDEX_API_KEY` or
-`WARDEX_ENDPOINT`) unless your process already called it. Each Hermes turn is
-then one trace: `invoke_agent hermes`, a `chat` span per model call with every
-HTTP attempt under it (the failed ones too), an `execute_tool` span per tool
-call linked to the model call that asked for it, and a subagent's turn under
-the `delegate_task` call that started it. The turn span's input is the
-user's message and its output is Hermes's final response, through the same
-capped, masked payload path as a tool's arguments and result; an interrupted
-or failed turn has no output. The message is recorded once the turn's first
-model call starts, or at an end that is not a block, so a prompt another
-plugin's `pre_llm_call` blocked is in no span. A turn starts only at Hermes's
-`pre_llm_call`. Hermes's own background memory review and a side question run
-without one: each of their model calls is a `chat` span with no turn above it
-(a root marked `parent_unresolved` on v0.23.3), carrying the
-`wardex.hermes_agent.turn_id` Hermes gave it. A tool Hermes runs before a
-turn's first model call (a scripted prelude) is such a root too, with its
-turn's `wardex.hermes_agent.turn_id` and no link, since no model call asked
-for it. A tool that code in `execute_code` calls sits under that
-`execute_code` span with no call id and status unset: Hermes names it no id,
-so its report cannot be matched to it. An auxiliary call Hermes makes
-outside any turn (an MCP server's sampling request, a title call after its
-turn ended) names no turn, so its HTTP attempt is a root marked
-`parent_unresolved`. A turn's `gen_ai.conversation.id` is the conversation
-Hermes states: a subagent's turns carry their parent's, and a session Hermes
-compressed keeps the one it had. Hermes states it only on tool events, so a
-turn takes it from an earlier event of its session and is otherwise opened
-with the session id. The two differ in one case known on v0.23.3: the
-first turn of a session resumed after another process compressed it.
-wardex imports and patches nothing of Hermes. Its hooks return nothing, and
-each middleware call hands Hermes back its own result or its own exception.
+`WARDEX_ENDPOINT`) unless your process already called it. wardex imports and
+patches nothing of Hermes. Its hooks return nothing, and each middleware call
+hands Hermes back its own result or its own exception.
+
+Each Hermes turn is one trace:
+
+- `invoke_agent hermes` is the turn. Its input is the user's message and its
+  output is Hermes's final response, through the same capped, masked payload
+  path as a tool's arguments and result. The message is recorded when the
+  turn's first model call starts, so a prompt that another plugin's
+  `pre_llm_call` blocked is in no span.
+- A `chat` span per model call, with every HTTP attempt under it, the failed
+  ones too.
+- An `execute_tool` span per tool call, linked to the model call that asked
+  for it. A tool Hermes stopped waiting for (a timeout or a cancel) is
+  `ERROR`, with the message Hermes showed the model as its result.
+- A subagent's turn under the `delegate_task` call that started it, with the
+  parent's `gen_ai.conversation.id`. A subagent that outlives that call is a
+  trace of its own, linked to the turn that started it.
 
 A turn's status is what Hermes said: `OK` when Hermes reported the turn
-complete, `ERROR` when it reported the turn failed. A failed model call ends
-nothing, because Hermes retries it and may still answer. A turn Hermes never
-ended is closed unset with `session_aborted`, and
-`wardex.hermes_agent.close_cause` says why: the session's next turn began
-(`next_turn`), Hermes finalized that session (`finalize`), or nothing came
-for 120 seconds (`idle`). After a failed model call that wait is 300 seconds,
-long enough for Hermes's retry waits and its recovery ladder, and
-`wardex.hermes_agent.error_reason` keeps Hermes's reason. A provider
-Retry-After longer than that splits the turn: the second span has the same
-`turn_id`, `wardex.hermes_agent.generation` 1 and a `resumed_from` link to
-the first. In the gateway a failed turn is exported only by that wait, so a
-gateway stopped within 300 seconds of it loses the turn span, and the turn's
-model-call spans name a parent that never arrives. A tool Hermes stopped
-waiting for (its timeout or a cancel) closes `ERROR` at Hermes's report, with
-the message Hermes showed the model as its result. Three things are marked and
-not placed by a guess: the session-title call Hermes starts on its own thread
-(`possible_duplicate_chat` on the span built from Hermes's report,
-`parent_unresolved` on its wire span), a tool call the model asked for and
-Hermes never ran (`tool_call_not_dispatched` on the turn), and a turn whose
-model calls ran outside the process
-(`subprocess_model_calls_unobserved`). A subagent that outlives its
-`delegate_task` call is a trace of its own, linked to the turn that started
-it. The adapter is measured by the contract versions Hermes states in each
-payload (`hermes.observer.v1`, `hermes.middleware.v1`); on another version it
+complete, `ERROR` when it reported the turn failed. Hermes reports no end for
+a failed turn, and a failed model call does not end one, because Hermes
+retries it and may still answer. A turn Hermes never ended is closed unset
+with `session_aborted`, and `wardex.hermes_agent.close_cause` says why:
+
+- `next_turn`: the session's next turn began.
+- `finalize`: Hermes closed that session.
+- `idle`: no event of the turn came for 120 seconds. After a failed model
+  call the wait is 300 seconds, long enough for Hermes's retry waits and its
+  recovery ladder, and `wardex.hermes_agent.error_reason` keeps Hermes's
+  reason.
+
+Two consequences of that wait: a provider `Retry-After` longer than 300
+seconds splits the turn into two spans with one `turn_id`, the second with
+`wardex.hermes_agent.generation` 1 and a `resumed_from` link to the first;
+and a gateway that stops within 300 seconds of a failed turn, with no session
+closed first, exports that turn's model calls and not the turn span above
+them.
+
+What wardex cannot place is marked and never placed by a guess:
+
+- Hermes's background memory review and a side question run with no turn
+  start. Each of their model calls is a `chat` span with no turn above it,
+  marked `parent_unresolved`, carrying the `wardex.hermes_agent.turn_id`
+  Hermes gave it. A tool Hermes runs before a turn's first model call is such
+  a root too.
+- The session-title call, which Hermes starts on its own thread, and an
+  auxiliary call outside any turn (an MCP server's sampling request):
+  `parent_unresolved` on the HTTP attempt. The title call's span built from
+  Hermes's report carries `possible_duplicate_chat`.
+- A tool call the model asked for and Hermes never ran:
+  `tool_call_not_dispatched` on the turn.
+- A turn whose model calls ran outside the process:
+  `subprocess_model_calls_unobserved` on the turn.
+- A tool that code in `execute_code` calls sits under the `execute_code`
+  span with no call id and status unset. Hermes names it no id, so Hermes's
+  report cannot be matched to it.
+
+Hermes states a conversation id only on tool events, so a turn takes it from
+an earlier event of its session and otherwise opens with the session id. The
+two differ in one case known on v0.23.3: the first turn of a session resumed
+after another process compressed it.
+
+The adapter is measured by the contract versions Hermes states in each
+payload (`hermes.observer.v1`, `hermes.middleware.v1`). On another version it
 still records, and `wardex.diagnostics()` reports `measured=False`. While the
 plugin is not enabled, the adapter reads `unsupported` and its detail names
 the command that enables it.

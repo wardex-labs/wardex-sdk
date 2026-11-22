@@ -89,34 +89,21 @@ All notable changes to this project are documented here. The format follows
   enables one plugin whose `__init__.py` is
   `from wardex_sdk.hermes_agent import register`, sets `WARDEX_API_KEY` or
   `WARDEX_ENDPOINT`, and changes no code. Each turn is one trace:
-  `invoke_agent hermes`, each model call with every HTTP attempt under it
-  (failed attempts included), each tool call linked to the model call that
-  asked for it, and each subagent turn under the `delegate_task` call that
-  started it. The turn span carries the user's message as its input and
-  Hermes's final response as its output, capped and masked like tool payloads;
-  a prompt another plugin blocked is in no span. Only Hermes's `pre_llm_call`
-  starts a turn, so its background memory review and side questions are
-  `chat` spans with no turn above them. A tool run before a turn's first model
-  call, and a tool that code in `execute_code` calls, each still has its span,
-  though Hermes names no model call or no call id for it. An auxiliary call
-  outside any turn, such as an MCP server's sampling request, is marked
-  `parent_unresolved` and drops no event. A subagent's turns carry their
-  parent's conversation id, as Hermes states it, and a session Hermes
-  compressed keeps its conversation id. A failed model call
-  ends nothing, since Hermes may still recover. A turn Hermes never ended is closed with
-  `session_aborted` and `wardex.hermes_agent.close_cause` at the session's
-  next turn, at a finalize of that session, or after 120 seconds with no
-  event (300 after a failed call, with Hermes's reason in
-  `wardex.hermes_agent.error_reason`); a gateway stopped within that wait
-  after a failed turn loses the turn span. A tool Hermes stopped waiting for
-  closes `ERROR` at Hermes's report. The session-title call, a tool call
-  Hermes never ran and model calls made outside the process are marked
-  (`possible_duplicate_chat`, `tool_call_not_dispatched`,
-  `subprocess_model_calls_unobserved`). wardex imports and patches nothing of
-  Hermes, and Hermes gets its own results and exceptions back. Measured on
-  Hermes Agent v0.23.3 (`hermes.observer.v1`, `hermes.middleware.v1`).
-  `wardex.diagnostics()` reads `unsupported` with the enable command while
-  the plugin is off.
+  `invoke_agent hermes` with the user's message and Hermes's final response,
+  each model call with every HTTP attempt under it (failed attempts
+  included), each tool call linked to the model call that asked for it, and
+  each subagent turn under the `delegate_task` call that started it. A turn
+  that Hermes recovers after a provider outage stays one trace. A turn Hermes
+  never ended, which is every failed turn, is closed with `session_aborted`
+  and a `wardex.hermes_agent.close_cause`, at the session's next turn, when
+  Hermes closes the session, or after 120 seconds with no event (300 after a
+  failed model call). What wardex cannot place is marked, not guessed:
+  Hermes's background memory review, side questions, the session-title call,
+  a tool call Hermes never ran, and model calls made outside the process. A
+  prompt another plugin blocked is in no span. wardex imports and patches
+  nothing of Hermes, and Hermes gets its own results and exceptions back.
+  Measured on Hermes Agent v0.23.3 (`hermes.observer.v1`,
+  `hermes.middleware.v1`). The README's adapter section has the details.
 - **`tool_call_not_dispatched` is a new limitation marker.** It is on a run
   whose model asked for a tool call the framework never ran.
 - **`python -m wardex_sdk doctor` checks an install end to end.** It reads
