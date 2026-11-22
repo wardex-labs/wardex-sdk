@@ -30,6 +30,7 @@ from _hermes_fake import (
     Reply,
     ScriptedProvider,
     Usage,
+    conversation_of,
 )
 
 TOOL_RESULT = "<synthetic result>"
@@ -52,6 +53,7 @@ class Turn:
     title: _TitleThread | None = None
     message: object = QUESTION  # `user_message`: a string or a list of content parts
     block: str | None = None  # another plugin's `pre_llm_call` block message, when one came
+    conversation: str | None = None  # the id a compression rotation kept (`conversation_of`)
 
 
 @dataclass(frozen=True)
@@ -661,7 +663,7 @@ class FakeHermes:
             "api_request_id": call.api_request_id,
             "tool_call_id": tcid,
             "tool_name": name,
-            "conversation_id": turn.session_id,
+            "conversation_id": conversation_of(turn),
         }
 
     def _attempt(self, turn: Turn, answer: Answer, worker: bool) -> int | None:

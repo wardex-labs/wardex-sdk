@@ -122,7 +122,14 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "tool_name": "read_file",
             "args": {"path": "x"},
         },
-        ToolEnter("s-1", "t-1", "s-1:api:1", "call_1", "read_file", {"path": "x"}),
+        ToolEnter(
+            "read_file",
+            session_id="s-1",
+            turn_id="t-1",
+            api_request_id="s-1:api:1",
+            tool_call_id="call_1",
+            args={"path": "x"},
+        ),
     ),
     "post_tool_call": (
         {

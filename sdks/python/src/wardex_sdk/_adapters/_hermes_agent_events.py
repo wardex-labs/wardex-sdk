@@ -358,22 +358,28 @@ class CallError:
 
 @dataclass(frozen=True, slots=True)
 class ToolEnter:
-    """`tool_execution` frame entry. `args` is Hermes's object: read, never changed."""
+    """`tool_execution` frame entry. `args` is Hermes's object: read, never changed.
+
+    Only the name is required. Hermes sends an id it does not have as "" (`model_tools.py::
+    _CallIds.hook_kwargs`): no `api_request_id` for a tool that runs before the turn's first
+    model call (a scripted prelude), neither call id for a tool that code running in
+    `execute_code` calls, and no id at all from the MCP server of codex app-server mode.
+    """
 
     FRAME_KEY: ClassVar[str] = "tool_call_id"
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("session_id", "session_id", _text),
-        Field("turn_id", "turn_id", _text),
-        Field("api_request_id", "api_request_id", _text),
-        Field("tool_call_id", "tool_call_id", _text),
         Field("tool_name", "tool_name", _text),
+        Field("session_id", "session_id", _text, required=False),
+        Field("turn_id", "turn_id", _text, required=False),
+        Field("api_request_id", "api_request_id", _text, required=False),
+        Field("tool_call_id", "tool_call_id", _text, required=False),
         Field("args", "args", _raw, required=False),
     )
-    session_id: str
-    turn_id: str
-    api_request_id: str
-    tool_call_id: str
     tool_name: str
+    session_id: str | None = None
+    turn_id: str | None = None
+    api_request_id: str | None = None  # the model call that asked for it: a link, nothing else
+    tool_call_id: str | None = None  # what its post_tool_call is matched by
     args: object = None  # for record_input only
 
     def trigger(self) -> Trigger:
@@ -388,19 +394,21 @@ class ToolEnter:
 
 @dataclass(frozen=True, slots=True)
 class ToolReport:
-    """`post_tool_call`. Hermes returns a tool failure as a result, so `status` carries it."""
+    """`post_tool_call`. Hermes returns a tool failure as a result, so `status` carries it. Its
+    ids are `ToolEnter`'s, "" when Hermes has none; a report with no `tool_call_id` names no
+    frame."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("session_id", "session_id", _text),
-        Field("turn_id", "turn_id", _text),
-        Field("tool_call_id", "tool_call_id", _text),
+        Field("session_id", "session_id", _text, required=False),
+        Field("turn_id", "turn_id", _text, required=False),
+        Field("tool_call_id", "tool_call_id", _text, required=False),
         Field("status", "status", _text, required=False),  # "ok" measured; others verbatim
         Field("error_type", "error_type", _text, required=False),
         Field("result", "result", _raw, required=False),
     )
-    session_id: str
-    turn_id: str
-    tool_call_id: str
+    session_id: str | None = None
+    turn_id: str | None = None
+    tool_call_id: str | None = None
     status: str | None = None
     error_type: str | None = None
     result: object = None  # for record_output only

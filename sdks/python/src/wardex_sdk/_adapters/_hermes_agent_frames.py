@@ -207,12 +207,17 @@ class FrameEffects:
 
     def _frame(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
         """Open, describe and pin one frame unit of a live turn on the calling task. The turn's
-        first model-call frame is where its held input leaves the host, so it is recorded here."""
+        first model-call frame is where its held input leaves the host, so it is recorded here.
+
+        A tool frame Hermes named no `tool_call_id` for (one that code in `execute_code` called)
+        is kept by no turn: no report can name it, so it closes at its exit."""
         if isinstance(event, ToolEnter):
-            frame = FrameRecord(FrameKind.TOOL, event.tool_call_id)
-            with record.lock:
-                record.dispatched.add(event.tool_call_id)
-                record.frames[(FrameKind.TOOL, event.tool_call_id)] = frame
+            call_id = event.tool_call_id
+            frame = FrameRecord(FrameKind.TOOL, call_id or "")
+            if call_id:
+                with record.lock:
+                    record.dispatched.add(call_id)
+                    record.frames[(FrameKind.TOOL, call_id)] = frame
             self._open_tool(frame, event)
             return frame
         _ensure_lane(record)
@@ -240,7 +245,7 @@ class FrameEffects:
         turn is made for it. A tool here ran in Hermes's MCP child process for codex app-server
         mode, after a register mid-turn, or after a presumed close."""
         if isinstance(event, ToolEnter):
-            frame = FrameRecord(FrameKind.TOOL, event.tool_call_id, orphan=True)
+            frame = FrameRecord(FrameKind.TOOL, event.tool_call_id or "", orphan=True)
             self._open_tool(frame, event)
             return frame
         self._ctx.count("turn_start_missed")  # type: ignore[union-attr]
@@ -289,20 +294,30 @@ class FrameEffects:
     def _open_tool(self, frame: FrameRecord, event: ToolEnter) -> None:
         """`execute_tool <name>`: CALL, EXECUTE_TOOL, NESTED, linked TRIGGERED_BY the model call
         that asked for it, whether it ran alone, in a round or in a parallel batch. Its input
-        goes through the capped payload path only, and its slot is what the MCP seam reads."""
+        goes through the capped payload path only, and its slot is what the MCP seam reads.
+
+        Placed by context alone, never by an id: a tool that code in `execute_code` called runs
+        on a thread Hermes starts with the code tool's context, so it nests under that tool; a
+        prelude tool runs before the turn is ambient on any thread, so it is a root the core
+        marks PARENT_UNRESOLVED. With no `api_request_id` there is no link, and the span states
+        the turn id Hermes gave it instead, so a reader can still find its turn. With no
+        `tool_call_id` there is no call id and no alias."""
         ctx = self._ctx
         assert ctx is not None
-        name = event.tool_name
+        name, call_id, asked_by = event.tool_name, event.tool_call_id, event.api_request_id
+        turn_id = None if asked_by else event.turn_id
         args = event.args
         budget = ctx.record_budget
         expected = not frame.orphan
 
         def describe(h: RunHandle) -> None:
-            h.draft.set_tool(ToolAttributes(name=name, call_id=event.tool_call_id))
-            h.link(
-                LinkReason.TRIGGERED_BY, UnitKey(CALL_NS, event.api_request_id), expected=expected
-            )
-            h.alias(UnitKey(TOOL_NS, event.tool_call_id), remember=True)
+            h.draft.set_tool(ToolAttributes(name=name, call_id=call_id))
+            if asked_by:
+                h.link(LinkReason.TRIGGERED_BY, UnitKey(CALL_NS, asked_by), expected=expected)
+            elif turn_id:
+                h.draft.set_extra(PREFIX + "turn_id", turn_id)
+            if call_id:
+                h.alias(UnitKey(TOOL_NS, call_id), remember=True)
 
         handle = ctx.open_run(
             UnitKind.CALL,
@@ -350,10 +365,10 @@ class FrameEffects:
         that comes first. A report that says Hermes abandoned the tool's worker (a timeout or a
         cancel, sent from the loop thread while the worker still runs) closes the frame at once,
         from this thread: the core retires the worker's pin from afar, and the worker's late
-        exit then does nothing. A report with no frame (a missing middleware, or a frame that
-        raised and closed) is counted."""
+        exit then does nothing. A report with no frame (a missing middleware, a frame that raised
+        and closed, or a report that names no `tool_call_id`) is counted."""
         if isinstance(event, ToolReport):
-            key = (FrameKind.TOOL, event.tool_call_id)
+            key = (FrameKind.TOOL, event.tool_call_id or "")  # "" is never a kept frame's key
         else:
             key = (FrameKind.MODEL_CALL, event.api_request_id)
         with record.lock:
@@ -369,8 +384,10 @@ class FrameEffects:
 
     def _finish(self, frame: FrameRecord) -> None:
         """Close a frame unit once, by whichever side won: a raise is ERROR with the downstream
-        type; an orphan, or a frame whose report never came, is UNSET; otherwise the report
-        decides, and an api_request_error is ERROR with the type Hermes stated."""
+        type; a frame no report can reach (an orphan, or a tool Hermes named no id for), or one
+        whose report never came, is UNSET, since a frame that returned is not Hermes's verdict;
+        otherwise the report decides, and an api_request_error is ERROR with the type Hermes
+        stated."""
         handle = frame.handle
         if handle is None:
             return

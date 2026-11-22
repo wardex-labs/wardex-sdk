@@ -382,7 +382,8 @@ class FrameState(Enum):
               the worker's late exit does nothing
     PINNED or REPORTED -> (frame raises) CLOSED, ERROR with the downstream exception's type
     AWAITING_REPORT -> (its turn closes first) closed by the core with CHILD_SPAN_UNCLOSED
-    An orphan frame goes PINNED -> CLOSED at frame exit, UNSET unless it raised.
+    A frame no report can reach (`reportable()` False) goes PINNED -> CLOSED at frame exit,
+    UNSET unless it raised.
     """
 
     PINNED = "pinned"
@@ -408,9 +409,9 @@ class FrameRecord:
     """
 
     kind: FrameKind
-    key: str
+    key: str  # "" when Hermes named no id for it
     handle: RunHandle | None = None  # published by the effect that opened the unit
-    orphan: bool = False  # no live turn owns it: closed at frame exit, never by a report
+    orphan: bool = False  # no live turn owns it
     token: object | None = None  # the frame ContextVar token, reset at exit on the same task
     state: FrameState = FrameState.PINNED
     error_type: str | None = None  # the downstream exception's type when the frame raised
@@ -424,7 +425,7 @@ class FrameRecord:
         with self.lock:
             if self.state is FrameState.CLOSED or self.state is FrameState.AWAITING_REPORT:
                 return False
-            if error_type is None and not self.orphan and self.state is FrameState.PINNED:
+            if error_type is None and self.reportable() and self.state is FrameState.PINNED:
                 self.state = FrameState.AWAITING_REPORT
                 return False
             self.error_type = error_type
@@ -439,7 +440,7 @@ class FrameRecord:
         second report, or one after the close, is False and changes nothing.
         """
         with self.lock:
-            if self.state is FrameState.PINNED and not self.orphan:
+            if self.state is FrameState.PINNED and self.reportable():
                 self.kept_report = report
                 self.state = FrameState.CLOSED if abandoned else FrameState.REPORTED
                 return abandoned
@@ -460,6 +461,11 @@ class FrameRecord:
 
     def pinned(self) -> bool:
         return self.state in _PINNED
+
+    def reportable(self) -> bool:
+        """A post hook can find it: a live turn keeps it under the id Hermes named. Otherwise
+        nothing will report on it, and its exit closes it."""
+        return not self.orphan and bool(self.key)
 
 
 # -- turns -------------------------------------------------------------------------------------

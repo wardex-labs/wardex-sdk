@@ -310,7 +310,12 @@ plugin's `pre_llm_call` blocked is in no span. A turn starts only at Hermes's
 `pre_llm_call`. Hermes's own background memory review and a side question run
 without one: each of their model calls is a `chat` span with no turn above it
 (a root marked `parent_unresolved` on v0.23.3), carrying the
-`wardex.hermes_agent.turn_id` Hermes gave it.
+`wardex.hermes_agent.turn_id` Hermes gave it. A tool Hermes runs before a
+turn's first model call (a scripted prelude) is such a root too, with its
+turn's `wardex.hermes_agent.turn_id` and no link, since no model call asked
+for it. A tool that code in `execute_code` calls sits under that
+`execute_code` span with no call id and status unset: Hermes names it no id,
+so its report cannot be matched to it.
 wardex imports and patches nothing of Hermes. Its hooks return nothing, and
 each middleware call hands Hermes back its own result or its own exception.
 

@@ -419,7 +419,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
 
     def _by_key(self, event: Event, trigger: Trigger) -> _Out:
         key = event.key()
-        if key is None:  # an auxiliary call outside any turn
+        if key is None:  # Hermes named no turn: an auxiliary call or a tool outside any turn
             return self._run(None, event, step(None, trigger), trigger)
         record = self._book.find(key)
         if record is None:

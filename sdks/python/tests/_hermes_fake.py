@@ -113,6 +113,16 @@ def narrow(callback: Callable[..., Any], payload: Mapping[str, Any]) -> dict[str
     return {k: v for k, v in payload.items() if k in params and params[k].kind in kinds}
 
 
+def conversation_of(turn: Any) -> str:
+    """The `conversation_id` Hermes states on a turn's tool events (`agent/prompt_cache_scope.py::
+    conversation_id`): the id a compression rotation kept, else a delegated child's parent's
+    (`tools/delegate_tool.py` stamps it at spawn), else the session id. Duck-typed on the scripted
+    `Turn`: `conversation`, `parent`, `session_id`."""
+    if turn.conversation:
+        return turn.conversation
+    return conversation_of(turn.parent) if turn.parent is not None else turn.session_id
+
+
 def middleware_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """`hermes_cli/middleware.py::middleware_payload`: both schema versions, unless already set."""
     out = dict(payload)

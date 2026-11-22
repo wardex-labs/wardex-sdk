@@ -96,8 +96,10 @@ All notable changes to this project are documented here. The format follows
   Hermes's final response as its output, capped and masked like tool payloads;
   a prompt another plugin blocked is in no span. Only Hermes's `pre_llm_call`
   starts a turn, so its background memory review and side questions are
-  `chat` spans with no turn above them. A failed model call ends nothing,
-  since Hermes may still recover. A turn Hermes never ended is closed with
+  `chat` spans with no turn above them. A tool run before a turn's first model
+  call, and a tool that code in `execute_code` calls, each still has its span,
+  though Hermes names no model call or no call id for it. A failed model call
+  ends nothing, since Hermes may still recover. A turn Hermes never ended is closed with
   `session_aborted` and `wardex.hermes_agent.close_cause` at the session's
   next turn, at a finalize of that session, or after 120 seconds with no
   event (300 after a failed call, with Hermes's reason in

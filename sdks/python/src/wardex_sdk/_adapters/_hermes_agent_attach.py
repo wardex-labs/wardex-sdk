@@ -147,10 +147,13 @@ def _frame_callback(row: ContractRow) -> Callable[..., Any]:
             return next_call()
         frame_id = payload.get(frame_key)
         active = _DELIVERING.get()
-        fid = (row.name, frame_id)
-        if isinstance(frame_id, str) and fid in active:
+        # Only an id Hermes named tells one frame from another. Two nested frames sent with ""
+        # (a tool code in `execute_code` called, which dispatches another through Hermes) are
+        # two calls, both delivered.
+        fid = (row.name, frame_id) if isinstance(frame_id, str) and frame_id else None
+        if fid in active:
             return next_call()
-        token = _DELIVERING.set(active | {fid})
+        token = _DELIVERING.set(active | {fid} if fid else active)
         once = _Once(next_call)
         try:
             adapter.on_frame(row, once, payload)

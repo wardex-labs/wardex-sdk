@@ -203,6 +203,8 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_HF, "PREFIX + 'aux_task'", "event.aux_task", HOST),
     (_HF, "PREFIX + 'api_request_id'", "request_id", HOST),
     (_HF, "PREFIX + 'turn_id'", "turn_id", HOST),
+    # a tool Hermes ran before the turn's first model call: no link, so it states its turn
+    (_HF, "PREFIX + 'turn_id'", "turn_id", HOST),
     (_HF, "PREFIX + 'api_mode'", "api_mode", HOST),
     (_HF, "PREFIX + 'tool_status'", "report.status", HOST),
     # -- the LangGraph adapter --
