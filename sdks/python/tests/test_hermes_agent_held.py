@@ -35,6 +35,7 @@ from _hermes_support import (
 )
 from wardex_sdk._adapters import _hermes_agent_attach as attach_module
 from wardex_sdk._adapters import _hermes_agent_turns as turns_module
+from wardex_sdk._adapters._context import AdapterContext
 from wardex_sdk._assembly import Limitation, counters
 
 WIRE = "HTTP POST /v1/chat/completions"
@@ -272,6 +273,29 @@ def test_an_auxiliary_call_whose_end_never_came_holds_its_turn_only_for_its_boun
         held = time.monotonic() - declared
     assert held >= 0.6, "the attempt held the turn past the quiet net"
     assert extras(one(exported(transport), TURN_SPAN))["close_cause"] == "idle"
+
+
+def test_a_declaration_made_after_its_turn_closed_is_withdrawn(monkeypatch):
+    """The turn closes after `pre_auxiliary_call` kept its attempt and before the hook-built span
+    is stored with it, so the close found no declaration to withdraw. Forced here by closing
+    the turn from inside the declaration. The declaration is withdrawn at once: a request with
+    no parent made afterwards is a trace root, not unresolved."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        turn = on_loop(h.turn)
+        declare = AdapterContext.expect_unreached_carriers
+
+        def then_close(self, key) -> None:
+            declare(self, key)
+            h.finalize(turn.session_id, reason="session_close")
+
+        monkeypatch.setattr(AdapterContext, "expect_unreached_carriers", then_close)
+        _declare_title(h, turn)  # off the loop thread: outside the turn's lane
+        monkeypatch.undo()
+        assert extras(one(exported(transport), TURN_SPAN))["close_cause"] == "finalize"
+        h.provider.post(Reply.OK)
+    wire = one(exported(transport), WIRE)
+    assert outline((wire,)) == f"{WIRE} | trace_root 1.0 | OK | provider_inferred"
 
 
 def test_a_declaration_with_no_live_turn_wakes_the_wardex_thread_to_expire_it(monkeypatch):

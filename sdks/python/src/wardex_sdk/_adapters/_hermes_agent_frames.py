@@ -160,7 +160,9 @@ class FrameEffects:
         on its loop thread) the call's wire span is already under the turn: keep the attempt
         and open nothing. Outside it (the turn-start title thread, built before any frame) open
         a hook-built `chat <model>` child of the turn, marked POSSIBLE_DUPLICATE_CHAT, and
-        declare the unreached carrier, so the call's own wire span is marked unresolved.
+        declare the unreached carrier, so the call's own wire span is marked unresolved. If the
+        turn closed or the call ended while the declaration was being made, `_close` and
+        `_aux_finish` found nothing to withdraw, so it is withdrawn here.
         """
         key = event.attempt()
         with record.lock:
@@ -187,6 +189,8 @@ class FrameEffects:
             attempt = record.aux.get(key)
             if attempt is not None:
                 record.aux[key] = replace(attempt, draft=draft)
+        if attempt is None:  # the turn closed or the call ended since: nothing else withdraws it
+            self._ctx.release_unreached_carriers(_aux_key(event))  # type: ignore[union-attr]
         return None
 
     def _aux_finish(self, record: TurnRecord, event: AuxEnd, s: Step, trigger: Trigger) -> _Out:
