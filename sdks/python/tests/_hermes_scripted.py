@@ -230,8 +230,12 @@ class FakeHermes:
         `api_request_id`, each raising and firing `api_request_error`; its recovery ladder then
         waits (`between(cycle)`) and runs the loop again, `cycles` times
         (`agent/turn_recovery_autorecover.py`). Hermes's defaults are 3 and 5; the recorded
-        fixture `failed_turn` ran 1 and 0. When every round fails, Hermes returns a failed
-        result and fires NO `on_session_end` (`agent/turn_recovery.py`)."""
+        fixture `failed_turn` ran 1 and 0. The first frame sends `attempts` (a stream, then its
+        non-streamed fallback); Hermes then turns streaming off for the route
+        (`chat_completion_helpers.py::_maybe_disable_streaming`), so each later frame sends the
+        last attempt alone, as a real Hermes did at defaults (19 requests in 18 frames). When
+        every round fails, Hermes returns a failed result and fires NO `on_session_end`
+        (`agent/turn_recovery.py`)."""
         call = None
         for cycle in range(cycles + 1):
             if cycle and between is not None:
@@ -239,7 +243,11 @@ class FakeHermes:
             for retry in range(retries):
                 again = call is not None
                 call = self.model_call(
-                    turn, attempts, again=again, retry_count=retry, max_retries=retries
+                    turn,
+                    attempts[-1:] if again else attempts,
+                    again=again,
+                    retry_count=retry,
+                    max_retries=retries,
                 )
         assert call is not None
         return call
@@ -254,11 +262,12 @@ class FakeHermes:
         tool_calls: Sequence[str] = (),
     ) -> Call:
         """The recovery ladder at Hermes's defaults: `cycles` rounds of `retries` failed frames,
-        a wait before each later round, then the same call answers on a new frame."""
+        a wait before each later round, then the same call answers on a new frame, unstreamed
+        since streaming is off for the route after the first failure."""
         self.fail(turn, retries=retries, cycles=cycles - 1, between=between)
         if between is not None:
             between(cycles)
-        return self.model_call(turn, tool_calls=tool_calls, again=True)
+        return self.model_call(turn, (Reply.OK,), tool_calls=tool_calls, again=True)
 
     def interrupt(self, turn: Turn) -> Call:
         """A held stream cut by an interrupt: the frame raises `InterruptedError`, then

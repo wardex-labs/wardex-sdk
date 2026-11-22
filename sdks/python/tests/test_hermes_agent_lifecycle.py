@@ -54,6 +54,13 @@ FAILED_CALL = (
     "chat lab-model | unit_active 1.0 | ERROR(InternalServerError)",
     ((f"{WIRE} | contextvar 1.0 | ERROR(500)", ()),) * 2,
 )
+#: A later frame of a failed call: Hermes turned streaming off after the first frame's stream
+#: failed, so one attempt, and the answer that recovers it is unstreamed.
+FAILED_AGAIN = (FAILED_CALL[0], FAILED_CALL[1][:1])
+PLAIN_CHAT = (
+    "chat lab-model | unit_active 1.0 | OK",
+    ((f"{WIRE} | contextvar 1.0 | OK | provider_inferred", ()),),
+)
 UNBOUND_LINE = "carries no wardex context"
 
 
@@ -284,7 +291,7 @@ def test_a_turn_that_recovers_on_hermes_recovery_ladder_stays_one_turn():
 
         on_loop(run)
     nodes = exported(transport)
-    assert outline(nodes) == render((TURN, (FAILED_CALL, FAILED_CALL, FAILED_CALL, CHAT)))
+    assert outline(nodes) == render((TURN, (FAILED_CALL, FAILED_AGAIN, FAILED_AGAIN, PLAIN_CHAT)))
     (turn,) = _roots(nodes)
     assert extras(turn)["close_cause"] == "end_event"
     assert "error_reason" not in extras(turn), "the last event was not an error"
@@ -313,7 +320,7 @@ def test_a_turn_closed_by_the_idle_net_during_a_wait_resumes_in_a_linked_span(mo
         turn = on_loop(run)
     assert counters.get("assembly._units.pin_stale") == 0
     nodes = exported(transport)
-    assert outline(nodes) == render((ABORTED, (FAILED_CALL,)), (TURN, (CHAT,)))
+    assert outline(nodes) == render((ABORTED, (FAILED_CALL,)), (TURN, (PLAIN_CHAT,)))
     first = next(n for n in _roots(nodes) if n.limitations)
     resumed = next(n for n in _roots(nodes) if not n.limitations)
     assert extras(first)["close_cause"] == "idle"

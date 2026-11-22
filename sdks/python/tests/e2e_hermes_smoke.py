@@ -95,8 +95,10 @@ def _calls(tag: str, *calls: tuple[str, dict[str, Any]], **extra: Any) -> dict[s
     }
 
 
-def _error(tag: str, status: int) -> dict[str, Any]:
-    return {"kind": "error", "tag": tag, "status": status, "headers": {"retry-after": "0"}}
+def _error(tag: str, status: int, retry_after: str = "0") -> dict[str, Any]:
+    """An error reply. Hermes reads "0" as no Retry-After at all and backs off on its own
+    schedule; a positive value is the wait it honours (`agent/retry_utils.py`)."""
+    return {"kind": "error", "tag": tag, "status": status, "headers": {"retry-after": retry_after}}
 
 
 def _rule(responses: list[dict[str, Any]], repeat: bool = False, **match: Any) -> dict[str, Any]:
@@ -131,6 +133,9 @@ class Scenario:
 
     `tags` is the sorted list of reply tags the model server must have sent (Hermes ran to the
     end), `exit` the runner's exit code per mode (0 completed, 1 failed, 130 interrupted).
+    `nets` shortens wardex module constants (`"<module>.<NAME>": seconds`) in the Hermes
+    process, from this script's own witness plugin, so a net that waits minutes can be watched
+    before the process ends; the adapter reads no setting for them.
     """
 
     surface: str
@@ -145,6 +150,7 @@ class Scenario:
     env: dict[str, str] = field(default_factory=dict)
     interrupt_after: str | None = None
     fixture: bool = True
+    nets: dict[str, float] = field(default_factory=dict)
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -313,14 +319,50 @@ SCENARIOS: dict[str, Scenario] = {
         ("answer", "fail-503"),
         modes=("library", "cli"),
     ),
+    # Hermes's defaults: three frames a round, five more rounds on the recovery ladder, then
+    # the turn fails with no end event. The first frame sends a stream and its non-streamed
+    # fallback, and Hermes then turns streaming off: 19 requests in 18 frames. A short
+    # Retry-After keeps every wait under a second.
     "failed_turn": Scenario(
         "Turn",
         "[smoke:failed_turn] Say hello.",
-        [_rule([_error("fail-500", 500)], repeat=True)],
-        ("fail-500", "fail-500"),
+        [_rule([_error("fail-500", 500, "0.1")], repeat=True)],
+        ("fail-500",) * 19,
         exit={"library": 1, "cli": 2},
         modes=("library", "cli"),
-        config={"agent": {"api_max_retries": 1, "auto_recovery_cycles": 0}},
+        nets={
+            "_hermes_agent_turns.IDLE_AFTER_ERROR_S": 3.0,
+            "_hermes_agent_attach.IDLE_SWEEP_S": 0.2,
+        },
+    ),
+    # One round of three failed frames (four requests, as in `failed_turn`), a wait on the
+    # recovery ladder, then the next round's first frame answers.
+    "recovery_ladder": Scenario(
+        "Turn",
+        "[smoke:recovery_ladder] Say hello.",
+        [
+            _rule(
+                [*[_error("fail-500", 500, "0.1")] * 4, _text("answer", "Hello after the outage.")],
+                **_FIRST,
+            )
+        ],
+        ("answer", *("fail-500",) * 4),
+        modes=("library", "cli"),
+        fixture=False,
+    ),
+    # Hermes's background memory review after the turn, on the first turn instead of the tenth.
+    "review_fork": Scenario(
+        "Turn",
+        "[smoke:review_fork] Say hello.",
+        [
+            _rule(
+                [_text("answer", "Hello from the smoke provider.")],
+                last_user_contains="[smoke:review_fork]",
+            )
+        ],
+        ("answer", "default"),
+        config={"memory": {"nudge_interval": 1}},
+        fixture=False,
     ),
     "interrupted": Scenario(
         "Interrupted turn; abandoned tool worker",
@@ -541,6 +583,8 @@ ROWS: tuple[Row, ...] = (
         ),
     ),
     Row(
+        # Hermes sends no end for the failed turn: the quiet net closes it (shortened here,
+        # `Scenario.nets`), with Hermes's reason from the last api_request_error.
         "Turn",
         "failed_turn",
         (
@@ -551,20 +595,82 @@ ROWS: tuple[Row, ...] = (
                 status="UNSET",
                 markers=("session_aborted",),
                 attrs={
-                    A + "close_cause": "retries_spent",
+                    A + "close_cause": "idle",
                     A + "error_reason": "server_error",
                     INPUT: "[smoke:failed_turn] Say hello.",
                 },
                 absent=(OUTPUT,),
             ),
         ),
+        mode="library",
+    ),
+    Row(
+        # In the gateway too: its shutdown finalizes only agents still running, so the net is
+        # what exports a failed turn there, and a gateway stopped sooner loses the turn span.
+        "Turn",
+        "failed_turn",
+        (
+            Traces(1),
+            Span(
+                TURN,
+                parent="",
+                status="UNSET",
+                markers=("session_aborted",),
+                attrs={A + "close_cause": "idle", A + "error_reason": "server_error"},
+                absent=(OUTPUT,),
+            ),
+        ),
+        mode="cli",
     ),
     Row(
         "Model call attempt, retries included",
         "failed_turn",
         (
             Span(CHAT, parent=TURN, source=UNIT, confidence=1.0, status="ERROR"),
-            Count("HTTP POST /v1/chat/completions", 2, parent=CHAT),
+            Count(CHAT, 18, parent=TURN),
+            Count("HTTP POST /v1/chat/completions", 19, parent=CHAT),
+        ),
+    ),
+    Row(
+        # The recovery ladder: three failed frames, a wait, then the same call answers. One
+        # turn, completed.
+        "Turn",
+        "recovery_ladder",
+        (
+            Traces(1),
+            Span(
+                TURN,
+                parent="",
+                status="OK",
+                no_markers=("session_aborted",),
+                attrs={
+                    A + "close_cause": "end_event",
+                    INPUT: "[smoke:recovery_ladder] Say hello.",
+                    OUTPUT: "Hello after the outage.",
+                },
+                absent=(A + "error_reason",),
+            ),
+            Count(CHAT, 4, parent=TURN),
+            Span(CHAT, nth=3, parent=TURN, status="OK"),
+        ),
+    ),
+    Row(
+        # Hermes's background memory review: a fork under the user's session id that sends no
+        # pre_llm_call and no end. Its call is a chat span of its own, never a second turn.
+        "Turn",
+        "review_fork",
+        (
+            Traces(2),
+            Count(TURN, 1),
+            Span(TURN, parent="", status="OK", attrs={A + "close_cause": "end_event"}),
+            Span(
+                CHAT,
+                parent="",
+                source="unresolved",
+                confidence=0.0,
+                status="UNSET",
+                markers=("parent_unresolved",),
+            ),
         ),
     ),
     Row(
@@ -1408,13 +1514,17 @@ def register(ctx):
 #: When not recording, the schema versions Hermes states are read by this plugin: one hook and
 #: one request middleware, neither of them in the adapter's set, both returning None.
 WITNESS = r"""
-import json, os
+import importlib, json, os
 def _note(**kwargs):
     seen = {k: kwargs.get(k) for k in ("telemetry_schema_version", "middleware_schema_version")
             if kwargs.get(k)}
     with open(os.environ["WARDEX_SMOKE_SCHEMAS"], "a", encoding="utf-8") as fh:
         fh.write(json.dumps(seen) + "\n")
 def register(ctx):
+    # `Scenario.nets`: loaded after wardex, so its modules are imported; read at call time.
+    for name, value in json.loads(os.environ.get("WARDEX_SMOKE_NETS") or "{}").items():
+        module, constant = name.rsplit(".", 1)
+        setattr(importlib.import_module("wardex_sdk._adapters." + module), constant, value)
     ctx.register_hook("on_session_start", _note)
     ctx.register_middleware("llm_request", _note)
 """
@@ -1910,6 +2020,7 @@ def run(
             "WARDEX_SERVICE_NAME": f"hermes-smoke-{name}",
             "WARDEX_SMOKE_RECORD": str(out / "record.jsonl"),
             "WARDEX_SMOKE_SCHEMAS": str(out / "schemas.jsonl"),
+            "WARDEX_SMOKE_NETS": json.dumps(sc.nets),
         },
     )
     seen: dict[str, Any] = {"mode": mode}
@@ -1933,7 +2044,7 @@ def run(
                 "truth": str(out / "truth.jsonl"),
                 "interrupt_after": sc.interrupt_after,
                 "timeout": 150,
-                "settle": 3.0,
+                "settle": 3.0 + max(sc.nets.values(), default=0.0),
                 "result": str(out / "result.json"),
             }
             (out / "spec.json").write_text(json.dumps(spec))
@@ -1969,6 +2080,9 @@ def run(
                 proc.kill()
                 seen["exit"] = f"timeout ({proc.wait()})"
         if mode == "cli":
+            # The turn ran in the gateway, which outlives `hermes -z`: give a shortened net
+            # its time there before the stop ends the process.
+            time.sleep(max(sc.nets.values(), default=0.0) * 2)
             subprocess.run(
                 hermes.cli("gateway", "stop"),
                 cwd=tmp / "sandbox",

@@ -173,19 +173,21 @@ def test_a_provider_that_never_recovers_gives_one_turn_holding_every_frame_of_th
     monkeypatch,
 ):
     """Hermes's defaults: three frames per round, five more rounds on its recovery ladder, all
-    under one `api_request_id`. No frame's error ends the turn; the quiet net does, once."""
+    under one `api_request_id`; the first frame's stream and its fallback, then one attempt a
+    frame. No frame's error ends the turn; the quiet net does, once."""
     _quiet_net(monkeypatch)
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
-        on_loop(lambda: h.fail(h.turn(), (Reply.SERVER_ERROR,), retries=3, cycles=5))
+        on_loop(lambda: h.fail(h.turn(), retries=3, cycles=5))
         _closed_by_the_net(transport)
     nodes = exported(transport)
-    failed = (
-        "chat lab-model | unit_active 1.0 | ERROR(InternalServerError)",
-        ((f"{WIRE} | contextvar 1.0 | ERROR(500)", ()),),
-    )
+    chat = "chat lab-model | unit_active 1.0 | ERROR(InternalServerError)"
+    wire = (f"{WIRE} | contextvar 1.0 | ERROR(500)", ())
     assert outline(nodes) == render(
-        ("invoke_agent hermes | trace_root 1.0 | UNSET | session_aborted", (failed,) * 18)
+        (
+            "invoke_agent hermes | trace_root 1.0 | UNSET | session_aborted",
+            ((chat, (wire, wire)), *[(chat, (wire,))] * 17),
+        )
     )
     assert extras(one(nodes, "invoke_agent hermes"))["close_cause"] == "idle"
 
