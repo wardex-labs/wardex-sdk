@@ -394,7 +394,8 @@ MARKERS: Mapping[Limitation, MarkerText] = MappingProxyType(
         ),
         _L.TOOL_CALL_NOT_DISPATCHED: MarkerText(
             "The model asked for a tool call that the framework never ran: a tool name it does "
-            "not have, a call another plugin blocked, or an interrupt before the call started.",
+            "not have, a call the framework answered with an error without running it, or an "
+            "interrupt before the call started.",
             "The run has no tool span for that call; "
             "wardex.hermes_agent.undispatched_tool_calls names the tools asked for.",
             _NOTHING,

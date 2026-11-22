@@ -308,6 +308,9 @@ Each Hermes turn is one trace:
   path as a tool's arguments and result. The message is recorded when the
   turn's first model call starts, so a prompt that another plugin's
   `pre_llm_call` blocked is in no span.
+  It is the message as the user sent it: a plugin that rewrites the model
+  request (an `llm_request` middleware) changes what the `chat` spans show,
+  not this input or a tool's recorded result.
 - A `chat` span per model call, with every HTTP attempt under it, the failed
   ones too.
 - An `execute_tool` span per tool call, linked to the model call that asked
