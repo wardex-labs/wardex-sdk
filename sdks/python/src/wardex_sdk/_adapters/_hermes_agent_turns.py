@@ -614,17 +614,17 @@ class Observation:
 
     name: str
     marker: Limitation
-    applies: Callable[[TurnRecord, CloseCause], bool]
+    applies: Callable[[TurnRecord, CloseCause | None], bool]  # None: the core closes it
 
 
-def _completed_without_a_seen_call(r: TurnRecord, cause: CloseCause) -> bool:
+def _completed_without_a_seen_call(r: TurnRecord, cause: CloseCause | None) -> bool:
     # Hermes says the turn completed and no llm_execution frame ran: the codex app-server
     # runtime, whose model calls happen in its own subprocess. A turn another plugin blocked
     # made no model call at all, so nothing went unobserved.
     return cause is CloseCause.ENDED_COMPLETED and r.model_frames == 0 and not r.blocked
 
 
-def _asked_for_a_tool_call_that_never_ran(r: TurnRecord, cause: CloseCause) -> bool:
+def _asked_for_a_tool_call_that_never_ran(r: TurnRecord, cause: CloseCause | None) -> bool:
     # True for any cause: an invented name, a malformed batch and a call an interrupt cut before
     # dispatch all leave the same trace, an asked call no frame under its model call explains.
     return bool(r.undispatched())

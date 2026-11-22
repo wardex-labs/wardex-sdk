@@ -223,7 +223,10 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
 
         The tool-call follow is undone BEFORE the installed check: an install that raised at the
         route patch had registered it with the flag still down, and the registry's rollback is
-        this call."""
+        this call.
+
+        A turn still live is closed by the core with ADAPTER_UNINSTALLED, not by `_close`, so
+        what it asked for and Hermes never ran is stated here first."""
         ctx = self._ctx
         if ctx is not None:
             ctx.unfollow_tool_calls()
@@ -234,6 +237,12 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         ctx.release_unreached_carriers(None)
         with self._lock:
             self._unreached.clear()
+        for record in self._book.live():
+            with record.lock:
+                undispatched = record.undispatched()
+                notes = [o.marker for o in OBSERVATIONS if o.applies(record, None)]
+            if record.handle is not None:
+                self._state_observed(record.handle, undispatched, notes)
         self._book.clear()
         ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
         _attach._EXPORT.wake()
@@ -669,18 +678,26 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             d.set_extra(PREFIX + "exit_reason", event.exit_reason)
         if error_reason:
             d.set_extra(PREFIX + "error_reason", error_reason)
-        if undispatched:
-            d.set_extra(
-                PREFIX + "undispatched_tool_calls", ",".join(undispatched[:UNDISPATCHED_NAMES])
-            )
         if aux_tasks:
             d.set_extra(PREFIX + "aux_tasks", ",".join(aux_tasks))
         if rule.marker is not None:
             handle.note(rule.marker)
-        for marker in notes:
-            handle.note(marker)
+        self._state_observed(handle, undispatched, notes)
         handle.close(status=rule.status, error_type=rule.error_type)
         return rule.export
+
+    @staticmethod
+    def _state_observed(
+        handle: RunHandle, undispatched: list[str], notes: list[Limitation]
+    ) -> None:
+        """What `OBSERVATIONS` found on a turn about to close: each marker, and the names of
+        the tool calls its model asked for that no frame explains."""
+        if undispatched:
+            handle.draft.set_extra(
+                PREFIX + "undispatched_tool_calls", ",".join(undispatched[:UNDISPATCHED_NAMES])
+            )
+        for marker in notes:
+            handle.note(marker)
 
     def _forget(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
         """The core already closed the record's unit: retire it and call no verb on it. Its

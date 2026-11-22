@@ -322,8 +322,10 @@ Each Hermes turn is one trace:
 
 A turn's status is what Hermes said: `OK` when Hermes reported the turn
 complete, `ERROR` when it reported the turn failed. Hermes reports no end for
-a failed turn, and a failed model call does not end one, because Hermes
-retries it and may still answer. A turn Hermes never ended is closed unset
+a failed turn, nor for one it stops early (a refusal, an answer cut at the
+output limit, three invalid tool calls in a row), and a failed model call
+does not end a turn, because Hermes retries it and may still answer. A turn
+Hermes never ended is closed unset
 with `session_aborted`, and `wardex.hermes_agent.close_cause` says why:
 
 - `next_turn`: the session's next turn began.
@@ -338,9 +340,9 @@ with `session_aborted`, and `wardex.hermes_agent.close_cause` says why:
 Two consequences of that wait: a provider `Retry-After` longer than 300
 seconds splits the turn into two spans with one `turn_id`, the second with
 `wardex.hermes_agent.generation` 1 and a `resumed_from` link to the first;
-and a gateway that stops within 300 seconds of a failed turn, with no session
-closed first, exports that turn's model calls and not the turn span above
-them.
+and a gateway that stops while a turn Hermes never ended is still inside its
+wait (120 seconds, 300 after a failed model call), with no session closed
+first, exports that turn's model calls and not the turn span above them.
 
 wardex cannot tell a turn Hermes stopped from one still running, so a turn
 that starts on the same thread while another is open is never put under that

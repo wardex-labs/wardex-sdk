@@ -333,6 +333,18 @@ def test_an_embedder_span_around_two_turns_holds_the_turn_after_one_hermes_never
     assert extras(span)["close_cause"] == "end_event"
 
 
+def test_a_turn_still_open_at_uninstall_names_the_tool_calls_that_never_ran():
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        stopped = on_loop(lambda: (turn := h.turn(), gave_up(h, turn))[0])
+        wardex_sdk.close()
+    span = _turn_span(exported(transport), stopped)
+    assert {Limitation.ADAPTER_UNINSTALLED, Limitation.TOOL_CALL_NOT_DISPATCHED} <= set(
+        span.limitations
+    )
+    assert extras(span)["undispatched_tool_calls"] == "lab_no_such_tool" + ",lab_no_such_tool" * 2
+
+
 def _stopped_then(h: FakeHermes, around_first, around_second) -> tuple[Turn, Turn]:
     """A turn Hermes stops with no end, then another session's turn on the same loop thread,
     each inside the block the embedder opens for it (`None` for no block)."""
