@@ -191,7 +191,7 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_HA, "PREFIX + 'child_role'", "tie.child_role", HOST),
     (_HA, "PREFIX + 'child_subagent_id'", "tie.child_subagent_id", HOST),
     (_HA, "PREFIX + 'exit_reason'", "event.exit_reason", HOST),
-    (_HA, "PREFIX + 'error_reason'", "event.reason", HOST),
+    (_HA, "PREFIX + 'error_reason'", "error_reason", HOST),
     (
         _HA,
         "PREFIX + 'undispatched_tool_calls'",
@@ -202,6 +202,7 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_HF, "PREFIX + 'aux_request_id'", "event.aux_request_id", HOST),
     (_HF, "PREFIX + 'aux_task'", "event.aux_task", HOST),
     (_HF, "PREFIX + 'api_request_id'", "request_id", HOST),
+    (_HF, "PREFIX + 'turn_id'", "turn_id", HOST),
     (_HF, "PREFIX + 'api_mode'", "api_mode", HOST),
     (_HF, "PREFIX + 'tool_status'", "report.status", HOST),
     # -- the LangGraph adapter --

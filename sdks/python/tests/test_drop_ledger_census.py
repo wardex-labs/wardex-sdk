@@ -629,10 +629,6 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     # -- adapters: Hermes Agent
     ("_adapters/_hermes_agent.py", "count", "'admit_race'"): L("FRAMEWORK_EVENT_UNMATCHED"),
     ("_adapters/_hermes_agent.py", "count", "'book_full'"): L("TABLE_FULL"),
-    ("_adapters/_hermes_agent.py", "count", "'turn_start_missed'"): NotADrop(
-        "a tally: a turn whose start this process never saw opens at its first model frame "
-        "and ships"
-    ),
     ("_adapters/_hermes_agent.py", "count", "'unreached_expired'"): NotADrop(
         "a declaration whose end was lost is withdrawn by the idle sweep; the wire spans it "
         "covered already shipped, marked"
@@ -706,6 +702,10 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_hermes_agent_frames.py", "count", "'report_without_frame'"): NotADrop(
         "a report for a frame that already closed on a raise, or never opened because Hermes "
         "refused its registration, which is recorded as unavailable instrumentation"
+    ),
+    ("_adapters/_hermes_agent_frames.py", "count", "'turn_start_missed'"): NotADrop(
+        "a tally: a model frame of a turn whose start this process never saw is a chat span "
+        "of its own and ships; no turn is made for it"
     ),
     ("_adapters/_hermes_agent_frames.py", "count", "f'{s.action.value}.{trigger.value}'"): (
         NotADrop(
