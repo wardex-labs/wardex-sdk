@@ -187,7 +187,7 @@ _SITES: list[tuple[str, str, str, str]] = [
     # asked for that never ran.
     (_HA, "PREFIX + 'turn_id'", "record.turn_id", HOST),
     (_HA, "PREFIX + 'platform'", "platform", HOST),
-    (_HA, "PREFIX + 'session_id'", "shadowed", HOST),
+    (_HA, "PREFIX + 'session_id'", "session_id", HOST),
     (_HA, "PREFIX + 'child_role'", "tie.child_role", HOST),
     (_HA, "PREFIX + 'child_subagent_id'", "tie.child_subagent_id", HOST),
     (_HA, "PREFIX + 'exit_reason'", "event.exit_reason", HOST),

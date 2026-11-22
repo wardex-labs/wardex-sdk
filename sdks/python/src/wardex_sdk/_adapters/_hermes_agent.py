@@ -50,6 +50,7 @@ from ._hermes_agent_attach import HOST_ISOLATION_LINE, NOT_ATTACHED_DETAIL
 from ._hermes_agent_events import (
     HOST_PROCESS_ENV,
     KNOWN_SCHEMAS,
+    CallEnter,
     CallError,
     ChildStart,
     ContractRow,
@@ -57,6 +58,8 @@ from ._hermes_agent_events import (
     DriftNote,
     Event,
     KeyKind,
+    ToolEnter,
+    ToolReport,
     TurnAnswer,
     TurnEnd,
     TurnStart,
@@ -400,7 +403,13 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         * pre_llm_call: first the NEXT_TURN net over the session's other live turns, on the
           hook thread Hermes calls before it builds the turn's title thread, then the turn.
         * Everything else: the one turn the key names.
+
+        A tool event's `conversation_id`, the only place Hermes states one, is kept for the
+        session's later turns first (`TurnBook.conversation_for`).
         """
+        if isinstance(event, (ToolEnter, ToolReport)):
+            if event.session_id and event.conversation_id:
+                self._book.state_conversation(event.session_id, event.conversation_id)
         trigger = event.trigger()
         if event.key_kind() is KeyKind.SESSION:
             key = event.key()
@@ -424,6 +433,10 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         record = self._book.find(key)
         if record is None:
             return self._resolve(key, event, trigger)
+        if isinstance(event, CallEnter) and event.session_id not in (None, record.session_id):
+            # Only a model call's frame tells: Hermes compresses right before one, and an
+            # auxiliary call's session id is the one its turn was admitted with.
+            self._book.rotate(record, event.session_id)
         return self._advance(record, trigger, event)
 
     def _advance(self, record: TurnRecord, trigger: Trigger, event: Event | None) -> _Out:
@@ -450,13 +463,19 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             return self._run(None, event, s, trigger)
         session_id = getattr(event, "session_id", None) or ""  # "" on a record Hermes sent none
         parent = getattr(event, "parent_session_id", None)
-        child = parent is not None or self._book.tie_for(session_id) is not None
+        tie = self._book.tie_for(session_id)
+        child = parent is not None or tie is not None
+        if tie is not None:
+            parent = parent or tie.parent_session_id
         record = TurnRecord(
             session_id=session_id,
             turn_id=turn_id,
             generation=0 if tomb is None else tomb.generation + 1,
             kind=TurnKind.CHILD if child else TurnKind.ROOT,
             state=s.next,
+            conversation=self._book.conversation_for(
+                session_id, parent if child else None, tie.parent_turn_id if tie else None
+            ),
             model_frames=0 if tomb is None else tomb.model_frames,
         )
         live = self._book.admit(record)
@@ -538,8 +557,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         assert ctx is not None
         tie = self._book.tie_for(record.session_id) if record.kind is TurnKind.CHILD else None
         delegate = _FRAME.get() if record.kind is TurnKind.CHILD else None
+        session_id = record.session_id
         conversation, shadowed = framework_conversation(
-            ctx, record.session_id, shadowed_counter="conversation_shadowed"
+            ctx, record.conversation, shadowed_counter="conversation_shadowed"
         )
         unit_kind = _UNIT_KIND[record.kind]
 
@@ -551,8 +571,8 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
                 d.set_extra(PREFIX + "generation", record.generation)
             if platform:
                 d.set_extra(PREFIX + "platform", platform)
-            if shadowed:
-                d.set_extra(PREFIX + "session_id", shadowed)
+            if shadowed:  # the host's conversation wins; Hermes's session id is kept beside it
+                d.set_extra(PREFIX + "session_id", session_id)
             if tie is not None:
                 if tie.child_role:
                     d.set_extra(PREFIX + "child_role", tie.child_role)
@@ -653,6 +673,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
                 event.parent_turn_id,
                 event.child_subagent_id,
                 event.child_role,
+                event.parent_session_id,
             )
         )
         return None

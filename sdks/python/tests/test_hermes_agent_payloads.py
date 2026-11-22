@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 import wardex_sdk as wardex
-from _hermes_payloads import code_calls, dispatch, prelude_tool, turnless_aux
+from _hermes_payloads import code_calls, compress, dispatch, prelude_tool, turnless_aux
 from _hermes_support import (
     exported,
     extras,
@@ -130,3 +130,75 @@ def test_an_auxiliary_call_outside_any_turn_is_marked_and_drops_nothing(caplog):
     assert wardex.diagnostics().losses == ()
     assert row.detail == ""
     assert [r.getMessage() for r in caplog.records] == []
+
+
+def _conversations(nodes) -> set[str]:
+    return {n.attributes["gen_ai.conversation.id"] for n in nodes if n.name != WIRE}
+
+
+@pytest.mark.parametrize("joined", [True, False], ids=["joined", "background"])
+def test_a_subagent_states_the_conversation_hermes_gave_it_its_parents(joined: bool):
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run():
+            turn = h.turn()
+            h.delegate(h.model_call(turn, tool_calls=["delegate_task"]), 2, joined=joined)
+            h.model_call(turn)
+            h.end(turn)
+            h.run_background()
+            return turn
+
+        turn = on_loop(run)
+    nodes = exported(transport)
+    assert len([n for n in nodes if n.name == "invoke_agent hermes"]) == 3
+    assert _conversations(nodes) == {turn.session_id}
+
+
+def test_a_session_hermes_compressed_keeps_its_conversation_and_its_finalize():
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run():
+            first = h.turn()
+            h.model_call(first)
+            rotated = compress(first)
+            h.model_call(first)
+            # Hermes finalizes by the id it rotated to, so this cuts the turn in flight.
+            h.finalize(rotated)
+            second = h.turn(session_id=rotated)
+            second.conversation = first.conversation
+            h.model_call(second)
+            h.end(second)
+            return first
+
+        first = on_loop(run)
+    nodes = exported(transport)
+    roots = [n for n in nodes if n.name == "invoke_agent hermes"]
+    assert [extras(r)["close_cause"] for r in roots] == ["finalize", "end_event"]
+    # No tool event stated the conversation: the turn kept it through the rotation.
+    assert _conversations(nodes) == {first.conversation}
+
+
+def test_a_later_turn_takes_the_conversation_hermes_stated_for_its_session():
+    """No payload before a turn's first tool event states Hermes's `conversation_id`, so the
+    turn that first states one (here a session resumed after an earlier process compressed it)
+    opened with its session id; every later turn of that session takes Hermes's."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run():
+            first = h.turn()
+            first.conversation = "20261121_000000_lineage"
+            h.tool(h.model_call(first, tool_calls=["read_file"]), "read_file")
+            h.model_call(first)
+            h.end(first)
+            second = h.turn(session_id=first.session_id)
+            h.model_call(second)
+            h.end(second)
+            return second
+
+        second = on_loop(run)
+    nodes = exported(transport)
+    mine = [n for n in nodes if extras(n).get("turn_id") == second.turn_id]
+    assert [n.attributes["gen_ai.conversation.id"] for n in mine] == ["20261121_000000_lineage"]

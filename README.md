@@ -318,7 +318,12 @@ for it. A tool that code in `execute_code` calls sits under that
 so its report cannot be matched to it. An auxiliary call Hermes makes
 outside any turn (an MCP server's sampling request, a title call after its
 turn ended) names no turn, so its HTTP attempt is a root marked
-`parent_unresolved`.
+`parent_unresolved`. A turn's `gen_ai.conversation.id` is the conversation
+Hermes states: a subagent's turns carry their parent's, and a session Hermes
+compressed keeps the one it had. Hermes states it only on tool events, so a
+turn takes it from an earlier event of its session and is otherwise opened
+with the session id. The two differ in one case known on v0.23.3: the
+first turn of a session resumed after another process compressed it.
 wardex imports and patches nothing of Hermes. Its hooks return nothing, and
 each middleware call hands Hermes back its own result or its own exception.
 

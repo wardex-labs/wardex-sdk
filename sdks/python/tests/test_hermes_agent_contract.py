@@ -119,6 +119,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "turn_id": "t-1",
             "api_request_id": "s-1:api:1",
             "tool_call_id": "call_1",
+            "conversation_id": "s-0",
             "tool_name": "read_file",
             "args": {"path": "x"},
         },
@@ -128,6 +129,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             turn_id="t-1",
             api_request_id="s-1:api:1",
             tool_call_id="call_1",
+            conversation_id="s-0",
             args={"path": "x"},
         ),
     ),
@@ -137,13 +139,14 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "session_id": "s-1",
             "turn_id": "t-1",
             "tool_call_id": "call_1",
+            "conversation_id": "s-0",
             "tool_name": "read_file",
             "status": "ok",
             "error_type": None,
             "result": "r",
             "duration_ms": 3,
         },
-        ToolReport("s-1", "t-1", "call_1", "ok", None, "r"),
+        ToolReport("s-1", "t-1", "call_1", "s-0", "ok", None, "r"),
     ),
     "pre_auxiliary_call": (
         {
@@ -296,9 +299,11 @@ _HERMES_SENDS_EMPTY = [
     ("tool_execution", "turn_id"),
     ("tool_execution", "api_request_id"),
     ("tool_execution", "tool_call_id"),
+    ("tool_execution", "conversation_id"),
     ("post_tool_call", "session_id"),
     ("post_tool_call", "turn_id"),
     ("post_tool_call", "tool_call_id"),
+    ("post_tool_call", "conversation_id"),
     ("pre_auxiliary_call", "session_id"),
     ("pre_auxiliary_call", "turn_id"),
     ("post_auxiliary_call", "session_id"),
@@ -495,7 +500,7 @@ def test_only_a_shutdown_finalize_is_a_shutdown(reason: str | None, trigger: Tri
 def test_a_tool_report_says_when_hermes_gave_up_on_the_worker(
     status: str, error_type: str | None, abandoned: bool
 ) -> None:
-    assert ToolReport("s-1", "t-1", "call_1", status, error_type).abandoned() is abandoned
+    assert ToolReport(status=status, error_type=error_type).abandoned() is abandoned
 
 
 @pytest.mark.parametrize(

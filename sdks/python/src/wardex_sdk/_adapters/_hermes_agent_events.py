@@ -373,6 +373,7 @@ class ToolEnter:
         Field("turn_id", "turn_id", _text, required=False),
         Field("api_request_id", "api_request_id", _text, required=False),
         Field("tool_call_id", "tool_call_id", _text, required=False),
+        Field("conversation_id", "conversation_id", _text, required=False),
         Field("args", "args", _raw, required=False),
     )
     tool_name: str
@@ -380,6 +381,7 @@ class ToolEnter:
     turn_id: str | None = None
     api_request_id: str | None = None  # the model call that asked for it: a link, nothing else
     tool_call_id: str | None = None  # what its post_tool_call is matched by
+    conversation_id: str | None = None  # Hermes's own, the only payload family that states it
     args: object = None  # for record_input only
 
     def trigger(self) -> Trigger:
@@ -402,6 +404,7 @@ class ToolReport:
         Field("session_id", "session_id", _text, required=False),
         Field("turn_id", "turn_id", _text, required=False),
         Field("tool_call_id", "tool_call_id", _text, required=False),
+        Field("conversation_id", "conversation_id", _text, required=False),
         Field("status", "status", _text, required=False),  # "ok" measured; others verbatim
         Field("error_type", "error_type", _text, required=False),
         Field("result", "result", _raw, required=False),
@@ -409,6 +412,7 @@ class ToolReport:
     session_id: str | None = None
     turn_id: str | None = None
     tool_call_id: str | None = None
+    conversation_id: str | None = None
     status: str | None = None
     error_type: str | None = None
     result: object = None  # for record_output only

@@ -484,6 +484,7 @@ class ChildTie:
     parent_turn_id: str | None  # None: the parent had no turn running, so nothing to link to
     child_subagent_id: str | None = None
     child_role: str | None = None
+    parent_session_id: str | None = None  # whose conversation the child's turns are in
 
 
 @dataclass(frozen=True, slots=True)
@@ -514,7 +515,9 @@ class TurnRecord:
     """One live turn generation. `lock` guards every field after it.
 
     Mutate the containers only under `lock`; `quiet()` and `undispatched()` iterate them and
-    are called under it too.
+    are called under it too. `session_id` is the one field before `lock` that changes: only
+    `TurnBook.rotate` writes it, and only under the book's lock, which `live_in_session`
+    reads it under.
     """
 
     session_id: str
@@ -522,6 +525,9 @@ class TurnRecord:
     generation: int  # 0; each continuation adds one
     kind: TurnKind
     state: TurnState
+    #: The conversation the turn's span states: Hermes's `conversation_id` when an earlier
+    #: event stated it for this session, a delegated child's parent's, else the session id.
+    conversation: str = ""
     lock: threading.RLock = field(default_factory=threading.RLock)
     handle: RunHandle | None = None  # published by the effect that opened the unit
     frames: dict[tuple[FrameKind, str], FrameRecord] = field(default_factory=dict)
@@ -620,9 +626,9 @@ OBSERVATIONS: tuple[Observation, ...] = (
 
 
 class TurnBook:
-    """The adapter's only shared table: live records, tombstones, child ties.
+    """The adapter's only shared table: live records, tombstones, child ties, conversations.
 
-    Bounded by `cap` in each of the three. A full live table admits nothing: `admit` returns
+    Bounded by `cap` in each of the four. A full live table admits nothing: `admit` returns
     None and the caller counts it. Tombstones and ties drop their oldest write first. A record
     leaves the live table when its turn closes (`retire`), when the adapter uninstalls
     (`clear`), or at fork (`_at_fork_reinit`: a forked child's handles point at units the core
@@ -638,6 +644,9 @@ class TurnBook:
         self._live: dict[str, TurnRecord] = {}
         self._tombs: OrderedDict[str, Tombstone] = OrderedDict()
         self._ties: OrderedDict[str, ChildTie] = OrderedDict()
+        #: Session id -> the conversation id Hermes stated for it, or one a turn of it took
+        #: from its parent or kept through a rotation. Only an id that differs is kept.
+        self._conversations: OrderedDict[str, str] = OrderedDict()
 
     def find(self, turn_id: str) -> TurnRecord | None:
         with self._lock:
@@ -699,12 +708,53 @@ class TurnBook:
         with self._lock:
             return self._ties.get(child_session_id)
 
+    def conversation_for(
+        self, session_id: str, parent_session_id: str | None, parent_turn_id: str | None
+    ) -> str:
+        """The conversation a new turn of `session_id` opens in, never one Hermes contradicted.
+
+        Hermes's `conversation_id` (`agent/prompt_cache_scope.py`) is a delegated child's
+        parent's, else the root of the session's compression lineage. No payload at or before
+        `pre_llm_call` states it, so a turn takes, in order: the id Hermes stated on an earlier
+        tool event of this session; for a child, the id stated for its parent's session, else
+        the conversation its parent turn's span states, else the parent's session id; else the
+        session id, which is the lineage root until Hermes compresses the session."""
+        with self._lock:
+            known = self._conversations.get(session_id)
+            if known is not None:
+                return known
+            if parent_session_id is None:
+                return session_id
+            found = self._conversations.get(parent_session_id)
+            if found is None:
+                parent = self._live.get(parent_turn_id) if parent_turn_id else None
+                found = parent.conversation if parent is not None else parent_session_id
+            if found and found != session_id:
+                _put(self._conversations, session_id, found, self._cap)
+            return found or session_id
+
+    def state_conversation(self, session_id: str, conversation_id: str) -> None:
+        """Hermes stated `conversation_id` for `session_id`: later turns of it take that."""
+        with self._lock:
+            if self._conversations.get(session_id, session_id) != conversation_id:
+                _put(self._conversations, session_id, conversation_id, self._cap)
+
+    def rotate(self, record: TurnRecord, session_id: str) -> None:
+        """Hermes moved a live turn to a new session id mid-turn (a context compression,
+        `agent/conversation_compression.py`): the session's finalize and its next turn name
+        the new id, and the conversation stays the lineage's."""
+        with self._lock:
+            record.session_id = session_id
+            if record.conversation and record.conversation != session_id:
+                _put(self._conversations, session_id, record.conversation, self._cap)
+
     def clear(self) -> None:
         """Uninstall: forget everything. The core closes the units themselves."""
         with self._lock:
             self._live.clear()
             self._tombs.clear()
             self._ties.clear()
+            self._conversations.clear()
 
     def _at_fork_reinit(self) -> None:
         # The child has one thread, and the parent's lock may have been held at the fork.
@@ -712,6 +762,7 @@ class TurnBook:
         self._live.clear()
         self._tombs.clear()
         self._ties.clear()
+        self._conversations.clear()
 
 
 _V = TypeVar("_V")
