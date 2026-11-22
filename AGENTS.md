@@ -277,7 +277,7 @@ rank 8   `_client.py` · `_finalize.py`
 rank 9   `_adapters/` · `_interceptors/`
 rank 10  `_runtime.py`
 rank 11  `_decorators.py` · `_environment.py` · `_snapshot_api.py` · `_tracing.py`
-rank 12  `__init__.py` · `__main__.py` · `testing/`
+rank 12  `__init__.py` · `__main__.py` · `hermes_agent.py` · `testing/`
 ```
 
 - Ranks 2..10 are the order the imports are meant to have, not one they already
