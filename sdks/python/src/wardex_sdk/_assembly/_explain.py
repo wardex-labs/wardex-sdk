@@ -384,9 +384,11 @@ MARKERS: Mapping[Limitation, MarkerText] = MappingProxyType(
         ),
         _L.SESSION_ABORTED: MarkerText(
             "The agent session ended without a clean result: it raised, was interrupted, or "
-            "ended with no result message. For a Hermes turn it also means wardex closed it "
-            "because Hermes never said it ended (the next turn began, it went quiet, the "
-            "process shut down); wardex.hermes_agent.close_cause says which.",
+            "ended with no result message. For a Hermes turn it can also mean wardex closed the "
+            "turn because Hermes never said it ended, for example when the session's next turn "
+            "began, Hermes finalized the session, or nothing came for 120 seconds (300 after a "
+            "failed model call, with Hermes's reason in wardex.hermes_agent.error_reason). "
+            "wardex.hermes_agent.close_cause says which.",
             "The run did not complete normally, or its end was not seen.",
             "Look at the run's own error; there is nothing to configure in wardex.",
         ),

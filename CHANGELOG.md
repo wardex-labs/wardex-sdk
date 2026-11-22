@@ -93,9 +93,17 @@ All notable changes to this project are documented here. The format follows
   (failed attempts included), each tool call linked to the model call that
   asked for it, and each subagent turn under the `delegate_task` call that
   started it. The turn span carries the user's message as its input and
-  Hermes's final response as its output, capped and masked like tool payloads.
-  A turn Hermes never ended is closed with `session_aborted` and
-  `wardex.hermes_agent.close_cause`; the session-title call, a tool call
+  Hermes's final response as its output, capped and masked like tool payloads;
+  a prompt another plugin blocked is in no span. Only Hermes's `pre_llm_call`
+  starts a turn, so its background memory review and side questions are
+  `chat` spans with no turn above them. A failed model call ends nothing,
+  since Hermes may still recover. A turn Hermes never ended is closed with
+  `session_aborted` and `wardex.hermes_agent.close_cause` at the session's
+  next turn, at a finalize of that session, or after 120 seconds with no
+  event (300 after a failed call, with Hermes's reason in
+  `wardex.hermes_agent.error_reason`); a gateway stopped within that wait
+  after a failed turn loses the turn span. A tool Hermes stopped waiting for
+  closes `ERROR` at Hermes's report. The session-title call, a tool call
   Hermes never ran and model calls made outside the process are marked
   (`possible_duplicate_chat`, `tool_call_not_dispatched`,
   `subprocess_model_calls_unobserved`). wardex imports and patches nothing of
