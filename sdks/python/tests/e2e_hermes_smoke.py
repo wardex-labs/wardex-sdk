@@ -660,13 +660,20 @@ ROWS: tuple[Row, ...] = (
         (
             Span(TURN, parent="", status="UNSET", markers=("session_aborted",)),
             Span(CHAT, parent=TURN, status="ERROR"),
+            Span(TURN, attrs={A + "exit_reason": "interrupted_during_api_call"}),
         ),
+        mode="library",
     ),
     Row(
+        # The CLI does not interrupt: Ctrl-C detaches it and the gateway finishes the turn.
         "Interrupted turn; abandoned tool worker",
         "interrupted",
-        (Span(TURN, attrs={A + "exit_reason": "interrupted_during_api_call"}),),
-        mode="library",
+        (
+            Traces(1),
+            Span(TURN, parent="", status="OK", attrs={A + "close_cause": "end_event"}),
+            Span(CHAT, parent=TURN, status="OK"),
+        ),
+        mode="cli",
     ),
     Row(
         "Subagents (delegate_task)",
@@ -1928,6 +1935,16 @@ def run(
                     time.sleep(0.05)
                 time.sleep(2.0)
                 proc.send_signal(signal.SIGINT)
+                # Ctrl-C on `hermes -z` only detaches the CLI ("accepted work continues at the
+                # gateway"), so the turn is not over: wait for the gateway to finish the answer
+                # before it is stopped below, or the stop kills a turn that was still running.
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline and not any(
+                    e.get("event") == "response" and e.get("tag") == sc.interrupt_after
+                    for e in _lines(out / "truth.jsonl")
+                ):
+                    time.sleep(0.05)
+                time.sleep(3.0)
             try:
                 seen["exit"] = proc.wait(200)
             except subprocess.TimeoutExpired:
