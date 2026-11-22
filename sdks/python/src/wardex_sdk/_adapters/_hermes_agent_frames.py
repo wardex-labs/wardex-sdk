@@ -94,7 +94,7 @@ class FrameEffects:
     the declarations made with no live turn, which the idle sweep releases."""
 
     _ctx: AdapterContext | None
-    _lock: threading.Lock
+    _lock: threading.RLock
     _unreached: dict[Hashable, float]
 
     # -- effects: auxiliary calls ---------------------------------------------------------------

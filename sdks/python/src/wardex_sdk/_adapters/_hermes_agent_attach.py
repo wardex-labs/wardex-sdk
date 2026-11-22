@@ -72,8 +72,10 @@ _DELIVERING: ContextVar[frozenset[tuple[str, str]]] = ContextVar(
 _ATTACHED: list[tuple[Callable[[], object], int]] = []
 #: Contract rows a Hermes context refused, in refusal order. Process-wide: a registration is.
 _REFUSED: list[str] = []
-#: Guards `_ATTACHED` and `_REFUSED`. Nothing is counted or reported while it is held.
-_ATTACH_LOCK = threading.Lock()
+#: Guards `_ATTACHED` and `_REFUSED`. Nothing is counted or reported while it is held. Every lock
+#: in this adapter is reentrant, as every lock in the SDK is: a weakref finalizer runs wardex
+#: code on whichever thread drops a last reference, and that can be a thread holding one.
+_ATTACH_LOCK = threading.RLock()
 
 #: Emptied by the first attach, which registers the fork reset with it: importing the module
 #: registers nothing, and the reset is needed only once something here holds state.
@@ -192,7 +194,7 @@ class _Exporter:
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._flush: Callable[[float | None], None] | None = None
@@ -255,7 +257,7 @@ class _Exporter:
 
     def _at_fork_reinit(self) -> None:
         # The child has no thread, and the parent's lock may have been held at the fork.
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._wake = threading.Event()
         self._thread = None
         self._flush_due = False
@@ -381,5 +383,5 @@ def _at_fork_reinit() -> None:
     child's Hermes still holds the registrations they describe, and `_ROUTE` stays, because the
     registry keeps the installed adapter across the fork and resets its turns itself."""
     global _ATTACH_LOCK
-    _ATTACH_LOCK = threading.Lock()
+    _ATTACH_LOCK = threading.RLock()
     _EXPORT._at_fork_reinit()

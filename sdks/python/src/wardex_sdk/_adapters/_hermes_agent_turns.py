@@ -377,7 +377,9 @@ class FrameRecord:
     state: FrameState = FrameState.PINNED
     error_type: str | None = None  # the downstream exception's type when the frame raised
     kept_report: object | None = None  # the post hook's event, when it came before the exit
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    #: Reentrant like every lock in the SDK: a weakref finalizer can run wardex code on a thread
+    #: that holds it.
+    lock: threading.RLock = field(default_factory=threading.RLock)
 
     def on_exit(self, error_type: str | None) -> bool:
         """The frame returned (`error_type` None) or raised. True: the caller closes the unit."""
@@ -464,7 +466,7 @@ class TurnRecord:
     generation: int  # 0; each continuation adds one
     kind: TurnKind
     state: TurnState
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.RLock = field(default_factory=threading.RLock)
     handle: RunHandle | None = None  # published by the effect that opened the unit
     frames: dict[tuple[FrameKind, str], FrameRecord] = field(default_factory=dict)
     requested: dict[str, str] = field(default_factory=dict)  # tool_call_id -> name, asked for
@@ -556,7 +558,7 @@ class TurnBook:
 
     def __init__(self, *, cap: int = 4096) -> None:
         self._cap = cap
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._live: dict[str, TurnRecord] = {}
         self._tombs: OrderedDict[str, Tombstone] = OrderedDict()
         self._ties: OrderedDict[str, ChildTie] = OrderedDict()
@@ -627,7 +629,7 @@ class TurnBook:
 
     def _at_fork_reinit(self) -> None:
         # The child has one thread, and the parent's lock may have been held at the fork.
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._live.clear()
         self._tombs.clear()
         self._ties.clear()

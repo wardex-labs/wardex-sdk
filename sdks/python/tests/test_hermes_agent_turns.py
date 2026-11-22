@@ -52,6 +52,23 @@ def _record(turn_id: str = "t-1", session_id: str = "s-1", **kw: object) -> Turn
     return TurnRecord(session_id, turn_id, **fields)  # type: ignore[arg-type]
 
 
+def _free_elsewhere(lock: threading.RLock, wait: float = 1.0) -> bool:
+    """Whether another thread can take `lock` now. A reentrant lock is always free to the thread
+    that holds it, so the probe runs on a thread of its own."""
+    got: list[bool] = []
+
+    def probe() -> None:
+        taken = lock.acquire(timeout=wait)
+        if taken:
+            lock.release()
+        got.append(taken)
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join(wait + 5)
+    return got == [True]
+
+
 def _walk(start: TurnState | None, *triggers: Trigger) -> list[tuple[Action, TurnState | None]]:
     """Feed triggers through the table the way the effects module does, state by state."""
     state, path = start, []
@@ -407,7 +424,7 @@ def test_advance_writes_state_and_time_and_releases_the_lock() -> None:
     r = _record()
     s = r.advance(_T.CALL_ENTER, now=42.0)
     assert (s.action, r.state, r.last_event) == (_A.FRAME, TurnState.AMBIENT, 42.0)
-    assert not r.lock.locked()
+    assert _free_elsewhere(r.lock)
 
 
 def _race(n: int, fn: Callable[[], object]) -> list[object]:
@@ -604,7 +621,25 @@ def test_clear_forgets_everything() -> None:
 def test_fork_reset_frees_a_lock_held_at_the_fork() -> None:
     book = TurnBook()
     book.admit(_record())
-    book._lock.acquire()  # noqa: SLF001 - the parent's lock, as a fork would copy it
-    book._at_fork_reinit()  # noqa: SLF001 - the fork-reset protocol itself
+    # Held by another thread, as a fork child finds a lock a parent thread held. The holder stays
+    # alive: a new thread can reuse a dead one's ident, and a reentrant lock then reads as its.
+    held, done = threading.Event(), threading.Event()
+    parent_lock = book._lock  # noqa: SLF001 - the parent's lock, as a fork would copy it
+
+    def hold() -> None:
+        parent_lock.acquire()
+        held.set()
+        done.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait(5)
+    try:
+        assert not _free_elsewhere(parent_lock, wait=0.2)
+        book._at_fork_reinit()  # noqa: SLF001 - the fork-reset protocol itself
+        assert _free_elsewhere(book._lock)  # noqa: SLF001 - the child's lock is a fresh one
+    finally:
+        done.set()
+        holder.join(5)
     assert book.find("t-1") is None
     assert book.admit(_record()) is not None

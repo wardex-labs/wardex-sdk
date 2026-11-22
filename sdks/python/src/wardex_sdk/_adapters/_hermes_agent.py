@@ -145,7 +145,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         self._installed = False
         self._ctx: AdapterContext | None = None
         self._book = TurnBook()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._seen: set[str] = set()  # schema fields seen with a known value
         self._schema_drift: dict[str, str] = {}  # schema field -> what Hermes stated, first
         self._dropped: dict[str, str] = {}  # contract row -> the first missing fields
@@ -175,7 +175,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         """Fork-child reset: a fresh lock, no turns, no declarations, no drift facts. A forked
         child's handles point at units the core has already dropped; it learns the rest again
         from its own events."""
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._book._at_fork_reinit()
         self._seen.clear()
         self._schema_drift.clear()
