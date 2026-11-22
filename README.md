@@ -220,6 +220,7 @@ tree.
 | LangGraph (tested on `langgraph` 1.2.x) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
 | Pydantic AI (tested on `pydantic-ai-slim` 2.x) | each agent run, model call and tool call, read from pydantic-ai's own OpenTelemetry spans; the model call's messages and token usage come from the wire |
 | Claude Agent SDK (tested on `claude-agent-sdk` 0.2.x) | agent turns and model calls, with tool calls correlated |
+| Hermes Agent (through a Hermes plugin; measured on v0.23.3) | each turn, each model call with every HTTP attempt under it, each tool call and each subagent turn; what wardex could not see is marked |
 | Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |
 | Any other framework, or your own loop | model calls with model, messages and token usage; decorators add the structure |
 
@@ -282,6 +283,45 @@ unwrapped function, and so does a client constructed before it. Such a session
 is still recorded, from the CLI's output alone: its root span carries
 `instrumentation_degraded`, and a warning on stderr says so once. Call `init()`
 before that import, or call `claude_agent_sdk.query(...)` through the module.
+
+The Hermes Agent adapter is reached through a Hermes plugin, because a
+Hermes user runs `hermes` and has no entry point of their own to call
+`init()` from. The plugin is one import, and Hermes calls `register` when it
+loads the plugin:
+
+```python
+# <Hermes home>/plugins/wardex/__init__.py
+from wardex_sdk.hermes_agent import register
+```
+
+The plugin's `plugin.yaml` lists the hook names in
+`wardex_sdk.hermes_agent.HOOKS` and the middleware kinds in `MIDDLEWARE`.
+`register` calls `init()` from the environment (`WARDEX_API_KEY` or
+`WARDEX_ENDPOINT`) unless your process already called it. Each Hermes turn is
+then one trace: `invoke_agent hermes`, a `chat` span per model call with every
+HTTP attempt under it (the failed ones too), an `execute_tool` span per tool
+call linked to the model call that asked for it, and a subagent's turn under
+the `delegate_task` call that started it. wardex imports and patches nothing
+of Hermes. Its hooks return nothing, and each middleware call hands Hermes
+back its own result or its own exception.
+
+A turn's status is what Hermes said: `OK` when Hermes reported the turn
+complete, `ERROR` when it reported the turn failed. A turn Hermes never
+ended (its retries ran out, the next turn began, nothing ran for 120 seconds,
+the process shut down) is closed unset with `session_aborted`, and
+`wardex.hermes_agent.close_cause` says which. Three things are marked and
+not placed by a guess: the session-title call Hermes starts on its own thread
+(`possible_duplicate_chat` on the span built from Hermes's report,
+`parent_unresolved` on its wire span), a tool call the model asked for and
+Hermes never ran (`tool_call_not_dispatched` on the turn), and a turn whose
+model calls ran outside the process
+(`subprocess_model_calls_unobserved`). A subagent that outlives its
+`delegate_task` call is a trace of its own, linked to the turn that started
+it. The adapter is measured by the contract versions Hermes states in each
+payload (`hermes.observer.v1`, `hermes.middleware.v1`); on another version it
+still records, and `wardex.diagnostics()` reports `measured=False`. While the
+plugin is not enabled, the adapter reads `unsupported` and its detail names
+the command that enables it.
 
 The Pydantic AI adapter reads the OpenTelemetry spans pydantic-ai already
 emits (`invoke_agent`, `chat`, `execute_tool`, instrumentation schema version

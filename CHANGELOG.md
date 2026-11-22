@@ -85,6 +85,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Hermes Agent turns are recorded, through a Hermes plugin.** A Hermes user
+  enables one plugin whose `__init__.py` is
+  `from wardex_sdk.hermes_agent import register`, sets `WARDEX_API_KEY` or
+  `WARDEX_ENDPOINT`, and changes no code. Each turn is one trace:
+  `invoke_agent hermes`, each model call with every HTTP attempt under it
+  (failed attempts included), each tool call linked to the model call that
+  asked for it, and each subagent turn under the `delegate_task` call that
+  started it. A turn Hermes never ended is closed with `session_aborted` and
+  `wardex.hermes_agent.close_cause`; the session-title call, a tool call
+  Hermes never ran and model calls made outside the process are marked
+  (`possible_duplicate_chat`, `tool_call_not_dispatched`,
+  `subprocess_model_calls_unobserved`). wardex imports and patches nothing of
+  Hermes, and Hermes gets its own results and exceptions back. Measured on
+  Hermes Agent v0.23.3 (`hermes.observer.v1`, `hermes.middleware.v1`).
+  `wardex.diagnostics()` reads `unsupported` with the enable command while
+  the plugin is off.
+- **`tool_call_not_dispatched` is a new limitation marker.** It is on a run
+  whose model asked for a tool call the framework never ran.
 - **`python -m wardex_sdk doctor` checks an install end to end.** It reads
   the environment as your app would, sends one test span, and ends with
   `OK: <url> accepted the test span.` (exit 0) or `FAIL:` and the fix
