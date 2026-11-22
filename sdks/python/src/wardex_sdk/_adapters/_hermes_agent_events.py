@@ -8,15 +8,19 @@ payload field, so a Hermes change lands here and nowhere else.
 
 Knows no wardex verb and no turn state beyond the `Trigger` each event maps to.
 
-What is never read, by design: model message and response content (`user_message`,
-`conversation_history`, `request`, `messages`, `assistant_response`, and every content member of
-`response` and `assistant_message`; the wire is the authority for model content), `sender_id`
-(end-user identity), `child_goal`, `child_summary`, cost, and any profile name. Of `response` and
-`assistant_message` only each tool call's id and name are read. `parse` reads only the fields a
-record's `FIELDS` names, so a field that is not named never reaches a record. Tool arguments and
-tool results are read, because no wire carries an in-process tool's input or output. They are
-carried through for the core's capped, masked payload path (`record_input` and `record_output`)
-only, never for an attribute.
+What is never read, by design: model message and response content (`conversation_history`,
+`request`, `messages`, and every content member of `response` and `assistant_message`; the wire
+is the authority for model content), `sender_id` (end-user identity), `child_goal`,
+`child_summary`, cost, and any profile name. Of `response` and `assistant_message` only each tool
+call's id and name are read. `parse` reads only the fields a record's `FIELDS` names, so a field
+that is not named never reaches a record.
+
+What is read for the core's capped, masked payload path (`record_input` and `record_output`)
+only, never for an attribute: tool arguments and tool results, because no wire carries an
+in-process tool's input or output; and the turn's own input and output, `pre_llm_call`'s
+`user_message` and `post_llm_call`'s `assistant_response`, because on the wire they sit inside
+the turn's first and last model calls, and a trace list reads a turn's input and output from the
+turn's own span.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ __all__ = [
     "Surface",
     "ToolEnter",
     "ToolReport",
+    "TurnAnswer",
     "TurnEnd",
     "TurnStart",
     "parse",
@@ -198,18 +203,24 @@ def _requested_in_response(v: object) -> object:
 
 @dataclass(frozen=True, slots=True)
 class TurnStart:
-    """`pre_llm_call`. `parent_session_id` is stated for a delegated child only."""
+    """`pre_llm_call`. `parent_session_id` is stated for a delegated child only.
+
+    `user_message` is Hermes's object, read and never changed: the user's message, a string or a
+    list of content parts, or a delegated child's task text.
+    """
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("session_id", "session_id", _text),
         Field("turn_id", "turn_id", _text),
         Field("parent_session_id", "parent_session_id", _text, required=False),
         Field("platform", "platform", _text, required=False),
+        Field("user_message", "user_message", _raw, required=False),
     )
     session_id: str
     turn_id: str
     parent_session_id: str | None = None
     platform: str | None = None
+    user_message: object = None  # for record_input only
 
     def trigger(self) -> Trigger:
         return Trigger.TURN_START
@@ -486,6 +497,39 @@ class ChildStop:
 
 
 @dataclass(frozen=True, slots=True)
+class TurnAnswer:
+    """`post_llm_call`: the turn's final response, for record_output only.
+
+    Hermes fires it once per turn, on a hook thread the loop thread waits for, after the tool
+    loop and before `on_session_end` (`agent/turn_finalizer.py::finalize_turn`). It fires only
+    when the turn has a final response and was not interrupted, and never for a detached fork
+    (`_persist_disabled`), which sends no `on_session_end` either. A failed turn that reaches
+    finalization can still send it: Hermes writes an explanation as the final response when the
+    turn stopped with a tool result pending or the interpreter shut down, and that text is what
+    the user was shown. A turn whose retries were spent returns before finalization and sends
+    neither this nor an end.
+    """
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("session_id", "session_id", _text),
+        Field("turn_id", "turn_id", _text),
+        Field("assistant_response", "assistant_response", _raw, required=False),
+    )
+    session_id: str
+    turn_id: str
+    assistant_response: object = None  # for record_output only
+
+    def trigger(self) -> Trigger:
+        return Trigger.TURN_ANSWER
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
 class TurnEnd:
     """`on_session_end`. It usually names its turn. The CLI's interrupted-run path sends only
     the session, and states its exit reason as `reason` with no `turn_exit_reason`, so then it
@@ -582,6 +626,7 @@ CONTRACT: tuple[ContractRow, ...] = (
     ContractRow(_H, "post_auxiliary_call", CallbackThread.HOOK_THREAD, _T, AuxEnd),
     ContractRow(_H, "subagent_start", CallbackThread.CALLER, _T, ChildStart),
     ContractRow(_H, "subagent_stop", CallbackThread.CALLER, _T, ChildStop),
+    ContractRow(_H, "post_llm_call", CallbackThread.HOOK_THREAD, _T, TurnAnswer),
     ContractRow(_H, "on_session_end", CallbackThread.HOOK_THREAD, _T, TurnEnd),
     ContractRow(_H, "on_session_finalize", CallbackThread.CALLER, None, Finalize),
 )
@@ -599,7 +644,6 @@ NOT_REGISTERED: Mapping[str, str] = {
     "same ids",
     "pre_api_request": "duplicates the llm_execution frame's ids from a hook thread",
     "pre_tool_call": "duplicates the tool_execution frame's ids and can veto a tool",
-    "post_llm_call": "carries turn content only, and is absent on a failed turn",
     "on_session_start": "fires per turn before pre_llm_call with no turn_id to key on",
     "transform_llm_output": "a transform: its return value changes what the user sees",
     "transform_tool_result": "a transform: its return value changes what the model sees",

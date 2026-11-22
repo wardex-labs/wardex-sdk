@@ -118,6 +118,7 @@ class Trigger(Enum):
     AUX_START = "aux_start"  # pre_auxiliary_call
     AUX_END = "aux_end"  # post_auxiliary_call
     CHILD_START = "child_start"  # subagent_start, applied to the parent's turn
+    TURN_ANSWER = "turn_answer"  # post_llm_call
     TURN_END = "turn_end"  # on_session_end
     NEXT_TURN = "next_turn"  # net: a newer pre_llm_call of the same session
     CHILD_STOP = "child_stop"  # net: subagent_stop for the child's session
@@ -155,6 +156,7 @@ class Action(Enum):
     #: so an end whose start was seen while the turn was live is safe here.
     AUX_RELEASE_UNREACHED = "aux_release_unreached"
     TIE = "tie"  # remember child session -> parent turn
+    ANSWER = "answer"  # record the turn's final response as the turn's output
     CLOSE = "close"  # close the turn per CLOSE_RULES[cause]
     #: The core already closed the record's unit. Retire the record to a PRESUMED_CLOSED
     #: tombstone and call no verb, so the event that found it continues the turn or is ignored.
@@ -285,6 +287,7 @@ for _live in LIVE:
             (_live, _T.AUX_START): Step(_live, _A.AUX_BEGIN),  # the turn-start title lands here
             (_live, _T.AUX_END): Step(_live, _A.AUX_FINISH),
             (_live, _T.CHILD_START): Step(_live, _A.TIE),
+            (_live, _T.TURN_ANSWER): Step(_live, _A.ANSWER),
             (_live, _T.TURN_END): Step(_S.CLOSED, _A.CLOSE),
             (_live, _T.UNIT_GONE): Step(_S.PRESUMED_CLOSED, _A.FORGET),
             # the nets close a live turn the same way, whatever it was doing

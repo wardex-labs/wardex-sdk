@@ -144,6 +144,9 @@ def test_a_recorded_fixture_exports_its_designed_tree_and_hermes_is_never_distur
     nodes = exported(transport)
     quiet = CUT_STREAM_MARKERS if name == "interrupted" else frozenset()
     assert outline(nodes, quiet) == render(*EXPECTED[name])
+    payloads = {"wardex.input_data", "wardex.output_data"}
+    turns = [n for n in nodes if n.name == "invoke_agent hermes"]
+    assert not [k for n in turns for k in n.attributes if k in payloads], "no content recorded"
     for tool in [n for n in nodes if n.name.startswith("execute_tool ")]:
         (reason, target), *rest = links(transport, tool, nodes)
         assert (reason, target, rest) == (LinkReason.TRIGGERED_BY, "chat lab-model", [])

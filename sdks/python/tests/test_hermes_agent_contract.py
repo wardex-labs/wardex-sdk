@@ -33,6 +33,7 @@ from wardex_sdk._adapters._hermes_agent_events import (
     Surface,
     ToolEnter,
     ToolReport,
+    TurnAnswer,
     TurnEnd,
     TurnStart,
     parse,
@@ -177,6 +178,19 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
         {**_OBS, "child_session_id": "s-2", "child_status": "completed", "duration_ms": 9},
         ChildStop("s-2"),
     ),
+    "post_llm_call": (
+        {
+            **_OBS,
+            "session_id": "s-1",
+            "task_id": "task-1",
+            "turn_id": "t-1",
+            "model": "lab-model",
+            "platform": "cli",
+            "side_question_token": None,
+            "review_signals": None,
+        },
+        TurnAnswer("s-1", "t-1"),
+    ),
     "on_session_end": (
         {
             **_OBS,
@@ -200,9 +214,7 @@ _NEVER_READ = {
     "request": {"messages": [{"content": "SECRET"}]},
     "original_request": {"messages": []},
     "messages": ["SECRET"],
-    "user_message": "SECRET",
     "conversation_history": ["SECRET"],
-    "assistant_response": "SECRET",
     "response": {"assistant_message": {"content": "SECRET"}},
     "system_prompt": "SECRET",
     "sender_id": "SECRET",
@@ -316,6 +328,31 @@ def test_content_identity_and_next_call_never_reach_a_record(name: str) -> None:
     assert not names & (set(_NEVER_READ) | {"next_call"})
     assert "SECRET" not in _all_values(event)
     assert calls == []
+
+
+#: The turn's own input and output: read into one record each, for the payload path only.
+_TURN_IO = {"user_message": "SECRET", "assistant_response": "SECRET"}
+_TURN_IO_READ_BY = {"pre_llm_call": "user_message", "post_llm_call": "assistant_response"}
+
+
+@pytest.mark.parametrize("name", list(_SAMPLES))
+def test_the_turn_input_and_output_reach_only_their_own_records(name: str) -> None:
+    event, drift = parse(_ROWS[name], {**_SAMPLES[name][0], **_NEVER_READ, **_TURN_IO})
+    assert drift is None
+    assert event is not None
+    held = [f.name for f in dataclasses.fields(event) if getattr(event, f.name) == "SECRET"]  # type: ignore[arg-type]
+    assert held == ([_TURN_IO_READ_BY[name]] if name in _TURN_IO_READ_BY else [])
+
+
+def test_the_turn_input_and_output_are_carried_as_hermes_sent_them() -> None:
+    parts = [{"type": "text", "text": "Describe this."}, {"type": "image_url", "image_url": {}}]
+    start, _ = parse(_ROWS["pre_llm_call"], {**_SAMPLES["pre_llm_call"][0], "user_message": parts})
+    assert isinstance(start, TurnStart)
+    assert start.user_message is parts
+    payload = {**_SAMPLES["post_llm_call"][0], "assistant_response": "Hello."}
+    assert parse(_ROWS["post_llm_call"], payload) == (TurnAnswer("s-1", "t-1", "Hello."), None)
+    absent = {**payload, "assistant_response": None}
+    assert parse(_ROWS["post_llm_call"], absent) == (TurnAnswer("s-1", "t-1"), None)
 
 
 def test_requested_tool_calls_keep_ids_and_names_only() -> None:

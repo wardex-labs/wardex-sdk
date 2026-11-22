@@ -33,6 +33,9 @@ from _hermes_fake import (
 )
 
 TOOL_RESULT = "<synthetic result>"
+QUESTION = "<synthetic question>"
+TASK = "<synthetic task>"
+ANSWER = "<synthetic answer>"
 
 
 @dataclass
@@ -45,6 +48,7 @@ class Turn:
     subagent_id: str | None = None
     calls: int = 0
     title: _TitleThread | None = None
+    message: object = QUESTION  # `user_message`: a string or a list of content parts
 
 
 @dataclass(frozen=True)
@@ -87,12 +91,15 @@ class FakeHermes:
     _gate: threading.Event = field(default_factory=threading.Event)
     _background: list[threading.Thread] = field(default_factory=list)
 
-    def turn(self, session_id: str | None = None, *, title: bool = False) -> Turn:
+    def turn(
+        self, session_id: str | None = None, *, title: bool = False, message: object = QUESTION
+    ) -> Turn:
         """`on_session_start` then `pre_llm_call`, both bounded hooks (fixture `single_turn`).
-        With `title`, the turn-start title thread is constructed now, before any middleware runs."""
+        With `title`, the turn-start title thread is constructed now, before any middleware runs.
+        `message` is the `user_message` Hermes hands `pre_llm_call` and `post_llm_call`."""
         sid = session_id or f"20261122_0000{next(self._seq) % 100:02d}_{secrets.token_hex(3)}"
         task = str(uuid.uuid4())
-        turn = Turn(sid, task, f"{sid}:{task}:{secrets.token_hex(4)}")
+        turn = Turn(sid, task, f"{sid}:{task}:{secrets.token_hex(4)}", message=message)
         self._open(turn)
         if title:
             turn.title = _TitleThread()
@@ -356,9 +363,12 @@ class FakeHermes:
         interrupted: bool = False,
         failed: bool = False,
         reason: str = "text_response(finish_reason=stop)",
+        answer: object = ANSWER,
     ) -> None:
         """`transform_llm_output`, `post_llm_call`, `on_session_end`: the normal close in fixture
-        `single_turn`."""
+        `single_turn`. `post_llm_call` fires only for a turn with a final response that was not
+        interrupted (`agent/turn_finalizer.py::finalize_turn`); `answer` is that response. A
+        failed turn that reaches finalization has one too: Hermes writes an explanation there."""
         light = {
             "session_id": turn.session_id,
             "turn_id": turn.turn_id,
@@ -366,7 +376,19 @@ class FakeHermes:
             "platform": turn.platform,
         }
         self._emit("transform_llm_output", light)
-        self._emit("post_llm_call", {**light, "task_id": turn.task_id})
+        if answer and not interrupted:
+            self._emit(
+                "post_llm_call",
+                {
+                    **light,
+                    "task_id": turn.task_id,
+                    "user_message": turn.message,
+                    "assistant_response": answer,
+                    "conversation_history": [],
+                    "side_question_token": None,
+                    "review_signals": None,
+                },
+            )
         self._emit(
             "on_session_end",
             {
@@ -440,7 +462,14 @@ class FakeHermes:
         parent = turn.parent.session_id if turn.parent else ""
         self._emit(
             "pre_llm_call",
-            {**self._turn_ids(turn), "parent_session_id": parent, "is_first_turn": True},
+            {
+                **self._turn_ids(turn),
+                "user_message": turn.message,
+                "conversation_history": [],
+                "is_first_turn": True,
+                "parent_session_id": parent,
+                "sender_id": "",
+            },
         )
 
     def _attempt(self, turn: Turn, answer: Answer, worker: bool) -> int | None:
@@ -527,7 +556,8 @@ class FakeHermes:
     def _child(self, parent: Turn, k: int) -> Turn:
         sid = f"20261122_0000{next(self._seq) % 100:02d}_{secrets.token_hex(3)}"
         agent = f"sa-{k}-{secrets.token_hex(4)}"
-        return Turn(sid, agent, f"{sid}:{agent}:{secrets.token_hex(4)}", "subagent", parent, agent)
+        turn_id = f"{sid}:{agent}:{secrets.token_hex(4)}"
+        return Turn(sid, agent, turn_id, "subagent", parent, agent, message=f"{TASK} {k}")
 
     def _run_child(self, kid: Turn, script: Callable[[FakeHermes, Turn], None]) -> None:
         self._open(kid)

@@ -312,6 +312,14 @@ def test_tool_frame_with_no_live_turn_still_gets_a_span(state: TurnState | None)
     assert step(state, _T.TOOL_ENTER) == Step(state, _A.ORPHAN_FRAME)
 
 
+def test_the_answer_is_kept_by_a_live_turn_and_moves_it_nowhere() -> None:
+    for live in LIVE:
+        assert step(live, _T.TURN_ANSWER) == Step(live, _A.ANSWER)
+    for state in (TurnState.PRESUMED_CLOSED, *FINAL):
+        assert step(state, _T.TURN_ANSWER) == Step(state, _A.IGNORE_LATE)
+    assert step(None, _T.TURN_ANSWER) == Step(None, _A.IGNORE_UNKNOWN)
+
+
 def test_a_missing_start_opens_late() -> None:
     assert step(None, _T.CALL_ENTER) == Step(TurnState.AMBIENT, _A.OPEN_LATE)
 

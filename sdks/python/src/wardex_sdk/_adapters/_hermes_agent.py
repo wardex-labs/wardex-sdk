@@ -57,6 +57,7 @@ from ._hermes_agent_events import (
     DriftNote,
     Event,
     KeyKind,
+    TurnAnswer,
     TurnEnd,
     TurnStart,
     parse,
@@ -87,6 +88,7 @@ from ._hermes_agent_turns import (
     TurnState,
     step,
 )
+from ._payload import _shaped_payload
 
 if TYPE_CHECKING:
     from .._diagnostics import AdapterStatus
@@ -163,6 +165,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             Action.AUX_DECLARE_UNREACHED: self._aux_unreached,
             Action.AUX_RELEASE_UNREACHED: self._aux_unreached,
             Action.TIE: self._tie,
+            Action.ANSWER: self._answer,
             Action.CLOSE: self._close,
             Action.FORGET: self._forget,
             Action.NOTHING: self._nothing,
@@ -478,8 +481,24 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         first turn or a gateway job, a root; the next turn on the same thread, the previous
         turn's pin, retired when that turn closed, so a clean root; a joined child, the live
         delegate_task unit, so nested under it; a background child, the delegate unit already
-        closed, which the core refuses, so a root with CORRELATION_CONFLICT."""
-        self._open_turn(record, getattr(event, "platform", None), resumed=False)
+        closed, which the core refuses, so a root with CORRELATION_CONFLICT.
+
+        The turn's input is the user's message `pre_llm_call` stated, through the capped payload
+        path. A late open or a continuation has no `pre_llm_call`, so no input."""
+        self._open_turn(record, event.platform, resumed=False)
+        handle = record.handle
+        if handle is not None and event.user_message is not None:
+            budget = self._ctx.record_budget  # type: ignore[union-attr]
+            handle.record_input(_shaped_payload(event.user_message, budget))
+        return None
+
+    def _answer(self, record: TurnRecord, event: TurnAnswer, s: Step, trigger: Trigger) -> _Out:
+        """post_llm_call, on a hook thread before the end event: Hermes's final response
+        becomes the turn's output, through the capped payload path. The turn stays open."""
+        handle = record.handle
+        if handle is not None and event.assistant_response is not None:
+            budget = self._ctx.record_budget  # type: ignore[union-attr]
+            handle.record_output(_shaped_payload(event.assistant_response, budget))
         return None
 
     def _open_late(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:

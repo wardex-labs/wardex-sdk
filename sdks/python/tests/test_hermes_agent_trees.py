@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from _hermes_fake import Reply
-from _hermes_scripted import FakeHermes
+from _hermes_scripted import ANSWER, QUESTION, TASK, FakeHermes
 from _hermes_support import (
     CUT_STREAM_MARKERS,
     Tree,
@@ -36,7 +36,7 @@ from _hermes_support import (
     wait_for,
 )
 from wardex_sdk._adapters import _hermes_agent_attach as attach_module
-from wardex_sdk._assembly import LinkReason
+from wardex_sdk._assembly import LinkReason, counters
 
 WIRE = "HTTP POST /v1/chat/completions"
 
@@ -496,3 +496,136 @@ def test_parallel_mcp_calls_to_one_tool_each_land_under_their_own_frame(recordin
         frame = next(n for n in nodes if n.span_id == wire.parent_id)
         sent = json.loads(wire.attributes["wardex.input_data"])
         assert frame.attributes["gen_ai.tool.call.arguments"] == repr(sent), "its own frame"
+
+
+# -- the turn's input and output ---------------------------------------------------------------
+
+TURN_SPAN = "invoke_agent hermes"
+EXPLANATION = "No reply: the turn stopped while a tool result was still pending."
+
+
+def _io(node) -> tuple[object, object]:
+    """What a backend's trace list shows for the span: its input and its output."""
+    return node.attributes.get("wardex.input_data"), node.attributes.get("wardex.output_data")
+
+
+def _turns(script) -> list:
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        on_loop(script, h)
+    return [n for n in exported(transport) if n.name == TURN_SPAN]
+
+
+def _answered(h: FakeHermes) -> None:
+    turn = h.turn()
+    h.model_call(turn)
+    h.end(turn)
+
+
+def test_a_completed_turn_carries_the_users_message_and_hermes_answer():
+    (turn,) = _turns(_answered)
+    assert _io(turn) == (QUESTION, ANSWER)
+
+
+def test_a_turn_whose_retries_were_spent_carries_its_input_and_no_output():
+    def script(h: FakeHermes) -> None:
+        h.fail(h.turn())
+
+    (turn,) = _turns(script)
+    assert extras(turn)["close_cause"] == "retries_spent"
+    assert _io(turn) == (QUESTION, None)
+
+
+def test_an_interrupted_turn_carries_its_input_and_no_output():
+    def script(h: FakeHermes) -> None:
+        h.interrupt(h.turn())
+
+    (turn,) = _turns(script)
+    assert _io(turn) == (QUESTION, None)
+
+
+def test_a_failed_turn_hermes_finalized_carries_the_explanation_hermes_showed():
+    def script(h: FakeHermes) -> None:
+        turn = h.turn()
+        h.model_call(turn)
+        h.end(turn, completed=False, failed=True, reason="pending_tool_result", answer=EXPLANATION)
+
+    (turn,) = _turns(script)
+    assert turn.status.name == "ERROR"
+    assert _io(turn) == (QUESTION, EXPLANATION)
+
+
+def test_each_child_turn_carries_its_own_task_and_answer():
+    def script(h: FakeHermes) -> None:
+        turn = h.turn()
+        h.delegate(h.model_call(turn, tool_calls=["delegate_task"]), 2)
+        h.model_call(turn)
+        h.end(turn)
+
+    turns = _turns(script)
+    children = sorted(_io(n) for n in turns if n.attributes["wardex.agent.type"] == "sub_agent")
+    assert children == [(f"{TASK} 0", ANSWER), (f"{TASK} 1", ANSWER)]
+    (parent,) = [n for n in turns if n.attributes["wardex.agent.type"] == "primary"]
+    assert _io(parent) == (QUESTION, ANSWER)
+
+
+def test_a_message_of_content_parts_is_the_turns_input_within_the_record_cap():
+    parts = [{"type": "text", "text": "Describe this."}, {"type": "image_url", "image_url": {}}]
+
+    def script(h: FakeHermes) -> None:
+        turn = h.turn(message=parts)
+        h.model_call(turn)
+        h.end(turn)
+
+    (turn,) = _turns(script)
+    assert _io(turn) == (repr(parts), ANSWER)
+
+
+def test_with_no_record_budget_the_turn_carries_neither_input_nor_output():
+    transport = start_wardex()
+    adapter = attach_module._ROUTE
+    assert adapter is not None and adapter._ctx is not None
+    adapter._ctx._units._max_record_bytes = 0
+    with plugin() as ctx, hermes(ctx) as h:
+        on_loop(_answered, h)
+    (turn,) = [n for n in exported(transport) if n.name == TURN_SPAN]
+    assert _io(turn) == (None, None)
+
+
+def test_an_answer_for_a_closed_turn_is_counted_and_changes_nothing():
+    counters.reset()
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def script() -> None:
+            turn = h.turn()
+            h.model_call(turn)
+            h.end(turn)
+            h._emit(
+                "post_llm_call",
+                {"session_id": turn.session_id, "turn_id": turn.turn_id, "assistant_response": "x"},
+            )
+
+        on_loop(script)
+    (turn,) = [n for n in exported(transport) if n.name == TURN_SPAN]
+    assert _io(turn) == (QUESTION, ANSWER)
+    assert counters.get("adapters.hermes_agent.ignore_late.turn_answer") == 1
+
+
+def test_an_answer_for_a_turn_whose_retries_were_spent_is_counted_and_changes_nothing():
+    counters.reset()
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def script() -> None:
+            turn = h.turn()
+            h.fail(turn)
+            h._emit(
+                "post_llm_call",
+                {"session_id": turn.session_id, "turn_id": turn.turn_id, "assistant_response": "x"},
+            )
+
+        on_loop(script)
+    (turn,) = [n for n in exported(transport) if n.name == TURN_SPAN]
+    assert _io(turn) == (QUESTION, None)
+    assert counters.get("adapters.hermes_agent.ignore_late.turn_answer") == 1
