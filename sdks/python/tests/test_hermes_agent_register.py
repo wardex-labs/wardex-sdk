@@ -72,6 +72,20 @@ def test_register_registers_one_callback_per_contract_row_and_nothing_else(insta
         assert status().state is AdapterState.INSTALLED
 
 
+@pytest.mark.parametrize("metadata", [True, False], ids=["packaged", "checkout_on_path"])
+def test_a_plain_init_records_hermes_turns_with_or_without_package_metadata(tmp_path, metadata):
+    """What the plugin itself does: `init()` names no adapter, so the Hermes adapter comes in by
+    auto-detection. Hermes run from a checkout on `PYTHONPATH` has no distribution record, and
+    its turns are recorded all the same."""
+    transport = RecordingTransport()
+    with hermes_installed(tmp_path, metadata=metadata):
+        wardex_sdk.init(transport=transport)
+        with plugin() as ctx, hermes(ctx) as h:
+            assert status().state is AdapterState.INSTALLED
+            on_loop(_one_turn, h)
+        assert _turns(exported(transport)) == ["invoke_agent hermes"]
+
+
 def test_registering_twice_on_one_context_registers_once(installed):
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:

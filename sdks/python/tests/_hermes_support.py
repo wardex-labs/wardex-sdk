@@ -40,18 +40,20 @@ _T = TypeVar("_T")
 
 
 @contextmanager
-def hermes_installed(root: Path) -> Iterator[Path]:
+def hermes_installed(root: Path, *, metadata: bool = True) -> Iterator[Path]:
     """A `hermes-agent` distribution and its `hermes_cli` package on `sys.path`, for as long as
-    the block runs."""
+    the block runs. `metadata=False` leaves the distribution record out: Hermes run from a
+    checkout or a Nix closure on `PYTHONPATH`."""
     site = root / "fake-hermes-site"
     package = site / "hermes_cli"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("")
-    record = site / f"hermes_agent-{HERMES_VERSION}.dist-info"
-    record.mkdir()
-    (record / "METADATA").write_text(
-        f"Metadata-Version: 2.1\nName: hermes-agent\nVersion: {HERMES_VERSION}\n"
-    )
+    if metadata:
+        record = site / f"hermes_agent-{HERMES_VERSION}.dist-info"
+        record.mkdir()
+        (record / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: hermes-agent\nVersion: {HERMES_VERSION}\n"
+        )
     sys.path.insert(0, str(site))
     importlib.invalidate_caches()
     # Hermes is running when it loads a plugin, so its package is always imported by then.
