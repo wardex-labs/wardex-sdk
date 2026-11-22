@@ -122,9 +122,8 @@ class Trigger(Enum):
 
     NEXT_TURN, IDLE and UNIT_GONE are derived by the caller, not sent by Hermes. NEXT_TURN comes
     from the session's next turn (a newer `pre_llm_call` of the same session) or the loop
-    thread's (a root turn's `pre_llm_call` on the thread the turn was pinned on, outside any
-    tool: Hermes's loop is synchronous, so the turn's loop there is over), IDLE from the clock.
-    FINALIZE and SHUTDOWN
+    thread's (a root turn's `pre_llm_call` on the thread the turn is pinned on, while Hermes's
+    last word on it is a failed call), IDLE from the clock. FINALIZE and SHUTDOWN
     are both `on_session_finalize` for the turn's session, told apart by Hermes's reason.
     UNIT_GONE says that the record's unit is no longer live in the core (closed with its parent,
     evicted, or closed by the signal path): the caller steps it before the event that found the

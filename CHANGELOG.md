@@ -95,10 +95,12 @@ All notable changes to this project are documented here. The format follows
   each subagent turn under the `delegate_task` call that started it. A turn
   that Hermes recovers after a provider outage stays one trace. A turn Hermes
   never ended, which is every failed turn, is closed with `session_aborted`
-  and a `wardex.hermes_agent.close_cause`, at the session's next turn or the
-  next turn on its thread, when Hermes closes the session, or after 120
-  seconds with no event (300 after a failed model call). Nothing that runs on
-  that thread after a failed turn sits under it. What wardex cannot place is
+  and a `wardex.hermes_agent.close_cause`, at the session's next turn or, once
+  its last model call failed, the next turn on its thread, when Hermes closes
+  the session, or after 120 seconds with no event (300 after a failed model
+  call). Nothing that runs on that thread after a failed turn sits under it.
+  An agent run inside a live turn (from a `step_callback`, or on a thread a
+  tool started) leaves that turn whole. What wardex cannot place is
   marked, not guessed: Hermes's background memory review, side questions, the
   session-title call, a tool call Hermes never ran, and model calls made
   outside the process. A prompt another plugin blocked is in no span. wardex

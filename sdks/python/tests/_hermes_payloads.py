@@ -165,3 +165,25 @@ def runs_as(call: Call, asked: str, name: str) -> Call:
     run through the `tool_call` bridge)."""
     renamed = tuple((i, name if n == asked else n) for i, n in call.tool_calls)
     return replace(call, tool_calls=renamed)
+
+
+# -- agents an embedder or a tool runs inside a live turn ---------------------------------------
+
+
+def tool_starts_agent(h: FakeHermes, call: Call, name: str, agent: Callable[[], None]):
+    """A plugin tool whose handler starts `agent` on a thread that carries a copy of the tool's
+    own context, as Hermes's own tools do (`tools/thread_context.py::
+    propagate_context_to_thread`), and returns at once. The thread is built inside the tool's
+    frame and returned unstarted, so a test starts it after the frame exited: the agent then
+    runs while the turn that called the tool is live and between two of its frames."""
+    tcid = next(i for i, nm in call.tool_calls if nm == name)
+    built: list[threading.Thread] = []
+
+    def body() -> None:
+        copied = contextvars.copy_context()
+        built.append(threading.Thread(target=copied.run, args=(agent,), name="lab-helper"))
+
+    copied = contextvars.copy_context()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(copied.run, h._tool_job, call, tcid, name, "ok", None, body).result()
+    return built[0]

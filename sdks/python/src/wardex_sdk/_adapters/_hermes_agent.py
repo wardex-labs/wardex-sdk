@@ -409,8 +409,10 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         * pre_llm_call: first the NEXT_TURN net, on the hook thread Hermes calls before it
           builds the turn's title thread, then the turn. The net closes the session's other
           live turns and, for a root turn, the live turn its loop thread is still pinned to
-          (`_finished_lane`): a failed turn sends no end, and the new turn must not open
-          under it. A child turn starts inside its parent's delegation and is never subject.
+          when Hermes's last word on that turn is a failed call (`_finished_lane`): a failed
+          turn sends no end, and the new turn must not open under it. Any other turn pinned
+          there may still be running (an agent run from a `step_callback`, or from a thread a
+          tool left running), so it stays open. A child turn is never subject.
         * Everything else: the one turn the key names.
 
         A tool event's `conversation_id`, the only place Hermes states one, is kept for the
@@ -525,9 +527,11 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         takes whatever is ambient in that copy, which is the measured answer for each case: a
         first turn or a gateway job, a root; the next turn on the same thread, the previous
         turn's pin, retired when that turn closed (by its end, or by the NEXT_TURN net just
-        before this when Hermes sent none), so a clean root; a joined child, the live
-        delegate_task unit, so nested under it; a background child, the delegate unit already
-        closed, which the core refuses, so a root with CORRELATION_CONFLICT.
+        before this when its last call failed), so a clean root; an agent an embedder's
+        `step_callback` runs inside a live turn, that turn, so nested under it; a joined child,
+        the live delegate_task unit, so nested under it; a background child, or an agent a
+        tool started on a thread it left running, the tool's unit already closed, which the
+        core refuses, so a root with CORRELATION_CONFLICT.
 
         With synchronous hooks (`plugins.hook_callback_timeout: 0`) this runs on the loop
         thread itself, where the previous turn's pin still stands: `_drop_lane` takes it down

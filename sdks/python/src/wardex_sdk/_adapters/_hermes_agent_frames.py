@@ -447,14 +447,20 @@ def _ensure_lane(record: TurnRecord) -> None:
 
 
 def _finished_lane(turn_id: str) -> TurnRecord | None:
-    """The turn this context's loop thread is still pinned to, when turn `turn_id` starts there
-    outside any tool. Hermes's loop is synchronous, so that turn's loop on this thread is over:
-    a turn started from inside a tool (a delegation, an agent a tool runs) has the tool's frame
-    pinned in its context, and gets None."""
+    """The turn this context's loop thread is still pinned to, when turn `turn_id` starts there,
+    only while Hermes's last word on that turn is that its call failed (`after_error`) and none
+    of its frames is pinned here: a refusal is an HTTP 200, so its frame returned and left the
+    pin up, and Hermes sends no end for a turn that failed for good.
+
+    Any other live turn here may still be running. An embedder's `step_callback` runs an agent
+    on the loop thread between two model calls of a live turn, and a tool can start an agent on
+    a thread that keeps the tool's context after the tool returned. Both get None, and the new
+    turn opens on whatever is ambient."""
     lane, frame = _LANE.get(), _FRAME.get()
     if lane is None or lane.turn_id == turn_id or (frame is not None and frame.pinned()):
         return None
-    return lane
+    with lane.lock:
+        return lane if lane.after_error else None
 
 
 def _drop_lane(only: TurnRecord | None = None) -> None:
