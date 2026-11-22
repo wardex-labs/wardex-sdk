@@ -268,7 +268,10 @@ def test_a_failed_turn_then_a_turn_gives_a_clean_second_root():
 
 
 def test_a_turn_that_carries_on_after_retries_were_predicted_spent_resumes_in_a_linked_span():
-    """Hermes's fallback recovered the call: the prediction that closed the turn was wrong."""
+    """Hermes's fallback recovered the call: the prediction that closed the turn was wrong. The
+    closed generation's pin comes down on the loop thread when the next one opens there, so no
+    later span on that thread meets a dead parent."""
+    counters.reset()
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
 
@@ -280,6 +283,7 @@ def test_a_turn_that_carries_on_after_retries_were_predicted_spent_resumes_in_a_
             return turn
 
         turn = on_loop(run)
+    assert counters.get("assembly._units.pin_stale") == 0
     nodes = exported(transport)
     assert outline(nodes) == render((ABORTED, (FAILED_CALL,)), (TURN, (CHAT,)))
     first = next(n for n in _roots(nodes) if n.limitations)

@@ -14,6 +14,7 @@ injection test makes one effect, or one step around them, raise every time it ru
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from collections.abc import Callable, Iterator
@@ -40,6 +41,9 @@ from wardex_sdk._adapters._registry import get_registry
 from wardex_sdk._assembly import Limitation
 from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk.hermes_agent import register
+
+# The package's registry names a factory `_hermes_agent`, which shadows the module attribute.
+adapter_module = importlib.import_module("wardex_sdk._adapters._hermes_agent")
 
 try:  # the assertion runs whenever OpenTelemetry is importable; the SDK does not need it
     from opentelemetry import trace as otel_trace
@@ -271,6 +275,36 @@ def test_a_frame_that_raises_gets_hermes_its_own_exception_object_whatever_warde
             return None
 
         assert on_loop(turn) is error
+    _assert_undisturbed(ctx)
+
+
+def test_wardex_failing_while_the_call_fails_still_gets_hermes_its_own_exception(monkeypatch):
+    """wardex failing on the very path that carries the call's own failure out to Hermes: the
+    trampoline hands Hermes its exception object, and the call is not run a second time."""
+    start_wardex()
+    monkeypatch.setattr(adapter_module, "_downstream_name", _raise_injected)
+    error = _HostError("the provider's own")
+    with _context() as ctx, ScriptedProvider() as provider:
+        h = FakeHermes(ctx, provider)
+        runs: list[None] = []
+
+        def terminal(payload: Any) -> Any:
+            runs.append(None)
+            raise error
+
+        def turn() -> BaseException | None:
+            t = h.turn()
+            ids = h._call_ids(t, f"{t.turn_id}:api:1")
+            try:
+                ctx.run_execution_chain(
+                    "llm_execution", terminal, request={}, original_request={}, **ids
+                )
+            except _HostError as exc:
+                return exc
+            return None
+
+        assert on_loop(turn) is error
+        assert len(runs) == 1
     _assert_undisturbed(ctx)
 
 
