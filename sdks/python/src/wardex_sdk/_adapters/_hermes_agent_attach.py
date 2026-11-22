@@ -28,7 +28,8 @@ from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
-from .._assembly import counters, guard, report_once
+from .._assembly import DropReason, counters, guard, report_once
+from .._assembly import record as ledger_record
 from ._hermes_agent_events import CONTRACT, HOST_PROCESS_ENV, ContractRow, Surface
 
 if TYPE_CHECKING:
@@ -128,6 +129,7 @@ def _hook_callback(row: ContractRow) -> Callable[..., None]:
                 adapter.on_hook(row, payload)
             except Exception:  # noqa: BLE001 - a hook must not raise into Hermes
                 counters.bump("adapters.hermes_agent.hook_escaped")
+                ledger_record(DropReason.INTERNAL_SDK_ERROR, where="adapters.hermes_agent.hook")
         # Always None: Hermes injects a `pre_llm_call` return as context, blocks a tool on a
         # `pre_tool_call` one, and shows an `on_session_finalize` one to the user.
         return None
@@ -156,6 +158,7 @@ def _frame_callback(row: ContractRow) -> Callable[..., Any]:
             if exc is once.raised:
                 raise
             counters.bump("adapters.hermes_agent.frame_escaped")
+            ledger_record(DropReason.INTERNAL_SDK_ERROR, where="adapters.hermes_agent.frame")
         finally:
             _DELIVERING.reset(token)
         return once.settle()
@@ -219,10 +222,12 @@ class _Exporter:
 
     def drain(self, timeout: float) -> None:
         """Flush on the calling thread, bounded by `timeout`. Shutdown only."""
-        flush = self._flush
-        if flush is not None:
+        # Not named `flush`: the limitation census keys helpers by bare name, and the WebSocket
+        # tracker's `flush(marker)` would make this argument read as a marker slot.
+        send = self._flush
+        if send is not None:
             with guard("adapters.hermes_agent.drain"):
-                flush(timeout)
+                send(timeout)
 
     def _run(self) -> None:
         me = threading.current_thread()
@@ -240,10 +245,10 @@ class _Exporter:
                     return
 
     def _once(self) -> None:
-        flush = self._flush
-        if self._flush_due and flush is not None:
+        send = self._flush
+        if self._flush_due and send is not None:
             self._flush_due = False
-            flush(EXPORT_TIMEOUT_S)
+            send(EXPORT_TIMEOUT_S)
         adapter = _ROUTE
         if adapter is not None:
             adapter.reap_idle(time.monotonic())
@@ -313,6 +318,11 @@ def attach(
         _ATTACHED[:] = [(r, len(accepted)) if r is ref else (r, n) for r, n in _ATTACHED]
         _REFUSED.extend(name for name in refusals if name not in _REFUSED)
     if refusals:
+        ledger_record(
+            DropReason.INSTRUMENTATION_UNAVAILABLE,
+            n=len(refusals),
+            where="adapters.hermes_agent.registration",
+        )
         report_once(
             "wardex: Hermes refused the registration of " + ", ".join(refusals) + ", so those "
             "events are not recorded",

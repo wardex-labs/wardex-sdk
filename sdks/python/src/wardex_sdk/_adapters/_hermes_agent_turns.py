@@ -203,8 +203,16 @@ class CloseRule:
 
 
 def _rule(next_state: TurnState, literal: str, export: ExportMode = ExportMode.KICK) -> CloseRule:
+    # A close rule's marker is always passed as `marker=`: the limitation census reads keyword
+    # slots, so the member is recorded here, where it is decided, not only where a close forwards
+    # it.
     return CloseRule(
-        StatusCode.UNSET, None, Limitation.SESSION_ABORTED, next_state, export, literal
+        StatusCode.UNSET,
+        None,
+        marker=Limitation.SESSION_ABORTED,
+        next_state=next_state,
+        export=export,
+        literal=literal,
     )
 
 
@@ -215,15 +223,20 @@ _S = TurnState
 #: SESSION_ABORTED. A guess lands in PRESUMED_CLOSED; shutdown cuts.
 CLOSE_RULES: dict[CloseCause, CloseRule] = {
     CloseCause.ENDED_COMPLETED: CloseRule(
-        StatusCode.OK, None, None, _S.CLOSED, ExportMode.KICK, "end_event"
+        StatusCode.OK,
+        None,
+        marker=None,
+        next_state=_S.CLOSED,
+        export=ExportMode.KICK,
+        literal="end_event",
     ),
     CloseCause.ENDED_FAILED: CloseRule(
         StatusCode.ERROR,
         "failed",
-        Limitation.SESSION_ABORTED,
-        _S.CLOSED,
-        ExportMode.KICK,
-        "end_event",
+        marker=Limitation.SESSION_ABORTED,
+        next_state=_S.CLOSED,
+        export=ExportMode.KICK,
+        literal="end_event",
     ),
     CloseCause.ENDED_INTERRUPTED: _rule(_S.CLOSED, "end_event"),
     CloseCause.ENDED_INCOMPLETE: _rule(_S.CLOSED, "end_event"),
@@ -509,17 +522,18 @@ def _asked_for_a_tool_call_that_never_ran(r: TurnRecord, cause: CloseCause) -> b
     return bool(r.undispatched())
 
 
-#: Close-time observations, in the order their markers are noted.
+#: Close-time observations, in the order their markers are noted. `marker=` by keyword, for the
+#: same reason as in `_rule`.
 OBSERVATIONS: tuple[Observation, ...] = (
     Observation(
         "model_calls_unobserved",
-        Limitation.SUBPROCESS_MODEL_CALLS_UNOBSERVED,
-        _completed_without_a_seen_call,
+        marker=Limitation.SUBPROCESS_MODEL_CALLS_UNOBSERVED,
+        applies=_completed_without_a_seen_call,
     ),
     Observation(
         "tool_calls_not_dispatched",
-        Limitation.TOOL_CALL_NOT_DISPATCHED,
-        _asked_for_a_tool_call_that_never_ran,
+        marker=Limitation.TOOL_CALL_NOT_DISPATCHED,
+        applies=_asked_for_a_tool_call_that_never_ran,
     ),
 )
 

@@ -158,9 +158,10 @@ MARKERS: Mapping[Limitation, MarkerText] = MappingProxyType(
             _NOTHING,
         ),
         _L.POSSIBLE_DUPLICATE_CHAT: MarkerText(
-            _RESERVED,
-            "It would mean an adapter's chat span may also have been recorded by the network "
-            "capture.",
+            "The Hermes adapter built this chat span from Hermes's own report of an auxiliary "
+            "model call (a title, a summary) that ran off the turn's thread.",
+            "The network capture may have recorded the same call too, as a separate chat span "
+            "marked parent_unresolved; count the two once.",
             _NOTHING,
         ),
         _L.STREAM_BUFFER_EXCEEDED: MarkerText(
@@ -382,15 +383,18 @@ MARKERS: Mapping[Limitation, MarkerText] = MappingProxyType(
             "use_responses_websocket=False, the default.",
         ),
         _L.SESSION_ABORTED: MarkerText(
-            "The agent session ended without a clean result: it raised, or ended with no "
-            "result message.",
-            "The run did not complete normally.",
+            "The agent session ended without a clean result: it raised, was interrupted, or "
+            "ended with no result message. For a Hermes turn it also means wardex closed it "
+            "because Hermes never said it ended (the next turn began, it went quiet, the "
+            "process shut down); wardex.hermes_agent.close_cause says which.",
+            "The run did not complete normally, or its end was not seen.",
             "Look at the run's own error; there is nothing to configure in wardex.",
         ),
         _L.TOOL_CALL_NOT_DISPATCHED: MarkerText(
-            _RESERVED,
-            "It would mean the model asked for a tool call that the framework never ran, so "
-            "the run has no tool span for that call.",
+            "The model asked for a tool call that the framework never ran: a tool name it does "
+            "not have, a call another plugin blocked, or an interrupt before the call started.",
+            "The run has no tool span for that call; "
+            "wardex.hermes_agent.undispatched_tool_calls names the tools asked for.",
             _NOTHING,
         ),
         _L.OTEL_BRIDGE_NO_DATA: MarkerText(
@@ -412,11 +416,13 @@ MARKERS: Mapping[Limitation, MarkerText] = MappingProxyType(
             _NOTHING,
         ),
         _L.SUBPROCESS_MODEL_CALLS_UNOBSERVED: MarkerText(
-            "The agent CLI (codex exec) reported one usage total per turn and no model calls, "
-            "so no chat spans were recorded; the run's span carries the total.",
+            "The agent's model calls ran in a subprocess wardex did not see, so no chat spans "
+            "were recorded: codex exec reports one usage total per turn (the run's span "
+            "carries it), and a Hermes turn on its codex app-server runtime reports none.",
             "Per-call model, usage and timing are missing.",
-            "Pass AdaptersConfig(codex_exec=CodexExecConfig(otel_bridge=True)) to record each "
-            "call from the CLI's own telemetry.",
+            "For codex exec, pass AdaptersConfig(codex_exec=CodexExecConfig(otel_bridge=True)) "
+            "to record each call from the CLI's own telemetry. For Hermes there is nothing to "
+            "configure.",
         ),
         _L.PII_FILTER_FAILED: MarkerText(
             "PII masking failed on this span or snapshot, so wardex removed its content "

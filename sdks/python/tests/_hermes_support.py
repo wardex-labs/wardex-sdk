@@ -59,6 +59,10 @@ def hermes_installed(root: Path) -> Iterator[Path]:
     try:
         yield site
     finally:
+        # The suite's teardown closes the client but leaves adapters installed, so an adapter a
+        # test's `init()` installed would outlive this install and the next test would find its
+        # route already taken. Closing wardex uninstalls it; it is a no-op when nothing is open.
+        wardex.close()
         sys.path.remove(str(site))
         sys.modules.pop("hermes_cli", None)
         importlib.invalidate_caches()

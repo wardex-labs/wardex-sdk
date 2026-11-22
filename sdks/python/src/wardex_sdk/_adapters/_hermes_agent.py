@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 
 from .._assembly import (
     AgentAttributes,
+    DropReason,
+    DropUnit,
     Limitation,
     LinkReason,
     SpanIntent,
@@ -37,6 +39,7 @@ from .._assembly import (
     UnitKind,
     report_once,
 )
+from .._assembly import record as ledger_record
 from .._enums import AdapterState, AgentType
 from . import _hermes_agent_attach as _attach
 from . import _hermes_agent_turns as _turns
@@ -355,6 +358,11 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             return
         if ctx is not None:
             ctx.count(f"dropped.{row.name}")
+            ledger_record(
+                DropReason.FRAMEWORK_EVENT_UNMATCHED,
+                unit=DropUnit.HOOK_EVENT,
+                where=f"adapters.hermes_agent.dropped.{row.name}",
+            )
         with self._lock:
             first = row.name not in self._dropped
             if first:
@@ -440,13 +448,21 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             model_frames=0 if tomb is None else tomb.model_frames,
         )
         live = self._book.admit(record)
-        if live is None:
+        if live is None:  # the live table is full: this event, and so its turn, go unrecorded
             self._ctx.count("book_full")  # type: ignore[union-attr]
+            ledger_record(
+                DropReason.TABLE_FULL, unit=DropUnit.HOOK_EVENT, where="adapters.hermes_agent.turns"
+            )
             return None
         if live is not record:  # another thread admitted it first: step the winner instead
             s = live.advance(trigger)
-            if s.action in CREATES:
+            if s.action in CREATES:  # and the winner was retired meanwhile: the event is lost
                 self._ctx.count("admit_race")  # type: ignore[union-attr]
+                ledger_record(
+                    DropReason.FRAMEWORK_EVENT_UNMATCHED,
+                    unit=DropUnit.HOOK_EVENT,
+                    where="adapters.hermes_agent.admit_race",
+                )
                 return None
             return self._run(live, event, s, trigger)
         return self._run(record, event, s, trigger)

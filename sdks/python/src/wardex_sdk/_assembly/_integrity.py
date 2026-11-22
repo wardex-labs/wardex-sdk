@@ -259,12 +259,11 @@ Two emit sites, and the first is the mechanism the second restates.
     loser, which is discarded exactly as ``close_span`` would discard it: a bound is a reason to
     stop tracking a draft, never a reason to promote one ``claim()`` already rejected.
 
-    In ``_adapters/_assembler.py`` — ``::_drain_children``, when a session stops
-    being driven with tools still open, which happens either because the
-    transport closed or because the registry evicted the session's root out from
-    under the assembler. It goes through ``_emit_tool(markers=...)``. Before the
-    census rewired the assembler's sites it was the free string
-    ``"tool_span_unclosed"``.
+    In ``_adapters/_assembler.py`` — ``::_drain_children``, when a session stops being driven with
+    tools still open, which happens either because the transport closed or because the registry
+    evicted the session's root out from under the assembler. It goes through
+    ``_emit_tool(markers=...)``. Before the census rewired the assembler's sites it was the free
+    string ``"tool_span_unclosed"``.
 
     ``SessionAssembler._open_tool``'s eviction was a second assembler site and is NOT one any more:
     a full ``open_tools`` table is a BOUND, and it names ``max_session_entries`` through
@@ -498,10 +497,10 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     POSSIBLE_DUPLICATE_CHAT = "possible_duplicate_chat"
-    """An adapter emitted a ``chat`` span that an installed interceptor may have
-    emitted as well. Dual-instrumentation policy, §8.1.
+    """An adapter emitted a ``chat`` span that an installed interceptor may have emitted as well.
 
-    Declared; no emitter until the ownership table of §8.2.
+    Emitted from ``_adapters/_hermes_agent_frames.py::_aux_begin`` on the hook-built chat span of a
+    Hermes auxiliary call outside the turn's lane: its wire span may be the same call.
     """
 
     STREAM_BUFFER_EXCEEDED = "stream_buffer_exceeded"
@@ -648,16 +647,14 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     # ------------------------------------------------------------------
-    # Caps reached (census + one added since). These stay separate members
-    # because they are separate FACTS about the capture, each with a different
-    # replay consequence — not, as the first draft of this section claimed,
-    # because each names a different `crates/wardex-limits` knob. Two of them
-    # (BODY_CAP_EXCEEDED, GRPC_MESSAGE_TRUNCATED) are driven by the same
-    # `max_body_bytes`, and another limit — `max_ws_frame_bytes` — surfaces
-    # under FRAME_PARSE_FAILED rather than here. Each docstring below names the
-    # knob that was MEASURED to drive it, because these values are what a
-    # dashboard turns into "raise this setting" advice — a knob named from
-    # memory sends the user to a tunable that changes nothing.
+    # Caps reached (census + one added since). These stay separate members because they are separate
+    # FACTS about the capture, each with a different replay consequence — not, as the first draft of
+    # this section claimed, because each names a different `crates/wardex-limits` knob. Two of them
+    # (BODY_CAP_EXCEEDED, GRPC_MESSAGE_TRUNCATED) are driven by the same `max_body_bytes`, and
+    # another limit — `max_ws_frame_bytes` — surfaces under FRAME_PARSE_FAILED rather than here.
+    # Each docstring below names the knob that was MEASURED to drive it, because these values are
+    # what a dashboard turns into "raise this setting" advice — a knob named from memory sends the
+    # user to a tunable that changes nothing.
     # ------------------------------------------------------------------
 
     BODY_CAP_EXCEEDED = "body_cap_exceeded"
@@ -981,15 +978,16 @@ Two emit sites, and the first is the mechanism the second restates.
     teardown arrived with no result message at all.
 
     Emitted from ``_adapters/_assembler.py::SessionAssembler._stamp_root``, on all three of its
-    # Adapter session (census + one since)
+    terminal branches (result present but errored, no result and an error, no result and no error),
+    and by ``CLOSE_RULES`` (``_adapters/_hermes_agent_turns.py``) on an unfinished Hermes turn.
     """
 
     TOOL_CALL_NOT_DISPATCHED = "tool_call_not_dispatched"
     """The model asked for this tool call and the framework never ran it, so no ``execute_tool``
-    span exists for it. Declared; no emitter yet. The first arrives with the Hermes Agent adapter
-    (``_adapters/_hermes_agent.py``) on the turn's ``invoke_agent`` span, from tool call ids asked
-    for minus those run. By id, as a framework may run another name under one id. Names NO knob. Not
-    ``TOOL_ARGS_UNPARSED`` (unreadable arguments) nor ``CHILD_SPAN_UNCLOSED`` (a tool left open).
+    span exists for it. Emitted by ``OBSERVATIONS`` in ``_adapters/_hermes_agent_turns.py`` on a
+    Hermes turn's ``invoke_agent`` span: tool call ids asked for minus those run. By id, as a
+    framework may run another name under one id. Names NO knob. Not ``TOOL_ARGS_UNPARSED``
+    (unreadable arguments) nor ``CHILD_SPAN_UNCLOSED`` (a tool left open).
     """
 
     # ------------------------------------------------------------------
@@ -1053,11 +1051,13 @@ Two emit sites, and the first is the mechanism the second restates.
     every tool call (Codex's built-in ``exec`` tool leaves no item). So no chat span ships, and the
     run's own span carries the turn's total usage.
 
-    Emitted from ``_adapters/_codex_exec.py``, on the run's ``invoke_agent`` span, whenever the
-    OTel bridge did not supply the calls (off, or fail-open). Reader's next action:
+    Emitted from ``_adapters/_codex_exec.py``, on the run's ``invoke_agent`` span, whenever the OTel
+    bridge did not supply the calls (off, or fail-open). Reader's next action:
     ``CodexExecConfig(otel_bridge=True)``, which reads each call's model, usage and interval from
-    the CLI's own traces. Not ``TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS``: that one says a call's
-    TIMING is the IPC stream's; this one says the calls themselves were never seen.
+    the CLI's own traces. Also on a Hermes turn that completed with no model-call frame
+    (``OBSERVATIONS`` in ``_adapters/_hermes_agent_turns.py``). Not
+    ``TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS``: that one says a call's TIMING is the IPC stream's;
+    this one says the calls themselves were never seen.
     """
 
     # ------------------------------------------------------------------
