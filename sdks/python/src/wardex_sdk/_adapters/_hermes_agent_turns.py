@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -536,8 +536,10 @@ class TurnRecord:
     lock: threading.RLock = field(default_factory=threading.RLock)
     handle: RunHandle | None = None  # published by the effect that opened the unit
     frames: dict[tuple[FrameKind, str], FrameRecord] = field(default_factory=dict)
-    requested: dict[str, str] = field(default_factory=dict)  # tool_call_id -> name, asked for
-    dispatched: set[str] = field(default_factory=set)  # tool_call_ids that entered a frame
+    #: api_request_id -> the tool names that model call asked for, in its order, and the tool
+    #: names whose frame named that call. Compared per call by count, see `undispatched`.
+    requested: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    dispatched: dict[str, list[str]] = field(default_factory=dict)
     model_frames: int = 0
     aux: dict[tuple[str, int], AuxAttempt] = field(default_factory=dict)  # in flight
     aux_tasks: list[str] = field(default_factory=list)  # task names Hermes stated, first seen first
@@ -565,12 +567,26 @@ class TurnRecord:
                 self.error_reason = None
             return s
 
-    def undispatched(self) -> dict[str, str]:
-        """Tool calls a model asked for that never reached a frame, compared by tool_call_id.
-
-        Never by name: a bridged call runs another tool name under the same id (measured).
-        """
-        return {i: n for i, n in self.requested.items() if i not in self.dispatched}
+    def undispatched(self) -> list[str]:
+        """Names of tool calls a model call asked for that never reached a frame, by count per
+        call: Hermes rewrites ids between report and dispatch (a reused id, a provider's ids in a
+        parallel batch) and names too (a repair, the deferred-tool bridge). A shortfall names the
+        asked-for names no frame ran, in asked order, cut to the shortfall: a repaired name can
+        make it name the wrong one of two, never the wrong number."""
+        missing: list[str] = []
+        for call, asked in self.requested.items():
+            ran = self.dispatched.get(call, [])
+            if len(ran) >= len(asked):
+                continue
+            left = Counter(ran)
+            unmatched = []
+            for name in asked:
+                if left[name]:
+                    left[name] -= 1
+                else:
+                    unmatched.append(name)
+            missing += unmatched[: len(asked) - len(ran)]
+        return missing
 
     def quiet(self, now: float) -> bool:
         """No frame pinned and no auxiliary attempt in flight within its bound: what the idle
@@ -606,8 +622,9 @@ def _completed_without_a_seen_call(r: TurnRecord, cause: CloseCause) -> bool:
 
 
 def _asked_for_a_tool_call_that_never_ran(r: TurnRecord, cause: CloseCause) -> bool:
-    # True for any cause: an invented tool name, a call another plugin vetoed and a call an
-    # interrupt cut before dispatch all leave the same trace, an id asked for and never run.
+    # True for any cause: an invented tool name, a malformed batch Hermes answered with error
+    # results, and a call an interrupt cut before dispatch all leave the same trace, a model
+    # call that asked for more tool calls than ran under it.
     return bool(r.undispatched())
 
 

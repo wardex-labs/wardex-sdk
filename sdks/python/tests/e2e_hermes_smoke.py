@@ -469,6 +469,44 @@ SCENARIOS: dict[str, Scenario] = {
         ("answer", "call-invented"),
         fixture=False,
     ),
+    "tool_ids_normalized": Scenario(
+        "Tool calls, sequential and parallel",
+        "[smoke:tool_ids_normalized] Read three files.",
+        [
+            _rule(
+                [
+                    _calls(
+                        "call-vllm",
+                        _read("a.txt"),
+                        _read("b.txt"),
+                        _read("c.txt"),
+                        id_prefix="chatcmpl-tool-",
+                    )
+                ],
+                **_FIRST,
+            ),
+            _rule([_text("answer", "Three tokens.")], last_role="tool", min_tool_results=3),
+        ],
+        ("answer", "call-vllm"),
+        fixture=False,
+    ),
+    "tool_ids_reused": Scenario(
+        "Tool calls, sequential and parallel",
+        "[smoke:tool_ids_reused] Invent, then read.",
+        [
+            # Hermes answers the invented call itself; its id stays in the session, so the
+            # next call's reuse of it runs as `call_0_d2`.
+            _rule([_calls("call-first", ("lab_no_such_tool", {"x": 1}), ids=["call_0"])], **_FIRST),
+            _rule(
+                [_calls("call-again", _read("b.txt"), ids=["call_0"])],
+                last_role="tool",
+                tool_results=1,
+            ),
+            _rule([_text("answer", "One token.")], last_role="tool", tool_results=2),
+        ],
+        ("answer", "call-again", "call-first"),
+        fixture=False,
+    ),
     "failing_tool": Scenario(
         "Tool calls, sequential and parallel",
         "[smoke:failing_tool] Read a missing file.",
@@ -836,6 +874,30 @@ ROWS: tuple[Row, ...] = (
     ),
     Row(
         "Tool calls, sequential and parallel",
+        "tool_ids_normalized",
+        (
+            Traces(1),
+            Count("execute_tool read_file", 3, parent=TURN),
+            Span(TURN, parent="", status="OK", no_markers=("tool_call_not_dispatched",)),
+        ),
+    ),
+    Row(
+        "Tool calls, sequential and parallel",
+        "tool_ids_reused",
+        (
+            Traces(1),
+            Count("execute_tool read_file", 1, parent=TURN),
+            Span(
+                TURN,
+                parent="",
+                status="OK",
+                markers=("tool_call_not_dispatched",),
+                attrs={A + "undispatched_tool_calls": "lab_no_such_tool"},
+            ),
+        ),
+    ),
+    Row(
+        "Tool calls, sequential and parallel",
         "failing_tool",
         (Span("execute_tool read_file", parent=TURN, status="ERROR", error_type="tool_error"),),
     ),
@@ -1083,13 +1145,17 @@ def provider_handler(rules: list[dict[str, Any]], truth: GroundTruth) -> type:
                 "total_tokens": 1010 + 2 * seq,
                 "prompt_tokens_details": {"cached_tokens": 0},
             }
+            # `ids` and `id_prefix` stand in for providers whose ids Hermes rewrites before it
+            # runs the calls: vLLM's `chatcmpl-tool-*`, and a provider that reuses `call_0`.
+            asked, prefix = reply.get("calls") or [], reply.get("id_prefix", "call_smoke_")
+            ids = reply.get("ids") or [f"{prefix}{seq}_{n}" for n in range(len(asked))]
             calls = [
                 {
-                    "id": f"call_smoke_{seq}_{n}",
+                    "id": ids[n],
                     "type": "function",
                     "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])},
                 }
-                for n, c in enumerate(reply.get("calls") or [])
+                for n, c in enumerate(asked)
             ]
             content, finish = reply.get("content"), "tool_calls" if calls else "stop"
             rid, model = f"chatcmpl-smoke-{seq}", body.get("model") or "lab-model"

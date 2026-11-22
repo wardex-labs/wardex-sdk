@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextvars
+import hashlib
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from _hermes_fake import OBSERVER_V1, Answer, Reply, Usage, conversation_of
@@ -128,3 +130,38 @@ def compress(turn: Turn) -> str:
     turn.conversation = conversation_of(turn)
     turn.session_id = f"{turn.session_id}_c{uuid.uuid4().hex[:4]}"
     return turn.session_id
+
+
+# -- what Hermes does to the tool calls a model call reported, before it dispatches them -------
+# `agent/turn_tool_validation.py::validate_tool_calls` runs after `post_api_request` has stated
+# the calls as the provider sent them. Each helper returns the `Call` as Hermes then dispatches
+# it; the fake's `post_api_request` keeps stating the original.
+
+
+def reused_ids_renamed(call: Call) -> Call:
+    """`agent/message_sanitization.py::uniquify_tool_call_ids`: a provider that names every call
+    `call_0` turn after turn reuses an id the session already holds, and Hermes runs the call
+    under `<id>_d<n>` instead."""
+    return replace(call, tool_calls=tuple((f"{i}_d2", n) for i, n in call.tool_calls))
+
+
+def provider_ids_normalized(call: Call) -> Call:
+    """`agent/message_sanitization.py::normalize_provider_tool_call_ids`: a parallel batch whose
+    ids are all provider-minted (`chatcmpl-tool-*`, which vLLM sends) runs under
+    `call_<12 hex of the id's sha256>`. The fake's own ids stand in for the provider's here; the
+    smoke row `tool_ids_normalized` drives the real prefix through a real Hermes."""
+    assert len(call.tool_calls) > 1, "Hermes normalizes a batch of two or more"
+
+    def digest(i: str) -> str:
+        return f"call_{hashlib.sha256(i.encode()).hexdigest()[:12]}"
+
+    return replace(call, tool_calls=tuple((digest(i), n) for i, n in call.tool_calls))
+
+
+def runs_as(call: Call, asked: str, name: str) -> Call:
+    """A call Hermes runs under another tool name and the same id:
+    `agent/agent_runtime_helpers.py::repair_tool_call` (a misspelled name repaired to a
+    registered tool) or `agent/turn_tool_validation.py::_route_deferred_call` (a deferred tool
+    run through the `tool_call` bridge)."""
+    renamed = tuple((i, name if n == asked else n) for i, n in call.tool_calls)
+    return replace(call, tool_calls=renamed)

@@ -210,13 +210,16 @@ class FrameEffects:
         first model-call frame is where its held input leaves the host, so it is recorded here.
 
         A tool frame Hermes named no `tool_call_id` for (one that code in `execute_code` called)
-        is kept by no turn: no report can name it, so it closes at its exit."""
+        is kept by no turn: no report can name it, so it closes at its exit. A tool frame is
+        counted under the model call its `api_request_id` names, by the name it runs under: that
+        count, not its id, is what `TurnRecord.undispatched` compares with the call's ask."""
         if isinstance(event, ToolEnter):
-            call_id = event.tool_call_id
+            call_id, asked_by = event.tool_call_id, event.api_request_id
             frame = FrameRecord(FrameKind.TOOL, call_id or "")
-            if call_id:
-                with record.lock:
-                    record.dispatched.add(call_id)
+            with record.lock:
+                if asked_by:
+                    record.dispatched.setdefault(asked_by, []).append(event.tool_name)
+                if call_id:
                     record.frames[(FrameKind.TOOL, call_id)] = frame
             self._open_tool(frame, event)
             return frame
@@ -380,7 +383,7 @@ class FrameEffects:
             key = (FrameKind.MODEL_CALL, event.api_request_id)
         with record.lock:
             if isinstance(event, CallReport):
-                record.requested.update(event.requested)
+                record.requested[event.api_request_id] = event.requested
             frame = record.frames.get(key)
         abandoned = isinstance(event, ToolReport) and event.abandoned()
         if frame is None:

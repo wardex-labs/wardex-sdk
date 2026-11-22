@@ -402,11 +402,11 @@ def test_completed_turn_with_no_model_frame_says_its_calls_were_unobserved() -> 
 def test_turn_that_asked_for_a_tool_call_that_never_ran_says_so_whatever_closed_it() -> None:
     marker = Limitation.TOOL_CALL_NOT_DISPATCHED
     asked = _record()
-    asked.requested.update({"call_1": "read_file", "call_2": "lab_no_such_tool"})
-    asked.dispatched.add("call_1")
+    asked.requested["t:api:1"] = ("read_file", "lab_no_such_tool")
+    asked.dispatched["t:api:1"] = ["read_file"]
     ran_all = _record()
-    ran_all.requested["call_1"] = "read_file"
-    ran_all.dispatched.add("call_1")
+    ran_all.requested["t:api:1"] = ("read_file",)
+    ran_all.dispatched["t:api:1"] = ["read_file"]
     for cause in CloseCause:
         assert marker in _applying(asked, cause), cause
         assert marker not in _applying(ran_all, cause), cause
@@ -416,13 +416,26 @@ def test_turn_that_asked_for_a_tool_call_that_never_ran_says_so_whatever_closed_
 # -- records -----------------------------------------------------------------------------------
 
 
-def test_undispatched_compares_tool_call_ids_not_names() -> None:
+def test_undispatched_counts_the_frames_under_each_model_call_against_what_it_asked_for() -> None:
     r = _record()
-    r.requested.update({"call_1": "read_file", "call_2": "lab_no_such_tool", "call_3": "tool_call"})
-    r.dispatched.update({"call_1", "call_3"})  # call_3 ran under another name, same id
-    assert r.undispatched() == {"call_2": "lab_no_such_tool"}
-    r.dispatched.add("call_2")
-    assert r.undispatched() == {}
+    # Hermes ran every call, under names it repaired or bridged: nothing is missing.
+    r.requested["t:api:1"] = ("Read_File", "lab_deferred")
+    r.dispatched["t:api:1"] = ["read_file", "tool_call"]
+    assert r.undispatched() == []
+    # One of three never ran: the shortfall names the asked-for name no frame matched.
+    r.requested["t:api:2"] = ("read_file", "lab_no_such_tool", "read_file")
+    r.dispatched["t:api:2"] = ["read_file", "read_file"]
+    assert r.undispatched() == ["lab_no_such_tool"]
+    # More frames than asked (a bridge call Hermes split) leave nothing missing.
+    r.dispatched["t:api:2"].append("read_file")
+    assert r.undispatched() == []
+    # A repaired name plus a shortfall: the count is right, the names are cut to it in order.
+    r.requested["t:api:3"] = ("Read_File", "write_file")
+    r.dispatched["t:api:3"] = ["read_file"]
+    assert r.undispatched() == ["Read_File"]
+    # A frame counts only under the model call it names.
+    r.requested["t:api:4"] = ("read_file",)
+    assert r.undispatched() == ["Read_File", "read_file"]
 
 
 def test_quiet_only_with_nothing_pinned_and_no_auxiliary_attempt_in_flight() -> None:

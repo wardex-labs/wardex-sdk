@@ -633,7 +633,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             record.blocked = ended and event.blocked()
             held, record.held_input = record.held_input, None
             error_reason = record.error_reason if record.after_error else None
-            undispatched = list(record.undispatched().values())
+            undispatched = record.undispatched()
             notes = [o.marker for o in OBSERVATIONS if o.applies(record, cause)]
             aux_tasks = record.aux_tasks[:AUX_TASK_NAMES]
             pending = list(record.aux.items())

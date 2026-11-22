@@ -98,11 +98,12 @@ All notable changes to this project are documented here. The format follows
   and a `wardex.hermes_agent.close_cause`, at the session's next turn or the
   next turn on its thread, when Hermes closes the session, or after 120
   seconds with no event (300 after a failed model call). Nothing that runs on
-  that thread after a failed turn sits under it. What wardex cannot place is marked, not guessed:
-  Hermes's background memory review, side questions, the session-title call,
-  a tool call Hermes never ran, and model calls made outside the process. A
-  prompt another plugin blocked is in no span. wardex imports and patches
-  nothing of Hermes, and Hermes gets its own results and exceptions back.
+  that thread after a failed turn sits under it. What wardex cannot place is
+  marked, not guessed: Hermes's background memory review, side questions, the
+  session-title call, a tool call Hermes never ran, and model calls made
+  outside the process. A prompt another plugin blocked is in no span. wardex
+  imports and patches nothing of Hermes, and Hermes gets its own results and
+  exceptions back.
   Measured on Hermes Agent v0.23.3 (`hermes.observer.v1`,
   `hermes.middleware.v1`). The README's adapter section has the details.
 - **`tool_call_not_dispatched` is a new limitation marker.** It is on a run

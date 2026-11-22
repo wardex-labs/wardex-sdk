@@ -96,7 +96,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "assistant_message": _TOOL_CALLS,
             "assistant_tool_call_count": 1,
         },
-        CallReport("t-1", "s-1:api:1", "s-1", _CORE_USAGE, (("call_1", "read_file"),)),
+        CallReport("t-1", "s-1:api:1", "s-1", _CORE_USAGE, ("read_file",)),
     ),
     "api_request_error": (
         {
@@ -400,16 +400,20 @@ def test_the_turn_input_and_output_are_carried_as_hermes_sent_them() -> None:
     assert parse(_ROWS["post_llm_call"], absent) == (TurnAnswer("s-1", "t-1"), None)
 
 
-def test_requested_tool_calls_keep_ids_and_names_only() -> None:
+def test_requested_tool_calls_keep_names_only_in_the_order_asked() -> None:
     row = _ROWS["post_api_request"]
     base = _SAMPLES["post_api_request"][0]
     as_mapping = {"tool_calls": [{"id": "call_1", "name": "read_file", "arguments": "{}"}]}
     for message in (_TOOL_CALLS, as_mapping):
         event, _ = parse(row, {**base, "assistant_message": message})
         assert isinstance(event, CallReport)
-        assert event.requested == (("call_1", "read_file"),)
-    broken = SimpleNamespace(tool_calls=[SimpleNamespace(id="", name="x"), SimpleNamespace(id="c")])
-    for message in (broken, SimpleNamespace(tool_calls=None), SimpleNamespace()):
+        assert event.requested == ("read_file",)
+    # A blank id still runs (Hermes supplies one): it is counted. A call with no name is not.
+    blank = SimpleNamespace(tool_calls=[SimpleNamespace(id="", name="x"), SimpleNamespace(id="c")])
+    event, _ = parse(row, {**base, "assistant_message": blank})
+    assert isinstance(event, CallReport)
+    assert event.requested == ("x",)
+    for message in (SimpleNamespace(tool_calls=None), SimpleNamespace()):
         event, _ = parse(row, {**base, "assistant_message": message})
         assert isinstance(event, CallReport)
         assert event.requested == ()

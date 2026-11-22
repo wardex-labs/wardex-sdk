@@ -350,7 +350,11 @@ What wardex cannot place is marked and never placed by a guess:
   `parent_unresolved` on the HTTP attempt. The title call's span built from
   Hermes's report carries `possible_duplicate_chat`.
 - A tool call the model asked for and Hermes never ran:
-  `tool_call_not_dispatched` on the turn.
+  `tool_call_not_dispatched` on the turn, and
+  `wardex.hermes_agent.undispatched_tool_calls` names it. It is decided by
+  count for each model call: fewer tools ran under the call than it asked
+  for. Hermes renames tool-call ids and repairs tool names before it runs
+  them, so neither is compared.
 - A turn whose model calls ran outside the process:
   `subprocess_model_calls_unobserved` on the turn.
 - A tool that code in `execute_code` calls sits under the `execute_code`

@@ -12,7 +12,7 @@ What is never read, by design: model message and response content (`conversation
 `request`, `messages`, and every content member of `response` and `assistant_message`; the wire
 is the authority for model content), `sender_id` (end-user identity), `child_goal`,
 `child_summary`, cost, and any profile name. Of `response` and `assistant_message` only each tool
-call's id and name are read. `parse` reads only the fields a record's `FIELDS` names, so a field
+call's name is read. `parse` reads only the fields a record's `FIELDS` names, so a field
 that is not named never reaches a record.
 
 What is read for the core's capped, masked payload path (`record_input` and `record_output`)
@@ -202,22 +202,23 @@ def _error_type(v: object) -> object:
 
 
 def _requested(v: object) -> object:
-    """`assistant_message` -> ((tool_call_id, tool name), ...) from its `tool_calls`.
+    """`assistant_message` -> (tool name, ...) from its `tool_calls`, in the order asked.
 
-    Ids and names only: `arguments` and every content member are left unread. A call without a
-    string id and name is skipped, since the id is what a dispatched frame is matched by.
+    Names only: not the id, which Hermes may rewrite before dispatch (and supplies when it is
+    blank), so a dispatched frame is matched by count, not by id; `arguments` and every content
+    member are left unread. A call without a string name is skipped: there is nothing to state.
     """
     if v is None:
         return MISSING
     calls = _member(v, "tool_calls")
     if not isinstance(calls, (list, tuple)):
         return ()
-    pairs = ((_member(c, "id"), _member(c, "name")) for c in calls)
-    return tuple((i, n) for i, n in pairs if isinstance(i, str) and i and isinstance(n, str) and n)
+    names = (_member(c, "name") for c in calls)
+    return tuple(n for n in names if isinstance(n, str) and n)
 
 
 def _requested_in_response(v: object) -> object:
-    """`response` -> the same pairs, from its `assistant_message` member.
+    """`response` -> the same names, from its `assistant_message` member.
 
     Hermes hands `post_api_request` both a JSON-able `response` dict, whose `assistant_message`
     holds the tool calls, and the `assistant_message` object itself. The recorded payloads keep
@@ -294,7 +295,7 @@ class CallEnter:
 @dataclass(frozen=True, slots=True)
 class CallReport:
     """`post_api_request`: Hermes's usage (held, never promoted here) and the tool calls the
-    model asked for, by id and name."""
+    model asked for, by name."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("turn_id", "turn_id", _text),
@@ -309,7 +310,7 @@ class CallReport:
     api_request_id: str
     session_id: str | None = None  # Hermes sends "" when its agent has none
     usage: tuple[tuple[str, int], ...] = ()
-    requested: tuple[tuple[str, str], ...] = ()
+    requested: tuple[str, ...] = ()
 
     def trigger(self) -> Trigger:
         return Trigger.CALL_REPORT
@@ -379,7 +380,7 @@ class ToolEnter:
     tool_name: str
     session_id: str | None = None
     turn_id: str | None = None
-    api_request_id: str | None = None  # the model call that asked for it: a link, nothing else
+    api_request_id: str | None = None  # the model call that asked for it: a link and a count
     tool_call_id: str | None = None  # what its post_tool_call is matched by
     conversation_id: str | None = None  # Hermes's own, the only payload family that states it
     args: object = None  # for record_input only
