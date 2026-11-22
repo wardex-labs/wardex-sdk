@@ -171,31 +171,55 @@ def typed_usage(node: SpanNode) -> dict[str, Any]:
     return {k: v for k, v in node.attributes.items() if k.startswith("gen_ai.usage.")}
 
 
-def _line(node: SpanNode) -> str:
+def _line(node: SpanNode, quiet: frozenset[str] = frozenset()) -> str:
     status = node.status.name if node.status is not None else "-"
     error = node.attributes.get("error.type")
     if error is not None:
         status += f"({error})"
     strategy = node.strategy.name.lower() if node.strategy is not None else "-"
     line = f"{node.name} | {strategy} {node.confidence} | {status}"
-    markers = sorted(m.name.lower() for m in node.limitations)
+    markers = sorted(m.name.lower() for m in node.limitations if m.name.lower() not in quiet)
     return line + (" | " + ", ".join(markers) if markers else "")
 
 
-def outline(nodes: tuple[SpanNode, ...]) -> str:
+#: The markers a stream cut by an interrupt may or may not carry, by how much of it had arrived.
+CUT_STREAM_MARKERS = frozenset(
+    {"provider_inferred", "reassembled_from_stream", "stream_usage_unavailable"}
+)
+
+#: An expected tree: a span's outline line and its children, as `render` draws them.
+Tree = tuple[str, tuple["Tree", ...]]
+
+
+def _drawn(line: str, kids: list[list[str]], depth: int) -> list[str]:
+    # Siblings sort by everything they draw, so threads finishing in another order, or two
+    # siblings with the same line and different children, always draw the same outline.
+    ordered = sorted(kids)
+    return ["  " * depth + line] + [row for lines in ordered for row in lines]
+
+
+def outline(nodes: tuple[SpanNode, ...], quiet: frozenset[str] = frozenset()) -> str:
     """Every exported tree as indented lines: name, parent source and confidence, status (with
-    `error.type`), markers. Siblings are sorted by their own lines, so threads finishing in a
-    different order draw the same outline."""
+    `error.type`), markers. Markers named in `quiet` are left out: the seam's account of a stream
+    cut mid-chunk depends on how much of it had arrived."""
     ids = {n.span_id for n in nodes}
 
     def draw(node: SpanNode, depth: int) -> list[str]:
-        kids = [n for n in nodes if n.parent_id == node.span_id]
-        drawn = sorted((draw(k, depth + 1) for k in kids), key=lambda lines: lines[0])
-        return ["  " * depth + _line(node)] + [line for lines in drawn for line in lines]
+        kids = [draw(n, depth + 1) for n in nodes if n.parent_id == node.span_id]
+        return _drawn(_line(node, quiet), kids, depth)
 
-    roots = [n for n in nodes if n.parent_id not in ids]
-    drawn = sorted((draw(r, 0) for r in roots), key=lambda lines: lines[0])
-    return "\n".join(line for lines in drawn for line in lines)
+    roots = sorted(draw(r, 0) for r in nodes if r.parent_id not in ids)
+    return "\n".join(row for lines in roots for row in lines)
+
+
+def render(*roots: Tree) -> str:
+    """The outline the trees in `roots` draw: what `outline` must return for them."""
+
+    def draw(tree: Tree, depth: int) -> list[str]:
+        line, kids = tree
+        return _drawn(line, [draw(k, depth + 1) for k in kids], depth)
+
+    return "\n".join(row for lines in sorted(draw(r, 0) for r in roots) for row in lines)
 
 
 def links(transport: RecordingTransport, node: SpanNode, nodes: tuple[SpanNode, ...]) -> list:
