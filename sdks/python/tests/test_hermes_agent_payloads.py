@@ -7,13 +7,14 @@ turn's first model call has no `api_request_id`; a tool that code in `execute_co
 
 from __future__ import annotations
 
+import logging
 import textwrap
 from pathlib import Path
 
 import pytest
 
 import wardex_sdk as wardex
-from _hermes_payloads import code_calls, dispatch, prelude_tool
+from _hermes_payloads import code_calls, dispatch, prelude_tool, turnless_aux
 from _hermes_support import (
     exported,
     extras,
@@ -113,3 +114,19 @@ def test_tools_code_in_execute_code_calls_nest_under_it_with_no_call_id():
         assert "api_request_id" not in extras(node)
     assert wardex.diagnostics().losses == ()
     assert row.detail == ""
+
+
+def test_an_auxiliary_call_outside_any_turn_is_marked_and_drops_nothing(caplog):
+    counters.reset()
+    transport = start_wardex()
+    with caplog.at_level(logging.WARNING, logger="wardex_sdk"):
+        with plugin() as ctx, hermes(ctx) as h:
+            on_loop(turnless_aux, h, name="mcp-loop")
+            row = status()
+    # Hermes named no turn, so the attempt keeps its own trace and says it has no proven parent.
+    assert outline(exported(transport)) == f"{WIRE} | unresolved 0.0 | OK | " + ", ".join(
+        ("parent_unresolved", "provider_inferred")
+    )
+    assert wardex.diagnostics().losses == ()
+    assert row.detail == ""
+    assert [r.getMessage() for r in caplog.records] == []

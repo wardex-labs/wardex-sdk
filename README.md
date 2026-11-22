@@ -315,7 +315,10 @@ turn's first model call (a scripted prelude) is such a root too, with its
 turn's `wardex.hermes_agent.turn_id` and no link, since no model call asked
 for it. A tool that code in `execute_code` calls sits under that
 `execute_code` span with no call id and status unset: Hermes names it no id,
-so its report cannot be matched to it.
+so its report cannot be matched to it. An auxiliary call Hermes makes
+outside any turn (an MCP server's sampling request, a title call after its
+turn ended) names no turn, so its HTTP attempt is a root marked
+`parent_unresolved`.
 wardex imports and patches nothing of Hermes. Its hooks return nothing, and
 each middleware call hands Hermes back its own result or its own exception.
 

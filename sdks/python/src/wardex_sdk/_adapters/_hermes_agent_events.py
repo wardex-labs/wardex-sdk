@@ -269,15 +269,15 @@ class CallEnter:
     #: the first (wardex registered twice) is recognized by it before anything is parsed.
     FRAME_KEY: ClassVar[str] = "api_request_id"
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("session_id", "session_id", _text),
         Field("turn_id", "turn_id", _text),
         Field("api_request_id", "api_request_id", _text),
+        Field("session_id", "session_id", _text, required=False),
         Field("model", "model", _text, required=False),
         Field("api_mode", "api_mode", _text, required=False),
     )
-    session_id: str
     turn_id: str
     api_request_id: str
+    session_id: str | None = None  # Hermes sends "" when its agent has none
     model: str | None = None
     api_mode: str | None = None
 
@@ -297,17 +297,17 @@ class CallReport:
     model asked for, by id and name."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("session_id", "session_id", _text),
         Field("turn_id", "turn_id", _text),
         Field("api_request_id", "api_request_id", _text),
+        Field("session_id", "session_id", _text, required=False),
         Field("usage", "usage", _usage, required=False),
         # Two sources for one attribute: a later field overwrites an earlier one it read.
         Field("response", "requested", _requested_in_response, required=False),
         Field("assistant_message", "requested", _requested, required=False),
     )
-    session_id: str
     turn_id: str
     api_request_id: str
+    session_id: str | None = None  # Hermes sends "" when its agent has none
     usage: tuple[tuple[str, int], ...] = ()
     requested: tuple[tuple[str, str], ...] = ()
 
@@ -334,15 +334,15 @@ class CallError:
     """
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("session_id", "session_id", _text),
         Field("turn_id", "turn_id", _text),
         Field("api_request_id", "api_request_id", _text),
+        Field("session_id", "session_id", _text, required=False),
         Field("reason", "reason", _text, required=False),
         Field("error", "error_type", _error_type, required=False),
     )
-    session_id: str
     turn_id: str
     api_request_id: str
+    session_id: str | None = None  # Hermes sends "" when its agent has none
     reason: str | None = None
     error_type: str | None = None  # Hermes's `error.type`, the class of what failed
 
@@ -432,20 +432,22 @@ class ToolReport:
 
 @dataclass(frozen=True, slots=True)
 class AuxStart:
-    """`pre_auxiliary_call`, once per physical attempt. `turn_id` is optional: an auxiliary call
-    outside any turn is legal, and keys no turn. `model` names the hook-built span."""
+    """`pre_auxiliary_call`, once per physical attempt. `session_id` and `turn_id` are optional:
+    Hermes sends both as "" for an auxiliary call outside any turn
+    (`agent/auxiliary_hooks.py::_parent_turn_identity`: cron, gateway idle work, an MCP server's
+    sampling request), which is legal and keys no turn. `model` names the hook-built span."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("session_id", "session_id", _text),
         Field("api_request_id", "aux_request_id", _text),  # "aux-<hex>"
         Field("retry_count", "retry_count", _int),
+        Field("session_id", "session_id", _text, required=False),
         Field("turn_id", "turn_id", _text, required=False),
         Field("aux_task", "aux_task", _text, required=False),
         Field("model", "model", _text, required=False),
     )
-    session_id: str
     aux_request_id: str
     retry_count: int
+    session_id: str | None = None
     turn_id: str | None = None
     aux_task: str | None = None
     model: str | None = None
@@ -469,16 +471,16 @@ class AuxEnd:
     """`post_auxiliary_call`. Its usage is written as held extras on the hook-built span only."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("session_id", "session_id", _text),
         Field("api_request_id", "aux_request_id", _text),
         Field("retry_count", "retry_count", _int),
+        Field("session_id", "session_id", _text, required=False),
         Field("turn_id", "turn_id", _text, required=False),
         Field("error_type", "error_type", _text, required=False),
         Field("usage", "usage", _usage, required=False),
     )
-    session_id: str
     aux_request_id: str
     retry_count: int
+    session_id: str | None = None
     turn_id: str | None = None
     error_type: str | None = None
     usage: tuple[tuple[str, int], ...] = ()
@@ -502,14 +504,14 @@ class ChildStart:
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("parent_session_id", "parent_session_id", _text),
-        Field("parent_turn_id", "parent_turn_id", _text),
         Field("child_session_id", "child_session_id", _text),
+        Field("parent_turn_id", "parent_turn_id", _text, required=False),
         Field("child_subagent_id", "child_subagent_id", _text, required=False),
         Field("child_role", "child_role", _text, required=False),
     )
     parent_session_id: str
-    parent_turn_id: str
     child_session_id: str
+    parent_turn_id: str | None = None  # "" from a parent with no turn running: keys no turn
     child_subagent_id: str | None = None
     child_role: str | None = None
 

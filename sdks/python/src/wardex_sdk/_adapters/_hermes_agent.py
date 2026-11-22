@@ -448,7 +448,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         s = step(None if tomb is None else tomb.state, trigger)
         if s.action not in CREATES or event is None or s.next is None:
             return self._run(None, event, s, trigger)
-        session_id = getattr(event, "session_id", "")
+        session_id = getattr(event, "session_id", None) or ""  # "" on a record Hermes sent none
         parent = getattr(event, "parent_session_id", None)
         child = parent is not None or self._book.tie_for(session_id) is not None
         record = TurnRecord(
@@ -558,7 +558,8 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
                     d.set_extra(PREFIX + "child_role", tie.child_role)
                 if tie.child_subagent_id:
                     d.set_extra(PREFIX + "child_subagent_id", tie.child_subagent_id)
-                h.link(LinkReason.TRIGGERED_BY, UnitKey(TURN_NS, tie.parent_turn_id))
+                if tie.parent_turn_id:
+                    h.link(LinkReason.TRIGGERED_BY, UnitKey(TURN_NS, tie.parent_turn_id))
             if delegate is not None and not delegate.pinned():  # the delegate call has returned
                 h.link(LinkReason.TRIGGERED_BY, UnitKey(TOOL_NS, delegate.key))
             if resumed:  # before the alias, so the key still names the closed generation

@@ -98,7 +98,9 @@ All notable changes to this project are documented here. The format follows
   starts a turn, so its background memory review and side questions are
   `chat` spans with no turn above them. A tool run before a turn's first model
   call, and a tool that code in `execute_code` calls, each still has its span,
-  though Hermes names no model call or no call id for it. A failed model call
+  though Hermes names no model call or no call id for it. An auxiliary call
+  outside any turn, such as an MCP server's sampling request, is marked
+  `parent_unresolved` and drops no event. A failed model call
   ends nothing, since Hermes may still recover. A turn Hermes never ended is closed with
   `session_aborted` and `wardex.hermes_agent.close_cause` at the session's
   next turn, at a finalize of that session, or after 120 seconds with no

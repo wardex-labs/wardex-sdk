@@ -481,7 +481,7 @@ class ChildTie:
     """What `subagent_start` said, kept until the child's own `pre_llm_call` reads it."""
 
     child_session_id: str
-    parent_turn_id: str
+    parent_turn_id: str | None  # None: the parent had no turn running, so nothing to link to
     child_subagent_id: str | None = None
     child_role: str | None = None
 

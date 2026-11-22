@@ -84,7 +84,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "api_mode": "chat_completions",
             "api_call_count": 1,
         },
-        CallEnter("s-1", "t-1", "s-1:api:1", "lab-model", "chat_completions"),
+        CallEnter("t-1", "s-1:api:1", "s-1", "lab-model", "chat_completions"),
     ),
     "post_api_request": (
         {
@@ -96,7 +96,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "assistant_message": _TOOL_CALLS,
             "assistant_tool_call_count": 1,
         },
-        CallReport("s-1", "t-1", "s-1:api:1", _CORE_USAGE, (("call_1", "read_file"),)),
+        CallReport("t-1", "s-1:api:1", "s-1", _CORE_USAGE, (("call_1", "read_file"),)),
     ),
     "api_request_error": (
         {
@@ -110,7 +110,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "reason": "server_error",
             "status_code": 500,
         },
-        CallError("s-1", "t-1", "s-1:api:1", "server_error"),
+        CallError("t-1", "s-1:api:1", "s-1", "server_error"),
     ),
     "tool_execution": (
         {
@@ -155,7 +155,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "aux_task": "title_generation",
             "model": "lab-aux-title",
         },
-        AuxStart("s-1", "aux-0f3a", 0, "t-1", "title_generation", "lab-aux-title"),
+        AuxStart("aux-0f3a", 0, "s-1", "t-1", "title_generation", "lab-aux-title"),
     ),
     "post_auxiliary_call": (
         {
@@ -167,7 +167,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "error_type": "BadRequestError",
             "usage": _USAGE,
         },
-        AuxEnd("s-1", "aux-0f3a", 0, "t-1", "BadRequestError", _CORE_USAGE),
+        AuxEnd("aux-0f3a", 0, "s-1", "t-1", "BadRequestError", _CORE_USAGE),
     ),
     "subagent_start": (
         {
@@ -179,7 +179,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "child_role": "leaf",
             "parent_subagent_id": None,
         },
-        ChildStart("s-1", "t-1", "s-2", "sa-1", "leaf"),
+        ChildStart("s-1", "s-2", "t-1", "sa-1", "leaf"),
     ),
     "subagent_stop": (
         {**_OBS, "child_session_id": "s-2", "child_status": "completed", "duration_ms": 9},
@@ -281,6 +281,39 @@ def test_a_missing_required_field_drops_the_event_and_names_the_field(
 ) -> None:
     payload = {k: v for k, v in _SAMPLES[name][0].items() if k != field}
     assert parse(_ROWS[name], payload) == (None, DriftNote(Drift.FIELD, name, f"missing {field}"))
+
+
+#: Ids Hermes v0.23.3 sends as "" when it has none (`model_tools.py::_CallIds.hook_kwargs`,
+#: `agent/auxiliary_hooks.py::_parent_turn_identity`, `agent/turn_api_call.py`,
+#: `tools/delegate_tool.py`): legal payloads, so none of them may drop the event.
+_HERMES_SENDS_EMPTY = [
+    ("pre_llm_call", "parent_session_id"),
+    ("pre_llm_call", "platform"),
+    ("llm_execution", "session_id"),
+    ("post_api_request", "session_id"),
+    ("api_request_error", "session_id"),
+    ("tool_execution", "session_id"),
+    ("tool_execution", "turn_id"),
+    ("tool_execution", "api_request_id"),
+    ("tool_execution", "tool_call_id"),
+    ("post_tool_call", "session_id"),
+    ("post_tool_call", "turn_id"),
+    ("post_tool_call", "tool_call_id"),
+    ("pre_auxiliary_call", "session_id"),
+    ("pre_auxiliary_call", "turn_id"),
+    ("post_auxiliary_call", "session_id"),
+    ("post_auxiliary_call", "turn_id"),
+    ("subagent_start", "parent_turn_id"),
+]
+
+
+@pytest.mark.parametrize(("name", "field"), _HERMES_SENDS_EMPTY, ids=lambda v: v)
+def test_an_id_hermes_sends_empty_keeps_the_event_and_states_no_value(
+    name: str, field: str
+) -> None:
+    event, drift = parse(_ROWS[name], {**_SAMPLES[name][0], field: ""})
+    assert drift is None
+    assert event is not None and getattr(event, field) is None
 
 
 def test_a_mistyped_field_counts_as_missing() -> None:
