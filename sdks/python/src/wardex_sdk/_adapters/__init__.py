@@ -99,6 +99,12 @@ def _anthropic_agent_sdk() -> AdapterInterface:
     return AnthropicAgentSdkAdapter()
 
 
+def _hermes_agent() -> AdapterInterface:
+    from ._hermes_agent import HermesAgentAdapter
+
+    return HermesAgentAdapter()
+
+
 def _langgraph() -> AdapterInterface:
     from ._langgraph import LangGraphAdapter
 
@@ -133,6 +139,9 @@ _ADAPTERS: dict[AdapterName, _Registration] = {
         attrgetter("codex_exec"),
         executable="codex",
     ),
+    # Hermes calls the plugin, so installing patches nothing of Hermes and imports none of it:
+    # the probe finds `hermes_cli`, and the adapter waits for `wardex_sdk.hermes_agent.register`.
+    AdapterName.HERMES_AGENT: _Registration("hermes_cli", "hermes-agent", _hermes_agent),
     AdapterName.LANGGRAPH: _Registration("langgraph", "langgraph", _langgraph),
     AdapterName.OPENAI_AGENTS: _Registration("agents", "openai-agents", _openai_agents),
     # The module is shipped by the slim distribution; the `pydantic-ai`

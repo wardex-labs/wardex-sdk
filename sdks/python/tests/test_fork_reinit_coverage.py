@@ -132,6 +132,13 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_adapters/_on_import.py", "finding"): "per-thread import stack, carries on in the child",
     ("_adapters/_on_import.py", "depths"): "per-thread import stack, carries on in the child",
     ("_interceptors/_registry.py", "_installed"): "install record, kept (I-fork-4)",
+    # -- what Hermes holds: the plugin contexts and their registrations crossed the fork in
+    #    the memory image and still call wardex in the child, so forgetting them would make
+    #    the child's adapter read "not attached" while Hermes keeps delivering.
+    ("_adapters/_hermes_agent_attach.py", "_ATTACHED"): "registration record, kept (I-fork-4)",
+    ("_adapters/_hermes_agent_attach.py", "_REFUSED"): (
+        "registration record, kept (I-fork-4): what Hermes refused before the fork stays refused"
+    ),
     ("context/_inject.py", "_installed"): "patch record, kept (I-fork-4)",
     ("_hub.py", "_said"): (
         "said-once keys of advisory log lines; a child inheriting them stays quiet about "

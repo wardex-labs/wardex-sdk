@@ -9,12 +9,14 @@ payload field, so a Hermes change lands here and nowhere else.
 Knows no wardex verb and no turn state beyond the `Trigger` each event maps to.
 
 What is never read, by design: model message and response content (`user_message`,
-`conversation_history`, `request`, `messages`, `response`, `assistant_response`; the wire is the
-authority for model content), `sender_id` (end-user identity), `child_goal`, `child_summary`,
-cost, and any profile name. `parse` reads only the fields a record's `FIELDS` names, so a field
-that is not named never reaches a record. Tool arguments and tool results are read, because no
-wire carries an in-process tool's input or output. They are carried through for the core's
-capped, masked payload path (`record_input` and `record_output`) only, never for an attribute.
+`conversation_history`, `request`, `messages`, `assistant_response`, and every content member of
+`response` and `assistant_message`; the wire is the authority for model content), `sender_id`
+(end-user identity), `child_goal`, `child_summary`, cost, and any profile name. Of `response` and
+`assistant_message` only each tool call's id and name are read. `parse` reads only the fields a
+record's `FIELDS` names, so a field that is not named never reaches a record. Tool arguments and
+tool results are read, because no wire carries an in-process tool's input or output. They are
+carried through for the core's capped, masked payload path (`record_input` and `record_output`)
+only, never for an attribute.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from ._hermes_agent_turns import CloseCause, Trigger
 
 __all__ = [
     "CONTRACT",
+    "HOST_PROCESS_ENV",
     "KNOWN_SCHEMAS",
     "MISSING",
     "NOT_REGISTERED",
@@ -72,6 +75,10 @@ USAGE_KEYS: Mapping[str, str] = {
     "cache_write_tokens": "gen_ai.usage.cache_creation.input_tokens",
     "reasoning_tokens": "gen_ai.usage.reasoning.output_tokens",
 }
+
+#: Set to "1" by Hermes in its plugin host process (`plugins.isolation: host`). Model traffic
+#: runs in the agent's own process, so nothing wardex could record is visible there.
+HOST_PROCESS_ENV = "HERMES_PLUGIN_HOST_PROCESS"
 
 
 class Surface(Enum):
@@ -174,6 +181,16 @@ def _requested(v: object) -> object:
     return tuple((i, n) for i, n in pairs if isinstance(i, str) and i and isinstance(n, str) and n)
 
 
+def _requested_in_response(v: object) -> object:
+    """`response` -> the same pairs, from its `assistant_message` member.
+
+    Hermes hands `post_api_request` both a JSON-able `response` dict, whose `assistant_message`
+    holds the tool calls, and the `assistant_message` object itself. The recorded payloads keep
+    only the dict, so it is read too; the object, read after it, wins when Hermes sends it.
+    """
+    return MISSING if v is None else _requested(_member(v, "assistant_message"))
+
+
 # -- event records -----------------------------------------------------------------------------
 
 
@@ -206,6 +223,9 @@ class TurnStart:
 class CallEnter:
     """`llm_execution` frame entry. `request` and `next_call` are in the same kwargs, unread."""
 
+    #: The payload field that names one frame: a second delivery of the same frame nested inside
+    #: the first (wardex registered twice) is recognized by it before anything is parsed.
+    FRAME_KEY: ClassVar[str] = "api_request_id"
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("session_id", "session_id", _text),
         Field("turn_id", "turn_id", _text),
@@ -239,6 +259,8 @@ class CallReport:
         Field("turn_id", "turn_id", _text),
         Field("api_request_id", "api_request_id", _text),
         Field("usage", "usage", _usage, required=False),
+        # Two sources for one attribute: a later field overwrites an earlier one it read.
+        Field("response", "requested", _requested_in_response, required=False),
         Field("assistant_message", "requested", _requested, required=False),
     )
     session_id: str
@@ -296,6 +318,7 @@ class CallError:
 class ToolEnter:
     """`tool_execution` frame entry. `args` is Hermes's object: read, never changed."""
 
+    FRAME_KEY: ClassVar[str] = "tool_call_id"
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("session_id", "session_id", _text),
         Field("turn_id", "turn_id", _text),
@@ -463,7 +486,8 @@ class ChildStop:
 @dataclass(frozen=True, slots=True)
 class TurnEnd:
     """`on_session_end`. It usually names its turn. The CLI's interrupted-run path sends only
-    the session, so then it applies to every live turn of the session."""
+    the session, and states its exit reason as `reason` with no `turn_exit_reason`, so then it
+    applies to every live turn of the session."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("session_id", "session_id", _text),
@@ -471,6 +495,8 @@ class TurnEnd:
         Field("completed", "completed", _flag, required=False),
         Field("failed", "failed", _flag, required=False),
         Field("interrupted", "interrupted", _flag, required=False),
+        # The CLI interrupt path's spelling first, so `turn_exit_reason` wins when both are sent.
+        Field("reason", "exit_reason", _text, required=False),
         Field("turn_exit_reason", "exit_reason", _text, required=False),
     )
     session_id: str

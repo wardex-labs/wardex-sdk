@@ -7,11 +7,13 @@ import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import pytest
 
+from _hermes_support import hermes_installed
 from wardex_sdk._adapters import (
     _ADAPTERS,
     _DETECT_PACKAGES,
@@ -33,6 +35,14 @@ def _frameworks_imported() -> None:
     tests select install at init() rather than waiting for that import."""
     for module in ("agents", "claude_agent_sdk", "langgraph.graph"):
         importlib.import_module(module)
+
+
+@pytest.fixture
+def _hermes_imported(tmp_path: Path):
+    """Hermes cannot be installed beside the other frameworks, so its distribution record and
+    package are written to a temporary site and imported, as Hermes's own is when it runs."""
+    with hermes_installed(tmp_path):
+        yield
 
 
 class _FakeAdapter(AdapterInterface):
@@ -158,7 +168,7 @@ def _config(enabled, *, debug=False, **options):
     return cfg
 
 
-def test_auto_detection_installs_when_package_present():
+def test_auto_detection_installs_when_package_present(_hermes_imported):
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
