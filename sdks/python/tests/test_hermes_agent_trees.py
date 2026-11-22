@@ -36,6 +36,7 @@ from _hermes_support import (
     wait_for,
 )
 from wardex_sdk._adapters import _hermes_agent_attach as attach_module
+from wardex_sdk._adapters import _hermes_agent_turns as turns_module
 from wardex_sdk._assembly import LinkReason, counters
 
 WIRE = "HTTP POST /v1/chat/completions"
@@ -136,10 +137,25 @@ def _failed_turn(h: FakeHermes) -> None:
     h.fail(h.turn())
 
 
-def test_a_failed_turn_closes_unset_aborted_with_the_error_on_the_call():
+def _quiet_net(monkeypatch) -> None:
+    """Hermes sends no end for a turn whose retries were spent, so the quiet net closes it. This
+    shortens the net so the test need not wait five minutes."""
+    monkeypatch.setattr(turns_module, "IDLE_AFTER_ERROR_S", 0.3)
+    monkeypatch.setattr(attach_module, "IDLE_SWEEP_S", 0.05)
+
+
+def _closed_by_the_net(transport) -> None:
+    assert wait_for(lambda: any(n.name == "invoke_agent hermes" for n in received(transport)))
+
+
+def test_a_failed_turn_closes_unset_aborted_on_the_quiet_net_with_the_error_on_the_call(
+    monkeypatch,
+):
+    _quiet_net(monkeypatch)
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
         on_loop(_failed_turn, h)
+        _closed_by_the_net(transport)
     nodes = exported(transport)
     assert outline(nodes) == _tree(f"""
     invoke_agent hermes | trace_root 1.0 | UNSET | session_aborted
@@ -148,16 +164,37 @@ def test_a_failed_turn_closes_unset_aborted_with_the_error_on_the_call():
         {WIRE} | contextvar 1.0 | ERROR(500)
     """)
     root = one(nodes, "invoke_agent hermes")
-    assert extras(root)["close_cause"] == "retries_spent"
+    assert extras(root)["close_cause"] == "idle"
     assert extras(root)["error_reason"] == "server_error"
     assert "exit_reason" not in extras(root), "Hermes sent no end, so no exit reason is stated"
+
+
+def test_a_provider_that_never_recovers_gives_one_turn_holding_every_frame_of_the_ladder(
+    monkeypatch,
+):
+    """Hermes's defaults: three frames per round, five more rounds on its recovery ladder, all
+    under one `api_request_id`. No frame's error ends the turn; the quiet net does, once."""
+    _quiet_net(monkeypatch)
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        on_loop(lambda: h.fail(h.turn(), (Reply.SERVER_ERROR,), retries=3, cycles=5))
+        _closed_by_the_net(transport)
+    nodes = exported(transport)
+    failed = (
+        "chat lab-model | unit_active 1.0 | ERROR(InternalServerError)",
+        ((f"{WIRE} | contextvar 1.0 | ERROR(500)", ()),),
+    )
+    assert outline(nodes) == render(
+        ("invoke_agent hermes | trace_root 1.0 | UNSET | session_aborted", (failed,) * 18)
+    )
+    assert extras(one(nodes, "invoke_agent hermes"))["close_cause"] == "idle"
 
 
 def test_a_failed_turn_is_exported_by_the_wardex_thread_with_no_flush_on_a_hermes_thread(
     monkeypatch,
 ):
-    """Hermes sends no end for a failed turn, and its CLI gateway may exit right after; the
-    close only wakes `wardex-hermes`, which flushes. No Hermes thread waits on export, and the
+    """Hermes sends no end for a failed turn, so the quiet net on `wardex-hermes` closes it and
+    flushes. No Hermes thread waits on export, and the
     flush names no budget: it follows the transport's, since a number would read as the host's."""
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
@@ -170,6 +207,7 @@ def test_a_failed_turn_is_exported_by_the_wardex_thread_with_no_flush_on_a_herme
             real(timeout)
 
         monkeypatch.setattr(attach_module._EXPORT, "_flush", spy)
+        _quiet_net(monkeypatch)
         on_loop(_failed_turn, h)
         assert wait_for(
             lambda: any(n.name == "invoke_agent hermes" for n in received(transport))
@@ -509,10 +547,12 @@ def _io(node) -> tuple[object, object]:
     return node.attributes.get("wardex.input_data"), node.attributes.get("wardex.output_data")
 
 
-def _turns(script) -> list:
+def _turns(script, *, closed_by_the_net: bool = False) -> list:
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
         on_loop(script, h)
+        if closed_by_the_net:
+            _closed_by_the_net(transport)
     return [n for n in exported(transport) if n.name == TURN_SPAN]
 
 
@@ -527,12 +567,13 @@ def test_a_completed_turn_carries_the_users_message_and_hermes_answer():
     assert _io(turn) == (QUESTION, ANSWER)
 
 
-def test_a_turn_whose_retries_were_spent_carries_its_input_and_no_output():
+def test_a_turn_whose_retries_were_spent_carries_its_input_and_no_output(monkeypatch):
     def script(h: FakeHermes) -> None:
         h.fail(h.turn())
 
-    (turn,) = _turns(script)
-    assert extras(turn)["close_cause"] == "retries_spent"
+    _quiet_net(monkeypatch)
+    (turn,) = _turns(script, closed_by_the_net=True)
+    assert extras(turn)["close_cause"] == "idle"
     assert _io(turn) == (QUESTION, None)
 
 
@@ -627,7 +668,8 @@ def test_an_answer_for_a_closed_turn_is_counted_and_changes_nothing():
     assert counters.get("adapters.hermes_agent.ignore_late.turn_answer") == 1
 
 
-def test_an_answer_for_a_turn_whose_retries_were_spent_is_counted_and_changes_nothing():
+def test_an_answer_for_a_turn_the_quiet_net_closed_is_counted_and_changes_nothing(monkeypatch):
+    _quiet_net(monkeypatch)
     counters.reset()
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
@@ -635,6 +677,7 @@ def test_an_answer_for_a_turn_whose_retries_were_spent_is_counted_and_changes_no
         def script() -> None:
             turn = h.turn()
             h.fail(turn)
+            _closed_by_the_net(transport)
             h._emit(
                 "post_llm_call",
                 {"session_id": turn.session_id, "turn_id": turn.turn_id, "assistant_response": "x"},

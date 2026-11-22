@@ -70,6 +70,7 @@ from ._hermes_agent_frames import (
     FrameEffects,
     _downstream_name,
     _drop_lane,
+    _message_text,
     _Out,
 )
 from ._hermes_agent_turns import (
@@ -102,7 +103,8 @@ AGENT_NAME = "hermes"
 #: Alias namespaces. Every alias is remembered, so a closed unit stays a link target.
 TURN_NS = "hermes.turn"  # turn_id
 
-#: The flush bound on the `on_session_finalize` caller, inside Hermes's own 10 s bound on it.
+#: The flush bound on the `on_session_finalize` caller at shutdown, inside Hermes's own 10 s
+#: bound on it.
 FINALIZE_DRAIN_S = 2.0
 #: How many undispatched tool names, and how many auxiliary task names, a turn states.
 UNDISPATCHED_NAMES = 16
@@ -127,26 +129,6 @@ def _tool_call_of(entry: Mapping[str, Any]) -> tuple[str, str | None] | None:
     """
     name = entry.get("tool_name")
     return (name, entry.get("tool_arguments")) if isinstance(name, str) else None
-
-
-def _message_text(value: object) -> object:
-    """A turn's message as its text. Hermes hands a string, or a list of content parts when the
-    message has attachments. Of the parts only the text is kept and any other part (an image, a
-    file) is named by its type, so a base64 image does not fill the record up to its cap. A
-    list that is not content parts is returned as it came, for the general shaper."""
-    if type(value) is not list:
-        return value
-    lines = []
-    for part in value:
-        kind = part.get("type") if type(part) is dict else None
-        text = part.get("text") if kind == "text" else None
-        if type(text) is str:
-            lines.append(text)
-        elif type(kind) is str:
-            lines.append(f"[{kind}]")
-        else:
-            return value
-    return "\n".join(lines)
 
 
 def _merge(modes: Iterable[_Out]) -> ExportMode | None:
@@ -175,7 +157,6 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         self._unreached: dict[Hashable, float] = {}  # declarations with no live turn -> when
         self._effects: Mapping[Action, Callable[[TurnRecord, Any, Step, Trigger], _Out]] = {
             Action.OPEN: self._open,
-            Action.OPEN_LATE: self._open_late,
             Action.CONTINUE: self._continue,
             Action.CONTINUE_CLOSE: self._continue_close,
             Action.FRAME: self._frame,
@@ -186,10 +167,10 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             Action.AUX_DECLARE_UNREACHED: self._aux_unreached,
             Action.AUX_RELEASE_UNREACHED: self._aux_unreached,
             Action.TIE: self._tie,
+            Action.NOTE_ERROR: self._note_error,
             Action.ANSWER: self._answer,
             Action.CLOSE: self._close,
             Action.FORGET: self._forget,
-            Action.NOTHING: self._nothing,
             Action.IGNORE_DUPLICATE: self._ignore,
             Action.IGNORE_LATE: self._ignore,
             Action.IGNORE_UNKNOWN: self._ignore,
@@ -290,17 +271,22 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             filed, measured=measured, measured_versions=versions, detail="; ".join(clauses)
         )
 
-    def has_live_turns(self) -> bool:
-        return bool(self._book.live_in_session(None))
+    def needs_sweep(self) -> bool:
+        """A turn is live or a declaration made with no live turn stands: the export thread
+        keeps waking for the idle net."""
+        with self._lock:
+            if self._unreached:
+                return True
+        return bool(self._book.live())
 
     def reap_idle(self, now: float) -> None:
-        """The IDLE net, from the export thread: every live turn quiet for IDLE_CLOSE_S, and every
-        declaration made with no live turn that is as old (its end was lost)."""
+        """The IDLE net, from the export thread: every live turn quiet for its `quiet_for()`, and
+        every declaration made with no live turn older than IDLE_CLOSE_S (its end was lost)."""
         ctx = self._ctx
         if ctx is None:
             return
         after = _turns.IDLE_CLOSE_S
-        modes = [self._advance(r, Trigger.IDLE, None) for r in self._book.idle(now, after)]
+        modes = [self._advance(r, Trigger.IDLE, None) for r in self._book.idle(now)]
         with self._lock:
             expired = [k for k, at in self._unreached.items() if now - at >= after]
             for key in expired:
@@ -408,17 +394,19 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         """Route one event to the turn or turns it names and run their steps.
 
         * A session-keyed event (finalize, subagent_stop, a turnless on_session_end): every live
-          turn of that session, or of every session for key None. Finalize always drains, so a
-          turn that closed just before shutdown is not left in the buffer either.
+          turn of that session, and none for key None. A finalize at shutdown always drains, so
+          a turn that closed just before it is not left in the buffer either; any other
+          finalize kicks the export thread, so no session boundary waits on export.
         * pre_llm_call: first the NEXT_TURN net over the session's other live turns, on the
           hook thread Hermes calls before it builds the turn's title thread, then the turn.
         * Everything else: the one turn the key names.
         """
         trigger = event.trigger()
         if event.key_kind() is KeyKind.SESSION:
-            live = self._book.live_in_session(event.key())
+            key = event.key()
+            live = self._book.live_in_session(key) if key is not None else []
             mode = _merge([self._advance(r, trigger, event) for r in live])
-            return ExportMode.DRAIN if trigger is Trigger.FINALIZE else mode
+            return ExportMode.DRAIN if trigger is Trigger.SHUTDOWN else mode
         if isinstance(event, TurnStart):
             others = [
                 r
@@ -504,13 +492,19 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         delegate_task unit, so nested under it; a background child, the delegate unit already
         closed, which the core refuses, so a root with CORRELATION_CONFLICT.
 
-        The turn's input is the user's message `pre_llm_call` stated, through the capped payload
-        path. A late open or a continuation has no `pre_llm_call`, so no input."""
+        With synchronous hooks (`plugins.hook_callback_timeout: 0`) this runs on the loop
+        thread itself, where the previous turn's pin still stands: `_drop_lane` takes it down
+        first, on the task that holds it. On a hook thread it only clears the copy.
+
+        The user's message is held, not recorded: another plugin's `pre_llm_call` may block the
+        prompt, and Hermes then keeps it off every store and provider. It becomes the turn's
+        input at the turn's first model-call frame or at a non-block end (`_release_input`).
+        A continuation has no `pre_llm_call`, so no input."""
+        _drop_lane()
         self._open_turn(record, event.platform, resumed=False)
-        handle = record.handle
-        if handle is not None and event.user_message is not None:
-            budget = self._ctx.record_budget  # type: ignore[union-attr]
-            handle.record_input(_shaped_payload(_message_text(event.user_message), budget))
+        if event.user_message is not None:
+            with record.lock:
+                record.held_input = event.user_message
         return None
 
     def _answer(self, record: TurnRecord, event: TurnAnswer, s: Step, trigger: Trigger) -> _Out:
@@ -522,14 +516,6 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             handle.record_output(_shaped_payload(_message_text(event.assistant_response), budget))
         return None
 
-    def _open_late(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
-        """A model frame for a turn this process never saw start (registered mid-turn, or a
-        renamed pre_llm_call): counted, opened as `_open` would, then framed."""
-        self._ctx.count("turn_start_missed")  # type: ignore[union-attr]
-        _drop_lane()
-        self._open_turn(record, None, resumed=False)
-        return self._frame(record, event, s, trigger)
-
     def _continue(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
         """A guess was wrong: the loop is still running a presumed-closed turn. Generation n+1
         opens on this loop thread, linked RESUMED_FROM the closed generation, then the frame."""
@@ -540,9 +526,10 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
     def _continue_close(
         self, record: TurnRecord, event: TurnEnd, s: Step, trigger: Trigger
     ) -> _Out:
-        """Hermes ended a turn wardex presumed closed (a fallback provider recovered after the
-        retries-spent prediction). The earlier span cannot be reopened, so a short generation
-        n+1 states Hermes's own outcome, linked RESUMED_FROM, and closes at once."""
+        """Hermes ended a turn wardex presumed closed (the idle net closed it during a wait
+        longer than its threshold, and no model frame came after). The earlier span cannot be
+        reopened, so a short generation n+1 states Hermes's own outcome, linked RESUMED_FROM,
+        and closes at once."""
         self._open_turn(record, None, resumed=True)
         return self._close(record, event, s, trigger)
 
@@ -592,34 +579,47 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         """The one close. Everything it states comes from CLOSE_RULES[cause] and OBSERVATIONS.
 
         The record is retired first, so an event that races the close resolves against the
-        tombstone. Then: the auxiliary declarations still standing are released; extras
-        close_cause, exit_reason (verbatim), error_reason (the api_request_error's `reason`),
-        undispatched_tool_calls and aux_tasks (the auxiliary tasks Hermes named for this turn);
-        the rule's marker and each applying observation's; the close.
+        tombstone. Then: the auxiliary declarations still standing are released; a held input
+        is recorded when Hermes's end says the prompt was not blocked, and dropped otherwise;
+        each frame still pinned whose report is kept is closed with it; extras close_cause,
+        exit_reason (verbatim), error_reason (the `reason` of an api_request_error that is the
+        turn's last event), undispatched_tool_calls and aux_tasks (the auxiliary tasks Hermes
+        named for this turn); the rule's marker and each applying observation's; the close.
         """
         cause = s.cause or event.cause()
         rule = CLOSE_RULES[cause]
         self._book.retire(record, rule.next_state)
+        ended = isinstance(event, TurnEnd)
         with record.lock:
+            record.blocked = ended and event.blocked()
+            held, record.held_input = record.held_input, None
+            error_reason = record.error_reason if record.after_error else None
             undispatched = list(record.undispatched().values())
             notes = [o.marker for o in OBSERVATIONS if o.applies(record, cause)]
             aux_tasks = record.aux_tasks[:AUX_TASK_NAMES]
             pending = list(record.aux.items())
             record.aux.clear()
+            kept = list(record.frames.values())
         ctx = self._ctx
         assert ctx is not None
         for key, attempt in pending:
             if attempt.draft is not None:
                 ctx.release_unreached_carriers(("aux", *key))
+        for frame in kept:
+            if frame.take_kept():
+                self._finish(frame)
         handle = record.handle
         if handle is None:
             return rule.export
+        if ended and held is not None and not record.blocked:
+            self._release_input(record, held)
+        _drop_lane(record)
         d = handle.draft
         d.set_extra(PREFIX + "close_cause", rule.literal)
-        if isinstance(event, TurnEnd) and event.exit_reason:
+        if ended and event.exit_reason:
             d.set_extra(PREFIX + "exit_reason", event.exit_reason)
-        if isinstance(event, CallError) and event.reason:
-            d.set_extra(PREFIX + "error_reason", event.reason)
+        if error_reason:
+            d.set_extra(PREFIX + "error_reason", error_reason)
         if undispatched:
             d.set_extra(
                 PREFIX + "undispatched_tool_calls", ",".join(undispatched[:UNDISPATCHED_NAMES])
@@ -656,8 +656,15 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         )
         return None
 
-    def _nothing(self, record: TurnRecord | None, event: Any, s: Step, trigger: Trigger) -> _Out:
-        return None
+    def _note_error(self, record: TurnRecord, event: CallError, s: Step, trigger: Trigger) -> _Out:
+        """api_request_error: the turn stays open, because Hermes may retry, park it on its
+        recovery ladder or fall back. Its reason is kept for the close, and the quiet net waits
+        IDLE_AFTER_ERROR_S while this is the turn's last event. The call's frame gets it as its
+        report (`_close_frame`)."""
+        with record.lock:
+            record.after_error = True
+            record.error_reason = event.reason
+        return self._close_frame(record, event, s, trigger)
 
     def _ignore(self, record: TurnRecord | None, event: Any, s: Step, trigger: Trigger) -> _Out:
         self._ctx.count(f"{s.action.value}.{trigger.value}")  # type: ignore[union-attr]

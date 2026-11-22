@@ -17,6 +17,7 @@ import threading
 import time
 from collections.abc import Hashable
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from .._assembly import (
@@ -30,8 +31,17 @@ from .._assembly import (
     canonical_arguments,
 )
 from .._enums import OperationName, StatusCode
+from . import _hermes_agent_attach as _attach
 from ._context import AdapterContext, Placement, RunHandle
-from ._hermes_agent_events import AuxEnd, AuxStart, CallReport, ToolEnter, ToolReport
+from ._hermes_agent_events import (
+    AuxEnd,
+    AuxStart,
+    CallEnter,
+    CallError,
+    CallReport,
+    ToolEnter,
+    ToolReport,
+)
 from ._hermes_agent_turns import (
     Action,
     AuxAttempt,
@@ -88,6 +98,26 @@ def _aux_key(event: AuxStart | AuxEnd) -> Hashable:
     return ("aux", *event.attempt())
 
 
+def _message_text(value: object) -> object:
+    """A turn's message as its text. Hermes hands a string, or a list of content parts when the
+    message has attachments. Of the parts only the text is kept and any other part (an image, a
+    file) is named by its type, so a base64 image does not fill the record up to its cap. A
+    list that is not content parts is returned as it came, for the general shaper."""
+    if type(value) is not list:
+        return value
+    lines = []
+    for part in value:
+        kind = part.get("type") if type(part) is dict else None
+        text = part.get("text") if kind == "text" else None
+        if type(text) is str:
+            lines.append(text)
+        elif type(kind) is str:
+            lines.append(f"[{kind}]")
+        else:
+            return value
+    return "\n".join(lines)
+
+
 class FrameEffects:
     """The frame half of `HermesAgentAdapter`'s effects, one method per frame or auxiliary
     `Action`. It reads three attributes the adapter owns: `_ctx`, and `_lock` with `_unreached`,
@@ -130,8 +160,9 @@ class FrameEffects:
         draft.add_limitation(Limitation.POSSIBLE_DUPLICATE_CHAT)
         self._ctx.expect_unreached_carriers(_aux_key(event))  # type: ignore[union-attr]
         with record.lock:
-            if key in record.aux:
-                record.aux[key] = AuxAttempt(event.aux_task, draft)
+            attempt = record.aux.get(key)
+            if attempt is not None:
+                record.aux[key] = replace(attempt, draft=draft)
         return None
 
     def _aux_finish(self, record: TurnRecord, event: AuxEnd, s: Step, trigger: Trigger) -> _Out:
@@ -164,6 +195,7 @@ class FrameEffects:
             ctx.expect_unreached_carriers(key)
             with self._lock:
                 self._unreached[key] = time.monotonic()
+            _attach._EXPORT.start()  # the idle sweep releases one whose end is lost
         else:
             ctx.release_unreached_carriers(key)
             with self._lock:
@@ -174,7 +206,8 @@ class FrameEffects:
     # -- effects: frames ------------------------------------------------------------------------
 
     def _frame(self, record: TurnRecord, event: Any, s: Step, trigger: Trigger) -> _Out:
-        """Open, describe and pin one frame unit of a live turn on the calling task."""
+        """Open, describe and pin one frame unit of a live turn on the calling task. The turn's
+        first model-call frame is where its held input leaves the host, so it is recorded here."""
         if isinstance(event, ToolEnter):
             frame = FrameRecord(FrameKind.TOOL, event.tool_call_id)
             with record.lock:
@@ -187,29 +220,56 @@ class FrameEffects:
         with record.lock:
             record.model_frames += 1
             record.frames[(FrameKind.MODEL_CALL, event.api_request_id)] = frame
-        self._open_call(frame, event.model, event.api_request_id, event.api_mode)
+            held, record.held_input = record.held_input, None
+        if held is not None:
+            self._release_input(record, held)
+        self._open_call(frame, event)
         return frame
 
-    def _orphan_frame(self, record: None, event: ToolEnter, s: Step, trigger: Trigger) -> _Out:
-        """A tool frame no live turn owns: a tool in Hermes's MCP child process for codex
-        app-server mode, a register mid-turn, a tool after a presumed close. It ran, so it gets a
-        span on whatever is ambient (PARENT_UNRESOLVED from the core when nothing is), closed at
-        frame exit, UNSET unless it raised: no report reaches it."""
-        frame = FrameRecord(FrameKind.TOOL, event.tool_call_id, orphan=True)
-        self._open_tool(frame, event)
+    def _orphan_frame(
+        self, record: None, event: CallEnter | ToolEnter, s: Step, trigger: Trigger
+    ) -> _Out:
+        """A frame no live turn owns. It ran, so it gets a span on whatever is ambient
+        (PARENT_UNRESOLVED from the core when nothing is), closed at frame exit, ERROR when it
+        raised and UNSET otherwise: Hermes's report on it comes after the exit or never, and a
+        frame that returned is not a verdict.
+
+        A model call here belongs to a run Hermes never announced (its background memory review
+        or a side question: forks that share the user's session id and send no `pre_llm_call`
+        and no end) or to a turn that started before wardex registered. It is counted, and no
+        turn is made for it. A tool here ran in Hermes's MCP child process for codex app-server
+        mode, after a register mid-turn, or after a presumed close."""
+        if isinstance(event, ToolEnter):
+            frame = FrameRecord(FrameKind.TOOL, event.tool_call_id, orphan=True)
+            self._open_tool(frame, event)
+            return frame
+        self._ctx.count("turn_start_missed")  # type: ignore[union-attr]
+        frame = FrameRecord(FrameKind.MODEL_CALL, event.api_request_id, orphan=True)
+        self._open_call(frame, event)
         return frame
 
-    def _open_call(
-        self, frame: FrameRecord, model: str | None, request_id: str, api_mode: str | None
-    ) -> None:
+    def _release_input(self, record: TurnRecord, message: object) -> None:
+        """The turn's input: the user's message from `pre_llm_call`, through the capped payload
+        path, once it is known to leave the host."""
+        handle = record.handle
+        if handle is not None:
+            budget = self._ctx.record_budget  # type: ignore[union-attr]
+            handle.record_input(_shaped_payload(_message_text(message), budget))
+
+    def _open_call(self, frame: FrameRecord, event: CallEnter) -> None:
         """The logical call: CALL, CHAT, NESTED under the turn pinned on this loop thread. Every
-        HTTP attempt of the frame, retries included, nests under it."""
+        HTTP attempt of the frame, retries included, nests under it. An orphan states the turn
+        id Hermes gave it, so a reader can group one fork's calls."""
         ctx = self._ctx
         assert ctx is not None
+        model, request_id, api_mode = event.model, event.api_request_id, event.api_mode
+        turn_id = event.turn_id if frame.orphan else None
 
         def describe(h: RunHandle) -> None:
             h.draft.set_gen_ai(_chat_block(model))
             h.draft.set_extra(PREFIX + "api_request_id", request_id)
+            if turn_id:
+                h.draft.set_extra(PREFIX + "turn_id", turn_id)
             if api_mode:
                 h.draft.set_extra(PREFIX + "api_mode", api_mode)
             h.alias(UnitKey(CALL_NS, request_id), remember=True)
@@ -275,30 +335,42 @@ class FrameEffects:
             self._finish(frame)
 
     def _close_frame(
-        self, record: TurnRecord, event: CallReport | ToolReport, s: Step, trigger: Trigger
+        self,
+        record: TurnRecord,
+        event: CallReport | CallError | ToolReport,
+        s: Step,
+        trigger: Trigger,
     ) -> _Out:
-        """post_api_request or post_tool_call, on a hook thread: hand the frame its report. A
-        report while the frame is still pinned (the concurrent tool path) is kept and applied at
-        exit, because a pinned unit is never closed from another thread. A report with no frame
-        (a missing middleware, or a frame that raised and closed) is counted."""
-        if isinstance(event, CallReport):
-            key = (FrameKind.MODEL_CALL, event.api_request_id)
-        else:
+        """post_api_request, api_request_error or post_tool_call, on a hook thread: hand the
+        frame its report.
+
+        An api_request_error after a frame that raised changes nothing; after one that returned
+        (a refusal is an HTTP 200) it closes the call ERROR. A report while the frame is still
+        pinned (the concurrent tool path) is kept and applied at exit, or at its turn's close if
+        that comes first. A report that says Hermes abandoned the tool's worker (a timeout or a
+        cancel, sent from the loop thread while the worker still runs) closes the frame at once,
+        from this thread: the core retires the worker's pin from afar, and the worker's late
+        exit then does nothing. A report with no frame (a missing middleware, or a frame that
+        raised and closed) is counted."""
+        if isinstance(event, ToolReport):
             key = (FrameKind.TOOL, event.tool_call_id)
+        else:
+            key = (FrameKind.MODEL_CALL, event.api_request_id)
         with record.lock:
             if isinstance(event, CallReport):
                 record.requested.update(event.requested)
             frame = record.frames.get(key)
+        abandoned = isinstance(event, ToolReport) and event.abandoned()
         if frame is None:
             self._ctx.count("report_without_frame")  # type: ignore[union-attr]
-        elif frame.on_report(event):
+        elif frame.on_report(event, abandoned=abandoned):
             self._finish(frame)
         return None
 
     def _finish(self, frame: FrameRecord) -> None:
         """Close a frame unit once, by whichever side won: a raise is ERROR with the downstream
         type; an orphan, or a frame whose report never came, is UNSET; otherwise the report
-        decides."""
+        decides, and an api_request_error is ERROR with the type Hermes stated."""
         handle = frame.handle
         if handle is None:
             return
@@ -309,6 +381,9 @@ class FrameEffects:
             for key, n in report.usage:
                 handle.draft.set_extra(HOLD_PREFIX + key, n)
             handle.close(status=StatusCode.OK)
+        elif isinstance(report, CallError):
+            error_type = report.error_type or report.reason or "api_request_error"
+            handle.close(status=StatusCode.ERROR, error_type=error_type)
         elif isinstance(report, ToolReport):
             self._close_tool(handle, report)
         else:
@@ -344,11 +419,11 @@ def _ensure_lane(record: TurnRecord) -> None:
     _LANE.set(record)
 
 
-def _drop_lane() -> None:
+def _drop_lane(only: TurnRecord | None = None) -> None:
     """Take down the previous lane's pin if this task holds it, so nothing opened next on this
-    thread nests under a turn that is over."""
+    thread nests under a turn that is over. With `only`, only when that turn is the lane."""
     lane = _LANE.get()
-    if lane is None:
+    if lane is None or (only is not None and lane is not only):
         return
     handle = lane.handle
     if handle is not None and handle.pinned_here:

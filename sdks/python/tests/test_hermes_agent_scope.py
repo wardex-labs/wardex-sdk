@@ -48,6 +48,8 @@ from _hermes_support import (
     status,
     wait_for,
 )
+from wardex_sdk._adapters import _hermes_agent_attach as attach_module
+from wardex_sdk._adapters import _hermes_agent_turns as turns_module
 from wardex_sdk._assembly import Limitation
 from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._diagnostics import AdapterStatus
@@ -84,7 +86,7 @@ NOT_MEASURED: tuple[str, ...] = (
     "MCP sampling",
     "codex app-server turn hooks",
     "a gateway that exits within milliseconds of a turn close",
-    "fallback recovery after a retries_spent close",
+    "a fallback provider that answers after the retries were spent",
 )
 
 L = Limitation
@@ -212,11 +214,23 @@ def _looped(body: Callable[[FakeHermes], None]) -> Script:
     return run
 
 
-def _replay(name: str) -> Script:
+#: Recorded fixtures whose turn Hermes sent no end for.
+NO_END = frozenset({"failed_turn"})
+
+
+def _replay(name: str, *, closed_by_the_net: bool = False) -> Script:
+    """`closed_by_the_net`: Hermes sent no end for the recorded turn, so the quiet net closes
+    it; the net is shortened so the run need not wait five minutes."""
+
     def run(stage: Stage) -> None:
-        stage.start()
+        if closed_by_the_net:
+            stage.monkeypatch.setattr(turns_module, "IDLE_AFTER_ERROR_S", 0.3)
+            stage.monkeypatch.setattr(attach_module, "IDLE_SWEEP_S", 0.05)
+        transport = stage.start()
         with plugin() as ctx, ScriptedProvider() as provider:
             on_loop(lambda: Replay(ctx, provider).run(name))
+            if closed_by_the_net:
+                assert wait_for(lambda: any(n.name == TURN for n in received(transport)))
 
     return run
 
@@ -301,23 +315,14 @@ def _invented_tool(h: FakeHermes) -> None:
 
 
 def _abandoned_tool(h: FakeHermes) -> None:
-    """Hermes ends the turn at a tool timeout while the worker still runs; the worker's report
-    comes after the end."""
+    """Hermes stops waiting on a tool worker at its timeout and reports the tool itself. The
+    turn goes on and completes; the worker's frame exits after the turn closed."""
     turn = h.turn()
     call = h.model_call(turn, (Reply.OK,), tool_calls=["slow_tool"])
-    entered, gate = threading.Event(), threading.Event()
-
-    def body() -> None:
-        entered.set()
-        gate.wait(10)
-
-    job = _on_worker(
-        lambda: h._tool_job(call, call.tool_calls[0][0], "slow_tool", "ok", None, body)
-    )
-    assert entered.wait(10)
-    h.end(turn, completed=False, interrupted=True, reason="tool_timeout")
-    gate.set()
-    job.result(10)
+    let_finish = h.abandon_tool(call, "slow_tool")
+    h.model_call(turn)
+    h.end(turn)
+    let_finish()
 
 
 def _mcp_sampling(h: FakeHermes) -> None:
@@ -346,6 +351,14 @@ def _fallback_recovered(h: FakeHermes) -> None:
     turn = h.turn()
     h.fail(turn)
     h.model_call(turn)
+    h.end(turn)
+
+
+def _recovery_ladder(h: FakeHermes) -> None:
+    """Hermes's defaults: a round of three failed frames, then its recovery ladder runs the
+    call again and it answers."""
+    turn = h.turn()
+    h.recover(turn, retries=3, cycles=1)
     h.end(turn)
 
 
@@ -425,6 +438,7 @@ SCRIPTS: dict[str, Script] = {
     "abandoned_tool": _looped(_abandoned_tool),
     "mcp_sampling": _looped(_mcp_sampling),
     "fallback_recovered": _looped(_fallback_recovered),
+    "recovery_ladder": _looped(_recovery_ladder),
     "two_gateway_sessions": _two_gateway_sessions,
     "gateway_exit": _gateway_exit,
     "two_profiles": _two_profiles,
@@ -451,23 +465,26 @@ SCOPE_ROWS: tuple[ScopeRow, ...] = (
               Span(TURN, parent="", source="trace_root", confidence=1.0, status="OK",
                    attrs={**_done, PREFIX + "exit_reason": "text_response(finish_reason=stop)",
                           "gen_ai.agent.name": "hermes"}))),
-    ScopeRow("turn-failed", "Turn", "fixture:failed_turn", (f"{TURNS}::CLOSE_RULES",),
+    ScopeRow("turn-failed", "Turn", "fixture:failed_turn",
+             (f"{TURNS}::CLOSE_RULES", f"{TURNS}::IDLE_AFTER_ERROR_S"),
              (Traces(1),
               Span(TURN, parent="", status="UNSET", markers=_aborted,
-                   attrs={PREFIX + "close_cause": "retries_spent",
+                   attrs={PREFIX + "close_cause": "idle",
                           PREFIX + "error_reason": "server_error"}))),
+    ScopeRow("turn-recovered", "Turn", "script:recovery_ladder",
+             (f"{TURNS}::TRANSITIONS", f"{AGENT}::_note_error"),
+             (Traces(1), Count(CHAT, 4),
+              Span(TURN, parent="", status="OK", no_markers=_aborted, attrs=_done, n=1),
+              Span(CHAT, parent=TURN, status="ERROR", error_type="InternalServerError", n=3))),
     ScopeRow("turn-concurrent", "Turn", "script:two_gateway_sessions", (f"{FRAMES}::_ensure_lane",),
              (Traces(2), Span(TURN, parent="", status="OK", n=2), Count(CHAT, 4),
               Span(CHAT, parent=TURN, source="unit_active", confidence=1.0, n=4)),
              unmeasured="two concurrent gateway sessions"),
     ScopeRow("turn-fallback", "Turn", "script:fallback_recovered",
-             (f"{AGENT}::_continue", f"{TURNS}::TRANSITIONS"),
-             (Span(TURN, status="UNSET", markers=_aborted,
-                   attrs={PREFIX + "close_cause": "retries_spent"}),
-              Span(TURN, status="OK", no_markers=_aborted,
-                   attrs={**_done, PREFIX + "generation": 1}),
-              Linked(TURN, "resumed_from", TURN)),
-             unmeasured="fallback recovery after a retries_spent close"),
+             (f"{AGENT}::_note_error", f"{TURNS}::TRANSITIONS"),
+             (Traces(1), Count(CHAT, 2),
+              Span(TURN, parent="", status="OK", no_markers=_aborted, attrs=_done, n=1)),
+             unmeasured="a fallback provider that answers after the retries were spent"),
     ScopeRow("attempts-retry", "Model call attempt, retries included", "fixture:retry",
              (f"{FRAMES}::_open_call",),
              (Count(CHAT, 1), Span(CHAT, parent=TURN, source="unit_active", confidence=1.0),
@@ -547,11 +564,10 @@ SCOPE_ROWS: tuple[ScopeRow, ...] = (
                    attrs={PREFIX + "exit_reason": "interrupted_during_api_call"}),
               Span(CHAT, parent=TURN, status="ERROR", error_type="InterruptedError"))),
     ScopeRow("abandoned-tool", "Interrupted turn; abandoned tool worker", "script:abandoned_tool",
-             (f"{AGENT}::_close", f"{AGENT}::_ignore"),
-             (Span(TURN, status="UNSET", markers=_aborted,
-                   attrs={PREFIX + "exit_reason": "tool_timeout"}),
-              Span("execute_tool slow_tool", parent=TURN, status="UNSET",
-                   markers=(L.CHILD_SPAN_UNCLOSED,), n=1)),
+             (f"{FRAMES}::_close_frame", f"{EVENTS}::ABANDONED_TOOL_STATUSES"),
+             (Traces(1), Span(TURN, status="OK", no_markers=_aborted, attrs=_done),
+              Span("execute_tool slow_tool", parent=TURN, status="ERROR",
+                   error_type="tool_timeout", no_markers=(L.CHILD_SPAN_UNCLOSED,), n=1)),
              unmeasured="tool timeout with an abandoned worker"),
     ScopeRow("profiles", "Several profiles in one process", "script:two_profiles",
              (f"{ATTACH}::attach",),
@@ -695,7 +711,7 @@ def test_scope_row_is_observable(row: ScopeRow, monkeypatch, tmp_path, caplog) -
     """Run the row's scenario through the fake plugin context, then check each expectation
     against exported spans, WARNING lines and `wardex.diagnostics()`."""
     kind, name = row.scenario.split(":", 1)
-    script = _replay(name) if kind == "fixture" else SCRIPTS[name]
+    script = _replay(name, closed_by_the_net=name in NO_END) if kind == "fixture" else SCRIPTS[name]
     stage = Stage(monkeypatch, tmp_path)
     reset_reports_for_test()  # a line is said once per process; this row must hear its own
     with caplog.at_level(logging.WARNING, logger="wardex_sdk"):

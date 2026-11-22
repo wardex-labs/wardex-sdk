@@ -270,18 +270,43 @@ def test_a_failed_turn_then_a_turn_gives_a_clean_second_root():
     assert outline(exported(transport)) == render((ABORTED, (FAILED_CALL,)), (TURN, (CHAT,)))
 
 
-def test_a_turn_that_carries_on_after_retries_were_predicted_spent_resumes_in_a_linked_span():
-    """Hermes's fallback recovered the call: the prediction that closed the turn was wrong. The
-    closed generation's pin comes down on the loop thread when the next one opens there, so no
-    later span on that thread meets a dead parent."""
+def test_a_turn_that_recovers_on_hermes_recovery_ladder_stays_one_turn():
+    """Hermes's defaults: three failed frames, a ladder wait, then the same call answers. No
+    api_request_error predicts the end of a turn, so it is one tree with every attempt."""
     counters.reset()
     transport = start_wardex()
     with plugin() as ctx, hermes(ctx) as h:
 
         def run():
             turn = h.turn()
-            h.fail(turn)
-            h.model_call(turn)
+            h.recover(turn, retries=3, cycles=1)
+            h.end(turn)
+
+        on_loop(run)
+    nodes = exported(transport)
+    assert outline(nodes) == render((TURN, (FAILED_CALL, FAILED_CALL, FAILED_CALL, CHAT)))
+    (turn,) = _roots(nodes)
+    assert extras(turn)["close_cause"] == "end_event"
+    assert "error_reason" not in extras(turn), "the last event was not an error"
+
+
+def test_a_turn_closed_by_the_idle_net_during_a_wait_resumes_in_a_linked_span(monkeypatch):
+    """A wait longer than the quiet net (a Retry-After above IDLE_AFTER_ERROR_S): the guess that
+    closed the turn is undone by the next frame, in a linked generation. The closed generation's
+    pin comes down on the loop thread when the next one opens there, so no later span on that
+    thread meets a dead parent."""
+    monkeypatch.setattr(turns_module, "IDLE_AFTER_ERROR_S", 0.3)
+    monkeypatch.setattr(attach_module, "IDLE_SWEEP_S", 0.05)
+    counters.reset()
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def wait(_cycle: int) -> None:
+            assert wait_for(lambda: bool(_roots(received(transport)))), "closed while waiting"
+
+        def run():
+            turn = h.turn()
+            h.recover(turn, retries=1, cycles=1, between=wait)
             h.end(turn)
             return turn
 
@@ -291,6 +316,8 @@ def test_a_turn_that_carries_on_after_retries_were_predicted_spent_resumes_in_a_
     assert outline(nodes) == render((ABORTED, (FAILED_CALL,)), (TURN, (CHAT,)))
     first = next(n for n in _roots(nodes) if n.limitations)
     resumed = next(n for n in _roots(nodes) if not n.limitations)
+    assert extras(first)["close_cause"] == "idle"
+    assert extras(first)["error_reason"] == "server_error"
     assert links(transport, resumed, nodes) == [(LinkReason.RESUMED_FROM, first.name)]
     assert extras(resumed)["turn_id"] == extras(first)["turn_id"] == turn.turn_id
     assert extras(resumed)["generation"] == 1
@@ -304,18 +331,44 @@ def test_an_end_that_arrives_after_the_turn_was_presumed_closed_closes_a_resumed
         def run():
             turn = h.turn()
             h.fail(turn)
+            h.turn(turn.session_id)  # the user sent the next message: next_turn
             h.end(turn, completed=False, failed=True, reason="failed")
 
         on_loop(run)
     nodes = exported(transport)
-    first = next(n for n in _roots(nodes) if extras(n)["close_cause"] == "retries_spent")
-    resumed = next(n for n in _roots(nodes) if n is not first)
+    first = next(n for n in _roots(nodes) if extras(n).get("close_cause") == "next_turn")
+    resumed = next(
+        n for n in _roots(nodes) if n is not first and extras(n).get("close_cause") == "end_event"
+    )
     assert (
         outline((resumed,))
         == "invoke_agent hermes | trace_root 1.0 | ERROR(failed) | session_aborted"
     )
     assert links(transport, resumed, nodes) == [(LinkReason.RESUMED_FROM, first.name)]
     assert extras(resumed)["exit_reason"] == "failed"
+    assert extras(first)["error_reason"] == "server_error"
+
+
+def test_a_failed_turn_waits_longer_on_the_quiet_net_than_a_quiet_one(monkeypatch):
+    """After an api_request_error Hermes may be waiting to retry: the net waits
+    IDLE_AFTER_ERROR_S, not IDLE_CLOSE_S, and the close keeps Hermes's reason."""
+    monkeypatch.setattr(turns_module, "IDLE_CLOSE_S", 0.2)
+    monkeypatch.setattr(turns_module, "IDLE_AFTER_ERROR_S", 1.5)
+    monkeypatch.setattr(attach_module, "IDLE_SWEEP_S", 0.05)
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        quiet = on_loop(h.turn)
+        on_loop(h.model_call, quiet)
+        failed = on_loop(h.turn)
+        on_loop(h.fail, failed)
+        assert wait_for(lambda: len(_roots(received(transport))) == 1)
+        time.sleep(0.5)
+        assert [extras(n)["turn_id"] for n in _roots(received(transport))] == [quiet.turn_id]
+        assert wait_for(lambda: len(_roots(received(transport))) == 2)
+    closed = {extras(n)["turn_id"]: n for n in _roots(exported(transport))}
+    assert extras(closed[failed.turn_id])["close_cause"] == "idle"
+    assert extras(closed[failed.turn_id])["error_reason"] == "server_error"
+    assert "error_reason" not in extras(closed[quiet.turn_id])
 
 
 def test_an_idle_turn_is_closed_and_exported_by_the_wardex_thread(monkeypatch):
@@ -363,6 +416,158 @@ def test_finalize_cuts_an_open_turn_and_drains_it_on_the_calling_thread_within_i
     assert took < 5.0
     assert [extras(n)["close_cause"] for n in seen] == ["finalize"], "on the wire before return"
     assert outline(exported(transport)) == render((ABORTED, (CHAT,)))
+
+
+def test_a_finalize_that_names_no_session_closes_no_turn():
+    """The gateway's `/new` in a chat with no session yet sends a finalize with no session id.
+    Other sessions' turns go on and are ended by Hermes; at shutdown it still drains."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run():
+            turns = [h.turn(), h.turn()]
+            for turn in turns:
+                h.model_call(turn)
+            h.finalize(None, reason="new_session")
+            h.finalize(None, reason="shutdown")
+            for turn in turns:
+                h.model_call(turn)
+                h.end(turn)
+
+        on_loop(run)
+    nodes = exported(transport)
+    assert outline(nodes) == render((TURN, (CHAT, CHAT)), (TURN, (CHAT, CHAT)))
+    assert {extras(n)["close_cause"] for n in _roots(nodes)} == {"end_event"}
+
+
+@pytest.mark.parametrize(
+    ("reason", "drained"),
+    [("new_session", False), ("session_boundary", False), ("shutdown", True), (None, True)],
+    ids=["gateway-new", "cli-new", "shutdown", "no-reason"],
+)
+def test_only_a_shutdown_finalize_waits_on_export(monkeypatch, reason, drained):
+    """Every session boundary fires on_session_finalize; only process shutdown flushes on the
+    calling thread, so `/new` never waits on a slow collector."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        drains: list[str] = []
+        real = attach_module._EXPORT.drain
+
+        def spy(timeout):
+            drains.append(threading.current_thread().name)
+            real(timeout)
+
+        monkeypatch.setattr(attach_module._EXPORT, "drain", spy)
+
+        def run():
+            turn = h.turn()
+            h.model_call(turn)
+            h.ctx.invoke_hook(
+                "on_session_finalize", session_id=turn.session_id, platform="cli", reason=reason
+            )
+
+        on_loop(run)
+        assert wait_for(lambda: bool(_roots(received(transport)))), "exported off the hook"
+        assert drains == (["hermes-loop"] if drained else [])
+    (turn,) = _roots(exported(transport))
+    assert extras(turn)["close_cause"] == "finalize"
+
+
+def test_synchronous_hooks_open_every_turn_as_a_clean_root():
+    """`plugins.hook_callback_timeout: 0`: every hook runs on the loop thread itself, where the
+    previous turn's pin still stands when the next `pre_llm_call` comes."""
+    counters.reset()
+    transport = start_wardex()
+    with plugin(hook_timeout_s=0) as ctx, hermes(ctx) as h:
+
+        def run():
+            for _ in range(3):
+                turn = h.turn()
+                h.model_call(turn)
+                h.end(turn)
+
+        on_loop(run)
+    nodes = exported(transport)
+    assert outline(nodes) == render((TURN, (CHAT,)), (TURN, (CHAT,)), (TURN, (CHAT,)))
+    assert all(not n.limitations for n in _roots(nodes))
+    assert all(r.thread == "hermes-loop" for r in ctx.returns if r.hook == "pre_llm_call")
+
+
+@pytest.mark.parametrize("review", ["during", "after"])
+def test_hermes_background_review_is_never_a_turn(review):
+    """The review fork shares the user's session id and sends no `pre_llm_call` and no end. Its
+    calls are spans of their own, named by the fork's turn id; no turn is made for it, and the
+    user's turn is closed only by its own end."""
+    counters.reset()
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run():
+            turn = h.turn()
+            h.model_call(turn)
+            h.end(turn, review=review)
+            return turn
+
+        turn = on_loop(run)
+    nodes = exported(transport)
+    turns = [n for n in nodes if n.name == "invoke_agent hermes"]
+    assert len(turns) == 1
+    assert extras(turns[0])["close_cause"] == "end_event"
+    assert extras(turns[0])["turn_id"] == turn.turn_id
+    assert not turns[0].limitations
+    forks = [n for n in nodes if n.name == "chat lab-model" and "turn_id" in extras(n)]
+    assert len(forks) == 2
+    assert len({extras(n)["turn_id"] for n in forks}) == 1
+    assert extras(forks[0])["turn_id"].startswith(turn.session_id)
+    assert counters.get("adapters.hermes_agent.turn_start_missed") == 2
+    tool = one(nodes, "execute_tool memory")
+    assert tool.status.name == "UNSET", "no report reaches an orphan tool frame"
+    fork_chat = "chat lab-model | {} | UNSET"
+    if review == "during":  # the fork's context still carries the live turn: nested under it
+        assert outline(nodes) == render(
+            (
+                TURN,
+                (
+                    CHAT,
+                    (fork_chat.format("unit_active 1.0"), ((STREAMED, ()),)),
+                    (fork_chat.format("unit_active 1.0"), ((STREAMED, ()),)),
+                    ("execute_tool memory | unit_active 1.0 | UNSET", ()),
+                ),
+            )
+        )
+    else:  # the turn has closed: roots, marked by the core
+        unresolved = "unresolved 0.0 | UNSET | parent_unresolved"
+        assert outline(nodes) == render(
+            (TURN, (CHAT,)),
+            ("chat lab-model | " + unresolved, ((STREAMED, ()),)),
+            ("chat lab-model | " + unresolved, ((STREAMED, ()),)),
+            ("execute_tool memory | " + unresolved, ()),
+        )
+
+
+def test_a_side_question_during_a_turn_is_no_turn_and_leaves_the_turn_alone():
+    counters.reset()
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run():
+            turn = h.turn()
+            h.model_call(turn)
+            h.side_question(turn.session_id)
+            h.model_call(turn)
+            h.end(turn)
+
+        on_loop(run)
+    nodes = exported(transport)
+    turns = [n for n in nodes if n.name == "invoke_agent hermes"]
+    assert len(turns) == 1
+    assert outline(turns) == TURN
+    side = [n for n in nodes if n.name == "chat lab-model" and "turn_id" in extras(n)]
+    assert len(side) == 1
+    assert outline(side[:1]).startswith(
+        "chat lab-model | unresolved 0.0 | UNSET | parent_unresolved"
+    )
+    assert counters.get("adapters.hermes_agent.turn_start_missed") == 1
 
 
 def test_a_child_that_never_ended_is_closed_by_its_subagent_stop():

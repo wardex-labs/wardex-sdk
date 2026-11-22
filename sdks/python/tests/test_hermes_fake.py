@@ -229,7 +229,10 @@ def test_a_joined_child_sees_the_parent_context_from_its_first_event(hermes):
     kids = in_loop(turn)
     for kid in kids:
         own = [s for s in recorder.seen if s.session == kid.session_id]
-        assert own[0].name == "on_session_start"
+        # Hermes gates a bounded callback on its call's `turn_id` or `tool_call_id`, and
+        # `on_session_start` carries neither: a child's start that overlaps its sibling's is
+        # skipped, as on Hermes.
+        assert own[0].name in ("on_session_start", "pre_llm_call")
         assert {s.probe for s in own} == {SET}
     child_attempts = [s for s in recorder.seen if s.surface == "attempt"][1:-1]
     assert len(child_attempts) == 4
@@ -539,7 +542,39 @@ def test_a_bounded_hook_that_overruns_is_abandoned_then_skipped_and_pre_tool_cal
     finally:
         gate.set()
     assert ctx.timeouts == [("pre_llm_call", "stuck"), ("pre_tool_call", "stuck")]
-    assert ctx.warnings == ["hook 'pre_llm_call' callback stuck skipped after a timeout"]
+    assert ctx.warnings == [
+        "hook 'pre_llm_call' callback stuck skipped after previous timeout or while still running"
+    ]
+
+
+def test_a_bounded_callback_still_running_for_a_turn_skips_that_turns_next_call_only():
+    """`_hook_call_identity`: the gate tells calls apart by `turn_id` (or `tool_call_id`)."""
+    ctx = FakePluginContext()
+    entered, gate = threading.Event(), threading.Event()
+    seen: list[str] = []
+
+    def slow(**kwargs):
+        seen.append(kwargs["turn_id"])
+        if kwargs["turn_id"] == "t-1" and not entered.is_set():
+            entered.set()
+            gate.wait(5)
+
+    ctx.register_hook("post_llm_call", slow)
+    first = threading.Thread(
+        target=ctx.invoke_hook, args=("post_llm_call",), kwargs={"turn_id": "t-1"}
+    )
+    first.start()
+    try:
+        assert entered.wait(5)
+        ctx.invoke_hook("post_llm_call", turn_id="t-1")
+        ctx.invoke_hook("post_llm_call", turn_id="t-2")
+    finally:
+        gate.set()
+        first.join(5)
+    assert seen == ["t-1", "t-2"]
+    assert ctx.warnings == [
+        "hook 'post_llm_call' callback slow skipped after previous timeout or while still running"
+    ]
 
 
 def test_every_return_is_recorded_and_finalize_hands_hermes_the_non_none_ones(hermes):

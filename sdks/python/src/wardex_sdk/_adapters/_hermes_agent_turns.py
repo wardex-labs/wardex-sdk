@@ -28,9 +28,13 @@ handler safe: an embedder's `init()` installs handlers on the main thread, the m
 Hermes's loop thread, and a handler that waited on a lock the interrupted frame holds would hang.
 
 Nets, stated once. Hermes sends no end event for a failed turn (measured), and a killed process
-sends nothing. Every close that wardex decides on a guess lands in PRESUMED_CLOSED, never in a
-final state, so a loop event that proves the guess wrong continues the turn instead of being
-lost. Only shutdown (`on_session_finalize`) cuts a turn for good.
+sends nothing. Only `pre_llm_call` opens a turn: Hermes runs internal agents under the user's
+session id that announce no start and no end (the background memory review, side questions),
+and a frame of a turn never seen open is an orphan frame, not a turn. An `api_request_error`
+closes nothing, because Hermes may still recover (its retry loop, its recovery ladder, a fallback
+provider). Every close that wardex decides on a guess lands in PRESUMED_CLOSED, never in a final
+state, so a loop event that proves the guess wrong continues the turn instead of being lost.
+Only `on_session_finalize` for the turn's session cuts a turn for good.
 """
 
 from __future__ import annotations
@@ -52,7 +56,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CLOSE_RULES",
+    "AUX_ATTEMPT_BOUND_S",
     "CREATES",
+    "IDLE_AFTER_ERROR_S",
     "IDLE_CLOSE_S",
     "LIVE",
     "OBSERVATIONS",
@@ -82,6 +88,19 @@ __all__ = [
 #: the CLI's gateway exports a turn Hermes never ended before it exits. Long work is safe: model
 #: calls and tools hold a frame pinned for as long as they run.
 IDLE_CLOSE_S = 120.0
+#: The same net while the turn's last event is an `api_request_error`, because Hermes now waits
+#: before its next attempt (Hermes v0.23.3 source): an ordinary retry at most 90 s (2 s doubling
+#: to 60 s, plus up to half again), a provider overload backoff at most 144 s, a recovery-ladder
+#: cycle at most 120 s (the provider's Retry-After up to 120 s, else 15/30/60/60/60 s plus up to
+#: a fifth). An ordinary retry honours a Retry-After up to 600 s, so one above this still splits
+#: the turn into two linked generations. Under the gateway's 600 s idle exit, after which nothing
+#: is exported.
+IDLE_AFTER_ERROR_S = 300.0
+#: An auxiliary attempt older than this no longer keeps its turn from being quiet: Hermes skips
+#: a hook callback while the previous one for the same key still runs, so an end can be lost.
+#: Above Hermes's 300 s floor on a compression call's timeout (other auxiliary calls default to
+#: 30 s), under the gateway's 600 s idle exit.
+AUX_ATTEMPT_BOUND_S = 360.0
 
 
 # -- alphabets ---------------------------------------------------------------------------------
@@ -102,17 +121,17 @@ class Trigger(Enum):
     """The lifecycle's input alphabet: one member per thing that can happen to a turn.
 
     NEXT_TURN, IDLE and UNIT_GONE are derived by the caller, not sent by Hermes. NEXT_TURN comes
-    from a newer `pre_llm_call` of the same session, IDLE from the clock. UNIT_GONE says that
-    the record's unit is no longer live in the core (closed with its parent, evicted, or closed
-    by the signal path): the caller steps it before the event that found the record, so that
-    event resolves against PRESUMED_CLOSED.
+    from a newer `pre_llm_call` of the same session, IDLE from the clock. FINALIZE and SHUTDOWN
+    are both `on_session_finalize` for the turn's session, told apart by Hermes's reason.
+    UNIT_GONE says that the record's unit is no longer live in the core (closed with its parent,
+    evicted, or closed by the signal path): the caller steps it before the event that found the
+    record, so that event resolves against PRESUMED_CLOSED.
     """
 
     TURN_START = "turn_start"  # pre_llm_call
     CALL_ENTER = "call_enter"  # llm_execution frame entered (loop task)
     CALL_REPORT = "call_report"  # post_api_request
-    CALL_FAILED = "call_failed"  # api_request_error, retries left
-    CALL_FAILED_FINAL = "call_failed_final"  # api_request_error, retries predicted spent
+    CALL_FAILED = "call_failed"  # api_request_error: Hermes may still retry or recover
     TOOL_ENTER = "tool_enter"  # tool_execution frame entered (tool worker)
     TOOL_REPORT = "tool_report"  # post_tool_call
     AUX_START = "aux_start"  # pre_auxiliary_call
@@ -122,20 +141,35 @@ class Trigger(Enum):
     TURN_END = "turn_end"  # on_session_end
     NEXT_TURN = "next_turn"  # net: a newer pre_llm_call of the same session
     CHILD_STOP = "child_stop"  # net: subagent_stop for the child's session
-    FINALIZE = "finalize"  # net: on_session_finalize
-    IDLE = "idle"  # net: no event for IDLE_CLOSE_S while quiet
+    FINALIZE = "finalize"  # net: on_session_finalize at a session boundary (/new, reset, close)
+    SHUTDOWN = "shutdown"  # net: on_session_finalize at process shutdown
+    IDLE = "idle"  # net: no event for IDLE_CLOSE_S (IDLE_AFTER_ERROR_S after an error) while quiet
     UNIT_GONE = "unit_gone"  # derived: the core no longer holds the record's unit
+
+
+#: Triggers that close a turn without being an event of it: they leave its last event standing.
+_NETS: frozenset[Trigger] = frozenset(
+    {
+        Trigger.NEXT_TURN,
+        Trigger.CHILD_STOP,
+        Trigger.FINALIZE,
+        Trigger.SHUTDOWN,
+        Trigger.IDLE,
+        Trigger.UNIT_GONE,
+    }
+)
 
 
 class Action(Enum):
     """What the effects module does for a step: one effect per member."""
 
     OPEN = "open"  # open_run the turn (the session's NEXT_TURN sweep has already run)
-    OPEN_LATE = "open_late"  # open the turn on a loop event; counts `turn_start_missed`
     CONTINUE = "continue"  # open the next generation, linked RESUMED_FROM the presumed-closed one
     CONTINUE_CLOSE = "continue_close"  # Hermes ended a presumed-closed turn: say so, then close
     FRAME = "frame"  # open and pin a frame unit; pin the turn on this task first if it is not
-    ORPHAN_FRAME = "orphan_frame"  # a tool frame no live turn owns: open on context, close at exit
+    #: A frame no live turn owns: open on whatever is ambient, close at frame exit. A model-call
+    #: frame of a turn never seen open counts `turn_start_missed` and opens no turn.
+    ORPHAN_FRAME = "orphan_frame"
     CLOSE_FRAME = "close_frame"  # hand a frame its post hook's report (`FrameRecord.on_report`)
     #: A live turn's auxiliary attempt starts. Keep one `AuxAttempt` under `attempt()`; a second
     #: start under the same key is a duplicate and does nothing. When the call ran outside the
@@ -156,21 +190,19 @@ class Action(Enum):
     #: so an end whose start was seen while the turn was live is safe here.
     AUX_RELEASE_UNREACHED = "aux_release_unreached"
     TIE = "tie"  # remember child session -> parent turn
+    NOTE_ERROR = "note_error"  # keep Hermes's reason; the quiet net waits IDLE_AFTER_ERROR_S
     ANSWER = "answer"  # record the turn's final response as the turn's output
     CLOSE = "close"  # close the turn per CLOSE_RULES[cause]
     #: The core already closed the record's unit. Retire the record to a PRESUMED_CLOSED
     #: tombstone and call no verb, so the event that found it continues the turn or is ignored.
     FORGET = "forget"
-    NOTHING = "nothing"  # legal and uninteresting (a failed attempt with retries left)
     IGNORE_DUPLICATE = "ignore_duplicate"  # counted
     IGNORE_LATE = "ignore_late"  # counted; a middleware frame still calls next_call
     IGNORE_UNKNOWN = "ignore_unknown"  # counted: a turn this process never saw open
 
 
 #: Actions whose effect needs a new `TurnRecord` (generation 0, or the tombstone's plus one).
-CREATES: frozenset[Action] = frozenset(
-    {Action.OPEN, Action.OPEN_LATE, Action.CONTINUE, Action.CONTINUE_CLOSE}
-)
+CREATES: frozenset[Action] = frozenset({Action.OPEN, Action.CONTINUE, Action.CONTINUE_CLOSE})
 
 
 class CloseCause(Enum):
@@ -180,16 +212,16 @@ class CloseCause(Enum):
     ENDED_INTERRUPTED = "ended_interrupted"
     ENDED_FAILED = "ended_failed"
     ENDED_INCOMPLETE = "ended_incomplete"
-    RETRIES_SPENT = "retries_spent"
     NEXT_TURN = "next_turn"
     CHILD_STOPPED = "child_stopped"
     IDLE = "idle"
     FINALIZE = "finalize"
+    SHUTDOWN = "shutdown"
 
 
 class ExportMode(Enum):
     KICK = "kick"  # wake the export thread; the calling hook returns at once
-    DRAIN = "drain"  # flush with a bound on the calling thread (shutdown only)
+    DRAIN = "drain"  # flush with a bound on the calling thread (process shutdown only)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +254,8 @@ _S = TurnState
 
 #: How a turn ends. Only Hermes's own verdict gives OK or ERROR: UNSET means Hermes said nothing
 #: about the outcome and wardex will not make one up. Every turn that did not complete carries
-#: SESSION_ABORTED. A guess lands in PRESUMED_CLOSED; shutdown cuts.
+#: SESSION_ABORTED. A guess lands in PRESUMED_CLOSED; a finalize for the session cuts, and only
+#: the one at process shutdown waits on export.
 CLOSE_RULES: dict[CloseCause, CloseRule] = {
     CloseCause.ENDED_COMPLETED: CloseRule(
         StatusCode.OK,
@@ -242,11 +275,11 @@ CLOSE_RULES: dict[CloseCause, CloseRule] = {
     ),
     CloseCause.ENDED_INTERRUPTED: _rule(_S.CLOSED, "end_event"),
     CloseCause.ENDED_INCOMPLETE: _rule(_S.CLOSED, "end_event"),
-    CloseCause.RETRIES_SPENT: _rule(_S.PRESUMED_CLOSED, "retries_spent"),
     CloseCause.NEXT_TURN: _rule(_S.PRESUMED_CLOSED, "next_turn"),
     CloseCause.CHILD_STOPPED: _rule(_S.PRESUMED_CLOSED, "subagent_stop"),
     CloseCause.IDLE: _rule(_S.PRESUMED_CLOSED, "idle"),
-    CloseCause.FINALIZE: _rule(_S.CUT, "finalize", ExportMode.DRAIN),
+    CloseCause.FINALIZE: _rule(_S.CUT, "finalize"),
+    CloseCause.SHUTDOWN: _rule(_S.CUT, "finalize", ExportMode.DRAIN),
 }
 
 
@@ -270,7 +303,8 @@ _NOT_LIVE: tuple[TurnState | None, ...] = (None, _S.PRESUMED_CLOSED, _S.CLOSED, 
 #: always an IGNORE_* action: an event the table does not name is counted, never acted on.
 TRANSITIONS: dict[tuple[TurnState | None, Trigger], Step] = {
     (None, _T.TURN_START): Step(_S.OPEN, _A.OPEN),
-    (None, _T.CALL_ENTER): Step(_S.AMBIENT, _A.OPEN_LATE),
+    # a run Hermes never announced (a review or side-question fork, a register mid-turn)
+    (None, _T.CALL_ENTER): Step(None, _A.ORPHAN_FRAME),
     # a guess closed it; the loop proves the guess wrong by coming back
     (_S.PRESUMED_CLOSED, _T.CALL_ENTER): Step(_S.AMBIENT, _A.CONTINUE),
     (_S.PRESUMED_CLOSED, _T.TURN_END): Step(_S.CLOSED, _A.CONTINUE_CLOSE),
@@ -283,7 +317,7 @@ for _live in LIVE:
             (_live, _T.TOOL_ENTER): Step(_live, _A.FRAME),
             (_live, _T.CALL_REPORT): Step(_live, _A.CLOSE_FRAME),
             (_live, _T.TOOL_REPORT): Step(_live, _A.CLOSE_FRAME),
-            (_live, _T.CALL_FAILED): Step(_live, _A.NOTHING),
+            (_live, _T.CALL_FAILED): Step(_live, _A.NOTE_ERROR),
             (_live, _T.AUX_START): Step(_live, _A.AUX_BEGIN),  # the turn-start title lands here
             (_live, _T.AUX_END): Step(_live, _A.AUX_FINISH),
             (_live, _T.CHILD_START): Step(_live, _A.TIE),
@@ -291,19 +325,17 @@ for _live in LIVE:
             (_live, _T.TURN_END): Step(_S.CLOSED, _A.CLOSE),
             (_live, _T.UNIT_GONE): Step(_S.PRESUMED_CLOSED, _A.FORGET),
             # the nets close a live turn the same way, whatever it was doing
-            (_live, _T.CALL_FAILED_FINAL): Step(
-                _S.PRESUMED_CLOSED, _A.CLOSE, CloseCause.RETRIES_SPENT
-            ),
             (_live, _T.NEXT_TURN): Step(_S.PRESUMED_CLOSED, _A.CLOSE, CloseCause.NEXT_TURN),
             (_live, _T.CHILD_STOP): Step(_S.PRESUMED_CLOSED, _A.CLOSE, CloseCause.CHILD_STOPPED),
             (_live, _T.IDLE): Step(_S.PRESUMED_CLOSED, _A.CLOSE, CloseCause.IDLE),
             (_live, _T.FINALIZE): Step(_S.CUT, _A.CLOSE, CloseCause.FINALIZE),
+            (_live, _T.SHUTDOWN): Step(_S.CUT, _A.CLOSE, CloseCause.SHUTDOWN),
         }
     )
 # For a turn that is not live: a child's tie is a fact about the parent, kept in any state. A
 # tool that starts after its turn ended still ran, so it gets a span of its own, marked by the
-# core. An auxiliary call still has a wire span to mark. A late model frame needs nothing: the
-# socket tee records its attempts wherever the context puts them.
+# core. An auxiliary call still has a wire span to mark. A model frame of an ended turn needs
+# nothing: the socket tee records its attempts wherever the context puts them.
 for _gone in _NOT_LIVE:
     TRANSITIONS.update(
         {
@@ -345,6 +377,9 @@ class FrameState(Enum):
 
     PINNED -> (frame returns) AWAITING_REPORT -> (post hook) CLOSED
     PINNED -> (post hook, concurrent path) REPORTED -> (frame returns) CLOSED with that report
+    REPORTED -> (its turn closes first) CLOSED with that report, from the closing thread
+    PINNED -> (post hook saying Hermes abandoned the worker) CLOSED at once with that report;
+              the worker's late exit does nothing
     PINNED or REPORTED -> (frame raises) CLOSED, ERROR with the downstream exception's type
     AWAITING_REPORT -> (its turn closes first) closed by the core with CHILD_SPAN_UNCLOSED
     An orphan frame goes PINNED -> CLOSED at frame exit, UNSET unless it raised.
@@ -396,19 +431,29 @@ class FrameRecord:
             self.state = FrameState.CLOSED
             return True
 
-    def on_report(self, report: object) -> bool:
+    def on_report(self, report: object, *, abandoned: bool = False) -> bool:
         """The post hook reported. True: the caller closes the unit with `report`.
 
-        While pinned the report is kept and False is returned: the exit closes it. A second
-        report, or one after the close, is False and changes nothing.
+        While pinned the report is kept and False is returned: the exit closes it. When the
+        report says Hermes abandoned the worker, its exit may never come, so True at once. A
+        second report, or one after the close, is False and changes nothing.
         """
         with self.lock:
             if self.state is FrameState.PINNED and not self.orphan:
                 self.kept_report = report
-                self.state = FrameState.REPORTED
-                return False
+                self.state = FrameState.CLOSED if abandoned else FrameState.REPORTED
+                return abandoned
             if self.state is FrameState.AWAITING_REPORT:
                 self.kept_report = report
+                self.state = FrameState.CLOSED
+                return True
+            return False
+
+    def take_kept(self) -> bool:
+        """The frame's turn is closing while the frame is still pinned with its report kept.
+        True: the caller closes the unit with that report, from its own thread."""
+        with self.lock:
+            if self.state is FrameState.REPORTED:
                 self.state = FrameState.CLOSED
                 return True
             return False
@@ -440,11 +485,13 @@ class AuxAttempt:
     """One auxiliary attempt in flight, from `pre_auxiliary_call` to `post_auxiliary_call`.
 
     `draft` is the hook-built child span when the call ran outside the turn's lane, and None
-    when it ran in the lane, where its wire span is already under the turn.
+    when it ran in the lane, where its wire span is already under the turn. `started` is when
+    its start was seen: past AUX_ATTEMPT_BOUND_S the attempt no longer keeps its turn busy.
     """
 
     task: str | None
     draft: SpanDraft | None = None
+    started: float = field(default_factory=time.monotonic)
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,8 +524,15 @@ class TurnRecord:
     model_frames: int = 0
     aux: dict[tuple[str, int], AuxAttempt] = field(default_factory=dict)  # in flight
     aux_tasks: list[str] = field(default_factory=list)  # task names Hermes stated, first seen first
-    error_reason: str | None = None  # Hermes's `reason` from the api_request_error that closed it
-    exit_reason: str | None = None  # Hermes's `turn_exit_reason`, verbatim
+    #: The turn's last event was an api_request_error: Hermes may be waiting to retry, so the
+    #: quiet net waits IDLE_AFTER_ERROR_S. `error_reason` is that event's `reason`. Any later
+    #: event of the turn clears both; a net that closes it does not.
+    after_error: bool = False
+    error_reason: str | None = None
+    #: The user's message from `pre_llm_call`, held until it is known to leave the host: the
+    #: turn's first model-call frame, or an end event that is not another plugin's block.
+    held_input: object = None
+    blocked: bool = False  # Hermes ended the turn because another plugin blocked its prompt
     last_event: float = field(default_factory=time.monotonic)
 
     def advance(self, trigger: Trigger, now: float | None = None) -> Step:
@@ -489,6 +543,9 @@ class TurnRecord:
             if s.next is not None:
                 self.state = s.next
             self.last_event = time.monotonic() if now is None else now
+            if trigger is not Trigger.CALL_FAILED and trigger not in _NETS:
+                self.after_error = False
+                self.error_reason = None
             return s
 
     def undispatched(self) -> dict[str, str]:
@@ -498,9 +555,17 @@ class TurnRecord:
         """
         return {i: n for i, n in self.requested.items() if i not in self.dispatched}
 
-    def quiet(self) -> bool:
-        """No frame pinned and no auxiliary attempt in flight: what the idle net reads."""
-        return not self.aux and not any(f.pinned() for f in self.frames.values())
+    def quiet(self, now: float) -> bool:
+        """No frame pinned and no auxiliary attempt in flight within its bound: what the idle
+        net reads."""
+        bound = AUX_ATTEMPT_BOUND_S
+        if any(now - a.started < bound for a in self.aux.values()):
+            return False
+        return not any(f.pinned() for f in self.frames.values())
+
+    def quiet_for(self) -> float:
+        """How long the idle net waits on this turn, read at call time so a test can shorten it."""
+        return IDLE_AFTER_ERROR_S if self.after_error else IDLE_CLOSE_S
 
 
 # -- what a close observes ---------------------------------------------------------------------
@@ -518,8 +583,9 @@ class Observation:
 
 def _completed_without_a_seen_call(r: TurnRecord, cause: CloseCause) -> bool:
     # Hermes says the turn completed and no llm_execution frame ran: the codex app-server
-    # runtime, whose model calls happen in its own subprocess.
-    return cause is CloseCause.ENDED_COMPLETED and r.model_frames == 0
+    # runtime, whose model calls happen in its own subprocess. A turn another plugin blocked
+    # made no model call at all, so nothing went unobserved.
+    return cause is CloseCause.ENDED_COMPLETED and r.model_frames == 0 and not r.blocked
 
 
 def _asked_for_a_tool_call_that_never_ran(r: TurnRecord, cause: CloseCause) -> bool:
@@ -598,20 +664,23 @@ class TurnBook:
                 del self._live[record.turn_id]
             _put(self._tombs, record.turn_id, tomb, self._cap)
 
-    def live_in_session(self, session_id: str | None) -> list[TurnRecord]:
-        """Live records of one session, or of every session for None, in admission order."""
+    def live(self) -> list[TurnRecord]:
+        """Every live record, in admission order."""
         with self._lock:
-            return [
-                r for r in self._live.values() if session_id is None or r.session_id == session_id
-            ]
+            return list(self._live.values())
 
-    def idle(self, now: float, after: float = IDLE_CLOSE_S) -> list[TurnRecord]:
-        """Live records quiet for `after` seconds. Each record is read under its own lock, after
-        the book's lock is released."""
+    def live_in_session(self, session_id: str) -> list[TurnRecord]:
+        """Live records of one session, in admission order."""
+        with self._lock:
+            return [r for r in self._live.values() if r.session_id == session_id]
+
+    def idle(self, now: float) -> list[TurnRecord]:
+        """Live records quiet for their `quiet_for()`. Each record is read under its own lock,
+        after the book's lock is released."""
         quiet = []
-        for r in self.live_in_session(None):
+        for r in self.live():
             with r.lock:
-                if r.state in LIVE and r.quiet() and now - r.last_event >= after:
+                if r.state in LIVE and r.quiet(now) and now - r.last_event >= r.quiet_for():
                     quiet.append(r)
         return quiet
 

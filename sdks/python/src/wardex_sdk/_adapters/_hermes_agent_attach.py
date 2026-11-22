@@ -182,10 +182,11 @@ class _Exporter:
     """One daemon thread, `wardex-hermes`, started by the first turn that opens.
 
     A turn's close only sets an Event, so no Hermes thread waits on export. The thread flushes
-    when kicked and runs the idle net every IDLE_SWEEP_S while a turn is live; with no turn live
-    it waits on the Event alone. It ends once the adapter is uninstalled, and the next turn
-    after the next `init()` starts a new one. `drain` is the one flush on a Hermes thread: the
-    `on_session_finalize` caller at shutdown, bounded by its timeout.
+    when kicked and runs the idle net every IDLE_SWEEP_S while a turn is live or a declaration
+    made with no live turn stands (`needs_sweep`); otherwise it waits on the Event alone. It
+    ends once the adapter is uninstalled, and the next turn after the next `init()` starts a new
+    one. `drain` is the one flush on a Hermes thread: the `on_session_finalize` caller at
+    process shutdown, bounded by its timeout.
 
     Why per turn and not at exit: Hermes leaves its gateway with `os._exit`, so no plugin's
     exit handler runs there, and the CLI's one-shot turns run in that gateway.
@@ -233,9 +234,7 @@ class _Exporter:
         me = threading.current_thread()
         while True:
             adapter = _ROUTE
-            self._wake.wait(
-                IDLE_SWEEP_S if adapter is not None and adapter.has_live_turns() else None
-            )
+            self._wake.wait(IDLE_SWEEP_S if adapter is not None and adapter.needs_sweep() else None)
             self._wake.clear()
             with guard("adapters.hermes_agent.export_thread"):
                 self._once()

@@ -14,8 +14,10 @@ from collections.abc import Callable
 import pytest
 
 from wardex_sdk._adapters._hermes_agent_turns import (
+    AUX_ATTEMPT_BOUND_S,
     CLOSE_RULES,
     CREATES,
+    IDLE_AFTER_ERROR_S,
     IDLE_CLOSE_S,
     LIVE,
     OBSERVATIONS,
@@ -134,7 +136,7 @@ def test_final_states_never_reopen() -> None:
 
 
 def test_every_guess_is_undoable() -> None:
-    guesses = (_T.CALL_FAILED_FINAL, _T.NEXT_TURN, _T.CHILD_STOP, _T.IDLE, _T.UNIT_GONE)
+    guesses = (_T.NEXT_TURN, _T.CHILD_STOP, _T.IDLE, _T.UNIT_GONE)
     for state, trigger in itertools.product(LIVE, guesses):
         assert step(state, trigger).next is TurnState.PRESUMED_CLOSED
     assert step(TurnState.PRESUMED_CLOSED, _T.CALL_ENTER).action is Action.CONTINUE
@@ -167,13 +169,6 @@ _EXPECTED_RULES = {
         TurnState.CLOSED,
         "end_event",
     ),
-    CloseCause.RETRIES_SPENT: (
-        StatusCode.UNSET,
-        None,
-        Limitation.SESSION_ABORTED,
-        TurnState.PRESUMED_CLOSED,
-        "retries_spent",
-    ),
     CloseCause.NEXT_TURN: (
         StatusCode.UNSET,
         None,
@@ -202,6 +197,13 @@ _EXPECTED_RULES = {
         TurnState.CUT,
         "finalize",
     ),
+    CloseCause.SHUTDOWN: (
+        StatusCode.UNSET,
+        None,
+        Limitation.SESSION_ABORTED,
+        TurnState.CUT,
+        "finalize",
+    ),
 }
 
 
@@ -213,7 +215,7 @@ def test_close_rule_states_only_what_hermes_stated(cause: CloseCause) -> None:
 
 def test_only_shutdown_drains_on_the_calling_thread() -> None:
     drains = {c for c, r in CLOSE_RULES.items() if r.export is ExportMode.DRAIN}
-    assert drains == {CloseCause.FINALIZE}
+    assert drains == {CloseCause.SHUTDOWN}
 
 
 def test_no_close_claims_an_interrupt_marker() -> None:
@@ -243,10 +245,18 @@ def test_interrupt_closes_by_the_end_event() -> None:
     ]
 
 
-def test_failed_turn_with_no_end_event_is_presumed_closed() -> None:
-    path = _walk(TurnState.AMBIENT, _T.CALL_FAILED, _T.CALL_FAILED_FINAL)
-    assert path == [(_A.NOTHING, TurnState.AMBIENT), (_A.CLOSE, TurnState.PRESUMED_CLOSED)]
-    assert step(TurnState.AMBIENT, _T.CALL_FAILED_FINAL).cause is CloseCause.RETRIES_SPENT
+def test_a_failed_call_never_closes_its_turn() -> None:
+    """After its last retry Hermes falls back or parks the turn on its recovery ladder, so an
+    api_request_error is a note, and only a net or Hermes's own end closes the turn."""
+    path = _walk(TurnState.AMBIENT, _T.CALL_FAILED, _T.CALL_FAILED, _T.CALL_ENTER, _T.TURN_END)
+    assert path == [
+        (_A.NOTE_ERROR, TurnState.AMBIENT),
+        (_A.NOTE_ERROR, TurnState.AMBIENT),
+        (_A.FRAME, TurnState.AMBIENT),
+        (_A.CLOSE, TurnState.CLOSED),
+    ]
+    for live in LIVE:
+        assert step(live, _T.CALL_FAILED) == Step(live, _A.NOTE_ERROR)
 
 
 @pytest.mark.parametrize(
@@ -256,8 +266,9 @@ def test_failed_turn_with_no_end_event_is_presumed_closed() -> None:
         (_T.IDLE, CloseCause.IDLE),
         (_T.CHILD_STOP, CloseCause.CHILD_STOPPED),
         (_T.FINALIZE, CloseCause.FINALIZE),
+        (_T.SHUTDOWN, CloseCause.SHUTDOWN),
     ],
-    ids=["next-turn", "idle", "child-stop", "finalize"],
+    ids=["next-turn", "idle", "child-stop", "finalize", "shutdown"],
 )
 def test_nets_close_a_live_turn(trigger: Trigger, cause: CloseCause) -> None:
     for live in LIVE:
@@ -267,13 +278,14 @@ def test_nets_close_a_live_turn(trigger: Trigger, cause: CloseCause) -> None:
 
 def test_nets_leave_a_turn_that_is_not_live_alone() -> None:
     for state, trigger in itertools.product(
-        (TurnState.PRESUMED_CLOSED, *FINAL), (_T.NEXT_TURN, _T.IDLE, _T.CHILD_STOP, _T.FINALIZE)
+        (TurnState.PRESUMED_CLOSED, *FINAL),
+        (_T.NEXT_TURN, _T.IDLE, _T.CHILD_STOP, _T.FINALIZE, _T.SHUTDOWN),
     ):
         assert step(state, trigger) == Step(state, _A.IGNORE_LATE)
 
 
 def test_continuation_after_a_presumed_close() -> None:
-    path = _walk(TurnState.AMBIENT, _T.CALL_FAILED_FINAL, _T.CALL_ENTER, _T.TURN_END)
+    path = _walk(TurnState.AMBIENT, _T.IDLE, _T.CALL_ENTER, _T.TURN_END)
     assert path == [
         (_A.CLOSE, TurnState.PRESUMED_CLOSED),
         (_A.CONTINUE, TurnState.AMBIENT),
@@ -303,7 +315,7 @@ def test_late_report_is_ignored(state: TurnState) -> None:
 
 
 def test_report_for_a_turn_never_seen_is_unknown() -> None:
-    for trigger in (_T.TOOL_REPORT, _T.CALL_REPORT, _T.TURN_END, _T.CALL_FAILED_FINAL):
+    for trigger in (_T.TOOL_REPORT, _T.CALL_REPORT, _T.TURN_END, _T.CALL_FAILED):
         assert step(None, trigger) == Step(None, _A.IGNORE_UNKNOWN)
 
 
@@ -320,8 +332,16 @@ def test_the_answer_is_kept_by_a_live_turn_and_moves_it_nowhere() -> None:
     assert step(None, _T.TURN_ANSWER) == Step(None, _A.IGNORE_UNKNOWN)
 
 
-def test_a_missing_start_opens_late() -> None:
-    assert step(None, _T.CALL_ENTER) == Step(TurnState.AMBIENT, _A.OPEN_LATE)
+def test_only_a_start_opens_a_turn() -> None:
+    """A model frame of a turn never seen open is a run Hermes did not announce (a review or
+    side-question fork, a register mid-turn): an orphan frame, never a turn."""
+    assert step(None, _T.CALL_ENTER) == Step(None, _A.ORPHAN_FRAME)
+    opening = {
+        (state, t) for state, t in itertools.product(STATES, Trigger) if step(state, t).next in LIVE
+    }
+    assert {pair for pair in opening if pair[0] is None} == {(None, _T.TURN_START)}
+    for state in FINAL:
+        assert step(state, _T.CALL_ENTER) == Step(state, _A.IGNORE_LATE)
 
 
 def test_a_gone_unit_is_presumed_closed_at_its_next_event() -> None:
@@ -373,6 +393,8 @@ def test_completed_turn_with_no_model_frame_says_its_calls_were_unobserved() -> 
     marker = Limitation.SUBPROCESS_MODEL_CALLS_UNOBSERVED
     assert marker in _applying(_record(), CloseCause.ENDED_COMPLETED)
     assert marker not in _applying(_record(model_frames=1), CloseCause.ENDED_COMPLETED)
+    # another plugin blocked the prompt: no model call ran anywhere
+    assert marker not in _applying(_record(blocked=True), CloseCause.ENDED_COMPLETED)
     for cause in set(CloseCause) - {CloseCause.ENDED_COMPLETED}:
         assert marker not in _applying(_record(), cause), cause
 
@@ -405,18 +427,31 @@ def test_undispatched_compares_tool_call_ids_not_names() -> None:
 
 def test_quiet_only_with_nothing_pinned_and_no_auxiliary_attempt_in_flight() -> None:
     r = _record()
-    assert r.quiet()
+    assert r.quiet(0.0)
     frame = FrameRecord(FrameKind.TOOL, "call_1")
     r.frames[(FrameKind.TOOL, "call_1")] = frame
-    assert not r.quiet()
+    assert not r.quiet(0.0)
     assert not frame.on_report("report")  # concurrent path: reported, still pinned
-    assert not r.quiet()
+    assert not r.quiet(0.0)
     assert frame.on_exit(None)
-    assert r.quiet()
-    r.aux[("aux-1", 0)] = AuxAttempt(task="title_generation")
-    assert not r.quiet()
+    assert r.quiet(0.0)
+    r.aux[("aux-1", 0)] = AuxAttempt(task="title_generation", started=0.0)
+    assert not r.quiet(0.0)
     del r.aux[("aux-1", 0)]
-    assert r.quiet()
+    assert r.quiet(0.0)
+
+
+def test_an_auxiliary_attempt_whose_end_never_came_stops_holding_its_turn() -> None:
+    """Hermes skips a hook callback while the previous one for the same key still runs, so an
+    end can be lost; the attempt holds its turn busy only up to its bound."""
+    r = _record(last_event=0.0)
+    r.aux[("aux-1", 0)] = AuxAttempt(task="context_compression", started=0.0)
+    assert not r.quiet(AUX_ATTEMPT_BOUND_S - 1)
+    assert r.quiet(AUX_ATTEMPT_BOUND_S)
+    book = TurnBook()
+    book.admit(r)
+    assert book.idle(AUX_ATTEMPT_BOUND_S - 1) == []
+    assert book.idle(AUX_ATTEMPT_BOUND_S) == [r]
 
 
 def test_a_frame_awaiting_its_report_is_quiet() -> None:
@@ -425,7 +460,30 @@ def test_a_frame_awaiting_its_report_is_quiet() -> None:
     r.frames[(FrameKind.MODEL_CALL, "s-1:api:1")] = frame
     assert not frame.on_exit(None)
     assert frame.state is FrameState.AWAITING_REPORT
-    assert r.quiet()
+    assert r.quiet(0.0)
+
+
+def test_an_error_lengthens_the_quiet_net_until_the_next_event_of_its_turn() -> None:
+    r = _record(state=TurnState.AMBIENT, last_event=0.0)
+    assert r.quiet_for() == IDLE_CLOSE_S
+    r.advance(_T.CALL_FAILED, now=0.0)
+    r.after_error, r.error_reason = True, "server_error"  # what NOTE_ERROR writes
+    assert r.quiet_for() == IDLE_AFTER_ERROR_S
+    for net in (_T.IDLE, _T.NEXT_TURN, _T.FINALIZE, _T.SHUTDOWN, _T.CHILD_STOP, _T.UNIT_GONE):
+        probe = _record(state=TurnState.AMBIENT, after_error=True, error_reason="server_error")
+        probe.advance(net)
+        assert (probe.after_error, probe.error_reason) == (True, "server_error"), net
+    r.advance(_T.CALL_ENTER, now=1.0)
+    assert (r.after_error, r.error_reason, r.quiet_for()) == (False, None, IDLE_CLOSE_S)
+
+
+def test_the_error_threshold_covers_every_wait_hermes_announces() -> None:
+    """Hermes v0.23.3: an ordinary retry waits at most 60 s plus half again, a recovery-ladder
+    cycle at most 120 s; both under the threshold, which stays under the 600 s gateway exit."""
+    assert 60.0 * 1.5 < IDLE_AFTER_ERROR_S
+    assert 120.0 < IDLE_AFTER_ERROR_S < 600.0
+    assert IDLE_CLOSE_S < IDLE_AFTER_ERROR_S
+    assert 300.0 < AUX_ATTEMPT_BOUND_S < 600.0
 
 
 def test_advance_writes_state_and_time_and_releases_the_lock() -> None:
@@ -485,10 +543,30 @@ def test_a_raised_frame_closes_at_exit_with_its_error() -> None:
 
 
 def test_an_orphan_frame_closes_at_exit_and_never_by_report() -> None:
-    frame = FrameRecord(FrameKind.TOOL, "call_1", orphan=True)
+    for kind, key in ((FrameKind.TOOL, "call_1"), (FrameKind.MODEL_CALL, "fork:api:1")):
+        frame = FrameRecord(kind, key, orphan=True)
+        assert not frame.on_report("r")
+        assert frame.on_exit(None)
+        assert frame.kept_report is None
+
+
+def test_an_abandoned_worker_report_closes_the_frame_at_once() -> None:
+    frame = FrameRecord(FrameKind.TOOL, "call_1")
+    assert frame.on_report("timeout", abandoned=True)
+    assert (frame.state, frame.kept_report) == (FrameState.CLOSED, "timeout")
+    assert not frame.on_exit(None)  # the worker's late exit does nothing
+    assert not frame.on_exit("KeyboardInterrupt")
+    assert frame.error_type is None
+
+
+def test_a_kept_report_is_taken_once_when_its_turn_closes_first() -> None:
+    frame = FrameRecord(FrameKind.TOOL, "call_1")
+    assert not frame.take_kept()  # pinned, nothing kept
     assert not frame.on_report("r")
-    assert frame.on_exit(None)
-    assert frame.kept_report is None
+    assert frame.take_kept()
+    assert not frame.take_kept()
+    assert not frame.on_exit(None)
+    assert (frame.state, frame.kept_report) == (FrameState.CLOSED, "r")
 
 
 def test_exit_and_report_race_has_one_winner() -> None:
@@ -569,7 +647,7 @@ def test_session_snapshot() -> None:
     for r in (a, b, c):
         book.admit(r)
     assert book.live_in_session("s-1") == [a, c]
-    assert book.live_in_session(None) == [a, b, c]
+    assert book.live() == [a, b, c]
     snapshot = book.live_in_session("s-1")
     book.retire(a, TurnState.CLOSED)
     assert snapshot == [a, c]
@@ -580,12 +658,14 @@ def test_idle_lists_only_quiet_live_turns_past_the_limit() -> None:
     book = TurnBook()
     quiet = _record("t-1", last_event=0.0)
     busy = _record("t-2", last_event=0.0)
-    busy.aux[("aux-1", 0)] = AuxAttempt(task="title_generation")
+    busy.aux[("aux-1", 0)] = AuxAttempt(task="title_generation", started=0.0)
     recent = _record("t-3", last_event=IDLE_CLOSE_S)
-    for r in (quiet, busy, recent):
+    waiting = _record("t-4", last_event=0.0, after_error=True)
+    for r in (quiet, busy, recent, waiting):
         book.admit(r)
     assert book.idle(IDLE_CLOSE_S) == [quiet]
     assert book.idle(IDLE_CLOSE_S - 1) == []
+    assert book.idle(IDLE_AFTER_ERROR_S) == [quiet, recent, waiting]
 
 
 def test_ties_are_kept_until_evicted() -> None:
@@ -621,7 +701,7 @@ def test_clear_forgets_everything() -> None:
     book.retire(r, TurnState.CLOSED)
     book.tie(ChildTie("c", "p"))
     book.clear()
-    assert book.live_in_session(None) == []
+    assert book.live() == []
     assert book.tombstone("t-1") is None
     assert book.tie_for("c") is None
 

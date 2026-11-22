@@ -36,6 +36,8 @@ TOOL_RESULT = "<synthetic result>"
 QUESTION = "<synthetic question>"
 TASK = "<synthetic task>"
 ANSWER = "<synthetic answer>"
+#: `agent/turn_context.py::PRE_LLM_BLOCK_EXIT_REASON`.
+BLOCK_EXIT_REASON = "blocked_by_plugin_pre_llm_call"
 
 
 @dataclass
@@ -49,6 +51,7 @@ class Turn:
     calls: int = 0
     title: _TitleThread | None = None
     message: object = QUESTION  # `user_message`: a string or a list of content parts
+    block: str | None = None  # another plugin's `pre_llm_call` block message, when one came
 
 
 @dataclass(frozen=True)
@@ -113,14 +116,25 @@ class FakeHermes:
         tool_calls: Sequence[str] = (),
         on_worker: bool | None = None,
         usage: Usage | None = None,
+        again: bool = False,
+        retry_count: int = 0,
+        max_retries: int = 1,
+        refused: bool = False,
     ) -> Call:
         """One logical call: `llm_request`, `pre_api_request`, then one `llm_execution` frame on
         this thread holding every attempt (retries never leave the frame: fixture `retry`). Each
         attempt is a real request from a worker started inside the frame with a copied context
         (`chat_completion_helpers.py::_context_thread_target`); a child turn's attempts run on its
         own loop thread, as recorded in `two_subagents`. Spent retries raise out of the frame and
-        fire `transform_api_error_classification` and `api_request_error`, and no end event."""
-        turn.calls += 1
+        fire `transform_api_error_classification` and `api_request_error`, and no end event.
+
+        `again` is Hermes's next retry of the same call: a new frame under the same
+        `api_request_id` (`conversation_loop.py` sets it once per call, before its retry loop).
+        `refused` is a content-policy refusal: an HTTP 200 whose frame returns, then
+        `api_request_error` (retryable False) and no `post_api_request`
+        (`agent/turn_truncation.py::handle_content_policy_refusal`)."""
+        if not again:
+            turn.calls += 1
         ids = self._call_ids(turn, f"{turn.turn_id}:api:{turn.calls}")
         n = next(self._seq)
         asked = tuple((f"call_lab_{n}_{k}", name) for k, name in enumerate(tool_calls))
@@ -128,7 +142,7 @@ class FakeHermes:
         request = self.ctx.run_request_chain(
             "llm_request", "request", request={"model": self.model, "messages": []}, **ids
         )
-        self._emit("pre_api_request", {**ids, "retry_count": 0})
+        self._emit("pre_api_request", {**ids, "retry_count": retry_count})
         worker = turn.parent is None if on_worker is None else on_worker
         statuses: list[int | None] = []
 
@@ -161,15 +175,29 @@ class FakeHermes:
                 "api_request_error",
                 {
                     **ids,
-                    "retry_count": 0,
-                    "max_retries": len(attempts) - 1,
+                    "retry_count": retry_count,
+                    "max_retries": max_retries,
                     "retryable": exc.status_code >= 500,
                     "reason": "server_error" if exc.status_code >= 500 else "bad_request",
-                    "status_code": str(exc.status_code),
-                    "error_type": type(exc).__name__,
+                    "status_code": exc.status_code,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
                 },
             )
             return Call(turn, ids["api_request_id"], asked, statuses[-1])
+        if refused:
+            self._emit(
+                "api_request_error",
+                {
+                    **ids,
+                    "retry_count": retry_count,
+                    "max_retries": max_retries,
+                    "retryable": False,
+                    "reason": "content_policy_blocked",
+                    "status_code": None,
+                    "error": {"type": "ContentPolicyBlocked", "message": "model declined"},
+                },
+            )
+            return Call(turn, ids["api_request_id"], (), statuses[-1])
         reported = _usage(used)
         self._emit(
             "post_api_request",
@@ -189,10 +217,48 @@ class FakeHermes:
         )
         return Call(turn, ids["api_request_id"], asked, statuses[-1])
 
-    def fail(self, turn: Turn, attempts: Sequence[Reply] = (Reply.SERVER_ERROR,) * 2) -> Call:
-        """Retries spent: the frame raises, `api_request_error` fires, and Hermes fires NO
-        `on_session_end` (`agent/turn_recovery.py::_failed_turn_result`; fixture `failed_turn`)."""
-        return self.model_call(turn, attempts)
+    def fail(
+        self,
+        turn: Turn,
+        attempts: Sequence[Reply] = (Reply.SERVER_ERROR,) * 2,
+        *,
+        retries: int = 1,
+        cycles: int = 0,
+        between: Callable[[int], None] | None = None,
+    ) -> Call:
+        """Every attempt of one call fails. Hermes's retry loop runs `retries` frames under one
+        `api_request_id`, each raising and firing `api_request_error`; its recovery ladder then
+        waits (`between(cycle)`) and runs the loop again, `cycles` times
+        (`agent/turn_recovery_autorecover.py`). Hermes's defaults are 3 and 5; the recorded
+        fixture `failed_turn` ran 1 and 0. When every round fails, Hermes returns a failed
+        result and fires NO `on_session_end` (`agent/turn_recovery.py`)."""
+        call = None
+        for cycle in range(cycles + 1):
+            if cycle and between is not None:
+                between(cycle)
+            for retry in range(retries):
+                again = call is not None
+                call = self.model_call(
+                    turn, attempts, again=again, retry_count=retry, max_retries=retries
+                )
+        assert call is not None
+        return call
+
+    def recover(
+        self,
+        turn: Turn,
+        *,
+        retries: int = 3,
+        cycles: int = 1,
+        between: Callable[[int], None] | None = None,
+        tool_calls: Sequence[str] = (),
+    ) -> Call:
+        """The recovery ladder at Hermes's defaults: `cycles` rounds of `retries` failed frames,
+        a wait before each later round, then the same call answers on a new frame."""
+        self.fail(turn, retries=retries, cycles=cycles - 1, between=between)
+        if between is not None:
+            between(cycles)
+        return self.model_call(turn, tool_calls=tool_calls, again=True)
 
     def interrupt(self, turn: Turn) -> Call:
         """A held stream cut by an interrupt: the frame raises `InterruptedError`, then
@@ -211,6 +277,43 @@ class FakeHermes:
                 },
             )
             return Call(turn, f"{turn.turn_id}:api:{turn.calls}", (), None)
+
+    def abandon_tool(
+        self, call: Call, name: str, *, status: str = "timeout", error_type: str = "tool_timeout"
+    ) -> Callable[[], None]:
+        """A sequential tool Hermes gives up on (`agent/tool_executor.py::
+        _abandoned_sequential_result`): the worker runs the frame and blocks; the loop thread
+        stops waiting and fires the terminal `post_tool_call` itself, while the worker's frame
+        is still open. The turn goes on. The returned call lets the worker finish and waits for
+        its frame to exit."""
+        tcid = next(i for i, nm in call.tool_calls if nm == name)
+        release, entered = threading.Event(), threading.Event()
+        copied = contextvars.copy_context()
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        worker = pool.submit(
+            copied.run, self._tool_job, call, tcid, name, status, None, None, release, entered
+        )
+        pool.shutdown(wait=False)
+
+        def let_finish() -> None:
+            release.set()
+            worker.result(10)
+
+        assert entered.wait(10), "the tool worker entered its frame"
+        message = f"Error executing tool '{name}': timed out after 3.0s"
+        self._emit(
+            "post_tool_call",
+            {
+                **self._tool_ids(call, tcid, name),
+                "args": {"input": "<synthetic>"},
+                "result": message,
+                "duration_ms": 3000,
+                "status": status,
+                "error_type": error_type,
+                "error_message": message,
+            },
+        )
+        return let_finish
 
     def tool(self, call: Call, name: str, *, status: str = "ok", tool_call_id: str = "") -> None:
         """One tool on a fresh one-worker pool, context copied at submit on this thread
@@ -364,11 +467,18 @@ class FakeHermes:
         failed: bool = False,
         reason: str = "text_response(finish_reason=stop)",
         answer: object = ANSWER,
-    ) -> None:
+        review: str | None = None,
+    ) -> threading.Thread | None:
         """`transform_llm_output`, `post_llm_call`, `on_session_end`: the normal close in fixture
         `single_turn`. `post_llm_call` fires only for a turn with a final response that was not
         interrupted (`agent/turn_finalizer.py::finalize_turn`); `answer` is that response. A
-        failed turn that reaches finalization has one too: Hermes writes an explanation there."""
+        failed turn that reaches finalization has one too: Hermes writes an explanation there.
+
+        `review` spawns Hermes's background memory review between the two, as
+        `_mirror_turn_to_memory` does: a `bg-review` thread whose context is copied on this
+        thread (`tools/thread_context.py::propagate_context_to_thread`). "during" runs it to its
+        end before `on_session_end`; "after" lets it run once the end has fired. The thread is
+        returned."""
         light = {
             "session_id": turn.session_id,
             "turn_id": turn.turn_id,
@@ -389,6 +499,17 @@ class FakeHermes:
                     "review_signals": None,
                 },
             )
+        thread = None
+        if review is not None:
+            thread = threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(self._review_fork, turn),
+                name="bg-review",
+                daemon=True,
+            )
+            if review == "during":
+                thread.start()
+                thread.join(30)
         self._emit(
             "on_session_end",
             {
@@ -399,7 +520,33 @@ class FakeHermes:
                 "turn_exit_reason": reason,
             },
         )
+        if thread is not None and review == "after":
+            thread.start()
+            thread.join(30)
         self.ctx.drain_streams()
+        return thread
+
+    def end_blocked(self, turn: Turn) -> None:
+        """Another plugin's `pre_llm_call` blocked the prompt: Hermes finalizes the turn with no
+        model call and the block message as its answer (`conversation_loop.py::
+        _turn_without_loop`), and skips titling, memory sync and the review."""
+        assert turn.block is not None, "a vetoing pre_llm_call callback returned a block"
+        self.end(turn, reason=BLOCK_EXIT_REASON, answer=turn.block)
+
+    def side_question(self, session_id: str) -> None:
+        """`/btw` (`agent/side_question.py::_answer_via_fork`) on the CLI's `btw-side-question`
+        worker, a thread of the UI, not of the loop: a fork that shares the session id, runs one
+        `run_conversation` with persistence detached, and so sends no `pre_llm_call` and no end
+        (`agent/turn_context.py`). Its call still passes `llm_execution` and `post_api_request`."""
+        fork = self._fork(session_id)
+        thread = threading.Thread(
+            target=contextvars.Context().run,
+            args=(self.model_call, fork),
+            kwargs={"on_worker": False},
+            name="btw-side-question",
+        )
+        thread.start()
+        thread.join(30)
 
     def finalize(self, session_id: str | None = None, reason: str = "shutdown") -> list[Any]:
         """`on_session_finalize` on the calling thread (`hermes_cli/cli_shutdown.py` ->
@@ -460,7 +607,7 @@ class FakeHermes:
             {"session_id": turn.session_id, "model": self.model, "platform": turn.platform},
         )
         parent = turn.parent.session_id if turn.parent else ""
-        self._emit(
+        results = self._emit(
             "pre_llm_call",
             {
                 **self._turn_ids(turn),
@@ -471,6 +618,42 @@ class FakeHermes:
                 "sender_id": "",
             },
         )
+        # `turn_context.py`: a block counts only with a message.
+        turn.block = next(
+            (
+                r["message"]
+                for r in results
+                if isinstance(r, dict) and r.get("action") == "block" and r.get("message")
+            ),
+            None,
+        )
+
+    def _fork(self, session_id: str) -> Turn:
+        """`agent/background_review.py::build_cache_parity_fork`: the parent's session id, a
+        turn id of the fork's own `run_conversation`, and no `_open`: a `_persist_disabled`
+        agent fires no `pre_llm_call`."""
+        task = str(uuid.uuid4())
+        return Turn(session_id, task, f"{session_id}:{task}:{secrets.token_hex(4)}")
+
+    def _review_fork(self, parent: Turn) -> None:
+        """The review fork's run: a model call that asks for the memory tool, the tool, and a
+        closing model call. No `pre_llm_call`, no `post_llm_call`, no `on_session_end`."""
+        fork = self._fork(parent.session_id)
+        call = self.model_call(fork, tool_calls=["memory"])
+        self.tool(call, "memory")
+        self.model_call(fork)
+
+    def _tool_ids(self, call: Call, tcid: str, name: str) -> dict[str, Any]:
+        turn = call.turn
+        return {
+            "session_id": turn.session_id,
+            "task_id": turn.task_id,
+            "turn_id": turn.turn_id,
+            "api_request_id": call.api_request_id,
+            "tool_call_id": tcid,
+            "tool_name": name,
+            "conversation_id": turn.session_id,
+        }
 
     def _attempt(self, turn: Turn, answer: Answer, worker: bool) -> int | None:
         stream = answer.reply in (Reply.OK_STREAM, Reply.HOLD)
@@ -512,18 +695,12 @@ class FakeHermes:
             status = None
         return status
 
-    def _tool_job(self, call, tcid, name, status, barrier, body=None) -> None:
-        turn = call.turn
-        ids = {
-            "session_id": turn.session_id,
-            "task_id": turn.task_id,
-            "turn_id": turn.turn_id,
-            "api_request_id": call.api_request_id,
-            "tool_call_id": tcid,
-            "tool_name": name,
-            "conversation_id": turn.session_id,
-        }
-        ids = self._payload({"telemetry_schema_version": OBSERVER_V1, **ids})
+    def _tool_job(
+        self, call, tcid, name, status, barrier, body=None, hold=None, entered=None
+    ) -> None:
+        ids = self._payload(
+            {"telemetry_schema_version": OBSERVER_V1, **self._tool_ids(call, tcid, name)}
+        )
         args = self.ctx.run_request_chain(
             "tool_request", "args", args={"input": "<synthetic>"}, **ids
         )
@@ -539,6 +716,10 @@ class FakeHermes:
 
         def terminal(final_args: Any) -> Any:
             self._emit("pre_tool_call", {**ids, "args": final_args})
+            if hold is not None:  # abandoned: Hermes reports for it; it only finishes late
+                entered.set()
+                hold.wait(30)
+                return TOOL_RESULT
             if body is not None:
                 body()
             if barrier is not None:
@@ -550,7 +731,7 @@ class FakeHermes:
         self.ctx.run_execution_chain(
             "tool_execution", terminal, args=args, original_args=args, **ids
         )
-        if barrier is None:
+        if barrier is None and hold is None:
             self._emit("post_tool_call", post)
 
     def _child(self, parent: Turn, k: int) -> Turn:

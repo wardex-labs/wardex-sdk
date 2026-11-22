@@ -89,6 +89,8 @@ HOOK_LANES: Mapping[str, Lane] = {
     **{name: Lane.STREAM for name in ("on_stream_start", "on_stream_delta", "on_stream_end")},
 }
 #: `plugins_dispatch.py::_HOOK_CALLBACK_TIMEOUT_SECS` and `_HOOK_TIMEOUT_SUPPRESSION_SECONDS`.
+#: `plugins.hook_callback_timeout: 0` (documented: "set 0 to disable") runs every bounded hook
+#: inline on the caller instead (`_hook_uses_callback_timeout`): `hook_timeout_s=0` here.
 HOOK_TIMEOUT_S = 30.0
 SUPPRESSION_S = 60.0
 _SKIPPED = object()
@@ -186,6 +188,7 @@ class FakePluginContext:
     timeouts: list[tuple[str, str]] = field(default_factory=list)
     abandoned: bool = False
     _suppressed: dict[tuple[str, int], float] = field(default_factory=dict)
+    _running: set[tuple[str, int, str | None]] = field(default_factory=set)
     _streams: dict[tuple[str, int], _StreamDispatcher] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -247,7 +250,7 @@ class FakePluginContext:
         results: list[Any] = []
         for cb in callbacks:
             try:
-                if lane is Lane.BOUNDED:
+                if lane is Lane.BOUNDED and self.hook_timeout_s > 0:
                     ret = self._bounded(hook_name, cb, kwargs)
                     if ret is _SKIPPED:
                         if hook_name == "pre_tool_call":  # fail closed (`_run_hook_callbacks`)
@@ -379,12 +382,24 @@ class FakePluginContext:
 
     def _bounded(self, hook: str, cb: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
         """`_run_hook_callback_bounded`: a fresh daemon thread runs the callback in
-        `copy_context()` of the caller, who waits up to the timeout and then abandons it."""
+        `copy_context()` of the caller, who waits up to the timeout and then abandons it. A call
+        is skipped while the callback is suppressed after a timeout, or while the same callback
+        still runs for the same call identity (`_hook_call_identity`: `tool_call_id`, else
+        `turn_id`)."""
         key = (hook, id(cb))
+        identity = next(
+            (v for f in ("tool_call_id", "turn_id") if isinstance(v := kwargs.get(f), str) and v),
+            None,
+        )
+        gate = (hook, id(cb), identity)
         with self._lock:
-            if self._suppressed.get(key, 0.0) > time.monotonic():
-                self.warnings.append(f"hook {hook!r} callback {_name(cb)} skipped after a timeout")
+            if self._suppressed.get(key, 0.0) > time.monotonic() or gate in self._running:
+                self.warnings.append(
+                    f"hook {hook!r} callback {_name(cb)} skipped after previous timeout or "
+                    "while still running"
+                )
                 return _SKIPPED
+            self._running.add(gate)
         context = contextvars.copy_context()
         done = threading.Event()
         outcome: dict[str, Any] = {}
@@ -396,6 +411,8 @@ class FakePluginContext:
             except BaseException as exc:
                 outcome["error"] = exc
             finally:
+                with self._lock:
+                    self._running.discard(gate)
                 done.set()
 
         threading.Thread(target=runner, name=f"hermes-hook-{_name(cb)}"[:40], daemon=True).start()

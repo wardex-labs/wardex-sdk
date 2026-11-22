@@ -110,7 +110,7 @@ _SAMPLES: dict[str, tuple[dict[str, Any], object]] = {
             "reason": "server_error",
             "status_code": 500,
         },
-        CallError("s-1", "t-1", "s-1:api:1", 0, 1, True, "server_error"),
+        CallError("s-1", "t-1", "s-1:api:1", "server_error"),
     ),
     "tool_execution": (
         {
@@ -277,10 +277,10 @@ def test_a_missing_required_field_drops_the_event_and_names_the_field(
 
 
 def test_a_mistyped_field_counts_as_missing() -> None:
-    payload = {**_SAMPLES["api_request_error"][0], "turn_id": 7, "retryable": "yes"}
+    payload = {**_SAMPLES["api_request_error"][0], "turn_id": 7, "api_request_id": None}
     event, drift = parse(_ROWS["api_request_error"], payload)
     assert event is None
-    assert drift == DriftNote(Drift.FIELD, "api_request_error", "missing turn_id, retryable")
+    assert drift == DriftNote(Drift.FIELD, "api_request_error", "missing turn_id, api_request_id")
 
 
 @pytest.mark.parametrize("name", [r.name for r in CONTRACT if r.schema_field is not None])
@@ -405,19 +405,72 @@ def test_the_input_count_is_the_prompt_total_with_its_cached_part() -> None:
 
 
 @pytest.mark.parametrize(
-    ("retry_count", "max_retries", "retryable", "trigger"),
-    [
-        (0, 3, True, Trigger.CALL_FAILED),
-        (2, 3, True, Trigger.CALL_FAILED_FINAL),
-        (0, 1, True, Trigger.CALL_FAILED_FINAL),
-        (0, 3, False, Trigger.CALL_FAILED_FINAL),
-    ],
+    ("retry_count", "max_retries", "retryable"),
+    [(0, 3, True), (2, 3, True), (0, 1, True), (0, 3, False)],
     ids=["retries-left", "last-retry", "one-attempt", "not-retryable"],
 )
-def test_a_failed_call_predicts_whether_retries_are_spent(
-    retry_count: int, max_retries: int, retryable: bool, trigger: Trigger
+def test_a_failed_call_never_predicts_the_end_of_its_turn(
+    retry_count: int, max_retries: int, retryable: bool
 ) -> None:
-    assert CallError("s", "t", "a", retry_count, max_retries, retryable).trigger() is trigger
+    # After the last retry Hermes falls back or parks the turn on its recovery ladder.
+    payload = {
+        **_SAMPLES["api_request_error"][0],
+        "retry_count": retry_count,
+        "max_retries": max_retries,
+        "retryable": retryable,
+    }
+    event, drift = parse(_ROWS["api_request_error"], payload)
+    assert drift is None
+    assert isinstance(event, CallError)
+    assert event.trigger() is Trigger.CALL_FAILED
+
+
+@pytest.mark.parametrize(
+    ("reason", "trigger"),
+    [
+        ("shutdown", Trigger.SHUTDOWN),
+        (None, Trigger.SHUTDOWN),
+        ("new_session", Trigger.FINALIZE),
+        ("session_boundary", Trigger.FINALIZE),
+        ("cli_close", Trigger.FINALIZE),
+    ],
+    ids=["shutdown", "no-reason", "gateway-new", "cli-new", "viewer-close"],
+)
+def test_only_a_shutdown_finalize_is_a_shutdown(reason: str | None, trigger: Trigger) -> None:
+    assert Finalize("s-1", reason).trigger() is trigger
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type", "abandoned"),
+    [
+        ("timeout", "tool_timeout", True),
+        ("cancelled", "tool_interrupted", True),
+        ("cancelled", "keyboard_interrupt", True),
+        ("error", "thread_missing_result", True),
+        ("ok", None, False),
+        ("error", "FileNotFoundError", False),
+    ],
+    ids=["timeout", "interrupt", "keyboard", "no-result", "ok", "failed"],
+)
+def test_a_tool_report_says_when_hermes_gave_up_on_the_worker(
+    status: str, error_type: str | None, abandoned: bool
+) -> None:
+    assert ToolReport("s-1", "t-1", "call_1", status, error_type).abandoned() is abandoned
+
+
+@pytest.mark.parametrize(
+    ("exit_reason", "blocked"),
+    [
+        ("blocked_by_plugin_pre_llm_call", True),
+        ("text_response(finish_reason=stop)", False),
+        (None, False),
+    ],
+    ids=["block", "answer", "none"],
+)
+def test_an_end_says_when_another_plugin_blocked_the_prompt(
+    exit_reason: str | None, blocked: bool
+) -> None:
+    assert TurnEnd("s-1", "t-1", True, exit_reason=exit_reason).blocked() is blocked
 
 
 @pytest.mark.parametrize(

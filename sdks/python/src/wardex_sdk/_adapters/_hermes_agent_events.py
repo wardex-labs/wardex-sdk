@@ -33,11 +33,15 @@ from typing import Any, ClassVar, Protocol
 from ._hermes_agent_turns import CloseCause, Trigger
 
 __all__ = [
+    "ABANDONED_TOOL_ERROR_TYPES",
+    "ABANDONED_TOOL_STATUSES",
     "CONTRACT",
+    "FINALIZE_SHUTDOWN_REASON",
     "HOST_PROCESS_ENV",
     "KNOWN_SCHEMAS",
     "MISSING",
     "NOT_REGISTERED",
+    "PRE_LLM_BLOCK_EXIT_REASON",
     "USAGE_KEYS",
     "AuxEnd",
     "AuxStart",
@@ -83,6 +87,24 @@ USAGE_KEYS: Mapping[str, str] = {
     "reasoning_tokens": "gen_ai.usage.reasoning.output_tokens",
 }
 
+#: The `turn_exit_reason` Hermes states when another plugin's `pre_llm_call` returned
+#: `{"action": "block", "message": ...}` (`agent/turn_context.py`). Hermes then withholds the
+#: prompt from every store and provider and finalizes the turn with no model call, so a blocked
+#: prompt never leaves the host through wardex either. The codex app-server runtime is the other
+#: ending with no model call in this process: its calls run in a subprocess, and its prompt did
+#: leave the host.
+PRE_LLM_BLOCK_EXIT_REASON = "blocked_by_plugin_pre_llm_call"
+
+#: The `reason` of an `on_session_finalize` at process shutdown: CLI exit, one-shot exit and
+#: gateway shutdown. Every other reason (`/new`, a reset, an expiry, a viewer's close) is a
+#: session boundary in a process that goes on.
+FINALIZE_SHUTDOWN_REASON = "shutdown"
+
+#: `post_tool_call` statuses with which Hermes says it gave up on a tool's worker while the
+#: worker may still run (`agent/tool_executor.py`): a timeout, a cancel, a worker with no result.
+ABANDONED_TOOL_STATUSES = frozenset({"timeout", "cancelled"})
+ABANDONED_TOOL_ERROR_TYPES = frozenset({"thread_missing_result"})
+
 #: Set to "1" by Hermes in its plugin host process (`plugins.isolation: host`). Model traffic
 #: runs in the agent's own process, so nothing wardex could record is visible there.
 HOST_PROCESS_ENV = "HERMES_PLUGIN_HOST_PROCESS"
@@ -107,7 +129,7 @@ class KeyKind(Enum):
 
     TURN = "turn"  # one turn, by turn_id (None when Hermes stated none)
     PARENT_TURN = "parent_turn"  # the parent's turn, by parent_turn_id (subagent_start)
-    SESSION = "session"  # every live turn of one session, or of every session for key None
+    SESSION = "session"  # every live turn of one session; none for key None
 
 
 class Event(Protocol):
@@ -173,6 +195,12 @@ def _member(obj: object, name: str) -> object:
     return getattr(obj, name, None)
 
 
+def _error_type(v: object) -> object:
+    """`api_request_error`'s `error`: `{"type": ..., "message": ...}`; only the type is read."""
+    kind = v.get("type") if isinstance(v, Mapping) else None
+    return kind if isinstance(kind, str) and kind else MISSING
+
+
 def _requested(v: object) -> object:
     """`assistant_message` -> ((tool_call_id, tool name), ...) from its `tool_calls`.
 
@@ -206,7 +234,8 @@ class TurnStart:
     """`pre_llm_call`. `parent_session_id` is stated for a delegated child only.
 
     `user_message` is Hermes's object, read and never changed: the user's message, a string or a
-    list of content parts, or a delegated child's task text.
+    list of content parts, or a delegated child's task text. It is held on the turn and recorded
+    only once it leaves the host (see PRE_LLM_BLOCK_EXIT_REASON).
     """
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
@@ -294,31 +323,31 @@ class CallReport:
 
 @dataclass(frozen=True, slots=True)
 class CallError:
-    """`api_request_error`. One per failed logical call; the attempts inside it are on the wire."""
+    """`api_request_error`. One per failed logical call; the attempts inside it are on the wire.
+
+    It never ends a turn, whatever its `retry_count`, `max_retries` and `retryable` say, so they
+    are not read (Hermes also sends them as None on some paths): after the last retry Hermes
+    moves to a fallback provider or parks the turn on its recovery ladder
+    (`agent/turn_recovery_autorecover.py`, five cycles by default). It is also Hermes's verdict
+    on a call whose frame returned: a content-policy refusal arrives as an HTTP 200, and Hermes
+    then sends this hook and no `post_api_request` (`agent/turn_truncation.py`).
+    """
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("session_id", "session_id", _text),
         Field("turn_id", "turn_id", _text),
         Field("api_request_id", "api_request_id", _text),
-        Field("retry_count", "retry_count", _int),
-        Field("max_retries", "max_retries", _int),
-        Field("retryable", "retryable", _flag),
         Field("reason", "reason", _text, required=False),
+        Field("error", "error_type", _error_type, required=False),
     )
     session_id: str
     turn_id: str
     api_request_id: str
-    retry_count: int
-    max_retries: int
-    retryable: bool
     reason: str | None = None
+    error_type: str | None = None  # Hermes's `error.type`, the class of what failed
 
     def trigger(self) -> Trigger:
-        """A prediction. Hermes fires this hook before it increments `retry_count` and fails the
-        turn when the incremented count reaches `max_retries`. A fallback provider can still
-        recover after the hook, which is why the close it causes is PRESUMED_CLOSED."""
-        spent = (not self.retryable) or self.retry_count + 1 >= self.max_retries
-        return Trigger.CALL_FAILED_FINAL if spent else Trigger.CALL_FAILED
+        return Trigger.CALL_FAILED
 
     def key_kind(self) -> KeyKind:
         return KeyKind.TURN
@@ -375,6 +404,13 @@ class ToolReport:
     status: str | None = None
     error_type: str | None = None
     result: object = None  # for record_output only
+
+    def abandoned(self) -> bool:
+        """Hermes gave up on the tool's worker: the frame's own exit may come after its turn
+        closed, or never."""
+        return (
+            self.status in ABANDONED_TOOL_STATUSES or self.error_type in ABANDONED_TOOL_ERROR_TYPES
+        )
 
     def trigger(self) -> Trigger:
         return Trigger.TOOL_REPORT
@@ -550,7 +586,11 @@ class TurnEnd:
     completed: bool = False
     failed: bool = False
     interrupted: bool = False
-    exit_reason: str | None = None  # an open set: kept verbatim, never parsed
+    exit_reason: str | None = None  # an open set: kept verbatim, never parsed but for a block
+
+    def blocked(self) -> bool:
+        """Another plugin blocked the turn's prompt, so it never left the host."""
+        return self.exit_reason == PRE_LLM_BLOCK_EXIT_REASON
 
     def cause(self) -> CloseCause:
         """From Hermes's three flags only. A stated failure outranks a stated interrupt, and
@@ -575,17 +615,23 @@ class TurnEnd:
 
 @dataclass(frozen=True, slots=True)
 class Finalize:
-    """`on_session_finalize`. Hermes shows a callback's return value to the user, so the
-    callback for this row returns None like every other."""
+    """`on_session_finalize`, at every session boundary and at shutdown. Hermes shows a
+    callback's return value to the user, so the callback for this row returns None like every
+    other."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("session_id", "session_id", _text, required=False),
         Field("reason", "reason", _text, required=False),
     )
-    session_id: str | None = None  # None: every live turn in this process
+    #: None closes no turn: the gateway's `/new` in a chat with no session yet sends one.
+    session_id: str | None = None
     reason: str | None = None
 
     def trigger(self) -> Trigger:
+        """SHUTDOWN for Hermes's shutdown reason, and for no reason at all: of the two sides,
+        the one that cannot lose a finished turn at exit."""
+        if self.reason is None or self.reason == FINALIZE_SHUTDOWN_REASON:
+            return Trigger.SHUTDOWN
         return Trigger.FINALIZE
 
     def key_kind(self) -> KeyKind:

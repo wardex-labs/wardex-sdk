@@ -149,8 +149,8 @@ def _everything(h: FakeHermes) -> None:
             "max_retries": 3,
             "retryable": True,
             "reason": "server_error",
-            "status_code": "503",
-            "error_type": "InternalServerError",
+            "status_code": 503,
+            "error": {"type": "InternalServerError", "message": "<synthetic>"},
         },
     )
     h.model_call(first)
@@ -159,15 +159,17 @@ def _everything(h: FakeHermes) -> None:
     _late_tool_report(h, first, call.tool_calls[0][0])
     h.aux(first, from_loop=True)
     h.tool(call, "read_file", tool_call_id="call_after_the_end")
-    # A presumed close that the turn proves wrong, and one that Hermes ends.
+    # A failed call leaves its turn open. A newer turn of the session presumes it closed; the
+    # old turn's loop proves that wrong, and Hermes ends another presumed-closed turn.
     second = h.turn()
     h.fail(second)
-    h.model_call(second)
+    third = h.turn(second.session_id)
+    h.model_call(second, again=True)
     h.end(second)
-    third = h.turn()
     h.fail(third)
+    h.turn(third.session_id)
     h.end(third, completed=False, failed=True, reason="failed")
-    # A turn whose start this process never saw, and an event for a turn it never knew.
+    # A run Hermes never announced (a fork), and an event for a turn this process never knew.
     ghost = Turn("s-ghost", "task-ghost", "s-ghost:task-ghost:0")
     h.model_call(ghost)
     h.end(ghost)

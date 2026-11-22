@@ -27,9 +27,13 @@ from _hermes_support import (
     on_loop,
     outline,
     plugin,
+    received,
     render,
     start_wardex,
+    wait_for,
 )
+from wardex_sdk._adapters import _hermes_agent_attach as attach_module
+from wardex_sdk._adapters import _hermes_agent_turns as turns_module
 from wardex_sdk._assembly import LinkReason
 
 WIRE = "HTTP POST /v1/chat/completions"
@@ -134,13 +138,27 @@ def test_every_recorded_fixture_has_an_expected_tree():
     assert sorted(EXPECTED) == sorted(SCENARIOS)
 
 
+# Hermes sends no end for a turn whose retries were spent: the quiet net closes it, shortened
+# here so the replay need not wait five minutes.
+_QUIET_NET = frozenset({"failed_turn"})
+
+
 @pytest.mark.parametrize("name", SCENARIOS)
-def test_a_recorded_fixture_exports_its_designed_tree_and_hermes_is_never_disturbed(name):
+def test_a_recorded_fixture_exports_its_designed_tree_and_hermes_is_never_disturbed(
+    name, monkeypatch
+):
+    if name in _QUIET_NET:
+        monkeypatch.setattr(turns_module, "IDLE_AFTER_ERROR_S", 0.3)
+        monkeypatch.setattr(attach_module, "IDLE_SWEEP_S", 0.05)
     transport = start_wardex()
     with plugin() as ctx, ScriptedProvider() as provider:
         fixture = on_loop(lambda: Replay(ctx, provider).run(name))
         assert ctx.failures == []
         assert {r.value for r in ctx.returns} <= {None}, "a hook's result is Hermes's to use"
+        if name in _QUIET_NET:
+            assert wait_for(
+                lambda: any(n.name == "invoke_agent hermes" for n in received(transport))
+            )
     nodes = exported(transport)
     quiet = CUT_STREAM_MARKERS if name == "interrupted" else frozenset()
     assert outline(nodes, quiet) == render(*EXPECTED[name])
@@ -150,6 +168,12 @@ def test_a_recorded_fixture_exports_its_designed_tree_and_hermes_is_never_distur
     for tool in [n for n in nodes if n.name.startswith("execute_tool ")]:
         (reason, target), *rest = links(transport, tool, nodes)
         assert (reason, target, rest) == (LinkReason.TRIGGERED_BY, "chat lab-model", [])
+    if name in _QUIET_NET:
+        (turn,) = turns
+        assert (extras(turn)["close_cause"], extras(turn)["error_reason"]) == (
+            "idle",
+            "server_error",
+        )
     if fixture.header["mode"] == "cli":
         roots = [n for n in nodes if n.name == "invoke_agent hermes"]
         assert {extras(n).get("platform") for n in roots} == {"cli"}
