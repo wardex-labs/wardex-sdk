@@ -164,3 +164,42 @@ def extras(node: SpanNode) -> dict[str, Any]:
     """The span's `wardex.hermes_agent.*` attributes, prefix removed."""
     prefix = "wardex.hermes_agent."
     return {k[len(prefix) :]: v for k, v in node.attributes.items() if k.startswith(prefix)}
+
+
+def typed_usage(node: SpanNode) -> dict[str, Any]:
+    """The span's typed `gen_ai.usage.*` attributes: the numbers a backend sums."""
+    return {k: v for k, v in node.attributes.items() if k.startswith("gen_ai.usage.")}
+
+
+def _line(node: SpanNode) -> str:
+    status = node.status.name if node.status is not None else "-"
+    error = node.attributes.get("error.type")
+    if error is not None:
+        status += f"({error})"
+    strategy = node.strategy.name.lower() if node.strategy is not None else "-"
+    line = f"{node.name} | {strategy} {node.confidence} | {status}"
+    markers = sorted(m.name.lower() for m in node.limitations)
+    return line + (" | " + ", ".join(markers) if markers else "")
+
+
+def outline(nodes: tuple[SpanNode, ...]) -> str:
+    """Every exported tree as indented lines: name, parent source and confidence, status (with
+    `error.type`), markers. Siblings are sorted by their own lines, so threads finishing in a
+    different order draw the same outline."""
+    ids = {n.span_id for n in nodes}
+
+    def draw(node: SpanNode, depth: int) -> list[str]:
+        kids = [n for n in nodes if n.parent_id == node.span_id]
+        drawn = sorted((draw(k, depth + 1) for k in kids), key=lambda lines: lines[0])
+        return ["  " * depth + _line(node)] + [line for lines in drawn for line in lines]
+
+    roots = [n for n in nodes if n.parent_id not in ids]
+    drawn = sorted((draw(r, 0) for r in roots), key=lambda lines: lines[0])
+    return "\n".join(line for lines in drawn for line in lines)
+
+
+def links(transport: RecordingTransport, node: SpanNode, nodes: tuple[SpanNode, ...]) -> list:
+    """The span's links as (reason, the linked span's name), in the order the span carries them."""
+    by_id = {n.span_id: n.name for n in nodes}
+    raw = next(s for e in transport.envelopes for s in e.spans if s.context.span_id == node.span_id)
+    return [(link.reason, by_id.get(link.span_id, "<not exported>")) for link in raw.links]
