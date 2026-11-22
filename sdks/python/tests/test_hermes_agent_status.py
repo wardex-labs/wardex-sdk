@@ -89,6 +89,7 @@ def test_an_unmeasured_contract_version_is_said_once_and_recording_continues(cap
             row = status()
     said = [r.getMessage() for r in caplog.records if "hermes.observer.v2" in r.getMessage()]
     assert len(said) == 1, said
+    assert "upgrade wardex-sdk" in said[0], "the line says what to do if turns look wrong"
     assert row.state is AdapterState.INSTALLED
     assert (row.measured, row.measured_versions) == (False, MEASURED)
     assert "'hermes.observer.v2'" in row.detail
@@ -106,7 +107,9 @@ def test_an_event_missing_a_required_field_is_dropped_counted_and_named(caplog):
     assert counters.get("adapters.hermes_agent.dropped.pre_llm_call") == 2
     said = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
     assert len(said) == 1 and "pre_llm_call" in said[0] and "turn_id" in said[0]
+    assert "upgrade wardex-sdk" in said[0], "the line says what to do"
     assert "pre_llm_call (missing turn_id)" in row.detail
+    assert "upgrade wardex-sdk" in row.detail
     assert ctx.failures == []
 
 
@@ -124,6 +127,7 @@ def test_a_refused_registration_is_said_once_and_named(caplog):
         wardex_sdk.hermes_agent.register(ctx)
     said = [r.getMessage() for r in caplog.records if "refused" in r.getMessage()]
     assert len(said) == 1 and "llm_execution, tool_execution" in said[0]
+    assert "Restart Hermes" in said[0], "the line says what to do"
     row = status()
     assert row.state is AdapterState.INSTALLED, "the hooks it took still record"
     assert "llm_execution, tool_execution" in row.detail

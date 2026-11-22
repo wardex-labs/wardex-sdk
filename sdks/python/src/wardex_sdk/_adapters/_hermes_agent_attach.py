@@ -330,7 +330,8 @@ def attach(
         )
         report_once(
             "wardex: Hermes refused the registration of " + ", ".join(refusals) + ", so those "
-            "events are not recorded",
+            "events are not recorded. Restart Hermes; if it repeats, report it with "
+            "wardex_sdk.diagnostics().report()",
             key="adapters.hermes_agent.registration_refused",
         )
     on_unload = getattr(ctx, "on_unload", None)

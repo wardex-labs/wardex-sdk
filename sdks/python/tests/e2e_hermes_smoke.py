@@ -136,7 +136,10 @@ class Scenario:
     `nets` shortens wardex module constants (`"<module>.<NAME>": seconds`) in the Hermes
     process, from this script's own witness plugin, so a net that waits minutes can be watched
     before the process ends; the adapter reads no setting for them. They travel in
-    `HERMES_SMOKE_NETS`, because wardex reports every `WARDEX_` name it does not read.
+    `HERMES_SMOKE_NETS`, as the witness's file paths travel in `HERMES_SMOKE_RECORD` and
+    `HERMES_SMOKE_SCHEMAS`, because wardex reports every `WARDEX_` name it does not read.
+    `prelude` is `(narration, tool, args)` Hermes runs as a scripted prelude before the turn's
+    first model call (`run_conversation(prelude=...)`, library mode only).
     """
 
     surface: str
@@ -152,6 +155,7 @@ class Scenario:
     interrupt_after: str | None = None
     fixture: bool = True
     nets: dict[str, float] = field(default_factory=dict)
+    prelude: tuple[str, str, dict[str, Any]] | None = None
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -171,6 +175,14 @@ SCENARIOS: dict[str, Scenario] = {
         ],
         ("answer", "call-read"),
         modes=("library", "cli"),
+    ),
+    "prelude_tool": Scenario(
+        "Tool calls, sequential and parallel",
+        "[smoke:prelude_tool] Summarize the notes.",
+        [_rule([_text("answer", "The token is SMOKE-1.")], **_AFTER_TOOL)],
+        ("answer",),
+        fixture=False,
+        prelude=("Reading the notes first.", *_read("notes.txt")),
     ),
     "parallel_tools": Scenario(
         "Tool calls, sequential and parallel",
@@ -687,6 +699,25 @@ ROWS: tuple[Row, ...] = (
                 status="ERROR",
             ),
             Span(CHAT, parent=CHAT, source=CTX, confidence=1.0),
+            Count(CHAT, 1, parent=TURN),
+        ),
+    ),
+    Row(
+        # A tool Hermes runs before the turn's first model call carries no api_request_id: no
+        # model call asked for it, so it links to none, and no turn is ambient yet on the worker.
+        "Tool calls, sequential and parallel",
+        "prelude_tool",
+        (
+            Traces(2),
+            Span(TURN, parent="", status="OK", attrs={A + "close_cause": "end_event"}),
+            Span(
+                "execute_tool read_file",
+                parent="",
+                source="unresolved",
+                confidence=0.0,
+                markers=("parent_unresolved",),
+                absent=(A + "api_request_id",),
+            ),
             Count(CHAT, 1, parent=TURN),
         ),
     ),
@@ -1343,7 +1374,11 @@ def turn():
         probe.push("caller")
         probe.emit("runner:run_conversation_call")
     try:
-        result["value"] = agent.run_conversation(spec["prompt"])
+        if spec["prelude"]:  # Hermes `send`s each tool result back into it: a generator
+            prelude = (step for step in [tuple(spec["prelude"])])
+            result["value"] = agent.run_conversation(spec["prompt"], prelude=prelude)
+        else:
+            result["value"] = agent.run_conversation(spec["prompt"])
     except BaseException as exc:
         result["error"] = type(exc).__name__
 def tags():
@@ -1432,7 +1467,7 @@ def emit(event, payload=None, **extra):
             "probe": list(PROBE.get()) if PROBE.get() is not None else None, **extra}
     if payload is not None:
         line["payload"] = keep(event, payload)
-    with _lock, open(os.environ["WARDEX_SMOKE_RECORD"], "a", encoding="utf-8") as fh:
+    with _lock, open(os.environ["HERMES_SMOKE_RECORD"], "a", encoding="utf-8") as fh:
         fh.write(json.dumps(line, default=str) + "\n")
 def watch_sockets(port):
     # httpcore writes with send() in a loop; other clients use sendall(). Wrap both.
@@ -1519,7 +1554,7 @@ import importlib, json, os
 def _note(**kwargs):
     seen = {k: kwargs.get(k) for k in ("telemetry_schema_version", "middleware_schema_version")
             if kwargs.get(k)}
-    with open(os.environ["WARDEX_SMOKE_SCHEMAS"], "a", encoding="utf-8") as fh:
+    with open(os.environ["HERMES_SMOKE_SCHEMAS"], "a", encoding="utf-8") as fh:
         fh.write(json.dumps(seen) + "\n")
 def register(ctx):
     # `Scenario.nets`: loaded after wardex, so its modules are imported; read at call time.
@@ -2019,8 +2054,8 @@ def run(
             **dict(kv.split("=", 1) for kv in args.env),
             "WARDEX_ENDPOINT": f"http://127.0.0.1:{recorder.server_address[1]}",
             "WARDEX_SERVICE_NAME": f"hermes-smoke-{name}",
-            "WARDEX_SMOKE_RECORD": str(out / "record.jsonl"),
-            "WARDEX_SMOKE_SCHEMAS": str(out / "schemas.jsonl"),
+            "HERMES_SMOKE_RECORD": str(out / "record.jsonl"),
+            "HERMES_SMOKE_SCHEMAS": str(out / "schemas.jsonl"),
             "HERMES_SMOKE_NETS": json.dumps(sc.nets),
         },
     )
@@ -2042,6 +2077,7 @@ def run(
                 "persistence": sc.persistence,
                 "mcp": sc.mcp,
                 "prompt": sc.prompt,
+                "prelude": _substitute(list(sc.prelude), values) if sc.prelude else None,
                 "truth": str(out / "truth.jsonl"),
                 "interrupt_after": sc.interrupt_after,
                 "timeout": 150,

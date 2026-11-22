@@ -267,7 +267,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             measured, versions = True, tuple(KNOWN_SCHEMAS.values())
         if dropped:
             each = ", ".join(f"{name} ({why})" for name, why in dropped.items())
-            clauses.append(f"events dropped for missing fields: {each}")
+            clauses.append(
+                f"events dropped for missing fields: {each}; upgrade wardex-sdk or report it"
+            )
         if refused:
             clauses.append("Hermes refused the registration of " + ", ".join(refused))
         return replace(
@@ -364,8 +366,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             if first:
                 report_once(
                     f"wardex: Hermes states {note.detail} on {row.name}, which this wardex "
-                    "release was not measured on. Hermes turns are still recorded; "
-                    "diagnostics() reads measured=False",
+                    "release was not measured on. Hermes turns are still recorded and "
+                    "diagnostics() reads measured=False; if they look wrong, upgrade wardex-sdk "
+                    "or report it with wardex_sdk.diagnostics().report()",
                     key=f"adapters.hermes_agent.schema_drift.{field}",
                 )
             return
@@ -383,7 +386,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         if first:
             report_once(
                 f"wardex: Hermes sent {row.name} with {note.detail}, so wardex dropped that "
-                "event and its turn may be incomplete",
+                "event and its turn may be incomplete. This wardex release does not expect that "
+                "payload: upgrade wardex-sdk, or report it with "
+                "wardex_sdk.diagnostics().report() and your Hermes version",
                 key=f"adapters.hermes_agent.dropped.{row.name}",
             )
 
