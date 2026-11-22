@@ -357,10 +357,14 @@ What wardex cannot place is marked and never placed by a guess:
   Hermes's report carries `possible_duplicate_chat`.
 - A tool call the model asked for and Hermes never ran:
   `tool_call_not_dispatched` on the turn, and
-  `wardex.hermes_agent.undispatched_tool_calls` names it. It is decided by
-  count for each model call: fewer tools ran under the call than it asked
-  for. Hermes renames tool-call ids and repairs tool names before it runs
-  them, so neither is compared.
+  `wardex.hermes_agent.undispatched_tool_calls` names it. It is decided for
+  each model call by tool name, never by id, because Hermes renames ids
+  before it runs a call. Names match ignoring case and separators, as
+  Hermes's own name repair does. A `tool_call` bridge call accounts for the
+  tools Hermes ran for it under their own names, so a call beside it that no
+  tool matches is named. A tool that ran under a legacy alias is matched by
+  count, so in a call that also skipped a tool the name can be the wrong one
+  of two, and beside a bridge call the alias itself is named.
 - A turn whose model calls ran outside the process:
   `subprocess_model_calls_unobserved` on the turn.
 - A tool that code in `execute_code` calls sits under the `execute_code`

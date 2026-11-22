@@ -402,10 +402,10 @@ def test_completed_turn_with_no_model_frame_says_its_calls_were_unobserved() -> 
 def test_turn_that_asked_for_a_tool_call_that_never_ran_says_so_whatever_closed_it() -> None:
     marker = Limitation.TOOL_CALL_NOT_DISPATCHED
     asked = _record()
-    asked.requested["t:api:1"] = ("read_file", "lab_no_such_tool")
+    asked.requested["t:api:1"] = (("read_file", "read_file"), ("lab_x", "lab_x"))
     asked.dispatched["t:api:1"] = ["read_file"]
     ran_all = _record()
-    ran_all.requested["t:api:1"] = ("read_file",)
+    ran_all.requested["t:api:1"] = (("read_file", "read_file"),)
     ran_all.dispatched["t:api:1"] = ["read_file"]
     for cause in CloseCause:
         assert marker in _applying(asked, cause), cause
@@ -416,26 +416,45 @@ def test_turn_that_asked_for_a_tool_call_that_never_ran_says_so_whatever_closed_
 # -- records -----------------------------------------------------------------------------------
 
 
-def test_undispatched_counts_the_frames_under_each_model_call_against_what_it_asked_for() -> None:
+def _ask(*names: str) -> tuple[tuple[str, str | None], ...]:
+    """A model call's ask as the record keeps it: each name with its key (`_tool_key`)."""
+    keyed = {"Read_File": "read_file", "tool_call": None, "Tool-Call": None}
+    return tuple((n, keyed.get(n, n)) for n in names)
+
+
+def test_undispatched_matches_each_model_calls_frames_to_what_it_asked_for_by_key() -> None:
     r = _record()
-    # Hermes ran every call, under names it repaired or bridged: nothing is missing.
-    r.requested["t:api:1"] = ("Read_File", "lab_deferred")
-    r.dispatched["t:api:1"] = ["read_file", "tool_call"]
+    # A repaired name runs under the key it was asked by; a frame counts only under its call.
+    r.requested["t:api:1"] = _ask("Read_File", "lab_x")
+    r.dispatched["t:api:1"] = ["read_file"]
+    r.dispatched["t:api:9"] = ["lab_x"]
+    assert r.undispatched() == ["lab_x"]
+    # A bridge call ran every frame left, so the call beside it that matched none is named.
+    r.requested["t:api:1"] = _ask("tool_call", "lab_x")
+    r.dispatched["t:api:1"] = ["todo_list", "todo_list"]
+    assert r.undispatched() == ["lab_x"]
+    # A bridge call whose frames ran under its own name (a connector batch: the wrapper and
+    # each entry), and a bridge that ran nothing, which is named with the rest.
+    r.requested["t:api:1"] = _ask("Tool-Call", "lab_x")
+    r.dispatched["t:api:1"] = [None, "connectors__a__get", "connectors__b__get"]
+    assert r.undispatched() == ["lab_x"]
+    r.dispatched["t:api:1"] = []
+    assert r.undispatched() == ["Tool-Call", "lab_x"]
+    # With no bridge call, the frames left ran renamed calls (a legacy alias): by count.
+    r.requested["t:api:1"] = _ask("todo", "memory", "lab_x")
+    r.dispatched["t:api:1"] = ["todo_list", "memory", "lab_x"]
     assert r.undispatched() == []
-    # One of three never ran: the shortfall names the asked-for name no frame matched.
-    r.requested["t:api:2"] = ("read_file", "lab_no_such_tool", "read_file")
-    r.dispatched["t:api:2"] = ["read_file", "read_file"]
-    assert r.undispatched() == ["lab_no_such_tool"]
-    # More frames than asked (a bridge call Hermes split) leave nothing missing.
-    r.dispatched["t:api:2"].append("read_file")
-    assert r.undispatched() == []
-    # A repaired name plus a shortfall: the count is right, the names are cut to it in order.
-    r.requested["t:api:3"] = ("Read_File", "write_file")
-    r.dispatched["t:api:3"] = ["read_file"]
-    assert r.undispatched() == ["Read_File"]
-    # A frame counts only under the model call it names.
-    r.requested["t:api:4"] = ("read_file",)
-    assert r.undispatched() == ["Read_File", "read_file"]
+    r.dispatched["t:api:1"] = ["todo_list", "memory"]
+    assert r.undispatched() == ["todo"]  # the known miss: the number is right, the name is not
+    # One call asked twice and run once: the second is named.
+    r.requested["t:api:1"] = _ask("read_file", "read_file")
+    r.dispatched["t:api:1"] = ["read_file"]
+    assert r.undispatched() == ["read_file"]
+    # The known miss beside a bridge: an alias that ran is named, since the bridge takes the
+    # frames left.
+    r.requested["t:api:1"] = _ask("todo", "tool_call")
+    r.dispatched["t:api:1"] = ["todo_list", "read_file"]
+    assert r.undispatched() == ["todo"]
 
 
 def test_quiet_only_with_nothing_pinned_and_no_auxiliary_attempt_in_flight() -> None:

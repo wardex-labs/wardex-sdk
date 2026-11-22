@@ -123,11 +123,11 @@ class Trigger(Enum):
     NEXT_TURN, IDLE and UNIT_GONE are derived by the caller, not sent by Hermes. NEXT_TURN comes
     from the session's next turn (a newer `pre_llm_call` of the same session) or the loop
     thread's (a root turn's `pre_llm_call` on the thread the turn is pinned on, while Hermes's
-    last word on it is a failed call), IDLE from the clock. FINALIZE and SHUTDOWN
-    are both `on_session_finalize` for the turn's session, told apart by Hermes's reason.
-    UNIT_GONE says that the record's unit is no longer live in the core (closed with its parent,
-    evicted, or closed by the signal path): the caller steps it before the event that found the
-    record, so that event resolves against PRESUMED_CLOSED.
+    last word on it is a failed call), IDLE from the clock. FINALIZE and SHUTDOWN are both
+    `on_session_finalize` for the turn's session, told apart by Hermes's reason. UNIT_GONE says
+    the record's unit is no longer live in the core (closed with its parent, evicted, or closed
+    by the signal path): the caller steps it before the event that found the record, so that
+    event resolves against PRESUMED_CLOSED.
     """
 
     TURN_START = "turn_start"  # pre_llm_call
@@ -537,10 +537,10 @@ class TurnRecord:
     lock: threading.RLock = field(default_factory=threading.RLock)
     handle: RunHandle | None = None  # published by the effect that opened the unit
     frames: dict[tuple[FrameKind, str], FrameRecord] = field(default_factory=dict)
-    #: api_request_id -> the tool names that model call asked for, in its order, and the tool
-    #: names whose frame named that call. Compared per call by count, see `undispatched`.
-    requested: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    dispatched: dict[str, list[str]] = field(default_factory=dict)
+    #: api_request_id -> (name, key) of each tool call that model call asked for, in its order,
+    #: and the keys of the tool frames that named that call. A key is None for a bridge call.
+    requested: dict[str, tuple[tuple[str, str | None], ...]] = field(default_factory=dict)
+    dispatched: dict[str, list[str | None]] = field(default_factory=dict)
     model_frames: int = 0
     aux: dict[tuple[str, int], AuxAttempt] = field(default_factory=dict)  # in flight
     aux_tasks: list[str] = field(default_factory=list)  # task names Hermes stated, first seen first
@@ -569,24 +569,27 @@ class TurnRecord:
             return s
 
     def undispatched(self) -> list[str]:
-        """Names of tool calls a model call asked for that never reached a frame, by count per
-        call: Hermes rewrites ids between report and dispatch (a reused id, a provider's ids in a
-        parallel batch) and names too (a repair, the deferred-tool bridge). A shortfall names the
-        asked-for names no frame ran, in asked order, cut to the shortfall: a repaired name can
-        make it name the wrong one of two, never the wrong number."""
+        """Names of asked tool calls no frame ran, per model call, matched by key, never by id
+        (Hermes rewrites ids). A bridge call (key None) is never matched: Hermes runs each tool
+        it carries under that tool's own name. If a bridge call and a frame are both left, the
+        bridge ran the frames left and every other call left is named; else the frames left ran
+        renamed calls (a legacy alias), and the calls left are named in asked order, cut to the
+        shortfall. So an alias beside a bridge call is named though it ran, and an alias in a
+        short batch can name the wrong call."""
         missing: list[str] = []
         for call, asked in self.requested.items():
-            ran = self.dispatched.get(call, [])
-            if len(ran) >= len(asked):
-                continue
-            left = Counter(ran)
+            left = Counter(self.dispatched.get(call, ()))
             unmatched = []
-            for name in asked:
-                if left[name]:
-                    left[name] -= 1
+            for name, key in asked:
+                if key is not None and left[key]:
+                    left[key] -= 1
                 else:
-                    unmatched.append(name)
-            missing += unmatched[: len(asked) - len(ran)]
+                    unmatched.append((name, key))
+            spare = sum(left.values())
+            if spare and any(key is None for _, key in unmatched):
+                missing += [name for name, key in unmatched if key is not None]
+            else:
+                missing += [name for name, _ in unmatched][: max(len(unmatched) - spare, 0)]
         return missing
 
     def quiet(self, now: float) -> bool:
@@ -623,9 +626,8 @@ def _completed_without_a_seen_call(r: TurnRecord, cause: CloseCause) -> bool:
 
 
 def _asked_for_a_tool_call_that_never_ran(r: TurnRecord, cause: CloseCause) -> bool:
-    # True for any cause: an invented tool name, a malformed batch Hermes answered with error
-    # results, and a call an interrupt cut before dispatch all leave the same trace, a model
-    # call that asked for more tool calls than ran under it.
+    # True for any cause: an invented name, a malformed batch and a call an interrupt cut before
+    # dispatch all leave the same trace, an asked call no frame under its model call explains.
     return bool(r.undispatched())
 
 

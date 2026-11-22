@@ -14,7 +14,7 @@ import contextvars
 import hashlib
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -161,10 +161,47 @@ def provider_ids_normalized(call: Call) -> Call:
 def runs_as(call: Call, asked: str, name: str) -> Call:
     """A call Hermes runs under another tool name and the same id:
     `agent/agent_runtime_helpers.py::repair_tool_call` (a misspelled name repaired to a
-    registered tool) or `agent/turn_tool_validation.py::_route_deferred_call` (a deferred tool
-    run through the `tool_call` bridge)."""
+    registered tool) or a legacy alias (`model_tools.py::_LEGACY_TOOL_ALIASES`, `todo` runs as
+    `todo_list`). A deferred tool asked for by its own name is routed through the `tool_call`
+    bridge and unwrapped again, so it runs under the name asked (measured)."""
     renamed = tuple((i, name if n == asked else n) for i, n in call.tool_calls)
     return replace(call, tool_calls=renamed)
+
+
+#: `tools/tool_search_catalog.py::TOOL_CALL_NAME`.
+BRIDGE = "tool_call"
+
+
+def bridge_split(call: Call, tools: Sequence[str]) -> Call:
+    """One `tool_call` bridge call carrying `tools`, as Hermes dispatches it: split after
+    `post_api_request` into one call per tool (`agent/tool_call_batches.py::
+    expand_local_tool_batches`), the first under the asked id and the rest under new ids
+    (`deterministic_call_id`, not derived from the asked one), each run under its tool's own
+    name (`agent/tool_executor.py::_unwrap_tool_search_call`). One tool is not split, and still
+    runs under its own name. Measured on a real Hermes with two `todo_list` calls."""
+    tcid = next(i for i, n in call.tool_calls if n == BRIDGE)
+    split = [(tcid if k == 0 else f"call_split_{k}", t) for k, t in enumerate(tools)]
+    rest = [(i, n) for i, n in call.tool_calls if i != tcid]
+    return replace(call, tool_calls=(*split, *rest))
+
+
+def connector_batch(h: FakeHermes, call: Call, connectors: Sequence[str]) -> None:
+    """A `tool_call` bridge call whose entries are all connector tools. Hermes does not split
+    it, so its frame runs under the bridge's own name, and inside that frame
+    `tools/connectors/dispatch.py::dispatch_connector_batch` runs each entry through
+    `model_tools.py::handle_function_call`: its own request middleware, `pre_tool_call`,
+    `tool_execution` frame and `post_tool_call`, on the same worker, under the wrapper's
+    `api_request_id` and the id `<wrapper id>#<position>`. From the source only: a connector
+    needs an outside host, so none was run in the lab."""
+    tcid = next(i for i, n in call.tool_calls if n == BRIDGE)
+
+    def entries() -> None:
+        for k, name in enumerate(connectors):
+            h._tool_job(call, f"{tcid}#{k}", name, "ok", None)
+
+    copied = contextvars.copy_context()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(copied.run, h._tool_job, call, tcid, BRIDGE, "ok", None, entries).result()
 
 
 # -- agents an embedder or a tool runs inside a live turn ---------------------------------------

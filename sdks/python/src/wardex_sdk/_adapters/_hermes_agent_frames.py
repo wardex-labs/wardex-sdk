@@ -34,6 +34,7 @@ from .._enums import OperationName, StatusCode
 from . import _hermes_agent_attach as _attach
 from ._context import AdapterContext, Placement, RunHandle
 from ._hermes_agent_events import (
+    TOOL_CALL_BRIDGE,
     AuxEnd,
     AuxStart,
     CallEnter,
@@ -96,6 +97,16 @@ def _chat_block(model: str | None) -> GenAIAttributes:
 
 def _aux_key(event: AuxStart | AuxEnd) -> Hashable:
     return ("aux", *event.attempt())
+
+
+def _tool_key(name: str) -> str | None:
+    """A tool name as Hermes's name repair compares it before its fuzzy steps
+    (`agent/agent_runtime_helpers.py::repair_tool_call`: lower case, `-` and space to `_`), so
+    a repaired call and the frame it ran as share a key, and no fuzzier: a guess here could
+    pair an invented tool with a tool that ran. None for the bridge, which is never matched by
+    name (`TurnRecord.undispatched`)."""
+    key = name.lower().replace("-", "_").replace(" ", "_")
+    return None if key == TOOL_CALL_BRIDGE else key
 
 
 def _message_text(value: object) -> object:
@@ -211,14 +222,15 @@ class FrameEffects:
 
         A tool frame Hermes named no `tool_call_id` for (one that code in `execute_code` called)
         is kept by no turn: no report can name it, so it closes at its exit. A tool frame is
-        counted under the model call its `api_request_id` names, by the name it runs under: that
-        count, not its id, is what `TurnRecord.undispatched` compares with the call's ask."""
+        kept under the model call its `api_request_id` names, by the key of the name it runs
+        under (`_tool_key`): that, not its id, is what `TurnRecord.undispatched` compares with
+        the call's ask."""
         if isinstance(event, ToolEnter):
             call_id, asked_by = event.tool_call_id, event.api_request_id
             frame = FrameRecord(FrameKind.TOOL, call_id or "")
             with record.lock:
                 if asked_by:
-                    record.dispatched.setdefault(asked_by, []).append(event.tool_name)
+                    record.dispatched.setdefault(asked_by, []).append(_tool_key(event.tool_name))
                 if call_id:
                     record.frames[(FrameKind.TOOL, call_id)] = frame
             self._open_tool(frame, event)
@@ -383,7 +395,8 @@ class FrameEffects:
             key = (FrameKind.MODEL_CALL, event.api_request_id)
         with record.lock:
             if isinstance(event, CallReport):
-                record.requested[event.api_request_id] = event.requested
+                asked = tuple((n, _tool_key(n)) for n in event.requested)
+                record.requested[event.api_request_id] = asked
             frame = record.frames.get(key)
         abandoned = isinstance(event, ToolReport) and event.abandoned()
         if frame is None:

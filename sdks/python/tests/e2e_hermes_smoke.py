@@ -110,6 +110,14 @@ def _read(name: str) -> tuple[str, dict[str, Any]]:
 
 
 _FIRST, _AFTER_TOOL = {"last_role": "user"}, {"last_role": "tool"}
+
+
+def _todo(item: str) -> dict[str, Any]:
+    """One `todo_list` entry of a `tool_call` bridge call."""
+    todos = [{"id": item, "content": f"smoke todo {item}", "status": "pending"}]
+    return {"name": "todo_list", "arguments": {"todos": todos}}
+
+
 _MCP = {
     "mcp_servers": {
         "labecho": {"command": "${PYTHON}", "args": ["-I", "${MCP_ECHO}"], "timeout": 30}
@@ -467,6 +475,27 @@ SCENARIOS: dict[str, Scenario] = {
             _rule([_text("answer", "Done.")], **_AFTER_TOOL),
         ],
         ("answer", "call-invented"),
+        fixture=False,
+    ),
+    "bridge_invented": Scenario(
+        "Tool calls, sequential and parallel",
+        "[smoke:bridge_invented] Batch through the bridge and invent.",
+        [
+            # Hermes splits the bridge call in two after `post_api_request` and runs each under
+            # `todo_list`; it answers the invented call itself.
+            _rule(
+                [
+                    _calls(
+                        "call-bridge",
+                        ("tool_call", {"calls": [_todo("1"), _todo("2")]}),
+                        ("lab_no_such_tool", {"x": 1}),
+                    )
+                ],
+                **_FIRST,
+            ),
+            _rule([_text("answer", "Done.")], last_role="tool", min_tool_results=3),
+        ],
+        ("answer", "call-bridge"),
         fixture=False,
     ),
     "tool_ids_normalized": Scenario(
@@ -870,6 +899,21 @@ ROWS: tuple[Row, ...] = (
             ),
             Count("execute_tool lab_no_such_tool", 0),
             Count("execute_tool read_file", 1),
+        ),
+    ),
+    Row(
+        "Tool calls, sequential and parallel",
+        "bridge_invented",
+        (
+            Count("execute_tool todo_list", 2, parent=TURN),
+            Count("execute_tool lab_no_such_tool", 0),
+            Span(
+                TURN,
+                parent="",
+                status="OK",
+                markers=("tool_call_not_dispatched",),
+                attrs={A + "undispatched_tool_calls": "lab_no_such_tool"},
+            ),
         ),
     ),
     Row(

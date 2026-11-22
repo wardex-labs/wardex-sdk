@@ -42,6 +42,7 @@ __all__ = [
     "MISSING",
     "NOT_REGISTERED",
     "PRE_LLM_BLOCK_EXIT_REASON",
+    "TOOL_CALL_BRIDGE",
     "USAGE_KEYS",
     "AuxEnd",
     "AuxStart",
@@ -104,6 +105,12 @@ FINALIZE_SHUTDOWN_REASON = "shutdown"
 #: worker may still run (`agent/tool_executor.py`): a timeout, a cancel, a worker with no result.
 ABANDONED_TOOL_STATUSES = frozenset({"timeout", "cancelled"})
 ABANDONED_TOOL_ERROR_TYPES = frozenset({"thread_missing_result"})
+
+#: Tool Search's bridge (`tools/tool_search_catalog.py::TOOL_CALL_NAME`, on by default). Hermes
+#: runs each tool one call of it carries under that tool's own name, split into several calls
+#: after `post_api_request` (`agent/tool_call_batches.py`); a batch of connector tools only runs
+#: under this name, with a frame per entry inside (`tools/connectors/dispatch.py`).
+TOOL_CALL_BRIDGE = "tool_call"
 
 #: Set to "1" by Hermes in its plugin host process (`plugins.isolation: host`). Model traffic
 #: runs in the agent's own process, so nothing wardex could record is visible there.
@@ -205,8 +212,8 @@ def _requested(v: object) -> object:
     """`assistant_message` -> (tool name, ...) from its `tool_calls`, in the order asked.
 
     Names only: not the id, which Hermes may rewrite before dispatch (and supplies when it is
-    blank), so a dispatched frame is matched by count, not by id; `arguments` and every content
-    member are left unread. A call without a string name is skipped: there is nothing to state.
+    blank), so a dispatched frame is matched by name, never by id; `arguments` and every
+    content member are left unread. A call without a string name is skipped.
     """
     if v is None:
         return MISSING
