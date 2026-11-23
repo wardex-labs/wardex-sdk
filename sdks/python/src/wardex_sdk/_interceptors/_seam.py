@@ -65,7 +65,7 @@ from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_c
 from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
 from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, _url_host, peer_address, placeholder_host
 from ._trackers import _Http1Tracker
-from ._txn import _Txn, _url_target
+from ._txn import _Txn, _url_target, settle_cut
 from ._ws_tracker import _WebSocketTracker
 
 if TYPE_CHECKING:
@@ -895,7 +895,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         # parser's own honest None ("not an LLM body") — `sem` cannot carry both facts.
         parsed = False
         with guard("interceptors.seam.parse", debug=p.debug):
-            sem = _parse_semantics(p)
+            sem = settle_cut(txn, _parse_semantics(p))
             parsed = True
         if not parsed:
             parse_failed = True

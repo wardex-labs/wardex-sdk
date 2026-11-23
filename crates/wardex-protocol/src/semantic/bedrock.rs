@@ -828,6 +828,7 @@ mod tests {
         assert_eq!(s.stream, Some(true));
         assert_eq!(s.stream_terminated, Some(true));
         assert_eq!(s.stream_events_unparsed, 0);
+        assert_eq!(s.stream_ends_at_final_event, Some(false), "never claimed");
         assert_eq!(s.finish_reasons, Some(vec!["tool_call".to_string()]));
         assert_eq!(
             s.usage.input_tokens(),

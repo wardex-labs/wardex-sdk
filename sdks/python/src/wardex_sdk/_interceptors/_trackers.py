@@ -224,11 +224,13 @@ class _Http1Tracker:
         self._expect_ws = False
         self._resp_raw = b""
 
-    def _response_txn(self, msg: ParsedMessage, now: int) -> _Txn | None:
+    def _response_txn(self, msg: ParsedMessage, now: int, let_go: bool = False) -> _Txn | None:
         """The transaction a final response completes at `now`, paired with the request it answers
         (`RequestSide.take`): None when not one byte of it was seen, `? /` when only part was (both
         counted). An `incomplete` response (the body is partial) is marked `FRAME_PARSE_FAILED` and
-        `response_cut`: its 2xx is not a success."""
+        `response_cut`: its 2xx is not a success. `let_go`: the client closed it, so the seam may
+        still find its event stream whole (`settle_cut`). The peer's EOF short of the framing is
+        never that: the client asked for more and the server had ended early."""
         taken = self._requests.take()
         if taken is None:
             return None
@@ -248,6 +250,9 @@ class _Http1Tracker:
         path = (request.url if request is not None else None) or "/"
         cut = (Limitation.FRAME_PARSE_FAILED,) if msg.incomplete else ()
         request_kept = request is None or request.body_use != "skipped"
+        request_truncated = request is not None and request.truncated
+        # `truncated` on an incomplete message is the cut's; the cap's own word is its marker.
+        capped = Limitation.BODY_CAP_EXCEEDED in msg.limitations
         return _Txn(
             method=(request.method if request is not None else None) or "?",
             path=_name_path(path),
@@ -263,12 +268,15 @@ class _Http1Tracker:
             start_ns=issue.start_ns or now,
             end_ns=now,
             ttfb_ms=ttfb,
-            truncated=(request is not None and request.truncated) or msg.truncated,
+            truncated=request_truncated or msg.truncated,
             request_counted=request is not None and not request.truncated and request_kept,
             response_counted=not msg.truncated and response_kept,
             request_body_kept=request_kept,
             response_body_kept=response_kept,
             response_cut=msg.incomplete,
+            uncut=(request_truncated or capped, response_kept and not capped)
+            if msg.incomplete and let_go
+            else None,
             limitations=_merge_markers(
                 request.limitations if request is not None else (), msg.limitations, cut
             ),
@@ -289,7 +297,7 @@ class _Http1Tracker:
         out: list[_Txn] = []
         if not still_open:
             msg = self._resp.flush(peer_closed=False)
-            if msg is not None and (txn := self._response_txn(msg, time.time_ns())) is not None:
+            if msg is not None and (txn := self._response_txn(msg, time.time_ns(), True)):
                 out.append(txn)
         self._requests.release()
         self._resp_raw = b""
@@ -608,6 +616,8 @@ class _Http2Tracker:
             request_counted=t.request_ended and not (t.request_truncated or request_evicted),
             response_counted=not t.response_truncated,
             response_cut=cut,
+            # The cut adds only its marker on HTTP/2: neither flag below reads it.
+            uncut=(t.truncated or request_evicted, not t.response_truncated) if cut else None,
             stream_id=t.stream_id,
             # A body past its cap carries the marker HTTP/1 gives the same cut (`append_capped`), so
             # one query finds every capped body whatever version carried it. HTTP/2 reports the cut

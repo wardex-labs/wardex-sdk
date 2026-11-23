@@ -261,10 +261,13 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # The lost request's unset size rides `_Txn.request_counted`, set there too.
     "H2_REQUEST_EVICTED": frozenset({"_interceptors/_trackers.py"}),
     # --- parsing / interpretation ---
+    # `_txn.py` never emits it: `settle_cut` takes it back off a response the
+    # client let go after its stream's final event.
     "FRAME_PARSE_FAILED": frozenset(
         {
             "_interceptors/_seam.py",
             "_interceptors/_trackers.py",
+            "_interceptors/_txn.py",
             "_interceptors/_ws_tracker.py",
             "_semantics/_grpc.py",
         }

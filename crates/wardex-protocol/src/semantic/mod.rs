@@ -26,6 +26,7 @@ use anthropic::{fill_anthropic, reassemble_anthropic};
 use bedrock::{fill_bedrock_converse, reassemble_converse_stream};
 pub use endpoint::{treatment, ws_upgrade, Treatment, WsUpgrade};
 use endpoint::{Api, Endpoint};
+use event_json::{is_done_marker, parse_event};
 use openai_chat::{fill_openai_chat, reassemble_openai};
 use openai_embeddings::fill_openai_embeddings;
 use openai_responses::{fill_openai_responses, reassemble_responses};
@@ -165,6 +166,12 @@ pub struct LlmSemantics {
     /// SSE only (None otherwise): whether the stream carried its provider's
     /// terminal event. `Some(false)` feeds a diagnostics counter, not a marker.
     pub stream_terminated: Option<bool>,
+    /// A reassembled stream only (None otherwise): whether the body ends at
+    /// the event its API's stream grammar ends with (`ends_at_final_event`).
+    /// `Some(true)` says the stream is whole even when the HTTP framing
+    /// around it never ended; the seam then ships a response let go there as
+    /// complete. Always `Some(false)` for a Bedrock event stream.
+    pub stream_ends_at_final_event: Option<bool>,
     /// SSE only (0 otherwise): events a reassembler skipped because their
     /// data was not JSON, even with an out-of-range number read as its own
     /// spelling (`semantic/event_json.rs`) — cut short, or not JSON at all.
@@ -234,6 +241,7 @@ fn try_parse_sse(
     // the non-streaming dispatch below: shape picks the parser, host picks
     // the label, so the two halves of one endpoint cannot disagree.
     let provider = endpoint::provider_for_host(host);
+    let at_final_event = matched.is_some_and(|e| ends_at_final_event(e.api, decoded, &events));
     match matched {
         Some(
             endpoint @ Endpoint {
@@ -243,7 +251,7 @@ fn try_parse_sse(
         ) => {
             let reassembled = reassemble_openai(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(endpoint, provider, reassembled);
+            let mut out = sse_semantics(endpoint, provider, reassembled, at_final_event);
             fill_openai_chat(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -255,7 +263,7 @@ fn try_parse_sse(
         ) => {
             let reassembled = reassemble_anthropic(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(endpoint, provider, reassembled);
+            let mut out = sse_semantics(endpoint, provider, reassembled, at_final_event);
             fill_anthropic(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -267,7 +275,7 @@ fn try_parse_sse(
         ) => {
             let reassembled = reassemble_responses(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(endpoint, provider, reassembled);
+            let mut out = sse_semantics(endpoint, provider, reassembled, at_final_event);
             fill_openai_responses(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -294,13 +302,62 @@ fn try_parse_sse(
     }
 }
 
+/// Is the last thing in an event-stream body the event its API's grammar
+/// ends with, whole through the blank line that closes it?
+///
+/// Those events are the Chat Completions `[DONE]` line, Anthropic's
+/// `message_stop` and the Responses API's terminal snapshot
+/// (`response.completed`, `response.incomplete`, `response.failed`); a
+/// gateway's `[DONE]` after either of the last two counts as well. The
+/// provider sends no event after one of them, so a connection let go there
+/// lost its HTTP framing and none of the stream. This is stricter than a
+/// reassembler's `terminated`, which a finish reason satisfies while a usage
+/// chunk and `[DONE]` are still to come. An in-stream `error` event is not
+/// one of them: it already fails the span, and whether anything follows it
+/// differs by provider.
+fn ends_at_final_event(api: Api, body: &[u8], events: &[sse::SseEvent]) -> bool {
+    let Some(last) = events.last() else {
+        return false;
+    };
+    if !sse::ends_on_blank_line(body) {
+        return false;
+    }
+    if is_done_marker(&last.data) {
+        return matches!(
+            api,
+            Api::OpenAiChatCompletions | Api::AnthropicMessages | Api::OpenAiResponses
+        );
+    }
+    // The reassemblers' reading of an event's type: its `event:` line, else
+    // the `type` in its data.
+    let in_data = if last.event.is_none() {
+        parse_event(&last.data)
+    } else {
+        None
+    };
+    let kind = last
+        .event
+        .as_deref()
+        .or_else(|| in_data.as_ref()?.get("type")?.as_str());
+    match api {
+        Api::AnthropicMessages => kind == Some("message_stop"),
+        Api::OpenAiResponses => matches!(
+            kind,
+            Some("response.completed" | "response.incomplete" | "response.failed")
+        ),
+        Api::OpenAiChatCompletions | Api::OpenAiEmbeddings | Api::BedrockConverse => false,
+    }
+}
+
 /// The shared SSE scaffold: operation/api_type from the endpoint, the
 /// provider label the host proves (empty and marked otherwise), the
-/// synthetic body, and the terminal verdict.
+/// synthetic body, the terminal verdict, and whether the body ends at the
+/// stream's final event.
 fn sse_semantics(
     endpoint: Endpoint,
     provider: Option<&'static str>,
     reassembled: parts::Reassembled,
+    at_final_event: bool,
 ) -> LlmSemantics {
     LlmSemantics {
         provider: provider.unwrap_or_default().to_string(),
@@ -309,6 +366,7 @@ fn sse_semantics(
         api_type: endpoint.api_type,
         reassembled_from_stream: true,
         stream_terminated: Some(reassembled.terminated),
+        stream_ends_at_final_event: Some(at_final_event),
         stream_events_unparsed: reassembled.unparsed,
         decoded_response: Some(reassembled.body),
         ..Default::default()
@@ -473,7 +531,10 @@ fn parse_bedrock_converse(
     let provider = endpoint::provider_for_host(host);
     let mut out = if streamed_body {
         let reassembled = reassemble_converse_stream(&decoded);
-        sse_semantics(endpoint, provider, reassembled)
+        // Never claimed for the AWS event stream encoding: `metadata`
+        // follows `messageStop`, and whether it is the last message of
+        // every stream is not something this parser has grounds to say.
+        sse_semantics(endpoint, provider, reassembled, false)
     } else {
         LlmSemantics {
             provider: provider.unwrap_or_default().to_string(),

@@ -796,10 +796,12 @@ All notable changes to this project are documented here. The format follows
   `[DONE]` and leaves it open, so a server or proxy that sends the stream's end
   in a separate, later frame left that call with no wire span, and the token
   usage it carried never reached your traces. Now, when the connection closes,
-  such a stream ships with everything that arrived, usage included. It is
-  marked `frame_parse_failed` and its status is left unset, because its end
-  was never seen, as an HTTP/1 response cut by a close already was. Under a
-  bridge adapter's chat span (pydantic-ai) the call is still counted once: the
+  such a stream ships with everything that arrived, usage included. A stream
+  read to the last event of its provider's grammar (`[DONE]`) is a complete,
+  successful call. One the client left before that event is marked
+  `frame_parse_failed` and its status is left unset, because its end was
+  never seen, as an HTTP/1 response cut by a close is. Under a bridge
+  adapter's chat span (pydantic-ai) the call is still counted once: the
   chat span keeps pydantic-ai's numbers and `no_wire_evidence`, and the HTTP/2
   span ships under it without token usage, the numbers it read kept under
   `wardex.usage_late.*` with `wardex.usage_late.demoted` set to say so.
@@ -1240,7 +1242,16 @@ All notable changes to this project are documented here. The format follows
   truncated, with no response size and no finish reason made up, and with
   status unset when the status line said 2xx: the success was never seen (a
   4xx/5xx stays an error). Its span ends where the cut was seen: the
-  server's close, or the client's. The default capture mode keeps a cut chat
+  server's close, or the client's. One case is not a cut: a streamed model
+  call your client stops reading at the event its provider's stream ends with
+  (`[DONE]` for Chat Completions, which the OpenAI SDK stops at; Anthropic's
+  `message_stop`; a Responses `response.completed`, `response.incomplete` or
+  `response.failed`). Everything the provider had to send was read, so that
+  span is complete and successful, with its response size, whether or not the
+  response's last chunk had arrived when the client closed. A stream left
+  anywhere before that event, a finish reason included, stays marked, and so
+  does one the server closed before finishing the response while your client
+  was still reading. The default capture mode keeps a cut chat
   call whose request named the model even when the cut came before any event
   did; on a host that names no provider (a local server, a gateway), a cut
   before the first body byte leaves nothing the SDK can identify, and only
