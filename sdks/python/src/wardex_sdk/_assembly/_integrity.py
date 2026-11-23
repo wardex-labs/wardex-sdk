@@ -820,11 +820,11 @@ Two emit sites, and the first is the mechanism the second restates.
     Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (gRPC frame parse raised; the span falls
     back to plain h2 fields), ``_interceptors/_ws_tracker.py::_WebSocketTracker._build_txn``
     (either direction's frame parser latched off) and ``_interceptors/_trackers.py::_Http1Tracker``
-    (an HTTP/1 response's stream ended before its framing did — a Content-Length not reached, a
-    chunked body short of its last chunk, an unframed body let go before the peer's EOF: the body
-    is what came, its size unset, a 2xx status UNSET). The first two replaced the free strings
-    ``grpc_parse_failed`` and ``ws_parse_failed``. On an HTTP span, look at the server, the network
-    or the client that let go: the parser read every byte that came.
+    (an HTTP/1 response ended before its framing did, a Content-Length not reached, a chunked body
+    short of its last chunk, an unframed body let go before the peer's EOF, and before its event
+    stream's final event, ``_txn.settle_cut``: the body is what came, its size unset, a 2xx UNSET).
+    The first two replaced ``grpc_parse_failed`` and ``ws_parse_failed``. On an HTTP span, look at
+    the server, the network or the client that let go: the parser read every byte that came.
 
     This member carries a LIMIT as well as a bug, which its name does not say: a WebSocket frame
     whose declared payload exceeds ``max_ws_frame_bytes`` makes

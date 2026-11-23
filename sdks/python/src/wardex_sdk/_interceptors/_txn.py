@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from .._assembly import Limitation
 from .._types import ConversationContext, SpanContext
@@ -77,6 +78,9 @@ class _Txn:
     response_body_kept: bool = True
     #: `ParsedMessage.incomplete`: status and headers were observed, how the exchange ended was not.
     response_cut: bool = False
+    #: Beside a `response_cut` the client's own close made: `(truncated, response_counted)` as they
+    #: read apart from the cut, for `settle_cut` to restore when the body holds its whole stream.
+    uncut: tuple[bool, bool] | None = None
     #: The HTTP/2 stream this transaction rode; None on HTTP/1.
     stream_id: int | None = None
     # Capture-limitation markers the protocol parser attached to this transaction, merged into the
@@ -171,3 +175,26 @@ def _url_target(txn: _Txn, origin: str, withhold: bool = False) -> str:
     if txn.method == "CONNECT" and not target.startswith("/"):  # authority form (`h:443`)
         return f"{origin.partition('://')[0]}://{target}"
     return f"{origin}{target}"
+
+
+def settle_cut(txn: _Txn, sem: Any) -> Any:
+    """Make a cut response whole when its event stream had already ended; return `sem` unchanged.
+
+    The response's own framing is one end (a last chunk, a Content-Length reached, END_STREAM, the
+    peer's EOF) and the stream inside it has another: the event its provider's grammar ends with
+    (`LlmSemantics.stream_ends_at_final_event`). A client may stop reading at that event and close.
+    The OpenAI SDK does at `[DONE]`, so a server that sends its last chunk or END_STREAM in a later
+    segment or TLS record has every streamed call let go before the framing ended. Nothing the
+    stream carried is missing then, and the transaction reads as one whose framing did end. A body
+    let go anywhere before that event keeps `response_cut` and its marker: the provider had more to
+    say, and what it was is not known. So does one with no `uncut`: an HTTP/1 response the server
+    ended short of its framing, which the client read as an error whatever the stream had said.
+    """
+    whole = getattr(sem, "stream_ends_at_final_event", None) is True
+    if whole and txn.response_cut and txn.uncut is not None:
+        txn.response_cut = False
+        txn.truncated, txn.response_counted = txn.uncut
+        txn.limitations = tuple(
+            m for m in txn.limitations if m is not Limitation.FRAME_PARSE_FAILED
+        )
+    return sem

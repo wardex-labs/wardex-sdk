@@ -1572,6 +1572,73 @@ fn anthropic_stream_without_message_stop_is_unterminated() {
     assert_eq!(plain.stream_terminated, None);
 }
 
+/// The stream's own end, apart from the HTTP framing around it: only the
+/// event the grammar ends with, whole through its blank line and with nothing
+/// after it, says a body let go there is a complete stream.
+#[test]
+fn a_stream_ends_at_its_final_event_only_when_that_event_is_whole_and_last() {
+    const CHAT: &str = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n";
+    const USAGE: &str = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n";
+    const MESSAGE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"c\",\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n";
+    const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"in_progress\"}}\n\n";
+    let snapshot = |kind: &str, named: bool| {
+        let line = if named {
+            format!("event: {kind}\n")
+        } else {
+            String::new()
+        };
+        format!("{CREATED}{line}data: {{\"type\":\"{kind}\",\"response\":{{\"id\":\"r\",\"model\":\"m\",\"status\":\"completed\",\"output\":[]}}}}\n\n")
+    };
+    let chat = "/v1/chat/completions";
+    let messages = "/v1/messages";
+    let responses = "/v1/responses";
+    let cases: Vec<(&str, &str, String, bool)> = vec![
+        ("done", chat, format!("{CHAT}{USAGE}data: [DONE]\n\n"), true),
+        ("done, CRLF", chat, format!("{CHAT}data: [DONE]\r\n\r\n"), true),
+        ("done, no space", chat, format!("{CHAT}data:[DONE]\n\n"), true),
+        ("a comment after done", chat, format!("{CHAT}data: [DONE]\n\n: bye\n\n"), true),
+        // A finish reason ends the answer, not the stream: the usage chunk
+        // and `[DONE]` are still to come.
+        ("finish reason only", chat, CHAT.to_string(), false),
+        ("usage chunk last", chat, format!("{CHAT}{USAGE}"), false),
+        ("done without its blank line", chat, format!("{CHAT}data: [DONE]\n"), false),
+        ("done cut short", chat, format!("{CHAT}data: [DON"), false),
+        ("an event after done", chat, format!("{CHAT}data: [DONE]\n\n{USAGE}"), false),
+        ("part of an event after done", chat, format!("{CHAT}data: [DONE]\n\ndata: {{\"id\""), false),
+        ("message_stop", messages, format!("{MESSAGE}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"), true),
+        ("message_stop named in its data", messages, format!("{MESSAGE}data: {{\"type\":\"message_stop\"}}\n\n"), true),
+        ("a gateway's done after message_stop", messages, format!("{MESSAGE}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\ndata: [DONE]\n\n"), true),
+        ("stop reason only", messages, MESSAGE.to_string(), false),
+        ("an error event", messages, format!("{MESSAGE}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"x\"}}}}\n\n"), false),
+        ("response.completed", responses, snapshot("response.completed", true), true),
+        ("response.incomplete", responses, snapshot("response.incomplete", true), true),
+        ("response.failed", responses, snapshot("response.failed", true), true),
+        ("response.completed named in its data", responses, snapshot("response.completed", false), true),
+        ("no terminal snapshot", responses, CREATED.to_string(), false),
+    ];
+    for (case, path, body, whole) in cases {
+        let s = parse_llm(
+            "llm.example.test",
+            path,
+            br#"{"model":"m","stream":true}"#,
+            body.as_bytes(),
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(s.stream_ends_at_final_event, Some(whole), "{case}");
+    }
+    // Not a stream: the question does not apply.
+    let plain = parse_llm(
+        "api.anthropic.com",
+        "/v1/messages",
+        br#"{"model":"c"}"#,
+        br#"{"model":"c","content":[{"type":"text","text":"x"}]}"#,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(plain.stream_ends_at_final_event, None);
+}
+
 /// At the Rust boundary the cap is the limit field, observed.
 #[test]
 fn usage_leaves_are_capped_by_max_extra_keys() {

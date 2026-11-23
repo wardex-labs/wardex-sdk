@@ -486,6 +486,13 @@ impl LlmSemantics {
     fn stream_terminated(&self) -> Option<bool> {
         self.inner.stream_terminated
     }
+    /// SSE only (None otherwise): does the body end at the event its API's
+    /// stream grammar ends with, whole through its closing blank line. True
+    /// makes a response whose HTTP framing never ended a complete one.
+    #[getter]
+    fn stream_ends_at_final_event(&self) -> Option<bool> {
+        self.inner.stream_ends_at_final_event
+    }
     /// SSE only (0 otherwise): events the reassembler skipped because their
     /// data was not JSON. Not 0 marks the span: what they carried is missing.
     #[getter]

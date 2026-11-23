@@ -59,6 +59,14 @@ pub fn parse(body: &[u8]) -> Vec<SseEvent> {
     events
 }
 
+/// Does a body end on the blank line that closes an event? False for a body
+/// that stops inside an event's lines, or after a last line with no blank line
+/// behind it: the rest of that event may still have been on its way. `parse`
+/// cannot say, because it emits a trailing event with or without that line.
+pub fn ends_on_blank_line(body: &[u8]) -> bool {
+    body.ends_with(b"\n\n") || body.ends_with(b"\n\r\n")
+}
+
 /// How many leading bytes of a body `opens_event_stream` reads.
 pub const OPENING_BYTES: usize = 1024;
 
@@ -138,6 +146,22 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].data, "{\"a\":1}");
         assert_eq!(evs[1].data, "{\"b\":2}");
+    }
+
+    #[test]
+    fn a_body_ends_on_a_blank_line_only_after_a_closed_event() {
+        for whole in [&b"data: x\n\n"[..], b"data: x\r\n\r\n", b"data: x\n\r\n"] {
+            assert!(ends_on_blank_line(whole));
+        }
+        // `parse` emits the event in each of these too: its last line ended,
+        // or did not, and the blank line that closes it never came.
+        for open in [&b""[..], b"\n", b"data: x", b"data: x\n", b"data: x\r\n"] {
+            assert!(!ends_on_blank_line(open));
+            assert_eq!(
+                parse(open).len(),
+                usize::from(!open.trim_ascii().is_empty())
+            );
+        }
     }
 
     #[test]

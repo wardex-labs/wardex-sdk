@@ -18,7 +18,12 @@ Two holes, both silent before:
 The line between "whole" and "cut short" is the peer's EOF: a read that asked
 for bytes and got none. A close the CLIENT makes first is not it, nor is the
 empty read after the client shut its own read side — that is a stream let go,
-and shipping it as whole would claim an end nobody saw. And what counts as the
+and shipping it as whole would claim an end nobody saw. One end is seen
+without the framing's: the event a provider's stream grammar ends with
+(`[DONE]`, `message_stop`, a Responses terminal snapshot). A client that lets
+go right after it, as the OpenAI SDK does at `[DONE]`, has read all the
+provider had to send, so that span is whole; let go anywhere before it, the
+span stays marked. And what counts as the
 end is the response's own framing, which for an answer to HEAD or CONNECT the
 request decides: no body, so nothing is in flight to be cut.
 
@@ -39,6 +44,7 @@ import socket
 import ssl
 import threading
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -47,6 +53,7 @@ import wardex_sdk as wardex
 from conftest import llm_fixture
 from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._enums import CaptureMode, StatusCode
+from wardex_sdk._limits import LimitsConfig
 from wardex_sdk.testing import RecordingTransport
 
 _CERTS = Path(__file__).parent / "fixtures"
@@ -276,6 +283,169 @@ def test_a_stream_the_client_lets_go_ships_marked_not_whole():
         conn.close()
 
     try:
+        span = _one_chat_span(_captured(drive))
+    finally:
+        hold.set()
+
+    assert Limitation.FRAME_PARSE_FAILED in _markers(span)
+    assert span.status is StatusCode.UNSET
+    assert span.capture_integrity.truncated is True
+    assert span.transport.response_size is None
+
+
+def _chunked_without_its_last_chunk(body: bytes) -> bytes:
+    """`body` as the one chunk of a response whose last chunk (`0\\r\\n\\r\\n`) the server holds."""
+    return (
+        SSE_HEAD
+        + b"Transfer-Encoding: chunked\r\n\r\n"
+        + f"{len(body):x}\r\n".encode()
+        + body
+        + b"\r\n"
+    )
+
+
+def _let_go_after(
+    port: int, path: str, request: bytes, seen: bytes, tls: bool = False, closed: bool = True
+) -> None:
+    """Read the response through the event whose line holds `seen`, then close without reading
+    on: what the OpenAI SDK does at `[DONE]`. Not `closed`: stop at that line, the blank line
+    that closes its event never having been sent."""
+    conn = (
+        http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=_client_tls())
+        if tls
+        else http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    )
+    conn.request("POST", path, request, {"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    while seen not in resp.readline():
+        pass
+    while closed and resp.readline().strip():  # the rest of that event, and its blank line
+        pass
+    resp.close()
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "path", "seen", "tls", "framed"),
+    [
+        pytest.param(None, "/v1/chat/completions", b"[DONE]", False, True, id="chat"),
+        pytest.param(None, "/v1/chat/completions", b"[DONE]", True, True, id="chat-tls"),
+        pytest.param(None, "/v1/chat/completions", b"[DONE]", False, False, id="chat-unframed"),
+        pytest.param(
+            "anthropic_messages_sse", "/v1/messages", b"message_stop", False, True, id="anthropic"
+        ),
+        pytest.param(
+            "openai_responses_sse",
+            "/v1/responses",
+            b"response.completed",
+            False,
+            True,
+            id="responses",
+        ),
+    ],
+)
+def test_a_stream_let_go_after_its_final_event_ships_whole(
+    case: str | None, path: str, seen: bytes, tls: bool, framed: bool
+):
+    """The client closes at the event its provider's stream ends with, while the response's own
+    end (a last chunk, or the server's close of a body with no framing) is still to come. Nothing
+    the stream carries is missing, so the span says the call succeeded and was captured whole."""
+    stream = CHAT_SSE if case is None else llm_fixture(case, "stream.sse")
+    request = CHAT_REQUEST if case is None else llm_fixture(case, "request.json")
+    response = _chunked_without_its_last_chunk(stream) if framed else UNFRAMED + stream
+    hold = threading.Event()
+    port = _serve_once(response, tls=tls, hold=hold)
+    try:
+        span = _one_chat_span(_captured(lambda: _let_go_after(port, path, request, seen, tls)))
+    finally:
+        hold.set()
+
+    assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
+    assert span.status is StatusCode.OK
+    assert span.capture_integrity.truncated is False
+    assert span.transport.response_size == len(stream)
+
+
+def test_a_whole_stream_the_server_ends_short_of_its_framing_stays_marked():
+    """The server closes after the final event without the last chunk, and the client, reading
+    on, gets an error (`IncompleteRead`). That is the server ending the response early, seen by
+    the client as a failure, so the span does not call it a success."""
+    port = _serve_once(_chunked_without_its_last_chunk(CHAT_SSE))
+
+    span = _one_chat_span(_captured(lambda: _post(port, "/v1/chat/completions", CHAT_REQUEST)))
+
+    assert Limitation.FRAME_PARSE_FAILED in _markers(span)
+    assert span.status is StatusCode.UNSET
+    assert span.capture_integrity.truncated is True
+
+
+def test_a_whole_stream_keeps_what_its_request_lost():
+    """Being let go after the final event undoes the cut and nothing else: a request body past
+    its cap is still a truncated capture, and says so, on a call that succeeded."""
+    request = json.dumps(
+        {"model": "gpt-4o", "stream": True, "messages": [{"role": "user", "content": "x" * 8192}]}
+    ).encode()
+    hold = threading.Event()
+    port = _serve_once(_chunked_without_its_last_chunk(CHAT_SSE), hold=hold)
+    transport = RecordingTransport()
+    wardex.init(transport=transport, intercept=True, limits=LimitsConfig(max_body_bytes=4096))
+    try:
+        _let_go_after(port, "/v1/chat/completions", request, b"[DONE]")
+    finally:
+        wardex.close()
+        hold.set()
+    span = _one_chat_span([s for env in transport.envelopes for s in env.spans])
+
+    assert Limitation.BODY_CAP_EXCEEDED in _markers(span)
+    assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
+    assert span.status is StatusCode.OK
+    assert span.capture_integrity.truncated is True
+    assert span.transport.request_size is None
+    assert span.transport.response_size == len(CHAT_SSE)
+
+
+def _without_last_event(stream: bytes) -> bytes:
+    return stream[: stream.rstrip(b"\n").rindex(b"\n\n") + 2]
+
+
+@pytest.mark.parametrize(
+    ("path", "stream", "seen", "closed"),
+    [
+        # A finish reason is not the end of the stream: a usage chunk or `[DONE]` may still follow.
+        pytest.param(
+            "/v1/chat/completions",
+            _without_last_event(CHAT_SSE),
+            b'"finish_reason":"stop"',
+            True,
+            id="chat-finish-reason",
+        ),
+        # `[DONE]` itself, short of the blank line that closes it.
+        pytest.param(
+            "/v1/chat/completions", CHAT_SSE[:-1], b"[DONE]", False, id="chat-done-unclosed"
+        ),
+        pytest.param(
+            "/v1/messages",
+            _without_last_event(llm_fixture("anthropic_messages_sse", "stream.sse")),
+            b"stop_reason",
+            True,
+            id="anthropic-stop-reason",
+        ),
+    ],
+)
+def test_a_stream_let_go_before_its_final_event_stays_marked(
+    path: str, stream: bytes, seen: bytes, closed: bool
+):
+    """Let go one event early, the provider had more to send and what it was is not known: the
+    span ships what arrived, marked, with no success claimed."""
+    request = (
+        CHAT_REQUEST
+        if path == "/v1/chat/completions"
+        else llm_fixture("anthropic_messages_sse", "request.json")
+    )
+    hold = threading.Event()
+    port = _serve_once(_chunked_without_its_last_chunk(stream), hold=hold)
+    try:
+        drive = partial(_let_go_after, port, path, request, seen, closed=closed)
         span = _one_chat_span(_captured(drive))
     finally:
         hold.set()

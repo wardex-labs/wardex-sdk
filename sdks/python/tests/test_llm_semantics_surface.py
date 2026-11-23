@@ -42,6 +42,9 @@ _SEAM_CONSUMED = frozenset(
         "decoded_response",
         "reassembled_from_stream",
         "stream_terminated",
+        # Read by `_txn.settle_cut` from the seam's parse: a cut response whose stream reached its
+        # final event is whole.
+        "stream_ends_at_final_event",
         "output_messages",
         "tool_args_unparsed",
         "output_messages_has_unmapped",
@@ -77,6 +80,7 @@ _SEAM_CONSUMED = frozenset(
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "wardex_sdk"
 _CONSUMER_SOURCES = (
     _SRC / "_interceptors" / "_seam.py",
+    _SRC / "_interceptors" / "_txn.py",
     _SRC / "_semantics" / "_genai.py",
 )
 
@@ -105,14 +109,14 @@ def test_the_surface_partition_is_exhaustive_and_disjoint():
     for i, a in enumerate(sets):
         for b in sets[i + 1 :]:
             assert not (a & b), f"claimed twice: {sorted(a & b)}"
-    # The partition arithmetic the integration record pins: 20 + 6 + 4 + 18.
+    # The partition arithmetic the integration record pins: 20 + 6 + 4 + 19.
     assert (len(fields), len(_GEN_AI_TRANSFORMED), len(extras), len(_SEAM_CONSUMED)) == (
         20,
         6,
         4,
-        18,
+        19,
     )
-    assert len(surface) == 48
+    assert len(surface) == 49
 
 
 def test_every_seam_consumed_name_appears_in_a_consumer_source():
