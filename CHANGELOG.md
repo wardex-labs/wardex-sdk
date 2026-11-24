@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0b1] - 2026-11-25
+
 ### Changed (breaking)
 
 - **`init()` with no destination installs nothing.** Without
