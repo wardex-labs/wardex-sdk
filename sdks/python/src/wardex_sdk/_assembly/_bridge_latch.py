@@ -59,14 +59,23 @@ trail is the counter `assembly._bridge_latch.tool_call_resolved`.
 
 The core never names OpenTelemetry: the bridge's resolver reads it, and an adapter that could not
 import it could not have installed.
+
+**An adapter may declare work it could not reach.** A host can start work on a thread whose
+context it copied before the adapter ran, so a request issued there carries no parent, and the
+seam would record it as a confident trace root. An adapter that knows such work is in flight
+declares it (`expect_unreached`), and while any declaration stands, a parentless request a seam
+observes is unresolved at confidence 0.0 (`_hub.unseen_parent`). Nothing is attached to anything,
+and no parent is guessed. The window is process-wide, so an adapter declares only for as long as
+the work runs and withdraws it after (`release_unreached`).
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from typing import TYPE_CHECKING
 
+from .. import _hub
 from ._diag import counters, guard
 from ._parentage import Ambient
 from ._units import Unit, _ambient_unit
@@ -225,10 +234,48 @@ def _tool_unit(ambient: Ambient, name: str, arguments: str | None) -> Unit | Non
     return None
 
 
+#: `(owner, key)` for each piece of work an adapter declared in flight where it could not put a
+#: parent. Adapters declare and withdraw from their host's threads while it runs, so every change
+#: is one call on the set (`add`, `discard`, the `tuple` copy), each atomic on its own. No lock
+#: is taken, so a signal handler that withdraws cannot wait on the frame it interrupted.
+_UNREACHED: set[tuple[object, Hashable]] = set()
+
+
+def expect_unreached(owner: object, key: Hashable) -> None:
+    """`owner` has work in flight under `key` whose requests may be issued where wardex's ambient
+    never reached. Idempotent. The first one hands `_hub` the probe, because at import it would
+    land in a `_hub` still importing this package."""
+    _UNREACHED.add((owner, key))
+    _hub.set_unreached_probe(_any_unreached)
+
+
+def release_unreached(owner: object, key: Hashable | None) -> None:
+    """Withdraw `owner`'s declaration under `key`, or every declaration of `owner` when `key` is
+    None. Idempotent. Withdrawing what was never declared changes nothing."""
+    if key is not None:
+        _UNREACHED.discard((owner, key))
+        return
+    for pair in tuple(_UNREACHED):
+        if pair[0] is owner:
+            _UNREACHED.discard(pair)
+
+
+def _any_unreached() -> bool:
+    return bool(_UNREACHED)
+
+
+def _at_fork_reinit() -> None:
+    """Fork-child reset. The declared work runs on the parent's threads, which the child does not
+    have, so none of the child's own requests is unresolved on its account."""
+    _UNREACHED.clear()
+
+
 __all__ = [
     "canonical_arguments",
+    "expect_unreached",
     "latch_parent",
     "latch_tool_call",
+    "release_unreached",
     "set_span_resolver",
     "set_tool_call_resolver",
 ]

@@ -132,6 +132,13 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_adapters/_on_import.py", "finding"): "per-thread import stack, carries on in the child",
     ("_adapters/_on_import.py", "depths"): "per-thread import stack, carries on in the child",
     ("_interceptors/_registry.py", "_installed"): "install record, kept (I-fork-4)",
+    # -- what Hermes holds: the plugin contexts and their registrations crossed the fork in
+    #    the memory image and still call wardex in the child, so forgetting them would make
+    #    the child's adapter read "not attached" while Hermes keeps delivering.
+    ("_adapters/_hermes_agent_attach.py", "_ATTACHED"): "registration record, kept (I-fork-4)",
+    ("_adapters/_hermes_agent_attach.py", "_REFUSED"): (
+        "registration record, kept (I-fork-4): what Hermes refused before the fork stays refused"
+    ),
     ("context/_inject.py", "_installed"): "patch record, kept (I-fork-4)",
     ("_hub.py", "_said"): (
         "said-once keys of advisory log lines; a child inheriting them stays quiet about "
@@ -582,6 +589,7 @@ def _walk_child_graph() -> dict:
         "wardex_sdk._interceptors._close_hook": ("_registry",),
         "wardex_sdk._assembly._diag": ("counters", "_REPORTED", "_REPORT_LOCK"),
         "wardex_sdk.context._inject": ("_install_lock", "_installed", "_patches"),
+        "wardex_sdk._assembly._bridge_latch": ("_UNREACHED",),
     }.items():
         module = _sys.modules.get(module_name)
         if module is None:
@@ -613,6 +621,7 @@ def test_fork_walk_reaches_every_holder():
     promised: tables empty (or allowlisted with a reason), locks free."""
     import wardex_sdk as wardex
     from wardex_sdk import _hub
+    from wardex_sdk._assembly import expect_unreached, release_unreached
     from wardex_sdk._config import BatchingConfig
     from wardex_sdk._enums import CaptureMode
     from wardex_sdk._interceptors._conn_timing import shared_timing_store
@@ -625,6 +634,7 @@ def test_fork_walk_reaches_every_holder():
         capture_mode=CaptureMode.ALL,
         batching=BatchingConfig(flush_interval=3600.0, flush_on_signals=False),
     )
+    declarer = object()
     try:
         # Fill what real traffic fills: a tracked connection on the ssl seam
         # (which also registers a close hook), a timing-store slot, buffered
@@ -711,6 +721,10 @@ def test_fork_walk_reaches_every_holder():
         finalize.submit(_StubDeferred(), ({}, None))
         assert finalize.pending() > 0, "the S-4 staging must survive to the fork"
 
+        # Work an adapter declared it could not reach runs on the parent's threads; the child
+        # starts with none, or every parentless request it sends would read unresolved.
+        expect_unreached(declarer, "before-fork")
+
         assert seam._conns and assembler.open_session_count() == 1
 
         r, w = os.pipe()
@@ -748,4 +762,5 @@ def test_fork_walk_reaches_every_holder():
         assert payload["locks_checked"] >= 8, payload
         assert payload["tables_checked"] >= 10, payload
     finally:
+        release_unreached(declarer, None)
         wardex.close()

@@ -1,7 +1,7 @@
 """The verbs a BRIDGE adapter needs from its context, kept beside `AdapterContext`.
 
 A bridge receives a framework's own spans (OpenTelemetry, for every bridge so far) and turns them
-into units. Two things it needs cannot be built from the verbs every adapter has:
+into units. What it needs cannot be built from the verbs every adapter has:
 
 * **Following the framework's current span.** The framework may re-attach its span on a task
   wardex's carrier never reached — measured on pydantic-ai's streaming run, where the request is
@@ -16,6 +16,9 @@ into units. Two things it needs cannot be built from the verbs every adapter has
 * **Holding framework usage.** A bridge CHAT unit carries the framework's usage demoted, and the
   core promotes it at close only when no model-call transaction was sealed under the unit
   (`_assembly/_usage_hold.py`).
+* **Declaring unreached carriers.** A host may run work on a thread whose context it copied
+  before the adapter ran, so the requests sent there carry no parent. While the adapter says such
+  work is in flight, those requests are unresolved instead of confident roots (`_bridge_latch`).
 
 A mixin, not methods on `AdapterContext` itself, because that module is at its line budget; and so
 the bridge verbs read as one set. `__slots__ = ()` because `AdapterContext` declares slots and a
@@ -30,10 +33,18 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from .._assembly import Unit, set_span_resolver, set_tool_call_resolver
+from .._assembly import (
+    Unit,
+    expect_unreached,
+    release_unreached,
+    set_span_resolver,
+    set_tool_call_resolver,
+)
 from .._assembly import hold_framework_usage as _hold
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
+
     from ._context import RunHandle
 
 
@@ -131,6 +142,24 @@ class BridgeVerbs:
     def unfollow_tool_calls(self) -> None:
         """Undo `follow_tool_calls`. Idempotent: safe before install and after uninstall."""
         set_tool_call_resolver(self, None)
+
+    def expect_unreached_carriers(self, key: Hashable) -> None:
+        """Declare work this adapter knows of running where it could not put a parent.
+
+        While any declaration stands, a request a seam observes with no parent at all is recorded
+        `unresolved` at confidence 0.0 with `parent_unresolved`, in place of a trace root at 1.0.
+        No parent is guessed. A unit this adapter opens and a span the host opens stay roots. The
+        window is process-wide, so declare it for the work's own interval only. Idempotent.
+        """
+        expect_unreached(self, key)
+
+    def release_unreached_carriers(self, key: Hashable | None) -> None:
+        """Withdraw the declaration under `key`, or with None every one this adapter made.
+
+        Idempotent. The registry withdraws them all when it drops the adapter, so an uninstall
+        leaves none standing.
+        """
+        release_unreached(self, key)
 
     def hold_framework_usage(self, handle: RunHandle, *, prefix: str) -> bool:
         """Declare `handle`'s own CHAT unit a framework-reported usage holder.

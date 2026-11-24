@@ -412,6 +412,14 @@ enum Limitation {
 
   // -- Adapter session.
   LIMITATION_SESSION_ABORTED = 37;
+  //    The model asked for a tool call and the framework never ran it, so no
+  //    EXECUTE_TOOL span exists for that call. Rides the run's INVOKE_AGENT
+  //    span. Calls are compared by tool call id and never by name, because a
+  //    framework may run another name under the same id. Names NO knob, since
+  //    no wardex setting makes the framework run the call. Not
+  //    TOOL_ARGS_UNPARSED (28), where a call's arguments could not be read,
+  //    and not CHILD_SPAN_UNCLOSED (8), where a tool began and never ended.
+  LIMITATION_TOOL_CALL_NOT_DISPATCHED = 58;
 
   // -- Agent SDK OTel bridge, fail-open. Both ride the session ROOT when the
   //    bridge was on and added nothing; the tree itself stays exactly what it

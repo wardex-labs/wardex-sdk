@@ -626,6 +626,93 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_pydantic_ai.py", "report_once", "f'adapters.pydantic_ai.degraded.{where}'"): (
         _GUARDED
     ),
+    # -- adapters: Hermes Agent
+    ("_adapters/_hermes_agent.py", "count", "'admit_race'"): L("FRAMEWORK_EVENT_UNMATCHED"),
+    ("_adapters/_hermes_agent.py", "count", "'book_full'"): L("TABLE_FULL"),
+    ("_adapters/_hermes_agent.py", "count", "'unreached_expired'"): NotADrop(
+        "a declaration whose end was lost is withdrawn by the idle sweep; the wire spans it "
+        "covered already shipped, marked"
+    ),
+    ("_adapters/_hermes_agent.py", "count", "f'dropped.{row.name}'"): L(
+        "FRAMEWORK_EVENT_UNMATCHED"
+    ),
+    ("_adapters/_hermes_agent.py", "count", "f'{s.action.value}.{trigger.value}'"): NotADrop(
+        "an event the turn table ignores: a repeat, one for a turn already closed and shipped, "
+        "or one for a turn this process never saw open; a model call's wire span ships wherever "
+        "its context puts it"
+    ),
+    ("_adapters/_hermes_agent.py", "record", "DropReason.FRAMEWORK_EVENT_UNMATCHED"): L(
+        "FRAMEWORK_EVENT_UNMATCHED"
+    ),
+    ("_adapters/_hermes_agent.py", "record", "DropReason.TABLE_FULL"): L("TABLE_FULL"),
+    ("_adapters/_hermes_agent.py", "report_once", "'adapters.hermes_agent.host_isolation'"): L(
+        "INSTRUMENTATION_UNAVAILABLE", at="_adapters/__init__.py"
+    ),
+    (
+        "_adapters/_hermes_agent.py",
+        "report_once",
+        "f'adapters.hermes_agent.dropped.{row.name}'",
+    ): L("FRAMEWORK_EVENT_UNMATCHED"),
+    (
+        "_adapters/_hermes_agent.py",
+        "report_once",
+        "f'adapters.hermes_agent.schema_drift.{field}'",
+    ): NotADrop("a contract version this release was not measured on, said once; turns ship"),
+    (
+        "_adapters/_hermes_agent_attach.py",
+        "bump",
+        "'adapters.hermes_agent.context_held_strongly'",
+    ): NotADrop("a plugin context that cannot be weakly referenced is held for the process"),
+    ("_adapters/_hermes_agent_attach.py", "bump", "'adapters.hermes_agent.frame_escaped'"): L(
+        "INTERNAL_SDK_ERROR"
+    ),
+    ("_adapters/_hermes_agent_attach.py", "bump", "'adapters.hermes_agent.hook_escaped'"): L(
+        "INTERNAL_SDK_ERROR"
+    ),
+    ("_adapters/_hermes_agent_attach.py", "record", "DropReason.INSTRUMENTATION_UNAVAILABLE"): L(
+        "INSTRUMENTATION_UNAVAILABLE"
+    ),
+    ("_adapters/_hermes_agent_attach.py", "record", "DropReason.INTERNAL_SDK_ERROR"): L(
+        "INTERNAL_SDK_ERROR"
+    ),
+    (
+        "_adapters/_hermes_agent_attach.py",
+        "report_once",
+        "'adapters.hermes_agent.host_isolation'",
+    ): NotADrop(
+        "Hermes's plugin host process makes no model call, so wardex starts nothing there by "
+        "design; where something else started wardex, the adapter's decline reaches the ledger"
+    ),
+    (
+        "_adapters/_hermes_agent_attach.py",
+        "report_once",
+        "'adapters.hermes_agent.init_refused'",
+    ): NotADrop(
+        "init() refused the environment's configuration, so no client exists to record into; "
+        "the line is the whole record, as the raise is for a direct caller of init()"
+    ),
+    (
+        "_adapters/_hermes_agent_attach.py",
+        "report_once",
+        "'adapters.hermes_agent.registration_refused'",
+    ): L("INSTRUMENTATION_UNAVAILABLE"),
+    ("_adapters/_hermes_agent_frames.py", "count", "'ignore_duplicate.aux_start'"): NotADrop(
+        "a repeated start for an auxiliary attempt already kept; nothing is lost"
+    ),
+    ("_adapters/_hermes_agent_frames.py", "count", "'report_without_frame'"): NotADrop(
+        "a report for a frame that already closed on a raise, or never opened because Hermes "
+        "refused its registration, which is recorded as unavailable instrumentation"
+    ),
+    ("_adapters/_hermes_agent_frames.py", "count", "'turn_start_missed'"): NotADrop(
+        "a tally: a model frame of a turn whose start this process never saw is a chat span "
+        "of its own and ships; no turn is made for it"
+    ),
+    ("_adapters/_hermes_agent_frames.py", "count", "f'{s.action.value}.{trigger.value}'"): (
+        NotADrop(
+            "a tally: an auxiliary call for a turn that is not live opens no span; its wire span "
+            "ships, marked by the declaration"
+        )
+    ),
     # -- adapters: the OTel bridge
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.attr_dropped'"): (
         NotADrop("an attribute outside the bridge's allow-list, left out by policy")

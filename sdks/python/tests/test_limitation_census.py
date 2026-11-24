@@ -246,7 +246,18 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "NO_WIRE_EVIDENCE": frozenset(
         {"_adapters/_codex_exec.py", "_adapters/_pydantic_ai.py", "_assembly/_usage_hold.py"}
     ),
-    "SUBPROCESS_MODEL_CALLS_UNOBSERVED": frozenset({"_adapters/_codex_exec.py"}),
+    # The Hermes adapter's turn table decides it too, as a close-time observation: a turn Hermes
+    # says completed with no model-call frame ran its model calls in a subprocess (the codex
+    # app-server runtime).
+    "SUBPROCESS_MODEL_CALLS_UNOBSERVED": frozenset(
+        {"_adapters/_codex_exec.py", "_adapters/_hermes_agent_turns.py"}
+    ),
+    # The Hermes turn's other close-time observation: a tool call the model asked for that no
+    # tool frame ever ran (an invented name, a vetoed call, an interrupt before dispatch).
+    "TOOL_CALL_NOT_DISPATCHED": frozenset({"_adapters/_hermes_agent_turns.py"}),
+    # A hook-built chat span for an auxiliary call outside the turn's lane, which the call's own
+    # wire span may repeat: the Hermes adapter's `_aux_begin`.
+    "POSSIBLE_DUPLICATE_CHAT": frozenset({"_adapters/_hermes_agent_frames.py"}),
     # --- caps ---
     # HTTP/2's half of the body cap: the h2 tracker's `_mk` turns the native
     # transaction's per-direction truncation flags into the member. HTTP/1's half
@@ -363,7 +374,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # span carrying this marker; the code they replace dropped the session and
     # its root with no marker and no test, which is the silent drop I10 forbids.
     "UNIT_EVICTED": frozenset({"_adapters/_assembler.py", "_assembly/_units.py"}),
-    "SESSION_ABORTED": frozenset({"_adapters/_assembler.py"}),
+    # The Hermes adapter's close table marks every turn that did not complete: a failed or
+    # interrupted end, and every close wardex decided (retries spent, the next turn, a child's
+    # stop, idle, shutdown).
+    "SESSION_ABORTED": frozenset({"_adapters/_assembler.py", "_adapters/_hermes_agent_turns.py"}),
     # The OTel bridge's two fail-open verdicts, both attached to the session
     # ROOT at finalize by `_merge_bridge`: NO_DATA when the read-back-confirmed
     # injection produced zero spans, SCHEMA_UNKNOWN when data arrived and
@@ -408,6 +422,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
         {
             "_adapters/_anthropic_agent_sdk.py",
             "_adapters/_codex_exec.py",
+            "_adapters/_hermes_agent.py",
             "_adapters/_langgraph.py",
             "_adapters/_openai_agents.py",
             "_adapters/_pydantic_ai.py",
@@ -804,6 +819,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # Declared long before an emitter: its first is the Codex adapter,
         # whose payloads are the host's stdin and stdout, not wire bytes.
         "NO_WIRE_EVIDENCE",
+        # Declared before an emitter, both: the first is the Hermes adapter, on
+        # the hook-built chat span of an auxiliary call outside the turn's lane,
+        # and on a turn's close when a tool call it asked for never ran.
+        "POSSIBLE_DUPLICATE_CHAT",
+        "TOOL_CALL_NOT_DISPATCHED",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1378,6 +1398,13 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_pydantic_ai.py", "Name:marker"),
         # And the Codex adapter's: `close_units(*, marker)` passing it on whole.
         ("_adapters/_codex_exec.py", "Name:marker"),
+        # And the Hermes adapter's, which is also its close's loop over the
+        # observations that apply (`for marker in notes: handle.note(marker)`).
+        # `Attribute:marker` is the same close noting `rule.marker`. Every member
+        # either can carry is spelled by keyword in `_hermes_agent_turns.py`'s
+        # `CLOSE_RULES` and `OBSERVATIONS`, where `_MEMBER_SITES` records them.
+        ("_adapters/_hermes_agent.py", "Attribute:marker"),
+        ("_adapters/_hermes_agent.py", "Name:marker"),
         ("_adapters/_registry.py", "Name:marker"),
         # The same forward for a hand-opened span: `_tracing._interrupt` puts
         # the marker `Runtime.interrupt_open_spans` hands it onto the span's
@@ -1850,6 +1877,12 @@ _VOCABULARY: dict[str, str] = {
     #     from INSTRUMENTATION_DEGRADED (there the capture was incomplete;
     #     here it was whole and was emptied on its way out) ---
     "PII_FILTER_FAILED": "pii_filter_failed",
+    # --- added after the census, ahead of its emitter (1). A tool call the
+    #     model asked for and the framework never ran, so the run has no tool
+    #     span for it. The Hermes Agent adapter is its first emitter. Kept apart
+    #     from CHILD_SPAN_UNCLOSED (a tool began and never ended) and from
+    #     TOOL_ARGS_UNPARSED (a call's arguments could not be read) ---
+    "TOOL_CALL_NOT_DISPATCHED": "tool_call_not_dispatched",
 }
 
 
@@ -1864,7 +1897,8 @@ def test_the_vocabulary_is_exactly_the_recorded_table() -> None:
     id + 1 for the OTel bridge's tolerant chat join + 1 for the h2 stream
     table's evicted request half + 1 for the inferred provider label + 1 for
     a CLI agent's unobserved model calls + 1 for a stream event no
-    reassembler could read + 1 for masking's own failure, name by name.
+    reassembler could read + 1 for masking's own failure + 1 for a tool call
+    the framework never ran, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

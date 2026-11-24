@@ -15,6 +15,7 @@ import logging
 import re
 import sys
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -317,6 +318,110 @@ def test_an_account_kept_after_close_is_not_read_as_an_adapter_still_installed(l
     still = {s.name: s.state for s in wardex.diagnostics().adapters}
     assert still["langgraph"] is AdapterState.INSTALLED, "the account itself is kept"
     assert _hub.installed_adapters() == frozenset()
+
+
+# --- what an adapter learns after it installed -------------------------------
+
+
+class _Learns(AdapterInterface):
+    """Installs, then learns from its host what its install could not know."""
+
+    def __init__(self) -> None:
+        self._installed = False
+        self.learned: dict[str, object] = {}
+        self.raises = False
+
+    def name(self) -> str:
+        return "learns"
+
+    def install(self, client, ctx=None) -> None:  # noqa: ANN001
+        self._installed = True
+
+    def uninstall(self) -> None:
+        self._installed = False
+
+    def restate(self, filed: wardex.AdapterStatus) -> wardex.AdapterStatus:
+        if self.raises:
+            raise RuntimeError("restate broke")
+        return replace(filed, **self.learned)
+
+
+def _row(name: str) -> wardex.AdapterStatus:
+    return next(s for s in wardex.diagnostics().adapters if s.name == name)
+
+
+def test_what_an_adapter_learns_after_install_is_what_diagnostics_says(lines):
+    adapter = _Learns()
+    get_registry().install(adapter, None)
+    assert _row("learns") == wardex.AdapterStatus("learns", AdapterState.INSTALLED)
+
+    adapter.learned = {
+        "measured": False,
+        "measured_versions": ("contract v1",),
+        "detail": "the host sends contract v2",
+        "framework": "renamed",
+        "version": "9.9",
+    }
+    row = _row("learns")
+    assert row.state is AdapterState.INSTALLED
+    assert (row.measured, row.measured_versions) == (False, ("contract v1",))
+    assert row.detail == "the host sends contract v2"
+    assert (row.framework, row.version) == (None, None), "only the adapter's own facts change"
+
+    adapter.learned = {"state": AdapterState.UNSUPPORTED, "detail": "the host never attached it"}
+    assert _row("learns").state is AdapterState.UNSUPPORTED
+    assert get_registry().is_installed("learns"), "a restated state uninstalls nothing"
+
+
+def test_a_restate_that_raises_answers_the_filed_row_and_is_counted(lines):
+    adapter = _Learns()
+    get_registry().install(adapter, None)
+    adapter.learned = {"measured": False}
+    adapter.raises = True
+
+    assert _row("learns") == wardex.AdapterStatus("learns", AdapterState.INSTALLED)
+    assert counters.get("adapters.learns.restate") == 1
+
+
+def test_the_last_thing_an_adapter_knew_outlives_close(lines):
+    wardex.init(transport=wardex.NoOpTransport(), adapters=AdaptersConfig(enabled=()))
+    adapter = _Learns()
+    get_registry().install(adapter, _hub.get_client())
+    adapter.learned = {"measured": False, "detail": "the host sends contract v2"}
+    wardex.close()
+
+    adapter.learned = {"detail": "asked after close"}
+    row = _row("learns")
+    assert not get_registry().is_installed("learns")
+    assert (row.measured, row.detail) == (False, "the host sends contract v2")
+
+
+class _ReadsWhileInstalling(_Learns):
+    """Reads diagnostics from inside its own install, as a host thread may while it runs."""
+
+    def install(self, client, ctx=None) -> None:  # noqa: ANN001
+        self.seen = _row("learns")
+        self._installed = True
+
+
+def test_a_row_an_install_is_still_writing_is_answered_as_filed(lines):
+    adapter = _ReadsWhileInstalling()
+    adapter.learned = {"state": AdapterState.INSTALLED, "detail": "said before it installed"}
+    waiting = wardex.AdapterStatus("learns", AdapterState.WAITING_FOR_IMPORT)
+    get_registry().record(waiting)
+
+    get_registry().install(adapter, None)
+    assert adapter.seen == waiting, "an install that may still fail is not reported installed"
+    assert _row("learns").detail == "said before it installed"
+
+
+def test_an_adapter_that_restates_nothing_is_filed_exactly_as_before(lines):
+    get_registry().install(_NoFlag(), None)
+    filed = wardex.AdapterStatus("no-flag", AdapterState.INSTALLED)
+    assert _row("no-flag") == filed
+    get_registry().uninstall_all()
+    assert _row("no-flag") == filed
+    assert counters.get("adapters.no-flag.restate") == 0
 
 
 # --- the table of tested versions --------------------------------------------

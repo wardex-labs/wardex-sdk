@@ -55,6 +55,10 @@ class Measured:
 MEASURED: dict[AdapterName, tuple[Measured, ...]] = {
     AdapterName.ANTHROPIC_AGENT_SDK: (Measured("claude-agent-sdk", ("0.2",)),),
     AdapterName.CODEX_EXEC: (),
+    # Hermes states its plugin contract version in every payload, and that, not the package
+    # version, is what the adapter was measured on (`KNOWN_SCHEMAS`); the adapter's own status
+    # says it once a payload arrives.
+    AdapterName.HERMES_AGENT: (),
     # The tool seam lives in a separately versioned distribution that langgraph
     # depends on, so a release of either one can move what the adapter patches.
     AdapterName.LANGGRAPH: (

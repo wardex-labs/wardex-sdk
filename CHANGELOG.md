@@ -85,6 +85,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Hermes Agent turns are recorded, through a Hermes plugin.** A Hermes user
+  enables one plugin whose `__init__.py` is
+  `from wardex_sdk.hermes_agent import register`, sets `WARDEX_API_KEY` or
+  `WARDEX_ENDPOINT`, and changes no code. Each turn is one trace:
+  `invoke_agent hermes` with the user's message and Hermes's final response,
+  each model call with every HTTP attempt under it (failed attempts
+  included), each tool call linked to the model call that asked for it, and
+  each subagent turn under the `delegate_task` call that started it. A turn
+  that Hermes recovers after a provider outage stays one trace. A turn Hermes
+  never ended, which is every failed turn, is closed with `session_aborted`
+  and a `wardex.hermes_agent.close_cause`, at the session's next turn, when
+  Hermes closes the session, or after 120 seconds with no event (300 after a
+  failed model call). A turn that starts on the thread of an open turn is
+  under the embedder's span that is open there, or a trace of its own, and so
+  is an agent run from a `step_callback` or on a thread a tool left running;
+  the open turn stays whole. When the open turn's last model call answered, a
+  span the embedder opens on that thread before that turn closes, and the
+  HTTP attempt of the new turn's session-title call, still land under it. A
+  turn an async embedder runs from inside a coroutine is one trace too. What
+  wardex cannot place is marked, not guessed: Hermes's background memory
+  review, side questions, the session-title call (but for the case above), a
+  tool call Hermes never ran, and model calls made outside the process. A
+  prompt another plugin blocked is in no span. wardex imports and patches
+  nothing of Hermes, and Hermes gets its own results and exceptions back.
+  Measured on Hermes Agent v0.23.3 (`hermes.observer.v1`,
+  `hermes.middleware.v1`). The README's adapter section has the details.
+- **`tool_call_not_dispatched` is a new limitation marker.** It is on a run
+  whose model asked for a tool call the framework never ran.
 - **`python -m wardex_sdk doctor` checks an install end to end.** It reads
   the environment as your app would, sends one test span, and ends with
   `OK: <url> accepted the test span.` (exit 0) or `FAIL:` and the fix

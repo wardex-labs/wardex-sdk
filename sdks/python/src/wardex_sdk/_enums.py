@@ -50,14 +50,15 @@ class AdapterName(Enum):
     at all, in silence. They were removed rather than answered with None — a
     name that cannot be spelled needs no validation — and each returns as a
     member when its adapter ships. `OPENAI_AGENTS` has returned; only
-    `LANGCHAIN` remains absent. `PYDANTIC_AI` was added with its adapter, never
-    ahead of it. The value is `adapter.name()` verbatim and
+    `LANGCHAIN` remains absent. `PYDANTIC_AI` and `HERMES_AGENT` were added with
+    their adapters, never ahead of them. The value is `adapter.name()` verbatim and
     doubles as the per-adapter field name on `AdaptersConfig`: one identifier
     per adapter, held to the registration table by a registry test.
     """
 
     ANTHROPIC_AGENT_SDK = "anthropic_agent_sdk"
     CODEX_EXEC = "codex_exec"
+    HERMES_AGENT = "hermes_agent"
     LANGGRAPH = "langgraph"
     OPENAI_AGENTS = "openai_agents"
     PYDANTIC_AI = "pydantic_ai"
@@ -76,7 +77,9 @@ class AdapterState(Enum):
     # The framework is installed and the application has not imported it yet;
     # the adapter installs right after that import finishes.
     WAITING_FOR_IMPORT = "waiting_for_import"
-    UNSUPPORTED = "unsupported"  # the framework is here; its surface is not one this wardex knows
+    # The framework is here; its surface is not one this wardex knows, or its host has not
+    # attached the adapter.
+    UNSUPPORTED = "unsupported"
     FAILED = "failed"  # the adapter raised while installing
     SHADOWED = "shadowed"  # a local package answers the framework's import name
     ABSENT = "absent"  # the framework is not installed

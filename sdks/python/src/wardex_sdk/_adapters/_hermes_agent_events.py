@@ -1,0 +1,795 @@
+"""Hermes's plugin contract as this adapter reads it: names, threads, schema versions, fields.
+
+Owns: `CONTRACT`, the one table registration is driven from (nothing is registered that is not a
+row of it); `NOT_REGISTERED`, every other Hermes hook and middleware kind with the reason it is
+left alone; `KNOWN_SCHEMAS`; `USAGE_KEYS`; the frozen event records parsed from payloads and the
+one generic `parse`. This is the only module that spells a Hermes hook name, middleware kind or
+payload field, so a Hermes change lands here and nowhere else.
+
+Knows no wardex verb and no turn state beyond the `Trigger` each event maps to.
+
+What is never read, by design: model message and response content (`conversation_history`,
+`request`, `messages`, and every content member of `response` and `assistant_message`; the wire
+is the authority for model content), `sender_id` (end-user identity), `child_goal`,
+`child_summary`, cost, and any profile name. Of `response` and `assistant_message` only each tool
+call's name is read. `parse` reads only the fields a record's `FIELDS` names, so a field
+that is not named never reaches a record.
+
+What is read for the core's capped, masked payload path (`record_input` and `record_output`)
+only, never for an attribute: tool arguments and tool results, because no wire carries an
+in-process tool's input or output; and the turn's own input and output, `pre_llm_call`'s
+`user_message` and `post_llm_call`'s `assistant_response`, because on the wire they sit inside
+the turn's first and last model calls, and a trace list reads a turn's input and output from the
+turn's own span.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, ClassVar, Protocol
+
+from ._hermes_agent_turns import CloseCause, Trigger
+
+__all__ = [
+    "ABANDONED_TOOL_ERROR_TYPES",
+    "ABANDONED_TOOL_STATUSES",
+    "CONTRACT",
+    "FINALIZE_SHUTDOWN_REASON",
+    "HOST_PROCESS_ENV",
+    "KNOWN_SCHEMAS",
+    "MISSING",
+    "NOT_REGISTERED",
+    "PRE_LLM_BLOCK_EXIT_REASON",
+    "TOOL_CALL_BRIDGE",
+    "USAGE_KEYS",
+    "AuxEnd",
+    "AuxStart",
+    "CallEnter",
+    "CallError",
+    "CallReport",
+    "CallbackThread",
+    "ChildStart",
+    "ChildStop",
+    "ContractRow",
+    "Drift",
+    "DriftNote",
+    "Event",
+    "Field",
+    "Finalize",
+    "KeyKind",
+    "Surface",
+    "ToolEnter",
+    "ToolReport",
+    "TurnAnswer",
+    "TurnEnd",
+    "TurnStart",
+    "parse",
+]
+
+#: The schema versions this release was measured on (Hermes v0.23.3), by the payload field that
+#: states each. Any other value is drift: one line, `measured=False`, and recording continues.
+KNOWN_SCHEMAS: Mapping[str, str] = {
+    "telemetry_schema_version": "hermes.observer.v1",
+    "middleware_schema_version": "hermes.middleware.v1",
+}
+
+#: Hermes `usage` keys mapped to the key, after the hold prefix, that the core's promotion table
+#: reads. The core's input count includes cached tokens, and Hermes's `input_tokens` does not: it
+#: is the uncached part, and `prompt_tokens` is it plus both cache buckets. So `prompt_tokens` is
+#: carried as the input count and `input_tokens` is not. `request_count` and `total_tokens`
+#: restate other keys, and `cache_write_by_ttl` has no field to land in.
+USAGE_KEYS: Mapping[str, str] = {
+    "prompt_tokens": "gen_ai.usage.input_tokens",
+    "output_tokens": "gen_ai.usage.output_tokens",
+    "cache_read_tokens": "gen_ai.usage.cache_read.input_tokens",
+    "cache_write_tokens": "gen_ai.usage.cache_creation.input_tokens",
+    "reasoning_tokens": "gen_ai.usage.reasoning.output_tokens",
+}
+
+#: The `turn_exit_reason` Hermes states when another plugin's `pre_llm_call` returned
+#: `{"action": "block", "message": ...}` (`agent/turn_context.py`). Hermes then withholds the
+#: prompt from every store and provider and finalizes the turn with no model call, so a blocked
+#: prompt never leaves the host through wardex either. The codex app-server runtime is the other
+#: ending with no model call in this process: its calls run in a subprocess, and its prompt did
+#: leave the host.
+PRE_LLM_BLOCK_EXIT_REASON = "blocked_by_plugin_pre_llm_call"
+
+#: The `reason` of an `on_session_finalize` at process shutdown: CLI exit, one-shot exit and
+#: gateway shutdown. Every other reason (`/new`, a reset, an expiry, a viewer's close) is a
+#: session boundary in a process that goes on.
+FINALIZE_SHUTDOWN_REASON = "shutdown"
+
+#: `post_tool_call` statuses with which Hermes says it gave up on a tool's worker while the
+#: worker may still run (`agent/tool_executor.py`): a timeout, a cancel, a worker with no result.
+ABANDONED_TOOL_STATUSES = frozenset({"timeout", "cancelled"})
+ABANDONED_TOOL_ERROR_TYPES = frozenset({"thread_missing_result"})
+
+#: Tool Search's bridge (`tools/tool_search_catalog.py::TOOL_CALL_NAME`, on by default). Hermes
+#: runs each tool one call of it carries under that tool's own name, split into several calls
+#: after `post_api_request` (`agent/tool_call_batches.py`); a batch of connector tools only runs
+#: under this name, with a frame per entry inside (`tools/connectors/dispatch.py`).
+TOOL_CALL_BRIDGE = "tool_call"
+
+#: Set to "1" by Hermes in its plugin host process (`plugins.isolation: host`). Model traffic
+#: runs in the agent's own process, so nothing wardex could record is visible there.
+HOST_PROCESS_ENV = "HERMES_PLUGIN_HOST_PROCESS"
+
+
+class Surface(Enum):
+    HOOK = "hook"  # ctx.register_hook
+    MIDDLEWARE = "middleware"  # ctx.register_middleware, execution kinds only
+
+
+class CallbackThread(Enum):
+    """The thread Hermes runs a callback on, as measured. It decides what the callback may do."""
+
+    HOOK_THREAD = "hook_thread"  # a fresh hook thread holding a COPY of the caller's context
+    LOOP = "loop"  # the agent's loop thread itself, no copy: a pin set here stays for the turn
+    TOOL_WORKER = "tool_worker"  # a pooled worker, context copied per job
+    CALLER = "caller"  # the caller's own thread, no copy (a tool worker, a delegate, shutdown)
+
+
+class KeyKind(Enum):
+    """What an event's `key()` names."""
+
+    TURN = "turn"  # one turn, by turn_id (None when Hermes stated none)
+    PARENT_TURN = "parent_turn"  # the parent's turn, by parent_turn_id (subagent_start)
+    SESSION = "session"  # every live turn of one session; none for key None
+
+
+class Event(Protocol):
+    """What every parsed event answers. The dispatcher needs nothing else to route it."""
+
+    def trigger(self) -> Trigger: ...
+    def key_kind(self) -> KeyKind: ...
+    def key(self) -> str | None: ...
+
+
+class _Missing:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "MISSING"
+
+
+#: What a field reader returns for a value that is absent or of the wrong type.
+MISSING: Any = _Missing()
+
+
+@dataclass(frozen=True, slots=True)
+class Field:
+    """One payload field: Hermes's name, the record's attribute, and the reader that checks it."""
+
+    payload: str
+    attr: str
+    read: Callable[[object], object]  # the value, or MISSING when absent or mistyped
+    required: bool = True
+
+
+def _text(v: object) -> object:
+    return v if isinstance(v, str) and v else MISSING
+
+
+def _int(v: object) -> object:
+    return v if isinstance(v, int) and not isinstance(v, bool) else MISSING
+
+
+def _flag(v: object) -> object:
+    return v if isinstance(v, bool) else MISSING
+
+
+def _raw(v: object) -> object:
+    return MISSING if v is None else v
+
+
+def _usage(v: object) -> object:
+    """`usage` -> ((core key, count), ...) for the keys in USAGE_KEYS whose value is an int."""
+    if not isinstance(v, Mapping):
+        return MISSING
+    return tuple(
+        (core, n)
+        for hermes, core in USAGE_KEYS.items()
+        if isinstance(n := v.get(hermes), int) and not isinstance(n, bool)
+    )
+
+
+def _member(obj: object, name: str) -> object:
+    # Hermes hands a `NormalizedResponse` object; its recorded form is a plain mapping.
+    if isinstance(obj, Mapping):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _error_type(v: object) -> object:
+    """`api_request_error`'s `error`: `{"type": ..., "message": ...}`; only the type is read."""
+    kind = v.get("type") if isinstance(v, Mapping) else None
+    return kind if isinstance(kind, str) and kind else MISSING
+
+
+def _requested(v: object) -> object:
+    """`assistant_message` -> (tool name, ...) from its `tool_calls`, in the order asked.
+
+    Names only: not the id, which Hermes may rewrite before dispatch (and supplies when it is
+    blank), so a dispatched frame is matched by name, never by id; `arguments` and every
+    content member are left unread. A call without a string name is skipped.
+    """
+    if v is None:
+        return MISSING
+    calls = _member(v, "tool_calls")
+    if not isinstance(calls, (list, tuple)):
+        return ()
+    names = (_member(c, "name") for c in calls)
+    return tuple(n for n in names if isinstance(n, str) and n)
+
+
+def _requested_in_response(v: object) -> object:
+    """`response` -> the same names, from its `assistant_message` member.
+
+    Hermes hands `post_api_request` both a JSON-able `response` dict, whose `assistant_message`
+    holds the tool calls, and the `assistant_message` object itself. The recorded payloads keep
+    only the dict, so it is read too; the object, read after it, wins when Hermes sends it.
+    """
+    return MISSING if v is None else _requested(_member(v, "assistant_message"))
+
+
+# -- event records -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TurnStart:
+    """`pre_llm_call`. `parent_session_id` is stated for a delegated child only.
+
+    `user_message` is Hermes's object, read and never changed: the user's message, a string or a
+    list of content parts, or a delegated child's task text. It is held on the turn and recorded
+    only once it leaves the host (see PRE_LLM_BLOCK_EXIT_REASON).
+    """
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("session_id", "session_id", _text),
+        Field("turn_id", "turn_id", _text),
+        Field("parent_session_id", "parent_session_id", _text, required=False),
+        Field("platform", "platform", _text, required=False),
+        Field("user_message", "user_message", _raw, required=False),
+    )
+    session_id: str
+    turn_id: str
+    parent_session_id: str | None = None
+    platform: str | None = None
+    user_message: object = None  # for record_input only
+
+    def trigger(self) -> Trigger:
+        return Trigger.TURN_START
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class CallEnter:
+    """`llm_execution` frame entry. `request` and `next_call` are in the same kwargs, unread."""
+
+    #: The payload field that names one frame: a second delivery of the same frame nested inside
+    #: the first (wardex registered twice) is recognized by it before anything is parsed.
+    FRAME_KEY: ClassVar[str] = "api_request_id"
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("turn_id", "turn_id", _text),
+        Field("api_request_id", "api_request_id", _text),
+        Field("session_id", "session_id", _text, required=False),
+        Field("model", "model", _text, required=False),
+        Field("api_mode", "api_mode", _text, required=False),
+    )
+    turn_id: str
+    api_request_id: str
+    session_id: str | None = None  # Hermes sends "" when its agent has none
+    model: str | None = None
+    api_mode: str | None = None
+
+    def trigger(self) -> Trigger:
+        return Trigger.CALL_ENTER
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class CallReport:
+    """`post_api_request`: Hermes's usage (held, never promoted here) and the tool calls the
+    model asked for, by name."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("turn_id", "turn_id", _text),
+        Field("api_request_id", "api_request_id", _text),
+        Field("session_id", "session_id", _text, required=False),
+        Field("usage", "usage", _usage, required=False),
+        # Two sources for one attribute: a later field overwrites an earlier one it read.
+        Field("response", "requested", _requested_in_response, required=False),
+        Field("assistant_message", "requested", _requested, required=False),
+    )
+    turn_id: str
+    api_request_id: str
+    session_id: str | None = None  # Hermes sends "" when its agent has none
+    usage: tuple[tuple[str, int], ...] = ()
+    requested: tuple[str, ...] = ()
+
+    def trigger(self) -> Trigger:
+        return Trigger.CALL_REPORT
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class CallError:
+    """`api_request_error`. One per failed logical call; the attempts inside it are on the wire.
+
+    It never ends a turn, whatever its `retry_count`, `max_retries` and `retryable` say, so they
+    are not read (Hermes also sends them as None on some paths): after the last retry Hermes
+    moves to a fallback provider or parks the turn on its recovery ladder
+    (`agent/turn_recovery_autorecover.py`, five cycles by default). It is also Hermes's verdict
+    on a call whose frame returned: a content-policy refusal arrives as an HTTP 200, and Hermes
+    then sends this hook and no `post_api_request` (`agent/turn_truncation.py`).
+    """
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("turn_id", "turn_id", _text),
+        Field("api_request_id", "api_request_id", _text),
+        Field("session_id", "session_id", _text, required=False),
+        Field("reason", "reason", _text, required=False),
+        Field("error", "error_type", _error_type, required=False),
+    )
+    turn_id: str
+    api_request_id: str
+    session_id: str | None = None  # Hermes sends "" when its agent has none
+    reason: str | None = None
+    error_type: str | None = None  # Hermes's `error.type`, the class of what failed
+
+    def trigger(self) -> Trigger:
+        return Trigger.CALL_FAILED
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class ToolEnter:
+    """`tool_execution` frame entry. `args` is Hermes's object: read, never changed.
+
+    Only the name is required. Hermes sends an id it does not have as "" (`model_tools.py::
+    _CallIds.hook_kwargs`): no `api_request_id` for a tool that runs before the turn's first
+    model call (a scripted prelude), neither call id for a tool that code running in
+    `execute_code` calls, and no id at all from the MCP server of codex app-server mode.
+    """
+
+    FRAME_KEY: ClassVar[str] = "tool_call_id"
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("tool_name", "tool_name", _text),
+        Field("session_id", "session_id", _text, required=False),
+        Field("turn_id", "turn_id", _text, required=False),
+        Field("api_request_id", "api_request_id", _text, required=False),
+        Field("tool_call_id", "tool_call_id", _text, required=False),
+        Field("conversation_id", "conversation_id", _text, required=False),
+        Field("args", "args", _raw, required=False),
+    )
+    tool_name: str
+    session_id: str | None = None
+    turn_id: str | None = None
+    api_request_id: str | None = None  # the model call that asked for it: a link and a count
+    tool_call_id: str | None = None  # what its post_tool_call is matched by
+    conversation_id: str | None = None  # Hermes's own, the only payload family that states it
+    args: object = None  # for record_input only
+
+    def trigger(self) -> Trigger:
+        return Trigger.TOOL_ENTER
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class ToolReport:
+    """`post_tool_call`. Hermes returns a tool failure as a result, so `status` carries it. Its
+    ids are `ToolEnter`'s, "" when Hermes has none; a report with no `tool_call_id` names no
+    frame."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("session_id", "session_id", _text, required=False),
+        Field("turn_id", "turn_id", _text, required=False),
+        Field("tool_call_id", "tool_call_id", _text, required=False),
+        Field("conversation_id", "conversation_id", _text, required=False),
+        Field("status", "status", _text, required=False),  # "ok" measured; others verbatim
+        Field("error_type", "error_type", _text, required=False),
+        Field("result", "result", _raw, required=False),
+    )
+    session_id: str | None = None
+    turn_id: str | None = None
+    tool_call_id: str | None = None
+    conversation_id: str | None = None
+    status: str | None = None
+    error_type: str | None = None
+    result: object = None  # for record_output only
+
+    def abandoned(self) -> bool:
+        """Hermes gave up on the tool's worker: the frame's own exit may come after its turn
+        closed, or never."""
+        return (
+            self.status in ABANDONED_TOOL_STATUSES or self.error_type in ABANDONED_TOOL_ERROR_TYPES
+        )
+
+    def trigger(self) -> Trigger:
+        return Trigger.TOOL_REPORT
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class AuxStart:
+    """`pre_auxiliary_call`, once per physical attempt. `session_id` and `turn_id` are optional:
+    Hermes sends both as "" for an auxiliary call outside any turn
+    (`agent/auxiliary_hooks.py::_parent_turn_identity`: cron, gateway idle work, an MCP server's
+    sampling request), which is legal and keys no turn. `model` names the hook-built span."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_request_id", "aux_request_id", _text),  # "aux-<hex>"
+        Field("retry_count", "retry_count", _int),
+        Field("session_id", "session_id", _text, required=False),
+        Field("turn_id", "turn_id", _text, required=False),
+        Field("aux_task", "aux_task", _text, required=False),
+        Field("model", "model", _text, required=False),
+    )
+    aux_request_id: str
+    retry_count: int
+    session_id: str | None = None
+    turn_id: str | None = None
+    aux_task: str | None = None
+    model: str | None = None
+
+    def attempt(self) -> tuple[str, int]:
+        """The key one attempt is kept under, from its start to its end."""
+        return (self.aux_request_id, self.retry_count)
+
+    def trigger(self) -> Trigger:
+        return Trigger.AUX_START
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class AuxEnd:
+    """`post_auxiliary_call`. Its usage is written as held extras on the hook-built span only."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_request_id", "aux_request_id", _text),
+        Field("retry_count", "retry_count", _int),
+        Field("session_id", "session_id", _text, required=False),
+        Field("turn_id", "turn_id", _text, required=False),
+        Field("error_type", "error_type", _text, required=False),
+        Field("usage", "usage", _usage, required=False),
+    )
+    aux_request_id: str
+    retry_count: int
+    session_id: str | None = None
+    turn_id: str | None = None
+    error_type: str | None = None
+    usage: tuple[tuple[str, int], ...] = ()
+
+    def attempt(self) -> tuple[str, int]:
+        return (self.aux_request_id, self.retry_count)
+
+    def trigger(self) -> Trigger:
+        return Trigger.AUX_END
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class ChildStart:
+    """`subagent_start`, applied to the parent's turn. `child_role` is never an agent name."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("parent_session_id", "parent_session_id", _text),
+        Field("child_session_id", "child_session_id", _text),
+        Field("parent_turn_id", "parent_turn_id", _text, required=False),
+        Field("child_subagent_id", "child_subagent_id", _text, required=False),
+        Field("child_role", "child_role", _text, required=False),
+    )
+    parent_session_id: str
+    child_session_id: str
+    parent_turn_id: str | None = None  # "" from a parent with no turn running: keys no turn
+    child_subagent_id: str | None = None
+    child_role: str | None = None
+
+    def trigger(self) -> Trigger:
+        return Trigger.CHILD_START
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.PARENT_TURN
+
+    def key(self) -> str | None:
+        return self.parent_turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class ChildStop:
+    """`subagent_stop`: the net for a child session that sent no end of its own."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (Field("child_session_id", "child_session_id", _text),)
+    child_session_id: str
+
+    def trigger(self) -> Trigger:
+        return Trigger.CHILD_STOP
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.SESSION
+
+    def key(self) -> str | None:
+        return self.child_session_id
+
+
+@dataclass(frozen=True, slots=True)
+class TurnAnswer:
+    """`post_llm_call`: the turn's final response, for record_output only.
+
+    Hermes fires it once per turn, on a hook thread the loop thread waits for, after the tool
+    loop and before `on_session_end` (`agent/turn_finalizer.py::finalize_turn`). It fires only
+    when the turn has a final response and was not interrupted, and never for a detached fork
+    (`_persist_disabled`), which sends no `on_session_end` either. A failed turn that reaches
+    finalization can still send it: Hermes writes an explanation as the final response when the
+    turn stopped with a tool result pending or the interpreter shut down, and that text is what
+    the user was shown. A turn whose retries were spent returns before finalization and sends
+    neither this nor an end.
+    """
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("session_id", "session_id", _text),
+        Field("turn_id", "turn_id", _text),
+        Field("assistant_response", "assistant_response", _raw, required=False),
+    )
+    session_id: str
+    turn_id: str
+    assistant_response: object = None  # for record_output only
+
+    def trigger(self) -> Trigger:
+        return Trigger.TURN_ANSWER
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN
+
+    def key(self) -> str | None:
+        return self.turn_id
+
+
+@dataclass(frozen=True, slots=True)
+class TurnEnd:
+    """`on_session_end`. It usually names its turn. The CLI's interrupted-run path sends only
+    the session, and states its exit reason as `reason` with no `turn_exit_reason`, so then it
+    applies to every live turn of the session."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("session_id", "session_id", _text),
+        Field("turn_id", "turn_id", _text, required=False),
+        Field("completed", "completed", _flag, required=False),
+        Field("failed", "failed", _flag, required=False),
+        Field("interrupted", "interrupted", _flag, required=False),
+        # The CLI interrupt path's spelling first, so `turn_exit_reason` wins when both are sent.
+        Field("reason", "exit_reason", _text, required=False),
+        Field("turn_exit_reason", "exit_reason", _text, required=False),
+    )
+    session_id: str
+    turn_id: str | None = None
+    completed: bool = False
+    failed: bool = False
+    interrupted: bool = False
+    exit_reason: str | None = None  # an open set: kept verbatim, never parsed but for a block
+
+    def blocked(self) -> bool:
+        """Another plugin blocked the turn's prompt, so it never left the host."""
+        return self.exit_reason == PRE_LLM_BLOCK_EXIT_REASON
+
+    def cause(self) -> CloseCause:
+        """From Hermes's three flags only. A stated failure outranks a stated interrupt, and
+        `completed` counts only when neither is stated."""
+        if self.failed:
+            return CloseCause.ENDED_FAILED
+        if self.interrupted:
+            return CloseCause.ENDED_INTERRUPTED
+        if self.completed:
+            return CloseCause.ENDED_COMPLETED
+        return CloseCause.ENDED_INCOMPLETE
+
+    def trigger(self) -> Trigger:
+        return Trigger.TURN_END
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.TURN if self.turn_id else KeyKind.SESSION
+
+    def key(self) -> str | None:
+        return self.turn_id or self.session_id
+
+
+@dataclass(frozen=True, slots=True)
+class Finalize:
+    """`on_session_finalize`, at every session boundary and at shutdown. Hermes shows a
+    callback's return value to the user, so the callback for this row returns None like every
+    other."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("session_id", "session_id", _text, required=False),
+        Field("reason", "reason", _text, required=False),
+    )
+    #: None closes no turn: the gateway's `/new` in a chat with no session yet sends one.
+    session_id: str | None = None
+    reason: str | None = None
+
+    def trigger(self) -> Trigger:
+        """SHUTDOWN for Hermes's shutdown reason, and for no reason at all: of the two sides,
+        the one that cannot lose a finished turn at exit."""
+        if self.reason is None or self.reason == FINALIZE_SHUTDOWN_REASON:
+            return Trigger.SHUTDOWN
+        return Trigger.FINALIZE
+
+    def key_kind(self) -> KeyKind:
+        return KeyKind.SESSION
+
+    def key(self) -> str | None:
+        return self.session_id
+
+
+# -- the contract table ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ContractRow:
+    """One registration. `record` is the event type its payload parses into."""
+
+    surface: Surface
+    name: str
+    thread: CallbackThread
+    schema_field: str | None  # None: the version is not measured on this row, so not checked
+    record: type[Any]
+
+
+_H, _M = Surface.HOOK, Surface.MIDDLEWARE
+_T = "telemetry_schema_version"
+
+#: The one table registration is driven from, in registration order.
+CONTRACT: tuple[ContractRow, ...] = (
+    ContractRow(_H, "pre_llm_call", CallbackThread.HOOK_THREAD, _T, TurnStart),
+    ContractRow(_M, "llm_execution", CallbackThread.LOOP, "middleware_schema_version", CallEnter),
+    ContractRow(_H, "post_api_request", CallbackThread.HOOK_THREAD, _T, CallReport),
+    ContractRow(_H, "api_request_error", CallbackThread.HOOK_THREAD, _T, CallError),
+    ContractRow(
+        _M, "tool_execution", CallbackThread.TOOL_WORKER, "middleware_schema_version", ToolEnter
+    ),
+    ContractRow(_H, "post_tool_call", CallbackThread.HOOK_THREAD, _T, ToolReport),
+    ContractRow(_H, "pre_auxiliary_call", CallbackThread.HOOK_THREAD, _T, AuxStart),
+    ContractRow(_H, "post_auxiliary_call", CallbackThread.HOOK_THREAD, _T, AuxEnd),
+    ContractRow(_H, "subagent_start", CallbackThread.CALLER, _T, ChildStart),
+    ContractRow(_H, "subagent_stop", CallbackThread.CALLER, _T, ChildStop),
+    ContractRow(_H, "post_llm_call", CallbackThread.HOOK_THREAD, _T, TurnAnswer),
+    ContractRow(_H, "on_session_end", CallbackThread.HOOK_THREAD, _T, TurnEnd),
+    ContractRow(_H, "on_session_finalize", CallbackThread.CALLER, None, Finalize),
+)
+
+_KANBAN = "kanban workers are not measured, and the payload carries profile_name"
+_STORE = "session store lifecycle, not a turn"
+_IN_TOOL = "approval prompts run inside a tool frame and are outside the scope map"
+
+#: Every other hook name and middleware kind Hermes declares at the measured version, with the
+#: reason wardex leaves it alone. CONTRACT names plus these keys equal Hermes's full list.
+NOT_REGISTERED: Mapping[str, str] = {
+    "llm_request": "request middleware may rewrite the request and costs Hermes a deep copy of "
+    "it; llm_execution carries the same ids on the same loop thread",
+    "tool_request": "request middleware may rewrite tool arguments; tool_execution carries the "
+    "same ids",
+    "pre_api_request": "duplicates the llm_execution frame's ids from a hook thread",
+    "pre_tool_call": "duplicates the tool_execution frame's ids and can veto a tool",
+    "on_session_start": "fires per turn before pre_llm_call with no turn_id to key on",
+    "transform_llm_output": "a transform: its return value changes what the user sees",
+    "transform_tool_result": "a transform: its return value changes what the model sees",
+    "transform_terminal_output": "a transform: its return value changes terminal output",
+    "transform_api_error_classification": "a transform: its return value changes retry policy",
+    "on_stream_start": "the wire is the authority for content and timing",
+    "on_stream_delta": "the wire is the authority for content, and it costs a call per delta",
+    "on_stream_end": "the wire is the authority for content and timing",
+    "on_interim_message": "content",
+    "pre_verify": "its return value decides whether the turn continues",
+    "on_session_open": _STORE,
+    "on_session_reset": _STORE,
+    "on_session_delete": _STORE,
+    "on_skill_lifecycle": "skill lifecycle facts, not a turn",
+    "pre_gateway_dispatch": "can skip or rewrite an incoming message, and carries the sender",
+    "post_gateway_admission": "carries the sender, which is end-user identity and not recorded",
+    "agent_loop_stopped": "a gateway stop names a session key, not a turn; the interrupted "
+    "turn's on_session_end closes the turn",
+    "pre_approval_request": _IN_TOOL,
+    "post_approval_response": _IN_TOOL,
+    "on_human_input_request": "content, inside a tool frame",
+    "on_human_input_resolved": "content, inside a tool frame",
+    "on_room_member_activity": "hosted group chat, not measured",
+    "pre_transcription": "its return value can rewrite transcription parameters",
+    "kanban_task_claimed": _KANBAN,
+    "kanban_task_completed": _KANBAN,
+    "kanban_task_blocked": _KANBAN,
+    "on_kanban_worker_spawned": _KANBAN,
+    "on_kanban_worker_exited": _KANBAN,
+    "on_kanban_worker_stale_claim": _KANBAN,
+    "on_kanban_task_updated": _KANBAN,
+    "on_kanban_dispatch_tick": _KANBAN,
+    "gateway_platform_event": "platform envelopes such as reactions and edits, not a turn",
+    "pre_command": "slash commands, not a turn",
+    "post_compaction": "the compaction's model calls arrive as auxiliary calls; this adds only "
+    "a summary of content",
+    "post_curator_run": "curator passes write files, not turns",
+}
+
+
+# -- parsing -----------------------------------------------------------------------------------
+
+
+class Drift(Enum):
+    SCHEMA = "schema"  # a version other than KNOWN_SCHEMAS: the event is kept, measured=False
+    FIELD = "field"  # a required field absent or mistyped: the event is dropped and counted
+
+
+@dataclass(frozen=True, slots=True)
+class DriftNote:
+    kind: Drift
+    name: str  # the contract row's name
+    detail: str  # "telemetry_schema_version='hermes.observer.v2'" or "missing turn_id"
+
+
+def parse(row: ContractRow, payload: Mapping[str, Any]) -> tuple[Event | None, DriftNote | None]:
+    """One payload into (event or None, drift or None).
+
+    The caller passes Hermes's keyword arguments without `next_call`. Only the fields the row's
+    record names are read, so content fields, `request` and `next_call` are never touched. A
+    schema drift keeps the event, because recording goes on. A field drift drops it, because an
+    event with no turn_id cannot be placed and an invented one would be a made-up value; when
+    both happen, the field drift is the one returned. Never raises on mappings, strings, numbers
+    or lists; an object whose attribute access raises propagates to the caller's guard.
+    """
+    drift = None
+    if row.schema_field is not None:
+        seen = payload.get(row.schema_field)
+        if seen != KNOWN_SCHEMAS[row.schema_field]:
+            drift = DriftNote(Drift.SCHEMA, row.name, f"{row.schema_field}={seen!r}")
+    values: dict[str, object] = {}
+    missing: list[str] = []
+    for f in row.record.FIELDS:
+        v = f.read(payload.get(f.payload))
+        if v is not MISSING:
+            values[f.attr] = v
+        elif f.required:
+            missing.append(f.payload)
+    if missing:
+        return None, DriftNote(Drift.FIELD, row.name, "missing " + ", ".join(missing))
+    return row.record(**values), drift

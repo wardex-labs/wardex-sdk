@@ -103,6 +103,7 @@ PROVIDERS = (
     "httpx",
     "pydantic_ai",
     "opentelemetry",
+    "hermes_cli",
 )
 
 

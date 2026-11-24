@@ -144,7 +144,7 @@ class StreamIssuers:
         scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
         parent, conversation = latch_parent(scope.active_span_context, scope.conversation)
         closed, identity = parent_is_closed_unit(parent), issued_scope()
-        unseen = None if parent is not None else _hub.unseen_parent(scope)
+        unseen = None if parent is not None else _hub.unseen_parent(scope, observed=True)
         self._by_stream[stream_id] = (parent, closed, conversation, identity, unseen)
         while len(self._by_stream) > self._cap:
             self._by_stream.pop(min(self._by_stream))

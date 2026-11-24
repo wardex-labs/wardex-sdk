@@ -23,10 +23,13 @@ from wardex_sdk._assembly import (
     Evidence,
     Limitation,
     ParentSource,
+    _bridge_latch,
     child_of,
     counters,
+    expect_unreached,
     guard,
     latch_ambient,
+    release_unreached,
     resolve_parentage,
 )
 from wardex_sdk._assembly._diag import LOG_FAILED
@@ -410,6 +413,78 @@ def test_latch_ambient_outside_any_span_is_empty_but_usable():
 
     assert ambient.span_context is None
     assert resolve_parentage(ambient).correlation.strategy is ParentSource.TRACE_ROOT
+
+
+# --- work an adapter declared it could not reach ----------------------------
+
+
+@pytest.fixture
+def declarations(monkeypatch):
+    monkeypatch.setattr(_bridge_latch, "_UNREACHED", set())
+
+
+def _is_unresolved(p) -> bool:  # noqa: ANN001
+    return (
+        p.parent_span_id is None
+        and p.correlation.strategy is ParentSource.UNRESOLVED
+        and p.correlation.confidence == 0.0
+        and Limitation.PARENT_UNRESOLVED in p.limitations
+    )
+
+
+def _is_trace_root(p) -> bool:  # noqa: ANN001
+    return (
+        p.parent_span_id is None
+        and p.correlation.strategy is ParentSource.TRACE_ROOT
+        and p.correlation.confidence == 1.0
+        and p.limitations == ()
+    )
+
+
+def test_an_observed_parentless_request_is_unresolved_while_a_declaration_stands(declarations):
+    adapter = object()
+    expect_unreached(adapter, "title")
+    expect_unreached(adapter, "title")
+    expect_unreached(adapter, "compress")
+    assert _is_unresolved(resolve_parentage(latch_ambient(observed=True)))
+
+    release_unreached(adapter, "title")
+    assert _is_unresolved(resolve_parentage(latch_ambient(observed=True))), "one still stands"
+
+    release_unreached(adapter, "compress")
+    assert _is_trace_root(resolve_parentage(latch_ambient(observed=True)))
+    release_unreached(adapter, "compress")
+    assert _is_trace_root(resolve_parentage(latch_ambient(observed=True)))
+
+
+def test_a_root_wardex_opens_on_request_ignores_the_declaration(declarations):
+    expect_unreached(object(), "title")
+    assert _is_trace_root(resolve_parentage(latch_ambient()))
+
+
+def test_releasing_every_key_of_one_adapter_leaves_another_adapters_standing(declarations):
+    first, second = object(), object()
+    expect_unreached(first, "a")
+    expect_unreached(first, "b")
+    expect_unreached(second, "a")
+
+    release_unreached(first, None)
+    assert _is_unresolved(resolve_parentage(latch_ambient(observed=True))), "second's stands"
+    release_unreached(second, "a")
+    assert _is_trace_root(resolve_parentage(latch_ambient(observed=True)))
+
+
+def test_a_declaration_changes_nothing_for_a_request_that_has_a_parent(declarations):
+    expect_unreached(object(), "title")
+    parent = _ctx()
+    with _hub.new_scope() as scope:
+        scope.active_span_context = parent
+        p = resolve_parentage(latch_ambient(observed=True))
+
+    assert p.parent_span_id == parent.span_id
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
+    assert p.correlation.confidence == 1.0
+    assert p.limitations == ()
 
 
 # --- guard: swallow, but never in silence (I6) ------------------------------

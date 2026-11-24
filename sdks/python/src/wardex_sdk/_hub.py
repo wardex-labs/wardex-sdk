@@ -116,9 +116,20 @@ def get_current_scope() -> Scope:
 #: `unseen_parent`'s reasons, as the `Ambient` that latched one carries them.
 UNBOUND_THREAD = "unbound_thread"
 TRACEPARENT_UNREADABLE = "traceparent_unreadable"
+ADAPTER_UNREACHED = "adapter_unreached"
+
+#: Whether an adapter's declaration of unreached work stands. Installed at the first declaration by
+#: `_assembly/_bridge_latch.py`, which keeps the declarations and which this module may not import.
+_unreached: Callable[[], bool] | None = None
 
 
-def unseen_parent(scope: Scope) -> str | None:
+def set_unreached_probe(probe: Callable[[], bool] | None) -> None:
+    """Install (or, with None, remove) the answer `unseen_parent` asks for `ADAPTER_UNREACHED`."""
+    global _unreached
+    _unreached = probe
+
+
+def unseen_parent(scope: Scope, *, observed: bool = False) -> str | None:
     """Why a trace root about to start under `scope` may have a parent wardex could not see.
 
     `scope` is the running Context's current scope with no active span, read
@@ -131,16 +142,24 @@ def unseen_parent(scope: Scope) -> str | None:
     span reached is not the second: there a root is what the code asked for.
     Nor is a root beside other unbound threads' roots: a thread-per-request
     program without middleware has one per worker, and none parents another.
+
+    A third cause only an adapter knows. It has declared work running on a
+    carrier it could not reach (`BridgeVerbs.expect_unreached_carriers`), such
+    as a thread its host started from a context copied before the adapter ran.
+    It is asked only when `observed` is true, which a seam passes for traffic it
+    records and did not start. A span an adapter or the host opens itself stays
+    a root, because there the code asked for one.
     """
     if scope._parent_unreadable:
         return TRACEPARENT_UNREADABLE
-    if not on_unbound_thread(scope):
-        return None
-    # A root opened on an unbound thread marks its `Interrupt` so (`_tracing`).
-    # A snapshot: other threads open and close spans meanwhile.
-    open_now = list(runtime()._open_spans.values())
-    if any(not getattr(interrupt, "unbound_root", False) for interrupt in open_now):
-        return UNBOUND_THREAD
+    if on_unbound_thread(scope):
+        # A root opened on an unbound thread marks its `Interrupt` so (`_tracing`).
+        # A snapshot: other threads open and close spans meanwhile.
+        open_now = list(runtime()._open_spans.values())
+        if any(not getattr(interrupt, "unbound_root", False) for interrupt in open_now):
+            return UNBOUND_THREAD
+    if observed and _unreached is not None and _unreached():
+        return ADAPTER_UNREACHED
     return None
 
 
@@ -157,7 +176,8 @@ def on_unbound_thread(scope: Scope | None = None) -> bool:
 
 
 def explain_unseen_parent(reason: str) -> None:
-    """Say once why a root was recorded as unresolved; the traceparent case was said at entry."""
+    """Say once why a root was recorded as unresolved; the traceparent case was said at entry.
+    `ADAPTER_UNREACHED` is never said, being an adapter's documented behaviour and no mistake."""
     if reason == UNBOUND_THREAD:
         say_once(
             UNBOUND_THREAD,

@@ -207,7 +207,7 @@ class _ProcState:
                 # Latched on the stdin-write path — the task that ISSUED the
                 # request. The response arrives on the subprocess reader, whose
                 # scope says nothing about who asked (design §4.1).
-                ambient = latch_ambient()
+                ambient = latch_ambient(observed=True)
                 nested = False
                 if m.method == "tools/call":
                     ambient, nested = latch_tool_call(ambient, m.params)

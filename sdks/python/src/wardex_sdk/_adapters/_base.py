@@ -9,6 +9,7 @@ from .._assembly import Limitation
 
 if TYPE_CHECKING:
     from .._client import Client
+    from .._diagnostics import AdapterStatus
     from ._context import AdapterContext
 
 
@@ -72,3 +73,16 @@ class AdapterInterface(ABC):
         force them all to write the same empty body.
         """
         return None
+
+    def restate(self, filed: AdapterStatus) -> AdapterStatus:
+        """This adapter's status as of now, given the one its install filed.
+
+        For what an adapter learns only after `install()` returned, such as whether its host
+        ever attached it, or which contract version the host's payloads carry. While the filed
+        row reads INSTALLED, the registry calls it on every `statuses()` read, so
+        `wardex.diagnostics()` says it, and once more at uninstall, so the last answer outlives
+        `close()`. It must be cheap and must not raise. Only `state`, `measured`,
+        `measured_versions` and `detail` of the answer are kept. The row's name, framework and
+        version stay as filed. The default restates nothing.
+        """
+        return filed

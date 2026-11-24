@@ -23,7 +23,8 @@ import pytest
 import wardex_sdk as wardex
 from conftest import _FakeSSLSocket, client_spans
 from wardex_sdk import _hub, _wardex_native
-from wardex_sdk._assembly import Limitation
+from wardex_sdk._adapters._registry import context_for
+from wardex_sdk._assembly import Limitation, ParentSource
 from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
@@ -501,6 +502,37 @@ def test_a_model_call_from_an_unbound_thread_while_a_span_is_open_is_not_a_confi
     assert (Limitation.PARENT_UNRESOLVED in span.capture_integrity.limitations) is not bound
     said = [r for r in caplog.records if "wardex.bind_context(fn)" in r.getMessage()]
     assert len(said) == (0 if bound else 1)
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["nothing-declared", "declared"])
+def test_a_model_call_from_work_an_adapter_could_not_reach_is_not_a_confident_root(
+    server, caplog, declared
+):
+    """A host thread started from a context copied before the adapter ran sends a model call with
+    no parent. While the adapter says such work is in flight the call is unresolved, and nothing
+    tells the user to change their threading, because there is nothing for them to change."""
+    _hub._said.clear()
+    server.post_reply = _CHAT_REPLY
+    wardex.init(transport=wardex.NoOpTransport(), adapters=wardex.AdaptersConfig(enabled=()))
+    ctx = context_for("unreached", _hub.get_client())
+    if declared:
+        ctx.expect_unreached_carriers("title")
+    call = functools.partial(_post, server.port, "/v1/chat/completions", _CHAT_REQUEST)
+    try:
+        with caplog.at_level("WARNING", logger="wardex_sdk"):
+            thread = threading.Thread(target=call)
+            thread.start()
+            thread.join()
+    finally:
+        ctx.release_unreached_carriers(None)
+    (span,) = [s for s in client_spans() if s.name == "HTTP POST /v1/chat/completions"]
+    assert span.parent_span_id is None
+    assert span.correlation.strategy is (
+        ParentSource.UNRESOLVED if declared else ParentSource.TRACE_ROOT
+    )
+    assert span.correlation.confidence == (0.0 if declared else 1.0)
+    assert (Limitation.PARENT_UNRESOLVED in span.capture_integrity.limitations) is declared
+    assert [r.getMessage() for r in caplog.records if r.name.startswith("wardex_sdk")] == []
 
 
 # --- intercept_hosts names a TLS host too ---------------------------------------------------

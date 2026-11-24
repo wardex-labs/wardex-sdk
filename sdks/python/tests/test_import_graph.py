@@ -932,6 +932,7 @@ _LAYER_RANK: dict[str, int] = {
     #      command line that checks an install.
     "__init__.py": 12,
     "__main__.py": 12,
+    "hermes_agent.py": 12,
     "testing/": 12,
 }
 

@@ -69,7 +69,7 @@ caps in `CaptureLimits`. Being uncollected also excludes it from the 3.10 floor
 check, which runs pytest — so after editing it, run it once more under
 `.venv-py310/bin/python`. Nothing else will catch a 3.11+-only call in there.
 
-Five more files are uncollected for the same reason and run only when a
+Six more files are uncollected for the same reason and run only when a
 person does. Each names the change that should trigger it:
 
 | File | Run it when you touch | Needs |
@@ -79,6 +79,7 @@ person does. Each names the change that should trigger it:
 | `sdks/python/tests/bench_parse_off_loop.py` | the parse-off-loop worker, the GIL release in `parse_llm_semantics`, or anything on the streaming hot path (event-loop drift, throughput, the GIL budget the bench itself prints) | nothing; `--quick` for a smoke run, report the full run |
 | `sdks/python/tests/bench_fork_semantics.py` | the fork hook, `Runtime._fork_reinit_us`, or the per-batch pid stamp | nothing |
 | `sdks/python/tests/bench_host_overhead.py` | the byte seams' send/recv wrappers, the HTTP/1 tracker or parser, the request-head capture decision (`_interceptors/_admission.py`), or anything else a request wardex does not keep passes through (budget: the added host-thread CPU per request the bench prints) | nothing; `--quick` for a smoke run, report the full run |
+| `sdks/python/tests/e2e_hermes_smoke.py` | any `_hermes_agent*` module or the fake Hermes (`tests/_hermes_fake.py`, `tests/_hermes_replay.py`); also run it against each new Hermes Agent release tag (`--record DIR` regenerates the fixtures and `contract_names.json`; `--off` checks a build with the plugin absent) | a Hermes Agent checkout and a Python environment with it installed; loopback only, no model key |
 
 The Rust core carries eight more. They are marked `#[ignore]`, so `cargo test
 --workspace` compiles them and runs none of them — it counts them in the
@@ -276,7 +277,7 @@ rank 8   `_client.py` · `_finalize.py`
 rank 9   `_adapters/` · `_interceptors/`
 rank 10  `_runtime.py`
 rank 11  `_decorators.py` · `_environment.py` · `_snapshot_api.py` · `_tracing.py`
-rank 12  `__init__.py` · `__main__.py` · `testing/`
+rank 12  `__init__.py` · `__main__.py` · `hermes_agent.py` · `testing/`
 ```
 
 - Ranks 2..10 are the order the imports are meant to have, not one they already

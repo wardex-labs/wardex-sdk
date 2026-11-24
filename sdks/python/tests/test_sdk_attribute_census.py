@@ -84,6 +84,8 @@ _MCP = "_interceptors/_mcp_stdio.py"
 _GENAI = "_semantics/_genai.py"
 _CX = "_adapters/_codex_exec.py"
 _PA = "_adapters/_pydantic_ai.py"
+_HA = "_adapters/_hermes_agent.py"
+_HF = "_adapters/_hermes_agent_frames.py"
 
 #: Every `set_extra` call in the package: (module, key as written, value as
 #: written) and where the value comes from. One row per call, so a key written
@@ -171,6 +173,40 @@ _SITES: list[tuple[str, str, str, str]] = [
     # tables in `_pydantic_ai_attrs.py`: run ids, demoted usage counts, cost, cache and
     # retry facts. Mixed, so judged as the host's: nothing is exempted from the walk.
     (_PA, "key", "value", HOST),
+    # -- the Hermes Agent adapter --
+    # Which close-table row closed the turn: one of `CLOSE_RULES`' literals.
+    (_HA, "PREFIX + 'close_cause'", "rule.literal", LITERAL),
+    # The turn's generation (0, or one more per time the loop came back to a presumed-closed
+    # turn), and Hermes's usage numbers, held off the typed block in both frame kinds.
+    (_HA, "PREFIX + 'generation'", "record.generation", NUMBER),
+    (_HF, "HOLD_PREFIX + key", "n", NUMBER),
+    (_HF, "HOLD_PREFIX + key", "n", NUMBER),
+    # What Hermes states, copied as it states it: its turn, session, request and subagent ids,
+    # the platform and API mode it names, a child's role, an auxiliary call's task, a tool's
+    # status, an end's exit reason, a failed request's reason, and the tool names a model
+    # asked for that never ran.
+    (_HA, "PREFIX + 'turn_id'", "record.turn_id", HOST),
+    (_HA, "PREFIX + 'platform'", "platform", HOST),
+    (_HA, "PREFIX + 'session_id'", "session_id", HOST),
+    (_HA, "PREFIX + 'child_role'", "tie.child_role", HOST),
+    (_HA, "PREFIX + 'child_subagent_id'", "tie.child_subagent_id", HOST),
+    (_HA, "PREFIX + 'exit_reason'", "event.exit_reason", HOST),
+    (_HA, "PREFIX + 'error_reason'", "error_reason", HOST),
+    (
+        _HA,
+        "PREFIX + 'undispatched_tool_calls'",
+        "','.join(undispatched[:UNDISPATCHED_NAMES])",
+        HOST,
+    ),
+    (_HA, "PREFIX + 'aux_tasks'", "','.join(aux_tasks)", HOST),
+    (_HF, "PREFIX + 'aux_request_id'", "event.aux_request_id", HOST),
+    (_HF, "PREFIX + 'aux_task'", "event.aux_task", HOST),
+    (_HF, "PREFIX + 'api_request_id'", "request_id", HOST),
+    (_HF, "PREFIX + 'turn_id'", "turn_id", HOST),
+    # a tool Hermes ran before the turn's first model call: no link, so it states its turn
+    (_HF, "PREFIX + 'turn_id'", "turn_id", HOST),
+    (_HF, "PREFIX + 'api_mode'", "api_mode", HOST),
+    (_HF, "PREFIX + 'tool_status'", "report.status", HOST),
     # -- the LangGraph adapter --
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),
@@ -277,6 +313,17 @@ _LITERAL_SETS: dict[tuple[str, str], Callable[[], tuple[str, ...]]] = {
     (_AS, "step_name"): lambda: (
         *importlib.import_module("wardex_sdk._adapters._otel_merge")._STEP_NAMES.values(),
         "llm_request",
+    ),
+    # Every literal the Hermes close table can write as the turn's close cause.
+    (_HA, "rule.literal"): lambda: tuple(
+        sorted(
+            {
+                rule.literal
+                for rule in importlib.import_module(
+                    "wardex_sdk._adapters._hermes_agent_turns"
+                ).CLOSE_RULES.values()
+            }
+        )
     ),
     # The kind of model span that requested the call, or the Responses label when none said.
     (_OA, "source"): lambda: tuple(

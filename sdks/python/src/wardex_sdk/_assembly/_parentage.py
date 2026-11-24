@@ -222,7 +222,7 @@ class Ambient:
 EMPTY_AMBIENT = Ambient(None, None, None)
 
 
-def latch_ambient() -> Ambient:
+def latch_ambient(*, observed: bool = False) -> Ambient:
     """Read the active parent NOW, on the caller's task/thread.
 
     Call this at the moment the outbound work is ISSUED (socket write, stdin
@@ -230,6 +230,10 @@ def latch_ambient() -> Ambient:
     time the ambient context has moved on. Naming this is the point: reading
     the context on the response path is the single most likely way a new
     adapter silently breaks the tree.
+
+    `observed` is for a seam recording traffic it did not start, and only
+    there may an adapter's unreached carriers make a root unresolved
+    (`_hub.unseen_parent`). A span wardex opens on request never passes it.
     """
     scope = _hub.get_current_scope()
     parent = scope.active_span_context
@@ -237,7 +241,7 @@ def latch_ambient() -> Ambient:
         span_context=parent,
         conversation=scope.conversation,
         tracestate=scope.tracestate,
-        unseen_parent=None if parent is not None else _hub.unseen_parent(scope),
+        unseen_parent=None if parent is not None else _hub.unseen_parent(scope, observed=observed),
     )
 
 

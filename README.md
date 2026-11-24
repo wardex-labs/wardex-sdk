@@ -220,6 +220,7 @@ tree.
 | LangGraph (tested on `langgraph` 1.2.x) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
 | Pydantic AI (tested on `pydantic-ai-slim` 2.x) | each agent run, model call and tool call, read from pydantic-ai's own OpenTelemetry spans; the model call's messages and token usage come from the wire |
 | Claude Agent SDK (tested on `claude-agent-sdk` 0.2.x) | agent turns and model calls, with tool calls correlated |
+| Hermes Agent (through a Hermes plugin; measured on v0.23.3) | each turn, each model call with every HTTP attempt under it, each tool call and each subagent turn; what wardex could not see is marked |
 | Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |
 | Any other framework, or your own loop | model calls with model, messages and token usage; decorators add the structure |
 
@@ -282,6 +283,118 @@ unwrapped function, and so does a client constructed before it. Such a session
 is still recorded, from the CLI's output alone: its root span carries
 `instrumentation_degraded`, and a warning on stderr says so once. Call `init()`
 before that import, or call `claude_agent_sdk.query(...)` through the module.
+
+The Hermes Agent adapter is reached through a Hermes plugin, because a
+Hermes user runs `hermes` and has no entry point of their own to call
+`init()` from. The plugin is one import, and Hermes calls `register` when it
+loads the plugin:
+
+```python
+# <Hermes home>/plugins/wardex/__init__.py
+from wardex_sdk.hermes_agent import register
+```
+
+The plugin's `plugin.yaml` lists the hook names in
+`wardex_sdk.hermes_agent.HOOKS` and the middleware kinds in `MIDDLEWARE`.
+`register` calls `init()` from the environment (`WARDEX_API_KEY` or
+`WARDEX_ENDPOINT`) unless your process already called it. wardex imports and
+patches nothing of Hermes. Its hooks return nothing, and each middleware call
+hands Hermes back its own result or its own exception.
+
+Each Hermes turn is one trace:
+
+- `invoke_agent hermes` is the turn. Its input is the user's message and its
+  output is Hermes's final response, through the same capped, masked payload
+  path as a tool's arguments and result. The message is recorded when the
+  turn's first model call starts, so a prompt that another plugin's
+  `pre_llm_call` blocked is in no span.
+  It is the message as the user sent it: a plugin that rewrites the model
+  request (an `llm_request` middleware) changes what the `chat` spans show,
+  not this input or a tool's recorded result.
+- A `chat` span per model call, with every HTTP attempt under it, the failed
+  ones too.
+- An `execute_tool` span per tool call, linked to the model call that asked
+  for it. A tool Hermes stopped waiting for (a timeout or a cancel) is
+  `ERROR`, with the message Hermes showed the model as its result.
+- A subagent's turn under the `delegate_task` call that started it, with the
+  parent's `gen_ai.conversation.id`. A subagent that outlives that call is a
+  trace of its own, linked to the turn that started it.
+
+A turn's status is what Hermes said: `OK` when Hermes reported the turn
+complete, `ERROR` when it reported the turn failed. Hermes reports no end for
+a failed turn, nor for one it stops early (a refusal, an answer cut at the
+output limit, three invalid tool calls in a row), and a failed model call
+does not end a turn, because Hermes retries it and may still answer. A turn
+Hermes never ended is closed unset
+with `session_aborted`, and `wardex.hermes_agent.close_cause` says why:
+
+- `next_turn`: the session's next turn began.
+- `finalize`: Hermes closed that session.
+- `idle`: no event of the turn came for 120 seconds. After a failed model
+  call the wait is 300 seconds, long enough for Hermes's retry waits and its
+  recovery ladder, and `wardex.hermes_agent.error_reason` keeps Hermes's
+  reason. The wait lasts until Hermes's loop goes on (its next attempt, a
+  tool, an answer). An auxiliary call that ends during it does not cut it
+  short.
+
+Two consequences of that wait: a provider `Retry-After` longer than 300
+seconds splits the turn into two spans with one `turn_id`, the second with
+`wardex.hermes_agent.generation` 1 and a `resumed_from` link to the first;
+and a gateway that stops while a turn Hermes never ended is still inside its
+wait (120 seconds, 300 after a failed model call), with no session closed
+first, exports that turn's model calls and not the turn span above them.
+
+wardex cannot tell a turn Hermes stopped from one still running, so a turn
+that starts on the same thread while another is open is never put under that
+turn. It sits under your own span if one is open there, and is a trace of
+its own if none is. The open turn is left as it is. That includes an agent
+your code runs from a `step_callback`: Hermes states no parent for it. When the open turn's last model call answered (a
+turn Hermes stopped, or a refusal), two things still land in its trace: a
+span your code opens on that thread before that turn closes, with all that
+runs inside it, a new turn included; and, when Hermes writes session titles,
+the HTTP attempt of the new turn's title call, unmarked. Both inherit the
+thread's context, where that turn is still current.
+
+What wardex cannot place is marked and never placed by a guess:
+
+- Hermes's background memory review and a side question run with no turn
+  start. Each of their model calls is a `chat` span with no turn above it,
+  marked `parent_unresolved`, carrying the `wardex.hermes_agent.turn_id`
+  Hermes gave it. A tool Hermes runs before a turn's first model call is such
+  a root too.
+- The session-title call, which Hermes starts on its own thread, and an
+  auxiliary call outside any turn (an MCP server's sampling request):
+  `parent_unresolved` on the HTTP attempt, except for the title call of a
+  turn that starts while another is open (above). The title call's span
+  built from Hermes's report carries `possible_duplicate_chat`.
+- A tool call the model asked for and Hermes never ran:
+  `tool_call_not_dispatched` on the turn, and
+  `wardex.hermes_agent.undispatched_tool_calls` names it. It is decided for
+  each model call by tool name, never by id, because Hermes renames ids
+  before it runs a call. Names match ignoring case and separators, as
+  Hermes's own name repair does. A `tool_call` bridge call accounts for the
+  tools Hermes ran for it under their own names, so a call beside it that no
+  tool matches is named. A tool that ran under a legacy alias is matched by
+  count, so in a call that also skipped a tool the name can be the wrong one
+  of two, and beside a bridge call the alias itself is named. Of two identical
+  bridge calls in one model call Hermes runs only the first, and the one it
+  dropped is not named.
+- A turn whose model calls ran outside the process:
+  `subprocess_model_calls_unobserved` on the turn.
+- A tool that code in `execute_code` calls sits under the `execute_code`
+  span with no call id and status unset. Hermes names it no id, so Hermes's
+  report cannot be matched to it.
+
+Hermes states a conversation id only on tool events, so a turn takes it from
+an earlier event of its session and otherwise opens with the session id. The
+two differ in one case known on v0.23.3: the first turn of a session resumed
+after another process compressed it.
+
+The adapter is measured by the contract versions Hermes states in each
+payload (`hermes.observer.v1`, `hermes.middleware.v1`). On another version it
+still records, and `wardex.diagnostics()` reports `measured=False`. While the
+plugin is not enabled, the adapter reads `unsupported` and its detail names
+the command that enables it.
 
 The Pydantic AI adapter reads the OpenTelemetry spans pydantic-ai already
 emits (`invoke_agent`, `chat`, `execute_tool`, instrumentation schema version
