@@ -571,6 +571,23 @@ SCENARIOS: dict[str, Scenario] = {
         ("answer", "call-again", "call-first"),
         fixture=False,
     ),
+    "rewritten_request": Scenario(
+        "Turn",
+        "[smoke:rewritten_request] Say hello to Ada Lovelace.",
+        # Matches only the replaced request, so the provider is shown to have received it.
+        [
+            _rule(
+                [_text("answer", "Hello from the smoke provider.")],
+                last_user_contains="<name>",
+                not_contains="Ada Lovelace",
+                **_FIRST,
+            )
+        ],
+        ("answer",),
+        modes=("library", "cli"),
+        env={"HERMES_SMOKE_REWRITE": "[smoke:rewritten_request] Say hello to <name>."},
+        fixture=False,
+    ),
     "failing_tool": Scenario(
         "Tool calls, sequential and parallel",
         "[smoke:failing_tool] Read a missing file.",
@@ -712,9 +729,30 @@ ROWS: tuple[Row, ...] = (
                     INPUT: "[smoke:single_turn] Say hello.",
                     OUTPUT: "Hello from the smoke provider.",
                 },
+                absent=(A + "request_rewritten",),
             ),
-            Span(CHAT, parent=TURN),
+            Span(CHAT, parent=TURN, absent=(A + "request_rewritten",)),
             Span(CHAT, parent=CHAT, source=CTX, confidence=1.0),
+        ),
+    ),
+    Row(
+        # Another plugin's `llm_request` middleware replaced the request (the witness, with
+        # `HERMES_SMOKE_REWRITE`): the call and its turn say so, and the turn's input is still
+        # the message the user sent.
+        "Turn",
+        "rewritten_request",
+        (
+            Traces(1),
+            Span(
+                TURN,
+                parent="",
+                status="OK",
+                attrs={
+                    A + "request_rewritten": True,
+                    INPUT: "[smoke:rewritten_request] Say hello to Ada Lovelace.",
+                },
+            ),
+            Span(CHAT, parent=TURN, attrs={A + "request_rewritten": True}),
         ),
     ),
     Row(
@@ -1795,7 +1833,9 @@ def register(ctx):
 """
 
 #: When not recording, the schema versions Hermes states are read by this plugin: one hook and
-#: one request middleware, neither of them in the adapter's set, both returning None.
+#: one request middleware, neither of them in the adapter's set, both returning None. With
+#: `HERMES_SMOKE_REWRITE` set (`Scenario.env`), the request middleware instead hands Hermes a
+#: request whose last user message is that text, as a plugin that scrubs a name would.
 WITNESS = r"""
 import importlib, json, os
 def _note(**kwargs):
@@ -1803,13 +1843,21 @@ def _note(**kwargs):
             if kwargs.get(k)}
     with open(os.environ["HERMES_SMOKE_SCHEMAS"], "a", encoding="utf-8") as fh:
         fh.write(json.dumps(seen) + "\n")
+def _rewrite(**kwargs):
+    _note(**kwargs)
+    text, request = os.environ.get("HERMES_SMOKE_REWRITE"), kwargs.get("request")
+    users = [m for m in (request or {}).get("messages") or [] if m.get("role") == "user"]
+    if not text or not users:
+        return None
+    users[-1]["content"] = text
+    return {"request": request, "name": "smoke-rewrite"}
 def register(ctx):
     # `Scenario.nets`: loaded after wardex, so its modules are imported; read at call time.
     for name, value in json.loads(os.environ.get("HERMES_SMOKE_NETS") or "{}").items():
         module, constant = name.rsplit(".", 1)
         setattr(importlib.import_module("wardex_sdk._adapters." + module), constant, value)
     ctx.register_hook("on_session_start", _note)
-    ctx.register_middleware("llm_request", _note)
+    ctx.register_middleware("llm_request", _rewrite)
 """
 
 MCP_ECHO = r"""

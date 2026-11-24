@@ -386,8 +386,7 @@ class FrameState(Enum):
               turn's model-call frame also takes the turn's pin down on its task, since a
               turn that failed for good sends no end, and Hermes's next attempt pins it again
     AWAITING_REPORT -> (its turn closes first) closed by the core with CHILD_SPAN_UNCLOSED
-    A frame no report can reach (`reportable()` False) goes PINNED -> CLOSED at frame exit,
-    UNSET unless it raised.
+    A frame no report reaches (`reportable()` False): PINNED -> CLOSED at exit, UNSET unless raised.
     """
 
     PINNED = "pinned"
@@ -551,6 +550,7 @@ class TurnRecord:
     #: turn's first model-call frame, or an end event that is not another plugin's block.
     held_input: object = None
     blocked: bool = False  # Hermes ended the turn because another plugin blocked its prompt
+    request_rewritten: bool = False  # another plugin's llm_request replaced a call's request
     last_event: float = field(default_factory=time.monotonic)
 
     def advance(self, trigger: Trigger, now: float | None = None) -> Step:

@@ -259,6 +259,8 @@ class FrameEffects:
         with record.lock:
             record.model_frames += 1
             record.frames[(FrameKind.MODEL_CALL, event.api_request_id)] = frame
+            if event.request_rewritten:  # the turn says so once, at its close
+                record.request_rewritten = True
             held, record.held_input = record.held_input, None
         if held is not None:
             self._release_input(record, held)
@@ -298,10 +300,12 @@ class FrameEffects:
     def _open_call(self, frame: FrameRecord, event: CallEnter) -> None:
         """The logical call: CALL, CHAT, NESTED under the turn pinned on this loop thread. Every
         HTTP attempt of the frame, retries included, nests under it. An orphan states the turn
-        id Hermes gave it, so a reader can group one fork's calls."""
+        id Hermes gave it, so a reader can group one fork's calls. A call whose request another
+        plugin replaced says so: its wire spans show that request, not the turn's input."""
         ctx = self._ctx
         assert ctx is not None
         model, request_id, api_mode = event.model, event.api_request_id, event.api_mode
+        rewritten = event.request_rewritten
         turn_id = event.turn_id if frame.orphan else None
 
         def describe(h: RunHandle) -> None:
@@ -311,6 +315,8 @@ class FrameEffects:
                 h.draft.set_extra(PREFIX + "turn_id", turn_id)
             if api_mode:
                 h.draft.set_extra(PREFIX + "api_mode", api_mode)
+            if rewritten:
+                h.draft.set_extra(PREFIX + "request_rewritten", True)
             h.alias(UnitKey(CALL_NS, request_id), remember=True)
 
         handle = ctx.open_run(

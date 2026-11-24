@@ -310,7 +310,11 @@ Each Hermes turn is one trace:
   `pre_llm_call` blocked is in no span.
   It is the message as the user sent it: a plugin that rewrites the model
   request (an `llm_request` middleware) changes what the `chat` spans show,
-  not this input or a tool's recorded result.
+  not this input or a tool's recorded result. When another plugin's
+  `llm_request` middleware replaced a model call's request, that call's
+  `chat` span and its turn carry `wardex.hermes_agent.request_rewritten`:
+  the `chat` span shows the request as sent, and the turn's input and the
+  tool results show the originals.
 - A `chat` span per model call, with every HTTP attempt under it, the failed
   ones too.
 - An `execute_tool` span per tool call, linked to the model call that asked

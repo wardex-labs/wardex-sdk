@@ -181,6 +181,10 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_HA, "PREFIX + 'generation'", "record.generation", NUMBER),
     (_HF, "HOLD_PREFIX + key", "n", NUMBER),
     (_HF, "HOLD_PREFIX + key", "n", NUMBER),
+    # Another plugin's `llm_request` middleware replaced a model call's request: a flag, on the
+    # call and on its turn.
+    (_HA, "PREFIX + 'request_rewritten'", "True", NUMBER),
+    (_HF, "PREFIX + 'request_rewritten'", "True", NUMBER),
     # What Hermes states, copied as it states it: its turn, session, request and subagent ids,
     # the platform and API mode it names, a child's role, an auxiliary call's task, a tool's
     # status, an end's exit reason, a failed request's reason, and the tool names a model

@@ -231,6 +231,8 @@ _NEVER_READ = {
     "child_goal": "SECRET",
     "child_summary": "SECRET",
     "error_message": "SECRET",
+    # Another plugin's own words about its rewrite: only whether there is an entry is kept.
+    "middleware_trace": [{"source": "SECRET", "reason": "SECRET", "name": "SECRET"}],
 }
 
 
