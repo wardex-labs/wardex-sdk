@@ -118,14 +118,6 @@ Python 3.10 or newer. Prebuilt wheels cover Linux with glibc (x86_64,
 aarch64), macOS (x86_64, arm64) and Windows (x86_64), so nothing compiles on
 install. Other platforms, such as Alpine (musl), have no wheel yet.
 
-This README describes the main branch. The current release on PyPI,
-0.6.0b1, does not have `python -m wardex_sdk doctor` or `explain`,
-`wardex.diagnostics().report()`, `wardex.current_span()`, `Span.set_input()`,
-`Span.set_output()`, `Span.add_event()`, `wardex.set_account()`,
-`capture_io=`, `wardex.testing.assert_no_capture_gaps()`, `--wardex-strict`
-or the `api_key` rows below; they arrive with the next release. Until then,
-install from a clone with a Rust toolchain: `pip install ./sdks/python`.
-
 ## Quickstart
 
 Point the SDK at any OpenTelemetry backend that accepts OTLP/HTTP (Langfuse,
