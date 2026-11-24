@@ -27,10 +27,12 @@ jobs:
         platform:
           - { runner: ubuntu-latest,  target: x86_64,  manylinux: auto }
           - { runner: ubuntu-latest,  target: aarch64, manylinux: auto }
-          # Intel macOS wheel is cross-compiled on an Apple Silicon runner —
-          # the macos-13 Intel hosted runner is retired / capacity-starved.
-          - { runner: macos-14,       target: x86_64,  manylinux: "" }
-          - { runner: macos-14,       target: aarch64, manylinux: "" }
+          # Intel macOS wheel is cross-compiled on an Apple Silicon runner.
+          # The label names an image GitHub still hosts: macOS 14 images were
+          # retired on 2026-11-02, and a job on a retired label is cancelled
+          # before it starts ("The configuration ... is not supported").
+          - { runner: macos-15,       target: x86_64,  manylinux: "" }
+          - { runner: macos-15,       target: aarch64, manylinux: "" }
           - { runner: windows-latest, target: x64,     manylinux: "" }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -88,8 +90,8 @@ jobs:
           - { runner: ubuntu-latest,  target: x86_64,  how: native,  python: "3.12" }
           - { runner: ubuntu-latest,  target: x86_64,  how: native,  python: "3.10" }
           - { runner: ubuntu-latest,  target: aarch64, how: qemu,    python: "3.12" }
-          - { runner: macos-14,       target: x86_64,  how: rosetta, python: "3.12" }
-          - { runner: macos-14,       target: aarch64, how: native,  python: "3.12" }
+          - { runner: macos-15,       target: x86_64,  how: rosetta, python: "3.12" }
+          - { runner: macos-15,       target: aarch64, how: native,  python: "3.12" }
           - { runner: windows-latest, target: x64,     how: native,  python: "3.12" }
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
