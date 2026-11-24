@@ -283,9 +283,13 @@ class FakePluginContext:
         for dispatcher in list(self._streams.values()):
             dispatcher.drain(timeout)
 
-    def run_request_chain(self, kind: str, payload_key: str, **kwargs: Any) -> Any:
+    def run_request_chain(
+        self, kind: str, payload_key: str, trace: list[dict[str, str]] | None = None, **kwargs: Any
+    ) -> Any:
         """`_apply_request_chain` + `invoke_middleware(_payload_key=...)`: each callback gets its
-        own copy of the payload; a dict returned under `payload_key` replaces it for the next."""
+        own copy of the payload; a dict returned under `payload_key` replaces it for the next and
+        appends one entry to `trace` (its `source`, `reason` and `name` strings, or
+        `{"source": "plugin"}`), which Hermes hands the execution frame as `middleware_trace`."""
         kwargs = middleware_payload(kwargs)
         original_key = "original_" + payload_key
         kwargs.setdefault(original_key, kwargs[payload_key])
@@ -302,6 +306,13 @@ class FakePluginContext:
                 continue
             if isinstance(ret, dict) and isinstance(ret.get(payload_key), dict):
                 kwargs[payload_key] = ret[payload_key]
+                if trace is not None:
+                    said = {
+                        k: v
+                        for k in ("source", "reason", "name")
+                        if isinstance(v := ret.get(k), str) and v
+                    }
+                    trace.append(said or {"source": "plugin"})
         return kwargs[payload_key]
 
     def run_execution_chain(self, kind: str, terminal: Callable[[Any], Any], **kwargs: Any) -> Any:

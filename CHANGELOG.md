@@ -111,6 +111,10 @@ All notable changes to this project are documented here. The format follows
   nothing of Hermes, and Hermes gets its own results and exceptions back.
   Measured on Hermes Agent v0.23.3 (`hermes.observer.v1`,
   `hermes.middleware.v1`). The README's adapter section has the details.
+- **A Hermes model call whose request another plugin rewrote says so.** When
+  another plugin's `llm_request` middleware replaced the request, the call's
+  `chat` span and its turn carry `wardex.hermes_agent.request_rewritten`, so
+  a reader knows the turn's input is not what the provider received.
 - **`tool_call_not_dispatched` is a new limitation marker.** It is on a run
   whose model asked for a tool call the framework never ran.
 - **`python -m wardex_sdk doctor` checks an install end to end.** It reads

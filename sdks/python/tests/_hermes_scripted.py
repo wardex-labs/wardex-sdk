@@ -141,9 +141,8 @@ class FakeHermes:
         n = next(self._seq)
         asked = tuple((f"call_lab_{n}_{k}", name) for k, name in enumerate(tool_calls))
         used = usage or Usage(1000 + n, 10 + n)
-        request = self.ctx.run_request_chain(
-            "llm_request", "request", request={"model": self.model, "messages": []}, **ids
-        )
+        sent, trace = {"model": self.model, "messages": []}, []  # `turn_api_request.py`
+        request = self.ctx.run_request_chain("llm_request", "request", trace, request=sent, **ids)
         self._emit("pre_api_request", {**ids, "retry_count": retry_count})
         worker = turn.parent is None if on_worker is None else on_worker
         statuses: list[int | None] = []
@@ -162,9 +161,8 @@ class FakeHermes:
             return SimpleNamespace(tool_calls=asked)
 
         try:
-            self.ctx.run_execution_chain(
-                "llm_execution", terminal, request=request, original_request=request, **ids
-            )
+            frame = {**ids, "original_request": sent, "middleware_trace": list(trace)}
+            self.ctx.run_execution_chain("llm_execution", terminal, request=request, **frame)
         except ProviderStatusError as exc:
             self.ctx.invoke_hook(
                 "transform_api_error_classification",

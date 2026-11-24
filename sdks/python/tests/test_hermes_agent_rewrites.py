@@ -7,15 +7,22 @@ name. None of that is a call that never ran, so a turn says `tool_call_not_dispa
 an asked call that no frame under its model call explains, and a bridge call explains any
 number of frames. Each case is driven on the fake Hermes with the rewrite Hermes v0.23.3 makes
 (`_hermes_payloads.py`).
+
+A model request another plugin's `llm_request` middleware replaced is a rewrite of another kind:
+the wire carries the replacement, and wardex keeps the user's message and the tool results as
+they were. Hermes states each replacement in `middleware_trace`, and the call and its turn carry
+`wardex.hermes_agent.request_rewritten`, so a reader knows the two differ.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from _hermes_fake import Reply
+import wardex_sdk
+from _hermes_fake import FakePluginContext, Reply
 from _hermes_payloads import (
     BRIDGE,
     bridge_split,
@@ -24,7 +31,7 @@ from _hermes_payloads import (
     reused_ids_renamed,
     runs_as,
 )
-from _hermes_scripted import FakeHermes, Turn
+from _hermes_scripted import QUESTION, FakeHermes, Turn
 from _hermes_support import (
     exported,
     extras,
@@ -39,6 +46,9 @@ from _hermes_support import (
 from wardex_sdk._assembly import Limitation
 
 TURN = "invoke_agent hermes"
+CHAT = "chat lab-model"
+REWRITTEN = "request_rewritten"
+SCRUBBED = "<scrubbed>"
 
 
 @pytest.fixture(autouse=True)
@@ -185,3 +195,127 @@ def test_a_repaired_name_beside_an_invented_tool_leaves_only_the_invented_one_na
     markers, attrs = _turn(script)
     assert Limitation.TOOL_CALL_NOT_DISPATCHED in markers
     assert attrs["undispatched_tool_calls"] == "lab_no_such_tool"
+
+
+# -- a model request another plugin rewrote ------------------------------------------------------
+
+
+def _scrub(**payload: Any) -> dict[str, Any]:
+    """A customer-name scrubber: replaces the request Hermes is about to send."""
+    request = dict(payload["request"])
+    request["messages"] = [{"role": "user", "content": SCRUBBED}]
+    return {"request": request, "name": "scrubber"}
+
+
+def _observe(**payload: Any) -> None:
+    """Reads the request and hands nothing back, so Hermes sends it unchanged."""
+
+
+def _beside(ctx: FakePluginContext, kind: str, callback: Any) -> FakePluginContext:
+    """A second plugin on the same Hermes, its middleware in the same table as wardex's."""
+    other = FakePluginContext(plugin_id="other", hooks=ctx.hooks, middleware=ctx.middleware)
+    other.register_middleware(kind, callback)
+    return other
+
+
+def _run(*callbacks: Any, calls: int = 1) -> tuple:
+    """One turn of `calls` model calls with each callback registered as another plugin's
+    `llm_request` middleware; every exported span."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        others = [_beside(ctx, "llm_request", cb) for cb in callbacks]
+
+        def run() -> None:
+            turn = h.turn()
+            for _ in range(calls):
+                h.model_call(turn)
+            h.end(turn)
+
+        on_loop(run)
+        assert [f for c in (ctx, *others) for f in c.failures] == []
+    return exported(transport)
+
+
+def test_a_request_another_plugin_rewrote_is_flagged_on_its_call_and_its_turn():
+    """The turn's input stays the message the user sent, and the call and the turn both say the
+    provider was sent something else."""
+    nodes = _run(_scrub)
+    turn = one(nodes, TURN)
+    assert extras(one(nodes, CHAT))[REWRITTEN] is True
+    assert extras(turn)[REWRITTEN] is True
+    assert turn.attributes.get("wardex.input_data") == QUESTION
+
+
+@pytest.mark.parametrize("callbacks", [(_observe,), ()], ids=["observes-only", "none"])
+def test_a_request_no_plugin_replaced_carries_no_flag(callbacks: tuple):
+    nodes = _run(*callbacks)
+    assert [n.name for n in nodes if REWRITTEN in extras(n)] == []
+    assert one(nodes, TURN).attributes.get("wardex.input_data") == QUESTION
+
+
+def test_only_the_call_whose_request_was_rewritten_is_flagged_and_its_turn_says_so():
+    def second_only(**payload: Any) -> dict[str, Any] | None:
+        return _scrub(**payload) if payload["api_request_id"].endswith(":api:2") else None
+
+    nodes = _run(second_only, calls=2)
+    flagged = {
+        extras(n)["api_request_id"][-1]: REWRITTEN in extras(n) for n in nodes if n.name == CHAT
+    }
+    assert flagged == {"1": False, "2": True}
+    assert extras(one(nodes, TURN))[REWRITTEN] is True
+
+
+@pytest.mark.parametrize("trace", ["scrubber", None, {"source": "plugin"}, []], ids=repr)
+def test_a_trace_that_is_not_a_list_with_entries_sets_nothing(trace: object):
+    """Only a non-empty list is Hermes saying a plugin replaced the request; nothing else is
+    read as yes or as no, and the frame still hands Hermes its own result."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+
+        def run() -> object:
+            turn = h.turn()
+            ids = h._call_ids(turn, f"{turn.turn_id}:api:1")
+            out = ctx.run_execution_chain(
+                "llm_execution", lambda p: "answer", request={}, middleware_trace=trace, **ids
+            )
+            h.end(turn)
+            return out
+
+        assert on_loop(run) == "answer"
+        assert ctx.failures == []
+    nodes = exported(transport)
+    assert CHAT in {n.name for n in nodes}
+    assert [n.name for n in nodes if REWRITTEN in extras(n)] == []
+
+
+def test_a_rewritten_call_no_live_turn_owns_is_flagged_on_its_own_span():
+    """A side question is a fork Hermes never announces as a turn, and its request passes the
+    same middleware. Its call says it was rewritten; the session's finished turn does not."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        turn = on_loop(h.turn)
+        on_loop(h.model_call, turn)
+        on_loop(h.end, turn)
+        other = _beside(ctx, "llm_request", _scrub)
+        h.side_question(turn.session_id)
+        assert ctx.failures == other.failures == []
+    nodes = exported(transport)
+    finished = one(nodes, TURN)
+    chats = {
+        n.parent_id == finished.span_id: REWRITTEN in extras(n) for n in nodes if n.name == CHAT
+    }
+    assert chats == {True: False, False: True}
+    assert REWRITTEN not in extras(finished)
+
+
+def test_a_turn_still_open_at_uninstall_says_its_request_was_rewritten():
+    """The core closes that turn, not the adapter, and the turn still says the provider was
+    sent something other than its input."""
+    transport = start_wardex()
+    with plugin() as ctx, hermes(ctx) as h:
+        _beside(ctx, "llm_request", _scrub)
+        on_loop(lambda: h.model_call(h.turn()))
+        wardex_sdk.close()
+    turn = one(exported(transport), TURN)
+    assert Limitation.ADAPTER_UNINSTALLED in turn.limitations
+    assert extras(turn)[REWRITTEN] is True

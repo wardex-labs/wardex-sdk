@@ -226,7 +226,8 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         this call.
 
         A turn still live is closed by the core with ADAPTER_UNINSTALLED, not by `_close`, so
-        what it asked for and Hermes never ran is stated here first."""
+        what it asked for and Hermes never ran, and whether another plugin replaced one of its
+        requests, is stated here first."""
         ctx = self._ctx
         if ctx is not None:
             ctx.unfollow_tool_calls()
@@ -241,8 +242,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             with record.lock:
                 undispatched = record.undispatched()
                 notes = [o.marker for o in OBSERVATIONS if o.applies(record, None)]
+                rewritten = record.request_rewritten
             if record.handle is not None:
-                self._state_observed(record.handle, undispatched, notes)
+                self._state_observed(record.handle, undispatched, notes, rewritten)
         self._book.clear()
         ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
         _attach._EXPORT.wake()
@@ -640,8 +642,9 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
         is recorded when Hermes's end says the prompt was not blocked, and dropped otherwise;
         each frame still pinned whose report is kept is closed with it; extras close_cause,
         exit_reason (verbatim), error_reason (the `reason` of an api_request_error that is the
-        turn's last event), undispatched_tool_calls and aux_tasks (the auxiliary tasks Hermes
-        named for this turn); the rule's marker and each applying observation's; the close.
+        turn's last event), undispatched_tool_calls, aux_tasks (the auxiliary tasks Hermes
+        named for this turn) and request_rewritten (another plugin replaced the request of one
+        of its model calls); the rule's marker and each applying observation's; the close.
         """
         cause = s.cause or event.cause()
         rule = CLOSE_RULES[cause]
@@ -655,6 +658,7 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             undispatched = record.undispatched()
             notes = [o.marker for o in OBSERVATIONS if o.applies(record, cause)]
             aux_tasks = record.aux_tasks[:AUX_TASK_NAMES]
+            rewritten = record.request_rewritten
             pending = list(record.aux.items())
             record.aux.clear()
             kept = list(record.frames.values())
@@ -682,16 +686,19 @@ class HermesAgentAdapter(FrameEffects, AdapterInterface):
             d.set_extra(PREFIX + "aux_tasks", ",".join(aux_tasks))
         if rule.marker is not None:
             handle.note(rule.marker)
-        self._state_observed(handle, undispatched, notes)
+        self._state_observed(handle, undispatched, notes, rewritten)
         handle.close(status=rule.status, error_type=rule.error_type)
         return rule.export
 
     @staticmethod
     def _state_observed(
-        handle: RunHandle, undispatched: list[str], notes: list[Limitation]
+        handle: RunHandle, undispatched: list[str], notes: list[Limitation], rewritten: bool
     ) -> None:
-        """What `OBSERVATIONS` found on a turn about to close: each marker, and the names of
-        the tool calls its model asked for that no frame explains."""
+        """What a turn about to close states however it closes: each marker `OBSERVATIONS`
+        found, the names of the tool calls its model asked for that no frame explains, and that
+        another plugin replaced the request of one of its model calls."""
+        if rewritten:
+            handle.draft.set_extra(PREFIX + "request_rewritten", True)
         if undispatched:
             handle.draft.set_extra(
                 PREFIX + "undispatched_tool_calls", ",".join(undispatched[:UNDISPATCHED_NAMES])

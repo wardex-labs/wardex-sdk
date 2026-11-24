@@ -12,8 +12,8 @@ What is never read, by design: model message and response content (`conversation
 `request`, `messages`, and every content member of `response` and `assistant_message`; the wire
 is the authority for model content), `sender_id` (end-user identity), `child_goal`,
 `child_summary`, cost, and any profile name. Of `response` and `assistant_message` only each tool
-call's name is read. `parse` reads only the fields a record's `FIELDS` names, so a field
-that is not named never reaches a record.
+call's name is read, and of `middleware_trace` only whether it has an entry. `parse` reads only
+the fields a record's `FIELDS` names, so a field that is not named never reaches a record.
 
 What is read for the core's capped, masked payload path (`record_input` and `record_output`)
 only, never for an attribute: tool arguments and tool results, because no wire carries an
@@ -184,6 +184,10 @@ def _raw(v: object) -> object:
     return MISSING if v is None else v
 
 
+def _entries(v: object) -> object:
+    return True if type(v) is list and v else MISSING
+
+
 def _usage(v: object) -> object:
     """`usage` -> ((core key, count), ...) for the keys in USAGE_KEYS whose value is an int."""
     if not isinstance(v, Mapping):
@@ -271,7 +275,10 @@ class TurnStart:
 
 @dataclass(frozen=True, slots=True)
 class CallEnter:
-    """`llm_execution` frame entry. `request` and `next_call` are in the same kwargs, unread."""
+    """`llm_execution` frame entry. `request` and `next_call` are in the same kwargs, unread.
+    `middleware_trace` has one entry per `llm_request` middleware that replaced the request
+    (`hermes_cli/middleware.py::_apply_request_chain`); its entries are another plugin's text,
+    so only whether it has one is kept, and an empty or absent trace is not read as a "no"."""
 
     #: The payload field that names one frame: a second delivery of the same frame nested inside
     #: the first (wardex registered twice) is recognized by it before anything is parsed.
@@ -282,12 +289,14 @@ class CallEnter:
         Field("session_id", "session_id", _text, required=False),
         Field("model", "model", _text, required=False),
         Field("api_mode", "api_mode", _text, required=False),
+        Field("middleware_trace", "request_rewritten", _entries, required=False),
     )
     turn_id: str
     api_request_id: str
     session_id: str | None = None  # Hermes sends "" when its agent has none
     model: str | None = None
     api_mode: str | None = None
+    request_rewritten: bool = False
 
     def trigger(self) -> Trigger:
         return Trigger.CALL_ENTER
@@ -338,8 +347,7 @@ class CallError:
     moves to a fallback provider or parks the turn on its recovery ladder
     (`agent/turn_recovery_autorecover.py`, five cycles by default). It is also Hermes's verdict
     on a call whose frame returned: a content-policy refusal arrives as an HTTP 200, and Hermes
-    then sends this hook and no `post_api_request` (`agent/turn_truncation.py`).
-    """
+    then sends this hook and no `post_api_request` (`agent/turn_truncation.py`)."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("turn_id", "turn_id", _text),
@@ -371,8 +379,7 @@ class ToolEnter:
     Only the name is required. Hermes sends an id it does not have as "" (`model_tools.py::
     _CallIds.hook_kwargs`): no `api_request_id` for a tool that runs before the turn's first
     model call (a scripted prelude), neither call id for a tool that code running in
-    `execute_code` calls, and no id at all from the MCP server of codex app-server mode.
-    """
+    `execute_code` calls, and no id at all from the MCP server of codex app-server mode."""
 
     FRAME_KEY: ClassVar[str] = "tool_call_id"
     FIELDS: ClassVar[tuple[Field, ...]] = (
@@ -565,8 +572,7 @@ class TurnAnswer:
     finalization can still send it: Hermes writes an explanation as the final response when the
     turn stopped with a tool result pending or the interpreter shut down, and that text is what
     the user was shown. A turn whose retries were spent returns before finalization and sends
-    neither this nor an end.
-    """
+    neither this nor an end."""
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("session_id", "session_id", _text),
@@ -775,8 +781,7 @@ def parse(row: ContractRow, payload: Mapping[str, Any]) -> tuple[Event | None, D
     schema drift keeps the event, because recording goes on. A field drift drops it, because an
     event with no turn_id cannot be placed and an invented one would be a made-up value; when
     both happen, the field drift is the one returned. Never raises on mappings, strings, numbers
-    or lists; an object whose attribute access raises propagates to the caller's guard.
-    """
+    or lists; an object whose attribute access raises propagates to the caller's guard."""
     drift = None
     if row.schema_field is not None:
         seen = payload.get(row.schema_field)
