@@ -1,0 +1,65 @@
+name: compat-watchdog
+
+# Watches the daily compatibility run for the one failure it cannot report
+# itself: not running. A scheduled workflow that stops (a cron line whose
+# owner lost access, a broken workflow file, GitHub switching schedules off
+# after sixty quiet days) leaves no red mark anywhere; it simply starts no
+# run. This asks the Actions run list when the schedule last fired and opens
+# an issue when two whole days have passed without it.
+#
+# Triggered by things that are not that schedule, on purpose: a push, a pull
+# request from this repository, and a weekly cron of its own. It never fails,
+# because a red mark on a commit for a reason that is not the commit teaches
+# people to ignore red marks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 7 * * 3"
+  workflow_dispatch:
+    inputs:
+      now:
+        description: "Rehearse the alarm: pretend it is this UTC instant (ISO 8601)"
+        required: false
+        default: ""
+      last:
+        description: "Rehearse the alarm: pretend the last scheduled record is from this instant"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# One at a time: two watchdogs that both find no issue would both open one.
+concurrency:
+  group: compat-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: is the daily run still running
+    # A pull request from a fork gets a read-only token and cannot open an issue.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # On a pull request, the scripts of the branch it targets: this job can write
+          # issues, and what it runs must not be whatever the pull request changed.
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          COMPAT_ASSIGNEE: ${{ vars.COMPAT_ASSIGNEE }}
+          NOW: ${{ inputs.now }}
+          LAST: ${{ inputs.last }}
+        run: |
+          python3 scripts/compat/watchdog.py ${NOW:+--now "$NOW"} ${LAST:+--last "$LAST"} \
+            || echo "::warning::the watchdog itself failed"

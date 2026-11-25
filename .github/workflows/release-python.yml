@@ -201,8 +201,11 @@ jobs:
           CHECK_RUST_ADVISORIES_BLOCKING: "1"
       - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
-          enable-cache: true
-          cache-dependency-glob: "**/pyproject.toml"
+          # No cache in the job that decides whether a release may publish. A
+          # cache is written by other runs on the default branch, and those
+          # install third-party packages published the same day; a job whose
+          # verdict gates PyPI resolves its dependencies itself.
+          enable-cache: false
       - name: uv sync (builds wardex_sdk via maturin)
         run: uv sync --python ${{ matrix.python-version }}
       - name: ruff check
@@ -226,10 +229,30 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # The five artifacts the `build` matrix uploads, by exact name. A glob would
+      # also take anything another job of this run uploaded under a matching
+      # name; artifact names are unique within a run, so naming each one means
+      # only `build` can have produced what is published. Keep this list equal
+      # to the `build` matrix.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: wheels-*
-          merge-multiple: true
+          name: wheels-ubuntu-latest-x86_64
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: wheels-ubuntu-latest-aarch64
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: wheels-macos-15-x86_64
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: wheels-macos-15-aarch64
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: wheels-windows-latest-x64
           path: dist
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:

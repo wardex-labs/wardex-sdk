@@ -5,11 +5,13 @@ and the handful of helpers the seam tests share: `client_spans`,
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import http.server
+import os
 import socket
 import ssl
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,58 @@ LLM_FIXTURES = (
     / "fixtures"
     / "llm"
 )
+
+
+#: Set by the daily compatibility run on a framework release above the tested
+#: range. Such a point asks one question, "would the suite pass if this
+#: release were added to the table of tested versions?", and the table is what
+#: makes `init()` say a release is untested, so the run answers it with the
+#: release added for the session. That `init()` does say so on the real table
+#: is checked separately, by `scripts/compat/attach_probe.py`. The name does not
+#: start with `WARDEX_`: `init()` warns about any variable of that prefix it
+#: does not read, and that warning would be the only thing a point then tested.
+COMPAT_ASSUME_MEASURED = "COMPAT_ASSUME_MEASURED"
+
+
+def assume_installed_versions_measured() -> dict:
+    """Add each installed framework's release line to the table of tested versions.
+
+    Returns the entries it replaced, so a caller can put them back."""
+    from wardex_sdk._adapters import _measured
+
+    before = dict(_measured.MEASURED)
+    for name, entries in before.items():
+        widened = []
+        for entry in entries:
+            version = _measured.installed_version(entry.distribution)
+            if version is None or _measured.is_measured(entry, version):
+                widened.append(entry)
+                continue
+            parts = version.split(".")
+            width = max((len(minor.split(".")) for minor in entry.minors), default=2)
+            line = ".".join(parts[:width])
+            widened.append(dataclasses.replace(entry, minors=(*entry.minors, line)))
+        _measured.MEASURED[name] = tuple(widened)
+    return before
+
+
+def compat_switch_is_on(environ: Mapping[str, str] = os.environ) -> bool:
+    """On only when the variable is exactly "1": an ordinary run must never widen the table."""
+    return environ.get(COMPAT_ASSUME_MEASURED) == "1"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _compat_assume_measured() -> Iterator[None]:
+    if not compat_switch_is_on():
+        yield
+        return
+    from wardex_sdk._adapters import _measured
+
+    before = assume_installed_versions_measured()
+    try:
+        yield
+    finally:
+        _measured.MEASURED.update(before)
 
 
 def llm_fixture(case: str, name: str) -> bytes:

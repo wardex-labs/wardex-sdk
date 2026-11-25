@@ -1,0 +1,226 @@
+name: compat
+
+# The daily compatibility run. Each adapter's tests run against exact framework
+# releases, in environments that hold only that framework: the oldest release
+# the README calls tested, the newest one, and the releases published since.
+# `scripts/compat/` holds the rules; AGENTS.md says how to read a result.
+#
+# Nothing here blocks a pull request. A framework release is not a reason for
+# an unrelated change to go red, so this runs on a schedule and on demand.
+
+on:
+  schedule:
+    # Off the hour: scheduled runs queue behind everyone who wrote `0 * * * *`,
+    # and this repository's on-the-hour schedule has started 8 to 11 hours late.
+    - cron: "23 19 * * *"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Run one adapter only (its name in the table of tested versions)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# One run per ref at a time, never cancelled: the report commits records, and
+# two reports must not write them concurrently.
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RECORDS_BRANCH: compat-results
+
+# Actions are pinned by commit SHA, as in ci.yml. No job here restores or
+# saves a cache: the point jobs run framework releases published the same day,
+# and a cache they could write is one a later, more privileged job would read.
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: read the records of earlier runs (none on the first run)
+        run: |
+          mkdir -p plan/last-green
+          if git fetch --depth 1 origin "$RECORDS_BRANCH" 2>/dev/null; then
+            git archive FETCH_HEAD last-green 2>/dev/null | tar -x -C plan || true
+          fi
+      - name: plan today's points
+        id: plan
+        env:
+          ONLY: ${{ inputs.only }}
+        run: python3 scripts/compat/plan.py --out plan/plan.json ${ONLY:+--only "$ONLY"}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compat-plan
+          path: plan
+
+  # Built the way the release builds it, so a point tests what a user installs.
+  wheel:
+    name: build the wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: build
+          args: --release --locked --out dist
+          target: x86_64
+          manylinux: auto
+          working-directory: sdks/python
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compat-wheel
+          path: sdks/python/dist
+
+  # One job per point, so a release that hangs costs its own point and no other.
+  # Read-only, no secrets: this is where code published today runs.
+  point:
+    name: ${{ matrix.key }}
+    needs: [plan, wheel]
+    runs-on: ubuntu-latest
+    # More than a point can take: `scripts/compat/manifest.py` bounds each test, each
+    # run of the files and whether a slow run is repeated, so a release that hangs
+    # still ends with a result instead of at this limit with none.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+        with:
+          # Pinned: the installer is a test tool, and a tool's release must not
+          # be what turns sixteen points red on one morning.
+          version: "0.12.23"
+          enable-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: compat-plan
+          path: plan
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: compat-wheel
+          path: dist
+      - name: run the point
+        env:
+          KEY: ${{ matrix.key }}
+        run: |
+          last_green=()
+          if [ -f "plan/last-green/$KEY.txt" ]; then
+            last_green=(--last-green-lock "plan/last-green/$KEY.txt")
+          fi
+          python3 scripts/compat/point.py --plan plan/plan.json --key "$KEY" \
+            --wheel-dir dist --work "$RUNNER_TEMP/point" --out "out" "${last_green[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: compat-point-${{ matrix.key }}
+          path: out
+          if-no-files-found: ignore
+
+  # The only job that can write, and it installs nothing: it reads the JSON the
+  # points left, checks its shape, and writes records and issues. Only a run on
+  # main writes them; a run on any other ref reports to its own summary, so a
+  # branch under repair cannot close an issue main still has.
+  report:
+    name: report
+    needs: [plan, point]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+    # Per ref: a queued job replaces an older queued job of its group, and a run on a
+    # branch must not be what cancels the default branch's pending report.
+    concurrency:
+      group: compat-report-${{ github.ref }}
+      cancel-in-progress: false
+    outputs:
+      judged: ${{ steps.report.outputs.judged }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: compat-plan
+          path: plan
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: compat-point-*
+          path: results
+      - name: check out the records branch (created empty on the first run)
+        run: |
+          if git fetch --depth 1 origin "$RECORDS_BRANCH" 2>/dev/null; then
+            git worktree add "$RUNNER_TEMP/records" FETCH_HEAD
+            git -C "$RUNNER_TEMP/records" switch -C "$RECORDS_BRANCH"
+          else
+            git worktree add --detach "$RUNNER_TEMP/records"
+            git -C "$RUNNER_TEMP/records" switch --orphan "$RECORDS_BRANCH"
+          fi
+      - name: report
+        id: report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPAT_ASSIGNEE: ${{ vars.COMPAT_ASSIGNEE }}
+          WRITE: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
+        run: |
+          mkdir -p results
+          export COMPAT_SDK_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' sdks/python/pyproject.toml | head -1)"
+          status=0
+          python3 scripts/compat/report.py --plan plan/plan.json --results results \
+            --state-dir "$RUNNER_TEMP/records" ${WRITE:+--write} || status=$?
+          # 0 is green and 10 is a verdict of red. Anything else is this step
+          # crashing: no verdict, and the `died` job says so.
+          if [ "$status" = 0 ] || [ "$status" = 10 ]; then
+            echo "judged=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: commit the records
+        # Only after a verdict: a report that crashed may have written half a state file.
+        if: github.ref == 'refs/heads/main' && steps.report.outputs.judged == 'true'
+        working-directory: ${{ runner.temp }}/records
+        run: |
+          git add -A
+          if git diff --cached --quiet; then exit 0; fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "compat: results $(date -u +%F)"
+          git push origin "HEAD:refs/heads/$RECORDS_BRANCH"
+      - name: the run's colour
+        env:
+          STATUS: ${{ steps.report.outputs.status }}
+        run: exit "$STATUS"
+
+  # A run that died before it could report says so itself, because a schedule
+  # that fails quietly looks exactly like one that passed.
+  died:
+    name: say so if the run died
+    needs: [plan, wheel, point, report]
+    if: always() && github.ref == 'refs/heads/main' && needs.report.outputs.judged != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          COMPAT_ASSIGNEE: ${{ vars.COMPAT_ASSIGNEE }}
+        run: python3 scripts/compat/watchdog.py --run-died "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

@@ -121,6 +121,70 @@ of this file. Run it on the same trigger as `e2e_usage_pricing_langfuse.py`; it
 needs a Langfuse v4.16.0 checkout with pnpm and tsx, and its README carries the
 setup.
 
+### The daily compatibility run
+
+`.github/workflows/compat.yml` runs each adapter's tests once a day against
+exact framework releases, each in an environment that holds the built wheel,
+that one framework and nothing another adapter needs. It blocks no pull
+request: a framework release is not a reason for an unrelated change to go red.
+
+The points are computed, not listed. `scripts/compat/plan.py` reads the table
+of tested versions (`_adapters/_measured.py`) and what PyPI lists at the run's
+start, and picks for each adapter:
+
+| Point | What | Python |
+|---|---|---|
+| floor | the oldest release PyPI still serves inside the tested range, installed with the dependencies that existed two weeks after it was published | 3.10 |
+| newest patch of a tested line | one per tested release line below the top one | 3.14 |
+| newest tested release | the top of the tested range | 3.14 and 3.10 |
+| newer than the tested range | the newest patch of each release line above the range, three lines at most | 3.14 |
+
+A release above the range is tested with `COMPAT_ASSUME_MEASURED=1`,
+which adds it to the table for the test session: that point asks whether the
+suite would pass if the release were added. That `init()` says "untested" on
+the real table is checked at every point by `scripts/compat/attach_probe.py`.
+
+The run is red in two cases only: a release inside the tested range does not
+pass, or a planned point left no result. Everything else that needs a person
+arrives as an issue labelled `compat`: one per adapter, one for problems with
+the run itself, and one opened by a run that ended without a verdict. Each is
+found by a marker in its body, rewritten by every run and closed by the run
+when nothing is left to do; on a day a release could not be checked at all,
+nothing is closed. Records accumulate on the `compat-results` branch, one JSON
+line per point per run under `records/`, with the hash-locked package list of
+each point's last pass under `last-green/`. Only a run on `main` writes issues
+and records.
+
+A failing run of an adapter's files is repeated once, whole and in the same
+order; only if that passes is the failure called flaky. A point inside the
+range that still fails is run once more on the packages of its last pass with
+today's wheel, which tells a dependency release from a wardex change.
+
+```bash
+gh workflow run compat.yml --ref <branch>                  # every point, from a branch
+gh workflow run compat.yml --ref <branch> -f only=langgraph
+
+# one point locally: build a wheel, plan, run the point
+(cd sdks/python && uvx maturin build --release --locked --out /tmp/compat-dist)
+python3 scripts/compat/plan.py --out /tmp/plan.json
+python3 scripts/compat/point.py --plan /tmp/plan.json --key langgraph--claim_top \
+    --wheel-dir /tmp/compat-dist --work /tmp/compat-work --out /tmp/compat-out
+```
+
+When you add an adapter, or a test file that imports a framework at module
+level, add it to `scripts/compat/manifest.py`; `test_compat_plan.py` fails
+until the table, the manifest and the test files agree. No requirement in the
+manifest carries an upper bound, and the three test tools are pinned exactly.
+
+To widen or narrow a tested range, change the table, the test pin in
+`sdks/python/pyproject.toml` and the README's framework table in one commit.
+A failing release is never answered by capping what the run installs.
+
+`.github/workflows/compat-watchdog.yml` asks the Actions run list when the
+schedule last started a run and opens an issue when two whole days have passed
+without one. It runs on pushes and pull requests because a schedule that has
+stopped cannot report that it stopped, and it never fails.
+
 ## Lint & format
 
 ```bash
