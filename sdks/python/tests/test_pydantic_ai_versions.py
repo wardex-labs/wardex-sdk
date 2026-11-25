@@ -16,7 +16,7 @@ from pydantic_ai.models.test import TestModel
 
 import wardex_sdk as wardex
 from _pydantic_ai_support import extras, one, user_owned
-from wardex_sdk._adapters._measured import installed_version
+from wardex_sdk._adapters._measured import MEASURED, installed_version, spelled
 from wardex_sdk._assembly import counters
 from wardex_sdk._config import AdaptersConfig
 from wardex_sdk._enums import AdapterName, AdapterState
@@ -42,20 +42,24 @@ def _status():
 def test_a_release_outside_the_measured_major_installs_and_says_so_once(
     transport, monkeypatch, capsys
 ):
+    # One major above whatever the table holds, so the test states the rule and not
+    # the table's current contents.
+    (entry,) = MEASURED[AdapterName.PYDANTIC_AI]
+    outside = f"{max(int(line.split('.')[0]) for line in entry.minors) + 1}.0.0"
     real = installed_version
     monkeypatch.setattr(
         "wardex_sdk._adapters.installed_version",
-        lambda dist: "3.0.0" if dist == "pydantic-ai-slim" else real(dist),
+        lambda dist: outside if dist == "pydantic-ai-slim" else real(dist),
     )
     with user_owned():
         wardex.init(transport=transport, adapters=_ONLY)
         status = _status()
         assert status.state is AdapterState.INSTALLED
-        assert (status.version, status.measured) == ("3.0.0", False)
-        assert status.measured_versions == ("2.x",)
+        assert (status.version, status.measured) == (outside, False)
+        assert status.measured_versions == tuple(f"{line}.x" for line in entry.minors)
         lines = [line for line in capsys.readouterr().err.splitlines() if "pydantic_ai" in line]
         assert len(lines) == 1
-        assert "pydantic-ai-slim 3.0.0 (tested: 2.x)" in lines[0]
+        assert f"pydantic-ai-slim {outside} (tested: {spelled(entry)})" in lines[0]
         assert counters.get("adapters.pydantic_ai.unmeasured_version") == 1
 
 
