@@ -90,8 +90,8 @@ jobs:
     name: ${{ matrix.key }}
     needs: [plan, wheel]
     runs-on: ubuntu-latest
-    # More than a point can take: `scripts/compat/manifest.py` bounds each test, each
-    # run of the files and whether a slow run is repeated, so a release that hangs
+    # More than a point may take: `scripts/compat/manifest.py` bounds each test, each
+    # run of the files and the point as a whole (45 minutes), so a release that hangs
     # still ends with a result instead of at this limit with none.
     timeout-minutes: 60
     strategy:

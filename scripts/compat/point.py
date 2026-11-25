@@ -145,6 +145,17 @@ def cause_without_replay(*, in_claim: bool, frozen: bool, has_baseline: bool) ->
     return None
 
 
+def replay_can_tell(failed_ids: list[str], replayed_files: list[str]) -> bool:
+    """Whether running `replayed_files` on the last pass's packages can explain the failure.
+
+    The replay runs only the files that last pass ran. A failure in a file
+    added since would not be run at all, the replay would pass, and a wardex
+    change would be blamed on a dependency release.
+    """
+    failing_files = {node.split("::")[0] for node in failed_ids}
+    return bool(failing_files) and failing_files <= set(replayed_files)
+
+
 class Point:
     def __init__(self, args: argparse.Namespace) -> None:
         plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
@@ -364,7 +375,9 @@ class Point:
         if self.point["assume_measured"]:
             env["COMPAT_ASSUME_MEASURED"] = "1"
         started = time.monotonic()
-        code, out, err = run(cmd, cwd=REPO, env=env, timeout=manifest.SUITE_TIMEOUT_S)
+        # Never longer than what the point has left, so the last word is always a result.
+        limit = int(max(60, min(manifest.SUITE_TIMEOUT_S, self._left() - 60)))
+        code, out, err = run(cmd, cwd=REPO, env=env, timeout=limit)
         print(out[-6000:], flush=True)
         if code not in (0, 1):
             print(err[-3000:], flush=True)
@@ -396,7 +409,7 @@ class Point:
             "skipped_ids": sorted(set(skipped)),
         }
 
-    def counterfactual(self, files: list[str]) -> None:
+    def counterfactual(self, files: list[str], failed_ids: list[str]) -> None:
         """Today's wheel and tests on the packages of this point's last pass."""
         then = self.last_green.read_text(encoding="utf-8")
         now = (self.out / "lock.txt").read_text(encoding="utf-8")
@@ -404,9 +417,13 @@ class Point:
         replay.write_text("\n".join(without_wardex(lock_entries(then))) + "\n", encoding="utf-8")
         # Only the files that last pass ran: a file whose dependencies were left out then
         # cannot be collected on those packages, and that would read as a wardex change.
-        listed = self.last_green.with_suffix(".files.json")
+        listed = self.last_green.with_name(self.last_green.stem + ".files.json")
         if listed.is_file():
             files = [name for name in files if name in json.loads(listed.read_text("utf-8"))]
+        if not replay_can_tell(failed_ids, files):
+            self.result["counterfactual"] = {"ran": False}
+            self.result["cause"] = "not_determined"
+            return
         venv = self.work / "venv-last-green"
         shutil.rmtree(venv, ignore_errors=True)
         steps = (
@@ -415,10 +432,10 @@ class Point:
             ["uv", "pip", "install", "--python", python_of(venv), "--no-deps", "-q", self.wheel],
         )
         for step in steps:
-            if not files or run(step, cwd=self.work)[0] != 0:
+            if run(step, cwd=self.work)[0] != 0:
                 # A release of that day has since been withdrawn: the past cannot be rebuilt.
                 self.result["counterfactual"] = {"ran": False}
-                self.result["cause"] = "no_baseline"
+                self.result["cause"] = "not_determined"
                 return
         again = self.pytest(venv, files, "last-green")
         before, after = pinned(then), pinned(now)
@@ -428,12 +445,16 @@ class Point:
             if before.get(name) != after.get(name)
         }
         self.result["counterfactual"] = {"ran": True, "passed": again["ok"], "changed": changed}
-        self.result["cause"] = "upstream" if again["ok"] else "ours"
+        if again["timed_out"]:
+            self.result["cause"] = "not_determined"
+        else:
+            self.result["cause"] = "upstream" if again["ok"] else "ours"
 
     # --- the point -----------------------------------------------------------
 
     def execute(self) -> None:
         started = time.monotonic()
+        self.deadline = started + manifest.POINT_BUDGET_S
         venv = self.work / "venv"
         try:
             self._steps(venv)
@@ -448,6 +469,10 @@ class Point:
                 json.dumps(self.result, indent=1, sort_keys=True), encoding="utf-8"
             )
             print(f"outcome: {self.result['outcome']} cause: {self.result['cause']}", flush=True)
+
+    def _left(self) -> float:
+        """Seconds this point may still spend before it must write its result."""
+        return self.deadline - time.monotonic()
 
     def _steps(self, venv: Path) -> None:
         result = self.result
@@ -477,10 +502,10 @@ class Point:
             return
         # Everything again, in the same order. An adapter patches its framework for the whole
         # process, so a failure that needs an earlier file to set it up is a real one, and a
-        # rerun of the failing file alone would pass and call it flaky every day. A run slow
-        # enough to threaten the job's time limit is not repeated: a result beats a second opinion.
-        quick = first["seconds"] < manifest.RERUN_BUDGET_S
-        if first["exit_code"] == 1 and quick:
+        # rerun of the failing file alone would pass and call it flaky every day. Not repeated
+        # when there is no time left for it: a result beats a second opinion.
+        again = first["seconds"] * 1.5 + 120
+        if first["exit_code"] == 1 and self._left() > again:
             second = self.pytest(venv, files, "rerun")
             result["rerun"] = {"passed": second["ok"]}
             if second["ok"]:
@@ -493,10 +518,10 @@ class Point:
             has_baseline=self.last_green is not None and self.last_green.is_file(),
         )
         if result["cause"] is None:
-            if quick:
-                self.counterfactual(files)
+            if self._left() > again:
+                self.counterfactual(files, first["failed_ids"])
             else:
-                result["cause"] = "no_baseline"
+                result["cause"] = "not_determined"
 
 
 def main(argv: list[str] | None = None) -> int:

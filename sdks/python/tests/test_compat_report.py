@@ -559,24 +559,87 @@ def test_the_cause_that_needs_no_second_run():
 # --- what a later reader of the report found, kept from coming back ---------------
 
 
-def test_an_issue_is_not_closed_on_a_day_its_failing_release_could_not_be_checked():
-    """Yesterday a tested release failed; today the index is down for that point. The run
-    is not red, and that is no ground to close the issue saying it passes."""
+def _failed_yesterday(point: dict, nodes: list[str]) -> dict:
+    checked = {
+        "date": "2026-11-25",
+        "outcome": "fail",
+        "cause": "upstream",
+        "targets": point["targets"],
+        "failed_ids": nodes,
+    }
+    return {"points": {point["key"]: {"last_checked": checked}}}
+
+
+@pytest.mark.parametrize("today", sorted(report.NOT_OURS | {"test_deps_unresolvable"}))
+def test_a_release_that_failed_and_cannot_be_checked_today_is_still_on_the_list(today):
+    """Yesterday a tested release failed; today it could not even be installed. The run
+    is not red, and the issue must neither close nor forget what it knew."""
     plan = _plan(_FLOOR, _TOP)
-    results = _results(_result(_FLOOR), _result(_TOP, "install_network"))
-    issue = report.adapter_issue("openai_agents", plan, results, _RUN)
-    assert (issue["open"], issue["hold"]) == (False, True)
+    nodes = ["t.py::test_tree"]
+    yesterday = report.adapter_issue(
+        "openai_agents",
+        plan,
+        _results(_result(_FLOOR), _result(_TOP, "fail", cause="upstream", failed_ids=nodes)),
+        _RUN,
+    )
+    results = _results(_result(_FLOOR), _result(_TOP, today))
+    issue = report.adapter_issue(
+        "openai_agents", plan, results, _RUN, _failed_yesterday(_TOP, nodes)
+    )
+    assert issue["open"]
+    assert "did not pass when last checked, on `2026-11-25`" in issue["body"]
+    assert issue["fingerprint"] == yesterday["fingerprint"], "no news, so no comment"
 
     tracker = _Tracker()
-    report.sync_issue(tracker, issue, [_existing()])
-    assert tracker.log == [], "an unchecked day changes nothing"
+    report.sync_issue(tracker, issue, [_existing(fingerprint=yesterday["fingerprint"])])
+    assert tracker.log == ["rewrite #7"]
 
-    checked = report.adapter_issue(
+
+def test_what_a_point_last_said_is_carried_only_for_the_same_release_inside_the_range():
+    plan = _plan(_FLOOR, _TOP, _ABOVE)
+    nodes = ["t.py::test_tree"]
+    # A release above the range that cannot be installed today needs nothing doing.
+    above = _results(_result(_ABOVE, "install_network"))
+    assert not report.adapter_issue(
+        "openai_agents", plan, above, _RUN, _failed_yesterday(_ABOVE, nodes)
+    )["open"]
+    # A different release now sits at this point: yesterday's failure was another version's.
+    moved = _failed_yesterday(_TOP, nodes)
+    moved["points"][_TOP["key"]]["last_checked"]["targets"] = {"openai-agents": "0.23.0"}
+    top = _results(_result(_TOP, "install_network"))
+    assert not report.adapter_issue("openai_agents", plan, top, _RUN, moved)["open"]
+    # A release that passed when last checked is not turned into a failure by an outage.
+    assert not report.adapter_issue("openai_agents", plan, top, _RUN, {})["open"]
+
+
+def test_the_closing_word_names_what_could_not_be_checked_instead_of_counting_it_as_passing():
+    plan = _plan(_FLOOR, _TOP)
+    results = _results(_result(_FLOOR), _result(_TOP, "not_installable"))
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN)
+    assert not issue["open"]
+    assert "Not checked today: `openai-agents 0.23.1` (cannot be installed" in issue["closing"]
+    clean = report.adapter_issue(
         "openai_agents", plan, _results(_result(_FLOOR), _result(_TOP)), _RUN
     )
-    assert (checked["open"], checked["hold"]) == (False, False)
-    report.sync_issue(tracker, checked, [_existing()])
-    assert tracker.log == ["rewrite #7", "comment on #7", "close #7"]
+    assert "Not checked today" not in clean["closing"]
+
+
+def test_an_outage_does_not_erase_what_a_point_said_when_it_was_last_checked(tmp_path):
+    failed = _results(_result(_TOP, "fail", cause="upstream", failed_ids=["t.py::test_a"]))
+    state = report.next_state({}, failed, _RUN, tmp_path)
+    state.pop("_locks")
+    assert state["points"][_TOP["key"]]["last_checked"]["failed_ids"] == ["t.py::test_a"]
+
+    outage = _results(_result(_TOP, "install_network"))
+    later = report.next_state(state, outage, {**_RUN, "date": "2026-11-27"}, tmp_path)
+    assert later["points"][_TOP["key"]]["last_checked"]["date"] == "2026-11-26"
+    assert later["points"][_TOP["key"]]["last"]["outcome"] == "install_network"
+
+
+def test_the_last_pass_remembers_which_files_it_ran(tmp_path):
+    _write(tmp_path, _result(_TOP))
+    state = report.next_state({}, _results(_result(_TOP)), _RUN, tmp_path)
+    assert state["points"][_TOP["key"]]["last_green"]["files"] == ["test_openai_agents_adapter.py"]
 
 
 def test_a_test_no_longer_skipped_is_more_tested_not_less():
@@ -593,9 +656,14 @@ def test_a_test_no_longer_skipped_is_more_tested_not_less():
         {"tests": {"failed_ids": "not-a-list"}},
         {"tests": {"failed_ids": [1, 2]}},
         {"tests": {"passed": "many"}},
+        {"tests": {"plugins": 5}},
         {"cause": "<img src=x>"},
         {"attach": ["not", "a", "table"]},
         {"resolved": "x"},
+        {"install": {"dropped_optional": 5}},
+        {"install": {"dropped_optional": [["ok"], "not-a-group"]}},
+        {"counterfactual": {"ran": True, "changed": ["a", "b"]}},
+        {"counterfactual": {"ran": True, "changed": {"a": "not-a-pair"}}},
     ],
 )
 def test_a_result_of_the_wrong_shape_is_no_result_and_cannot_crash_the_report(tmp_path, poison):
@@ -641,9 +709,20 @@ def test_the_health_issue_puts_a_points_own_words_inside_a_code_span():
 
 def test_a_duplicate_issue_is_closed_and_the_newest_one_is_kept():
     older = {**_existing(), "number": 5}
+    long_closed = {**_existing(state="closed"), "number": 3}
     tracker = _Tracker()
-    report.sync_issue(tracker, _wanted(), [older, _existing()])
+    report.sync_issue(tracker, _wanted(), [long_closed, older, _existing()])
     assert tracker.log == ["close duplicate #5", "rewrite #7"]
+
+
+def test_closing_one_duplicate_by_hand_does_not_leave_a_live_failure_with_no_open_issue():
+    """A person closes the newer of two. The older open one is the issue from then on;
+    taking the closed one and closing the other as its duplicate would leave none open."""
+    older_open = {**_existing(), "number": 5}
+    newer_closed = _existing(state="closed")
+    tracker = _Tracker()
+    report.sync_issue(tracker, _wanted(), [older_open, newer_closed])
+    assert tracker.log == ["rewrite #5"]
 
 
 def test_a_failure_that_returns_reopens_an_issue_a_person_closed_while_it_failed():
@@ -666,3 +745,49 @@ def test_a_failure_with_no_failing_test_is_not_called_zero_failures():
     )["body"]
     assert "fails 0 tests" not in body
     assert "does not finish its tests" in body
+
+
+def test_a_replay_cannot_explain_a_failure_in_a_file_it_does_not_run():
+    """The replay runs the files of the last pass. A test file added since is not among
+    them, the replay would pass, and a wardex change would be blamed on a dependency."""
+    assert point.replay_can_tell(["a.py::test_x"], ["a.py", "b.py"])
+    assert not point.replay_can_tell(["new.py::test_x"], ["a.py", "b.py"])
+    assert not point.replay_can_tell(["a.py::test_x", "new.py::test_y"], ["a.py"])
+    assert not point.replay_can_tell([], ["a.py"]), "nothing named, nothing to explain"
+
+
+def test_a_record_keeps_what_the_probe_counted_and_what_a_point_said_of_itself():
+    result = _result(_TOP, "fail", cause="ours")
+    result.update(
+        attach={
+            "state": "installed",
+            "measured": True,
+            "in_table": True,
+            "lines_said": 0,
+            "verdict": "ok",
+            "detail": "left out",
+        },
+        rerun={"passed": False},
+        install={"outcome": "ok", "dropped_optional": []},
+        cutoff="2026-09-02T12:00:00Z",
+    )
+    line = report.records(_plan(_TOP), _results(result), _RUN)[0]
+    assert line["attach"] == {
+        "state": "installed",
+        "measured": True,
+        "in_table": True,
+        "lines_said": 0,
+        "verdict": "ok",
+    }
+    assert (line["rerun_passed"], line["install_outcome"]) == (False, "ok")
+    assert line["point_cutoff"] == "2026-09-02T12:00:00Z"
+
+
+def test_a_stale_schedule_alarm_names_the_day_it_went_quiet():
+    """Two different quiet spells are two different alarms; the second must not be
+    taken for the first and stay closed."""
+    first = watchdog.wanted("2026-11-01T00:00:00Z", _at("2026-11-10"))
+    second = watchdog.wanted("2026-11-20T00:00:00Z", _at("2026-11-26"))
+    assert first["open"] and second["open"]
+    assert first["fingerprint"] != second["fingerprint"]
+    assert watchdog.wanted("2026-11-20T00:00:00Z", _at("2026-11-21"))["fingerprint"] == "clear"

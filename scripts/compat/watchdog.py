@@ -9,8 +9,7 @@ days) starts no run at all, and a run that starts and dies is the other
 question. Three or more calendar days since the last scheduled run means two
 whole days passed without one, which is more than a late start explains
 (scheduled runs here have started up to eleven hours late). Before the first
-scheduled run ever, the clock starts when the workflow file reached the
-default branch.
+scheduled run ever, the clock starts when GitHub registered the workflow.
 
 Did a run end without a verdict? The run itself says so, with `--run-died`,
 and the next run that reaches a verdict closes it (`report.py`).
@@ -48,15 +47,16 @@ def _get(repo: str, path: str):
 def last_scheduled(repo: str) -> tuple[str, bool]:
     """The instant the schedule last fired, and whether it ever has.
 
-    When it never has, the instant is when the workflow file first reached the
-    default branch: the moment from which a scheduled run could be expected.
-    Raises when GitHub does not answer, so the caller changes nothing.
+    When it never has, the instant is when GitHub first registered the
+    workflow: the moment from which a scheduled run could be expected. Not the
+    date of the commit that added the file, which can be days older than the
+    push that brought it to the default branch. Raises when GitHub does not
+    answer, so the caller changes nothing.
     """
     runs = _get(repo, f"actions/workflows/{WORKFLOW}/runs?event=schedule&per_page=1")
     if runs.get("workflow_runs"):
         return runs["workflow_runs"][0]["created_at"], True
-    commits = _get(repo, f"commits?path=.github/workflows/{WORKFLOW}&per_page=100")
-    return commits[-1]["commit"]["committer"]["date"], False
+    return _get(repo, f"actions/workflows/{WORKFLOW}")["created_at"], False
 
 
 def wanted(last: str, now: datetime, *, ever: bool = True) -> dict:

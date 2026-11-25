@@ -9,6 +9,7 @@ file missing from the run is a claim nobody is checking any more.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -219,6 +220,35 @@ def test_a_point_that_cannot_exist_is_a_note_and_never_a_problem():
     assert all("--beyond--" not in point["key"] for point in planned["points"])
 
 
+def test_a_tested_release_that_no_interpreter_can_run_is_a_problem():
+    """Inside the range the README calls it tested. If it cannot be run at all, a green
+    run would be vouching for a release nothing looked at."""
+    history = {
+        "openai-agents": [
+            _release("0.22.0", "2026-08-19"),
+            _release("0.23.1", "2026-10-02", python=">=3.15"),
+        ]
+    }
+    planned = plan.plan_adapter("openai_agents", _OPENAI, history, _CUTOFF)
+    assert planned["info"]["problems"] == [
+        "openai-agents 0.23.1 admits no supported interpreter; not run"
+    ]
+
+
+def test_a_plan_of_one_adapter_says_it_is_partial(tmp_path, monkeypatch):
+    """The report must not read one adapter's plan as the whole run."""
+    monkeypatch.setattr(plan, "read_measured", lambda: {"openai_agents": _OPENAI})
+    monkeypatch.setattr(plan, "fetch_releases", lambda dist: _OPENAI_HISTORY[dist])
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    out = tmp_path / "plan.json"
+    assert plan.main(["--out", str(out), "--cutoff", _CUTOFF, "--only", "openai_agents"]) == 0
+    assert json.loads(out.read_text())["partial"] is True
+    assert plan.main(["--out", str(out), "--cutoff", _CUTOFF]) == 0
+    whole = json.loads(out.read_text())
+    assert whole["partial"] is False
+    assert len(whole["points"]) == 7
+
+
 def test_the_same_inputs_give_the_same_plan():
     measured = {"openai_agents": _OPENAI}
     first = plan.build_plan(measured, _OPENAI_HISTORY, _CUTOFF)
@@ -277,21 +307,29 @@ def test_every_adapter_in_the_table_is_run_or_named_as_replay_only():
     assert set(manifest.ADAPTERS) | set(manifest.REPLAY_ONLY) == {name.value for name in MEASURED}
 
 
-#: Test files that import a framework at module level and are not run at that
-#: framework's points, each with the reason. Empty is the goal.
+#: Test files that import a framework and are not run at that framework's points, each
+#: with the reason. They run where every framework is installed together, in the pull
+#: request job, and nowhere else. Shorter is better.
+_SEVERAL = (
+    "exercises several frameworks in one process, so no single-framework environment holds it"
+)
 _NOT_AT_A_POINT = {
-    "test_adapter_envelopes.py": "imports two frameworks at once, so no single-framework "
-    "environment can collect it",
+    "test_adapter_envelopes.py": _SEVERAL,
+    "test_adapter_install_on_import.py": _SEVERAL,
+    "test_adapter_registry.py": _SEVERAL,
+    "test_strict_mode.py": _SEVERAL,
+    "test_uninstall_isolation.py": _SEVERAL,
 }
 
 
 def _reaches(path: Path, seen: set[Path]) -> set[str]:
-    """Every module `path` imports at module level, through the suite's own helper modules."""
+    """Every module `path` imports, at any depth of indentation, through the suite's own
+    helper modules. An import inside a test function needs the framework just the same."""
     if path in seen:
         return set()
     seen.add(path)
     reached = set()
-    for module in re.findall(r"^(?:import|from) (\w+)", path.read_text("utf-8"), re.M):
+    for module in re.findall(r"^[ \t]*(?:import|from) (\w+)", path.read_text("utf-8"), re.M):
         helper = _TESTS / f"{module}.py"
         reached |= _reaches(helper, seen) if helper.is_file() else {module}
     return reached
@@ -301,6 +339,7 @@ def test_every_test_file_that_imports_a_framework_runs_at_that_frameworks_points
     """A file left out of the selection is a file whose assertions no point checks.
     Followed through helper modules: a file that reaches a framework only through
     `_some_support.py` needs that framework installed just the same."""
+    unlisted = set(_NOT_AT_A_POINT)
     for name, spec in manifest.ADAPTERS.items():
         selected = {
             path.name
@@ -312,6 +351,8 @@ def test_every_test_file_that_imports_a_framework_runs_at_that_frameworks_points
             path.name for path in _TESTS.glob("test_*.py") if frameworks & _reaches(path, set())
         }
         assert importing - selected - set(_NOT_AT_A_POINT) == set(), name
+        unlisted -= importing
+    assert unlisted == set(), "listed as not run at a point, but imports no framework"
 
 
 def test_every_optional_test_file_is_also_in_the_adapters_selection():

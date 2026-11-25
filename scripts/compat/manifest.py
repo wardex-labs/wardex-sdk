@@ -42,8 +42,9 @@ TEST_TIMEOUT_S = 120
 #: Seconds one run of an adapter's files may take. A release that hangs many tests ends
 #: here with a result, instead of ending at the job's limit with none.
 SUITE_TIMEOUT_S = 1500
-#: A first run longer than this is not repeated, so that a point always fits its job.
-RERUN_BUDGET_S = 600
+#: Seconds a whole point may take, installs and second runs included. The job's limit in
+#: `compat.yml` is longer, so a point that runs out of time still writes its result.
+POINT_BUDGET_S = 2700
 
 TESTS_DIR = "sdks/python/tests"
 
@@ -100,13 +101,21 @@ ADAPTERS: dict[str, dict] = {
         "extras": {"pydantic-ai-slim": "[openai]"},
         "imports": ("pydantic_ai",),
         "requires": ("opentelemetry-api", "opentelemetry-sdk", "httpx[http2]", "h2", "hpack"),
-        "tests": ("test_pydantic_ai_*.py", "test_bridge_core.py", "test_h2c_unended_stream.py"),
+        "tests": (
+            "test_pydantic_ai_*.py",
+            "test_bridge_core.py",
+            "test_h2c_unended_stream.py",
+            "test_bedrock_semantics.py",
+        ),
         "optional": (
             {
                 "requires": ("fastmcp-slim[client]>=4.1", "mcp>=2.3", "anyio"),
                 "tests": ("test_pydantic_ai_mcp.py",),
             },
-            {"requires": ("boto3",), "tests": ("test_pydantic_ai_bedrock.py",)},
+            {
+                "requires": ("boto3",),
+                "tests": ("test_pydantic_ai_bedrock.py", "test_bedrock_semantics.py"),
+            },
         ),
         "evidence": "live",
         "replay_of": None,

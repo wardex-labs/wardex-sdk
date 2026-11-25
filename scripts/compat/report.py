@@ -59,6 +59,7 @@ CAUSE_WORDS = {
     "upstream": "a dependency release (the same wardex passes on the packages of the last pass)",
     "ours": "a wardex change (it fails on the packages of the last pass too)",
     "no_baseline": "unknown: this point has no earlier pass to compare with",
+    "not_determined": "not determined: a second run could not settle it",
 }
 
 
@@ -76,13 +77,16 @@ def code(value: object, limit: int = 200) -> str:
 
 def _shape_problem(data: dict) -> str:
     """Why a result is not of the form the rest of this module relies on, or ""."""
+
+    def texts(value: object) -> bool:
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
     tests = data.get("tests")
     if tests is not None:
         if not isinstance(tests, dict):
             return "malformed tests"
-        for field in ("failed_ids", "skipped_ids", "files", "excluded_files"):
-            value = tests.get(field, [])
-            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        for field in ("failed_ids", "skipped_ids", "files", "excluded_files", "plugins"):
+            if not texts(tests.get(field, [])):
                 return f"malformed tests.{field}"
         for field in ("passed", "failed", "errors", "skipped"):
             if not isinstance(tests.get(field, 0), int):
@@ -90,6 +94,14 @@ def _shape_problem(data: dict) -> str:
     for field in ("attach", "install", "counterfactual", "rerun", "sdk", "resolved", "uploaded"):
         if data.get(field) is not None and not isinstance(data[field], dict):
             return f"malformed {field}"
+    dropped = (data.get("install") or {}).get("dropped_optional", [])
+    if not isinstance(dropped, list) or not all(texts(group) for group in dropped):
+        return "malformed install.dropped_optional"
+    changed = (data.get("counterfactual") or {}).get("changed", {})
+    if not isinstance(changed, dict) or not all(
+        isinstance(pair, list) and len(pair) == 2 for pair in changed.values()
+    ):
+        return "malformed counterfactual.changed"
     if data.get("cause") not in (None, *CAUSE_WORDS):
         return "unknown cause"
     return ""
@@ -226,14 +238,17 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
                     ],
                 },
                 "attach": {
-                    k: clean(v)
-                    if isinstance(v, str)
-                    else v is True
-                    if isinstance(v, bool)
-                    else None
+                    k: clean(v) if isinstance(v, str) else v
                     for k, v in (result.get("attach") or {}).items()
-                    if k in ("state", "measured", "in_table", "verdict")
+                    if k in ("state", "measured", "in_table", "lines_said", "verdict")
+                    and (v is None or isinstance(v, (str, bool, int)))
                 },
+                "install_outcome": clean((result.get("install") or {}).get("outcome", "")),
+                "rerun_passed": (result.get("rerun") or {}).get("passed") is True
+                if result.get("rerun")
+                else None,
+                "note": clean(result.get("harness_error") or result.get("note") or "", 300),
+                "point_cutoff": clean(result.get("cutoff", ""), 30),
                 "outcome": result["outcome"],
                 "cause": result["cause"],
                 "replay_on_last_pass": {
@@ -259,11 +274,12 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
 
 
 def next_state(state: dict, results: dict[str, dict], run: dict, results_dir: Path) -> dict:
-    """The small file the next run reads: each point's last record and last pass."""
+    """The small file the next run reads: each point's last record, last check and last pass."""
     points = dict(state.get("points", {}))
     locks: dict[str, Path] = {}
     for key, result in results.items():
         entry = dict(points.get(key, {}))
+        tests = result.get("tests") or {}
         entry["last"] = {
             "date": run["date"],
             "outcome": result["outcome"],
@@ -271,6 +287,16 @@ def next_state(state: dict, results: dict[str, dict], run: dict, results_dir: Pa
             "targets": result["targets"],
             "url": run["url"],
         }
+        if result["outcome"] in GREEN | RED and result["outcome"] != "no_result":
+            # The last day this point was actually passed or failed. A later day on which it
+            # could not be installed says nothing new, and must not erase what this said.
+            entry["last_checked"] = {
+                "date": run["date"],
+                "outcome": result["outcome"],
+                "cause": result["cause"],
+                "targets": result["targets"],
+                "failed_ids": tests.get("failed_ids", []),
+            }
         # Days, not runs: a second run on the same day is the same outage seen twice.
         if result["outcome"] in NOT_OURS:
             if entry.get("not_ours_last") != run["date"]:
@@ -281,7 +307,6 @@ def next_state(state: dict, results: dict[str, dict], run: dict, results_dir: Pa
             entry.pop("not_ours_last", None)
         lock = results_dir / f"compat-point-{key}" / "lock.txt"
         if result["outcome"] in GREEN and lock.is_file():
-            tests = result.get("tests") or {}
             entry["last_green"] = {
                 "date": run["date"],
                 "targets": result["targets"],
@@ -338,17 +363,26 @@ def _fingerprint(items: list) -> str:
     return hashlib.sha256(json.dumps(items, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def adapter_issue(name: str, plan: dict, results: dict[str, dict], run: dict) -> dict:
-    """What the issue for one adapter should say after this run."""
+def adapter_issue(
+    name: str, plan: dict, results: dict[str, dict], run: dict, state: dict | None = None
+) -> dict:
+    """What the issue for one adapter should say after this run.
+
+    `state` holds what each point said the last time it was actually passed or
+    failed. A release inside the range that failed then, and could not be
+    checked today (the index was down, it would not install), is still failing
+    as far as anyone knows: it stays on the list, worded as such.
+    """
     info = plan["adapters"][name]
+    known = (state or {}).get("points", {})
     mine = [r for r in results.values() if r["adapter"] == name]
-    todo, marks, failing = [], [], []
+    todo, marks, failing, unchecked = [], [], [], []
     for result in mine:
         version, outcome = code(_version(result)), result["outcome"]
         tests = result.get("tests") or {}
-        count = len(tests.get("failed_ids", []))
-        if outcome == "fail" and count:
-            what = f"fails {count} tests"
+        nodes = tests.get("failed_ids", [])
+        if outcome == "fail" and nodes:
+            what = f"fails {len(nodes)} tests"
         elif outcome == "fail":
             what = "does not finish its tests (the run timed out, or failed outside any test)"
         else:
@@ -360,6 +394,20 @@ def adapter_issue(name: str, plan: dict, results: dict[str, dict], run: dict) ->
                 f"Cause: {cause}. This closes when it passes again, "
                 "or when the tested range no longer claims it."
             )
+        elif result["in_claim"] and outcome not in GREEN:
+            # Not checked today. What it said when it last was checked still stands.
+            before = known.get(result["key"], {}).get("last_checked") or {}
+            unchecked.append(f"{version} ({OUTCOME_WORDS[outcome]})")
+            if before.get("outcome") not in RED or before.get("targets") != result["targets"]:
+                continue
+            todo.append(
+                f"{version} is inside the tested range. It did not pass when last checked, on "
+                f"{code(before['date'])}, and could not be checked today: "
+                f"{OUTCOME_WORDS[outcome]}."
+            )
+            outcome, nodes = before["outcome"], before.get("failed_ids", [])
+            marks.append([result["key"], outcome, before.get("cause"), nodes])
+            continue
         elif not result["in_claim"] and outcome in ("fail", "attach_failed", "skips_changed"):
             todo.append(
                 f"{version} is newer than the tested range and {what}. Users on it are told "
@@ -373,12 +421,9 @@ def adapter_issue(name: str, plan: dict, results: dict[str, dict], run: dict) ->
             )
         else:
             continue
-        marks.append([result["key"], outcome, result["cause"], tests.get("failed_ids", [])])
-        if tests.get("failed_ids"):
-            failing.append((result, tests["failed_ids"]))
-    # A release inside the range that was neither passed nor failed today (the index was
-    # down, it could not be installed) was not checked. That is no ground to say it passes.
-    unchecked = [r for r in mine if r["in_claim"] and r["outcome"] not in GREEN | RED]
+        marks.append([result["key"], outcome, result["cause"], nodes])
+        if nodes:
+            failing.append((result, nodes))
 
     claim = "; ".join(
         f"{code(dist)} " + ", ".join(f"{line}.x" for line in lines)
@@ -415,20 +460,28 @@ def adapter_issue(name: str, plan: dict, results: dict[str, dict], run: dict) ->
         body += [f"- {code(node, 300)}" for node in nodes[:40]]
         if len(nodes) > 40:
             body.append(f"- and {len(nodes) - 40} more, in the run's log")
+    # Said when the issue closes. The run tests the default branch, so a published wardex
+    # release older than the commit that fixed this does not contain the fix; and a release
+    # that could not be checked today is named, not counted as passing.
+    closing = (
+        "Nothing here needs doing any more: every release inside the tested range that could be "
+        f"checked today passes on wardex {code(run['sdk_version'])} at "
+        f"{code(run['sdk_commit'][:10])}."
+    )
+    if unchecked:
+        closing += " Not checked today: " + "; ".join(unchecked) + "."
+    closing += (
+        " If a change to wardex is what fixed it, a wardex release published before that "
+        "commit does not contain the fix. Closing."
+    )
     return {
         "key": name,
         "title": f"Compatibility: {info['label']}",
         "body": "\n".join(body) + "\n",
         "fingerprint": _fingerprint(sorted(marks)),
         "open": bool(todo),
-        "hold": bool(unchecked),
         "changes": todo,
-        # The run tests the default branch. A published wardex release older than the
-        # commit that fixed this does not contain the fix, and the issue must not imply it.
-        "closing": "Nothing here needs doing any more: every release inside the tested range "
-        f"passes on wardex {code(run['sdk_version'])} at {code(run['sdk_commit'][:10])}. "
-        "If a change to wardex is what fixed it, a wardex release published before that "
-        "commit does not contain the fix. Closing.",
+        "closing": closing,
     }
 
 
@@ -524,7 +577,7 @@ def wanted_issues(plan: dict, results: dict[str, dict], state: dict, run: dict) 
     A run of one adapter knows nothing about the others, so it has no say
     about the two issues that speak for the whole run and must not close them.
     """
-    wanted = [adapter_issue(name, plan, results, run) for name in sorted(plan["adapters"])]
+    wanted = [adapter_issue(name, plan, results, run, state) for name in sorted(plan["adapters"])]
     if not plan.get("partial"):
         wanted += [health_issue(plan, results, state, run), died_issue()]
     return wanted
@@ -576,15 +629,15 @@ def sync_issue(gh: GitHub, wanted: dict, existing: list[dict], assignee: str = "
     """Make the issue with this key say what `wanted` says, without duplicating it.
 
     Found by a marker in the body, never by title, so a renamed issue is still
-    the same issue. A person who closes it while it still has something to say
-    is respected until what it has to say changes. `hold` means today's run
-    could not check everything the issue covers: nothing is closed on a day
-    like that, because "not checked" is not "passes".
+    the same issue. An open one is preferred to a closed one, so that closing a
+    duplicate by hand never leaves a live failure with no open issue. A person
+    who closes the only one while it still has something to say is respected
+    until what it has to say changes.
     """
     marker = f"<!-- compat-key: {wanted['key']} -->"
     same = sorted(
         (issue for issue in existing if marker in (issue.get("body") or "")),
-        key=lambda issue: issue["number"],
+        key=lambda issue: (issue["state"] == "open", issue["number"]),
     )
     mine = same[-1] if same else None
     for extra in same[:-1]:
@@ -608,8 +661,6 @@ def sync_issue(gh: GitHub, wanted: dict, existing: list[dict], assignee: str = "
             gh.do(f"open {wanted['title']}", "POST", "issues", payload)
         return
     path = f"issues/{mine['number']}"
-    if not wanted["open"] and wanted.get("hold"):
-        return
     if mine["state"] == "closed":
         if not wanted["open"]:
             if changed:
