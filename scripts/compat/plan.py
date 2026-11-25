@@ -274,9 +274,10 @@ def plan_adapter(name: str, entries: list[dict], releases: dict, cutoff: str) ->
     def add(role: str, version: str, prefer: str, *, pins: dict | None = None, line: str = ""):
         python = _python_for(finals, version, prefer)
         if python is None:
-            info["notes"].append(
-                f"{primary['distribution']} {version} admits no supported interpreter; not run"
-            )
+            # Above the range this is the framework's own business. Inside it, a release the
+            # README calls tested cannot be run at all, and that must not pass in silence.
+            said = f"{primary['distribution']} {version} admits no supported interpreter"
+            info["notes" if role == "beyond" else "problems"].append(f"{said}; not run")
             return
         targets = {primary["distribution"]: version, **(pins or {})}
         stamps = uploaded(targets)
