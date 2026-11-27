@@ -1192,6 +1192,21 @@ def test_what_a_displaced_point_said_is_forgotten_when_its_release_is_settled(tm
     state = report.next_state(before, passed, _RUN, tmp_path, plan)
     assert state["displaced"] == {} and "last_checked" not in state["points"][old["key"]]
 
+    # The same when the plan simply stops making the point (the release was listed as bad):
+    # nothing ran it today, and what it said before goes with it.
+    said = {"date": "2026-11-27", "outcome": "fail", "targets": old["targets"], "python": "3.14"}
+    held = {
+        "displaced": {"openai_agents": [item]},
+        "points": {old["key"]: {"last_checked": said}},
+    }
+    without = _plan_with_table(_FLOOR, newer)
+    results = _results(_result(_FLOOR), _result(newer))
+    dropped = report.next_state(held, results, _RUN, tmp_path, without)
+    assert dropped["displaced"] == {} and "last_checked" not in dropped["points"][old["key"]]
+    assert held["points"][old["key"]]["last_checked"] == said, "the state read is not edited"
+    untouched = report.next_state({**held, "displaced": {}}, results, _RUN, tmp_path, without)
+    assert untouched["points"][old["key"]]["last_checked"] == said, "only on leaving the list"
+
     state["displaced"] = {"openai_agents": [{**item, "failed_on": "2026-11-30"}]}
     stuck = _results(_result(_FLOOR), _result(newer), _result(old, "install_network"))
     later = report.next_state(state, stuck, _RUN, tmp_path, plan)

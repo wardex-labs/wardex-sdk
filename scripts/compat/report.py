@@ -421,7 +421,8 @@ def next_state(
     for key in keys(state.get("displaced") or {}) - keys(out["displaced"]):
         # Settled. If the release is ever remembered again, what its point said before
         # that must not outrank the newer failure.
-        points.get(key, {}).pop("last_checked", None)
+        if key in points:
+            points[key] = {k: v for k, v in points[key].items() if k != "last_checked"}
     if run["event"] == "schedule":
         out["last_scheduled"] = run["started_at"]
     out["_locks"] = locks
