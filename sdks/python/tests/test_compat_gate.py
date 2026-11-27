@@ -871,3 +871,16 @@ def test_a_tree_whose_version_cannot_be_read_has_no_release_to_excuse(
         assert "the version of this tree could not be read" in said
     pyproject.write_text("[project]\nversion = '0.7.0b2'\n", encoding="utf-8")
     assert gate.tree_version(tree) == "0.7.0b2", "either kind of quote is a version line"
+
+
+def test_nothing_is_published_without_the_gate_and_the_gate_can_only_read():
+    """`publish` waits for the gate, the gate judges the commit being released, and the
+    workflow gives it no way to write: a job that reads records must not be a way in."""
+    text = (_REPO / ".github/workflows/release-python.yml").read_text(encoding="utf-8")
+    assert "\npermissions:\n  contents: read\n" in text
+    publish = text.split("\n  publish:")[1]
+    needs = publish.split("needs: [")[1].split("]")[0].split(", ")
+    assert "compat-gate" in needs and {"build", "smoke", "gate"} <= set(needs)
+    job = text.split("\n  compat-gate:")[1].split("\n  publish:")[0]
+    assert 'gate.py --commit "$GITHUB_SHA"' in job and "persist-credentials: false" in job
+    assert "permissions:" not in job and "secrets." not in job and "if:" not in job
