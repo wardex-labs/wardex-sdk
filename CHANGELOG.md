@@ -5,6 +5,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The README shows what each adapter was run against, and when.** A table
+  under "Frameworks" lists the tested range of each adapter and what a pass
+  proves, with a cell per adapter that a daily run redraws: the newest tested
+  release and whether it passes, the newest release above the range, and the
+  date. The cell belongs to the wardex version the README describes, so the
+  page of a release on PyPI shows that release. Each cell links to the full
+  list of what was run, with versions, dates and failing tests by name.
+
 ### Changed
 
 - **The Pydantic AI adapter is tested on `pydantic-ai-slim` 2.54 and later,
