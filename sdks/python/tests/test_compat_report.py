@@ -2339,24 +2339,33 @@ def test_what_the_pages_know_of_a_release_survives_runs_of_one_adapter(tmp_path)
 
 def test_a_release_failing_on_one_wardex_build_starts_no_count_on_another(tmp_path):
     """The published release has failed on this framework release for weeks. The day the
-    default branch first fails on it is day one for the default branch."""
-    held = _published(_TOP)
+    default branch first fails on it, on the same interpreter, is day one for the default
+    branch; and the other way round."""
+    top = {**_TOP, "python": "3.14"}
+    held = {**_published(top), "python": "3.14"}
     plan = _release_plan(held)
-    state = report.next_state(
-        {},
-        _loaded(_result(_FLOOR), _result(_TOP), _result(held, "fail")),
-        {**_RUN, "date": "2026-11-01"},
-        tmp_path,
-        plan,
-    )
-    state.pop("_locks"), state.pop("_forget")
-    run = {**_RUN, "date": "2026-11-20"}
-    results = _loaded(_result(_FLOOR), _result(_TOP, "fail"), _result(held, "fail"))
-    state = report.next_state(state, results, run, tmp_path, plan)
-    assert state["points"][_TOP["key"]]["failing_since"]["date"] == "2026-11-20"
+
+    def day(state: dict, date: str, ours: str, theirs: str) -> dict:
+        results = _loaded(_result(_FLOOR), _result(top, ours), _result(held, theirs))
+        after = report.next_state(state, results, {**_RUN, "date": date}, tmp_path, plan)
+        after.pop("_locks"), after.pop("_forget")
+        return after
+
+    state = day({}, "2026-11-01", "pass", "fail")
+    state = day(state, "2026-11-20", "fail", "fail")
+    assert state["points"][top["key"]]["point"]["python"] == "3.14"
+    assert state["points"][held["key"]]["point"]["python"] == "3.14"
+    assert state["points"][top["key"]]["failing_since"]["date"] == "2026-11-20"
     assert state["points"][held["key"]]["failing_since"]["date"] == "2026-11-01"
+    run = {**_RUN, "date": "2026-11-20"}
+    results = _loaded(_result(_FLOOR), _result(top, "fail"), _result(held, "fail"))
     issue = report.adapter_issue("openai_agents", plan, results, run, state)
     assert "claim.py" not in issue["body"]
+
+    state = day({}, "2026-11-01", "fail", "pass")
+    state = day(state, "2026-11-20", "fail", "fail")
+    assert state["points"][held["key"]]["failing_since"]["date"] == "2026-11-20"
+    assert state["points"][top["key"]]["failing_since"]["date"] == "2026-11-01"
 
 
 def test_a_replaced_release_whose_own_point_cannot_run_yet_is_no_news(tmp_path):
@@ -2488,3 +2497,56 @@ def test_only_a_red_capable_point_of_this_build_makes_or_speaks_for_a_replaced_f
     passed = _loaded(_result(_FLOOR), _result(new), _result(beside))
     issue = report.adapter_issue("openai_agents", plan, passed, _RUN, state)
     assert issue["open"] and "taken its place" in issue["changes"][0]
+
+
+@pytest.mark.parametrize("taker", ["claim_top", "minor_newest", "claim_top_oldpy"])
+def test_a_count_follows_its_release_to_whichever_point_of_this_build_runs_it_next(tmp_path, taker):
+    """The patch that replaced a failing release is withdrawn, or the range grows, and a
+    rule's own point runs the old release again. It has been failing since the first day,
+    whoever holds it now. On another interpreter it is another failure with its own day."""
+    old = {**_point("claim_top", "0.23.1"), "python": "3.14"}
+    state = report.next_state(
+        {}, _results(_result(old, "fail")), {**_RUN, "date": "2026-11-01"}, tmp_path, _plan(old)
+    )
+    state.pop("_locks"), state.pop("_forget")
+    item = {**_remembered_item(), "key": "openai_agents--displaced--0.23.1-py3.14"}
+    item["failing_since"] = "2026-11-01"
+    state["displaced"] = {"openai_agents": [item]}
+    del state["points"][old["key"]]["failing_since"]
+
+    python = "3.10" if taker == "claim_top_oldpy" else "3.14"
+    again = {**_point(taker, "0.23.1"), "python": python}
+    result = _result(again, "fail")
+    result["planned_python"] = python
+    run = {**_RUN, "date": "2026-11-20"}
+    after = report.next_state(state, {again["key"]: result}, run, tmp_path, _plan(again))
+    began = "2026-11-20" if taker == "claim_top_oldpy" else "2026-11-01"
+    assert after["points"][again["key"]]["failing_since"]["date"] == began
+
+
+def test_a_count_is_also_taken_over_from_a_point_that_is_still_counting(tmp_path):
+    """The earliest day among the points of this build that hold the same release on the
+    same interpreter, and the item that remembers it. Not the day another interpreter
+    started failing on it."""
+    held = {**_point("claim_top", "0.23.1"), "python": "3.14"}
+    oldpy = {**_point("claim_top_oldpy", "0.23.1"), "python": "3.10"}
+    state: dict = {}
+    for date, planned in (("2026-10-20", oldpy), ("2026-11-03", held)):
+        result = _result(planned, "fail")
+        result["planned_python"] = planned["python"]
+        state = report.next_state(
+            state, {planned["key"]: result}, {**_RUN, "date": date}, tmp_path, _plan(planned)
+        )
+        state.pop("_locks"), state.pop("_forget")
+    assert state["points"][oldpy["key"]]["failing_since"]["date"] == "2026-10-20"
+    other = {**_point("minor_newest", "0.23.1"), "python": "3.14"}
+    result = _result(other, "fail")
+    result["planned_python"] = "3.14"
+    run = {**_RUN, "date": "2026-11-20"}
+    after = report.next_state(state, {other["key"]: result}, run, tmp_path, _plan(other))
+    assert after["points"][other["key"]]["failing_since"]["date"] == "2026-11-03"
+
+    item = {**_remembered_item(), "key": "openai_agents--displaced--0.23.1-py3.14"}
+    state["displaced"] = {"openai_agents": [{**item, "failing_since": "2026-11-01"}]}
+    after = report.next_state(state, {other["key"]: result}, run, tmp_path, _plan(other))
+    assert after["points"][other["key"]]["failing_since"]["date"] == "2026-11-01", "the earliest"
