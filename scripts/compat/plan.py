@@ -50,6 +50,14 @@ def vkey(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
 
+def _release(version: str) -> tuple[int, ...]:
+    """`vkey` with trailing zeros dropped: "2.54" and "2.54.0" are one release."""
+    parts = list(vkey(version))
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
 def iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -193,7 +201,7 @@ def claims(entry: dict, version: str) -> bool:
     two = ".".join(parts[:2])
     if version in entry["known_bad"]:
         return False
-    if entry.get("since") and vkey(version) < vkey(entry["since"]):
+    if entry.get("since") and _release(version) < _release(entry["since"]):
         return False
     return two in entry["minors"] or parts[0] in entry["minors"]
 

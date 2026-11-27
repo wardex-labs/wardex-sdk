@@ -180,6 +180,18 @@ def test_a_range_tested_from_a_release_on_has_its_floor_there():
     assert not plan.claims(entries[0], "2.53.0")
 
 
+@pytest.mark.parametrize("since", ["2.54", "2.54.0"])
+@pytest.mark.parametrize(
+    ("version", "claimed"),
+    [("2.54", True), ("2.54.0", True), ("2.53.9", False), ("2.9.0", False), ("2.100.0", True)],
+)
+def test_where_a_range_starts_is_compared_as_numbers_like_the_sdk_does(since, version, claimed):
+    """Compared as text, 2.9 would sort above 2.54 and 2.100 below it."""
+    row = {"minors": ("2",), "known_bad": (), "since": since}
+    assert plan.claims(row, version) is claimed
+    assert is_measured(_measured.Measured("x", ("2",), since=since), version) is claimed
+
+
 # --- a failed release that a newer one replaced --------------------------------
 
 _WITH_023_0 = {
@@ -212,6 +224,14 @@ def test_a_failed_release_that_a_newer_one_replaced_keeps_a_point_of_its_own():
     assert (point["python"], point["in_claim"], point["assume_measured"]) == ("3.14", True, False)
     assert point["cutoff"] == _CUTOFF
 
+    # On the interpreter it failed on, which is not always the newest.
+    old = _remembered("0.23.0", python="3.10")
+    planned = plan.plan_adapter("openai_agents", _OPENAI, _WITH_023_0, _CUTOFF, [item, old])
+    assert {p["key"]: p["python"] for p in planned["points"] if p["role"] == "displaced"} == {
+        "openai_agents--displaced--0.23.0-py3.14": "3.14",
+        "openai_agents--displaced--0.23.0-py3.10": "3.10",
+    }
+
     whole = plan.build_plan(
         {"openai_agents": _OPENAI}, _WITH_023_0, _CUTOFF, {"displaced": {"openai_agents": [item]}}
     )
@@ -241,6 +261,45 @@ def test_a_remembered_release_that_is_no_longer_claimed_is_not_planned(entries, 
     planned = plan.plan_adapter("openai_agents", entries, _WITH_023_0, _CUTOFF, [item])
     assert [p for p in planned["points"] if p["role"] == "displaced"] == []
     assert planned["info"]["problems"] == []
+
+
+def test_a_remembered_pair_whose_companion_was_withdrawn_is_not_planned_and_does_not_crash():
+    """LangGraph is remembered as a pair. With the companion's release gone from the index
+    the pair cannot be installed again, and a plan that died on it would die every day."""
+    entries = [
+        {"distribution": "langgraph", "minors": ("1.2",), "known_bad": ()},
+        {"distribution": "langgraph-prebuilt", "minors": ("1.1",), "known_bad": ()},
+    ]
+    history = {
+        "langgraph": [_release("1.2.0", "2026-05-12"), _release("1.2.24", "2026-11-20")],
+        "langgraph-prebuilt": [_release("1.1.0", "2026-05-12"), _release("1.1.3", "2026-11-19")],
+    }
+    gone = {"langgraph": "1.2.0", "langgraph-prebuilt": "1.1.2"}
+    here = {"langgraph": "1.2.0", "langgraph-prebuilt": "1.1.3"}
+    items = [{"key": "k", "targets": targets, "python": "3.14"} for targets in (gone, here)]
+    planned = plan.plan_adapter("langgraph", entries, history, _CUTOFF, items)
+    assert [p["targets"] for p in planned["points"] if p["role"] == "displaced"] == [here]
+    assert planned["info"]["problems"] == []
+
+
+def test_the_plan_is_handed_what_the_last_report_remembered(tmp_path, monkeypatch):
+    """The whole path, not the function: the workflow fetches `state.json` from the records
+    branch and gives it to `plan.py`, and `main` gives it to the plan."""
+    monkeypatch.setattr(plan, "read_measured", lambda: {"openai_agents": _OPENAI})
+    monkeypatch.setattr(plan, "fetch_releases", lambda dist: _WITH_023_0[dist])
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"displaced": {"openai_agents": [_remembered("0.23.0")]}}))
+    out = tmp_path / "plan.json"
+    assert plan.main(["--out", str(out), "--cutoff", _CUTOFF, "--state", str(state)]) == 0
+    keys = {point["key"] for point in json.loads(out.read_text())["points"]}
+    assert "openai_agents--displaced--0.23.0-py3.14" in keys
+    missing = tmp_path / "none.json"
+    assert plan.main(["--out", str(out), "--cutoff", _CUTOFF, "--state", str(missing)]) == 0
+
+    step = _jobs("compat.yml")["plan"]
+    assert "git show FETCH_HEAD:state.json > plan/state.json" in step
+    assert "plan.py --out plan/plan.json --state plan/state.json" in step
 
 
 def test_a_remembered_release_a_rule_picks_again_gets_no_second_point():
@@ -551,12 +610,17 @@ def test_a_fork_starts_no_scheduled_run_and_writes_no_issue_or_record():
     assert write == f"github.ref == 'refs/heads/main' && {_UPSTREAM} && '1' || ''"
     (commit,) = re.findall(r"if: (.*steps\.report\.outputs\.judged == 'true')", jobs["report"])
     assert _UPSTREAM in commit
-    died = " ".join(jobs["died"].split("steps:")[0].split())
-    assert f"github.ref == 'refs/heads/main' && {_UPSTREAM}" in died
-    assert "needs.plan.result != 'skipped'" in died
+    (died,) = re.findall(r"if: >-\n((?:      .*\n)+)", jobs["died"])
+    assert " ".join(died.split()) == (
+        f"always() && github.ref == 'refs/heads/main' && {_UPSTREAM} "
+        "&& needs.plan.result != 'skipped' && needs.report.outputs.judged != 'true'"
+    )
 
-    watch = " ".join(_jobs("compat-watchdog.yml")["watch"].split("steps:")[0].split())
-    assert f"if: >- {_UPSTREAM} &&" in watch
+    (watch,) = re.findall(r"if: >-\n((?:      .*\n)+)", _jobs("compat-watchdog.yml")["watch"])
+    assert " ".join(watch.split()) == (
+        f"{_UPSTREAM} && (github.event_name != 'pull_request' "
+        "|| github.event.pull_request.head.repo.full_name == github.repository)"
+    )
 
 
 def test_only_the_report_and_the_two_alarm_jobs_may_write():

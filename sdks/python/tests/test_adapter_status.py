@@ -491,14 +491,29 @@ def test_every_shipped_adapter_has_a_row_in_the_table():
         ("2.0.0", False),
         ("3.0.0", False),
         ("2.60.0", False),
+        ("2.9.0", False),
+        ("2.100.0", True),
     ],
-    ids=["first", "two-part", "later", "just-below", "oldest", "next-major", "bad"],
+    ids=[
+        "first",
+        "two-part",
+        "later",
+        "just-below",
+        "oldest",
+        "next-major",
+        "bad",
+        "one-digit-line",
+        "three-digit-line",
+    ],
 )
 def test_a_range_tested_from_a_release_on_leaves_everything_below_it_unmeasured(version, measured):
     """A range whose oldest releases fail the suite is claimed from the first one that
     passes. Below it the adapter still installs and says the release is untested."""
     entry = Measured("x", ("2",), known_bad=("2.60.0",), since="2.54")
     assert is_measured(entry, version) is measured
+    # The same release however many zeros either side spells it with.
+    padded = Measured("x", ("2",), known_bad=("2.60.0",), since="2.54.0")
+    assert is_measured(padded, version) is measured
 
 
 def test_the_range_is_spelled_with_where_it_starts():

@@ -301,9 +301,15 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
             kept[adapter] = list(items)
             continue
         for item in items:
-            result = results.get(item["key"])
-            if result is not None and result["outcome"] not in GREEN:
-                kept.setdefault(adapter, []).append(item)
+            result = results.get(item["key"]) or _picked_again(item, results)
+            # No point at all means the plan no longer claims the release. A point that ran
+            # it settles it either way: a pass ends it, and a failure at a rule's own point
+            # is on that point's record from here on.
+            if result is None or result["outcome"] in GREEN:
+                continue
+            if result["role"] != "displaced" and result["outcome"] in FAILED:
+                continue
+            kept.setdefault(adapter, []).append(item)
     for key, result in sorted(results.items()):
         before = state.get("points", {}).get(key, {}).get("last_checked") or {}
         entries = plan["adapters"].get(result["adapter"], {}).get("entries") or []
@@ -332,6 +338,18 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
     return {adapter: items for adapter, items in sorted(kept.items()) if items}
 
 
+def _picked_again(item: dict, results: dict[str, dict]) -> dict | None:
+    """The rule's point that runs a remembered release today, when one of the rules picks it
+    again (the release that replaced it was withdrawn) and the plan makes no second point."""
+    for result in results.values():
+        same = (
+            result["targets"] == item["targets"] and result.get("planned_python") == item["python"]
+        )
+        if same and result["in_claim"] and result["role"] != "displaced":
+            return result
+    return None
+
+
 def next_state(
     state: dict, results: dict[str, dict], run: dict, results_dir: Path, plan: dict | None = None
 ) -> dict:
@@ -353,9 +371,10 @@ def next_state(
             # What this point last said was about a release it no longer tests. Whether that
             # release is still owed a run was settled by `next_displaced`, once.
             del entry["last_checked"]
-        if result["outcome"] in GREEN | RED and result["outcome"] != "no_result":
-            # The last day this point was actually passed or failed. A later day on which it
-            # could not be installed says nothing new, and must not erase what this said.
+        if result["outcome"] in GREEN | FAILED:
+            # The last day this release was actually run. A later day on which it could not be
+            # installed, or on which the run itself broke, says nothing new about the release
+            # and must not erase what this said.
             entry["last_checked"] = {
                 "date": run["date"],
                 "outcome": result["outcome"],
@@ -445,6 +464,7 @@ def adapter_issue(
     """
     info = plan["adapters"][name]
     known = (state or {}).get("points", {})
+    remembered = {item["key"]: item for item in (state or {}).get("displaced", {}).get(name, [])}
     mine = [r for r in results.values() if r["adapter"] == name]
     todo, marks, failing, unchecked = [], [], [], []
     for result in mine:
@@ -475,6 +495,13 @@ def adapter_issue(
         elif result["in_claim"] and outcome not in GREEN:
             # Not checked today. What it said when it last was checked still stands.
             before = known.get(result["key"], {}).get("last_checked") or {}
+            item = remembered.get(result["key"]) or next(
+                (i for i in remembered.values() if _picked_again(i, {"": result})), None
+            )
+            if item and before.get("targets") != result["targets"]:
+                # A replaced release whose own point has not run it yet: what is known about
+                # it is the failure it was remembered for.
+                before = {"outcome": "fail", "targets": item["targets"], "date": item["failed_on"]}
             unchecked.append(f"{version} ({OUTCOME_WORDS[outcome]})")
             if before.get("outcome") not in RED or before.get("targets") != result["targets"]:
                 continue
@@ -503,8 +530,8 @@ def adapter_issue(
         if nodes:
             failing.append((result, nodes))
 
-    for item in (state or {}).get("displaced", {}).get(name, []):
-        if item["key"] in results:
+    for item in remembered.values():
+        if item["key"] in results or _picked_again(item, results):
             continue
         # Remembered by this run; the next plan is the first to make it a point.
         version = code(", ".join(f"{dist} {v}" for dist, v in item["targets"].items()))
