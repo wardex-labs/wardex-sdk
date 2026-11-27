@@ -342,13 +342,19 @@ def _replaced(points: list[dict], items: list[dict]) -> list[str]:
     """Releases that failed and that a newer one replaced, before their own point has run:
     still inside the range, known to fail, and in no row of the table above."""
     have = {point["key"] for point in points}
-    # A rule that picks the release again speaks for it in its own row.
-    run = [point["point"].get("targets") for point in points if point["point"].get("in_claim")]
+    # A rule that picks the release again speaks for it in its own row: the same release on
+    # the same interpreter, and not at the floor, which installs another time's packages.
+    run = [
+        (point["point"].get("targets"), point["point"].get("python"))
+        for point in points
+        if point["point"].get("in_claim")
+        and point["point"].get("role") not in ("displaced", "floor")
+    ]
     lines = []
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict) or not isinstance(item.get("targets"), dict):
             continue
-        if item.get("key") in have or item["targets"] in run:
+        if item.get("key") in have or (item["targets"], item.get("python")) in run:
             continue
         version = ", ".join(f"{dist} {v}" for dist, v in item["targets"].items())
         lines.append(

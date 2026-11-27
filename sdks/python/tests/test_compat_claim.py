@@ -291,6 +291,9 @@ def test_a_table_someone_left_a_hole_in_is_drift(tree):
         "`{dist}`\n9.1.x, 9.2.x",
         "`{dist}`  9.1.x,\n9.2.x",
         "`{dist}` 9.1.x\n   from 9.1.4, 9.2.x",
+        "`{dist}`\t9.1.x,\t9.2.x",
+        "> `{dist}`\n> 9.1.x,\n> 9.2.x",
+        "`{dist}` 9.1.x,\r\n9.2.x",
         "'{dist}>=9.1,<9.3'",
         '"{dist} >= 9.1, < 9.3"',
     ],
@@ -326,6 +329,7 @@ def test_a_phrase_the_table_writes_is_not_drift_for_being_wrapped(tree):
         "`{dist}`\n\n9.x of the documentation",
         "### `{dist}`\n\n9.x and later",
         "`{dist}` is described in section 9.x",
+        "`{dist}` {said},\n\n9.x is another paragraph",
     ],
 )
 def test_a_version_like_word_in_the_next_paragraph_is_not_a_claim(tree, written):
@@ -333,7 +337,22 @@ def test_a_version_like_word_in_the_next_paragraph_is_not_a_claim(tree, written)
     paragraph, and what follows says something else."""
     dist = _a_row_with_two_lines(tree)["distribution"]
     path = tree / claim.README
-    path.write_text(path.read_text("utf-8") + "\n" + written.format(dist=dist) + "\n", "utf-8")
+    said = plan.spelled(_a_row_with_two_lines(tree))
+    added = written.replace("{dist}", dist).replace("{said}", said)
+    path.write_text(path.read_text("utf-8") + "\n" + added + "\n", "utf-8")
     before = path.read_text("utf-8")
     assert claim.drift(tree) == []
     assert claim.main(["sync"], root=tree) == 0 and path.read_text("utf-8") == before
+
+
+def test_a_file_keeps_the_line_endings_it_came_with(tree):
+    for name in _FILES:
+        path = tree / name
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    assert claim.drift(tree) == []
+    row = _a_row_with_two_lines(tree)
+    assert claim.main(["widen", row["distribution"], _line_after(row)], root=tree) == 0
+    assert claim.drift(tree) == []
+    for name in (claim.MEASURED, claim.PYPROJECT, claim.README):
+        data = (tree / name).read_bytes()
+        assert data.count(b"\r\n") == data.count(b"\n") > 0, name

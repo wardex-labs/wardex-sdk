@@ -348,6 +348,7 @@ def test_the_index_lists_the_newest_release_first():
     ]
     assert listed == ["0.10.0", "0.9.0", "0.7.0.post1", "0.7.0", "0.7.0rc1", "0.7.0b10", "0.7.0b1"]
     more = {"0.7.0.post10": {}, "0.7.0.post2": {}, "v0.6": {}, "a b": {}, "../x": {}}
+    more["0.7.0.dev1"] = more["0.7.0+local"] = None
     state["versions"].update(more)
     again = render.index(state, _TODAY)
     assert again.index("0.7.0.post10]") < again.index("0.7.0.post2]") < again.index("0.7.0.post1]")
@@ -363,6 +364,7 @@ def test_a_failure_waiting_for_its_own_point_is_on_the_default_branchs_page():
         **{"openai_agents--claim_top": _entry(_identity("openai_agents", "claim_top", "0.23.2"))}
     )
     item = {"key": "openai_agents--displaced--0.23.1-py3.14", "failed_on": "2026-11-27"}
+    item["python"] = "3.14"
     item["targets"] = {"openai-agents": "0.23.1"}
     state["displaced"] = {"openai_agents": [item]}
     page = render.page(state, render.MAIN, _TODAY)
@@ -378,6 +380,15 @@ def test_a_failure_waiting_for_its_own_point_is_on_the_default_branchs_page():
     again = _identity("openai_agents", "claim_top", "0.23.1")
     state["points"]["openai_agents--claim_top"] = _entry(again, "install_network")
     assert "took its place" not in render.page(state, render.MAIN, _TODAY), "a rule picked it again"
+
+    state["displaced"]["openai_agents"] = [{**item, "python": "3.10"}]
+    page = render.page(state, render.MAIN, _TODAY)
+    assert "took its place" in page, "the same release on another interpreter is another failure"
+    floor = _identity("openai_agents", "floor", "0.23.1")
+    state["points"] = {"openai_agents--floor": _entry(floor)}
+    state["displaced"]["openai_agents"] = [item]
+    assert "took its place" in render.page(state, render.MAIN, _TODAY), "the floor is not it"
+    state["points"] = {"openai_agents--claim_top": _entry(again, "install_network")}
 
     odd = ["not an item", {"targets": "nor this"}, {"targets": {"x": None}}]
     state["displaced"]["openai_agents"] = odd

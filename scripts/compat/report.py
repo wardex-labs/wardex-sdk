@@ -324,7 +324,8 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
         before = state.get("points", {}).get(key, {}).get("last_checked") or {}
         entries = plan["adapters"].get(result["adapter"], {}).get("entries") or []
         if (
-            not result["in_claim"]
+            not _own(result)
+            or not result["in_claim"]
             or result["role"] == "displaced"
             or before.get("outcome") not in FAILED
             or before.get("targets") == result["targets"]
@@ -367,9 +368,19 @@ def _picked_again(item: dict, results: dict[str, dict]) -> dict | None:
         )
         # Not the floor: it installs the dependencies of the release's own time, and what
         # failed was the release with today's.
-        if same and result["in_claim"] and result["role"] not in ("displaced", "floor"):
+        picked = result["in_claim"] and result["role"] not in ("displaced", "floor")
+        if same and picked and _own(result):
             return result
     return None
+
+
+def _own(result: dict) -> bool:
+    """Whether a result speaks for the wheel this run built, as a red-capable point.
+
+    The list of replaced failures is about that build alone. The same release failing on
+    a published wardex is that release's finding, on its own page and under its own
+    heading, and must neither start nor settle anything here."""
+    return not is_watching(result) and _planned_sdk(result).get("origin", "build") == "build"
 
 
 _ABOUT = ("label", "evidence", "replay_of", "claim", "said", "newest")
@@ -661,6 +672,13 @@ def _lapse(result: dict, known: dict, run: dict) -> str:
     since = known.get(result["key"], {}).get("failing_since") or {}
     if since.get("targets") != result["targets"]:
         return ""
+    return _lapse_since(since.get("date"), result["targets"], run)
+
+
+def _lapse_since(began: object, targets: dict, run: dict) -> str:
+    """`_lapse` for a release and the first day of its failure, wherever that day is kept:
+    on its point, or on the item that remembers it while it has no point of its own."""
+    since, result = {"date": began}, {"targets": targets}
     try:
         days = (date.fromisoformat(run["date"]) - date.fromisoformat(since["date"])).days
     except (KeyError, TypeError, ValueError):
@@ -794,10 +812,16 @@ def adapter_issue(
             unchecked.append(f"{version} ({OUTCOME_WORDS[outcome]})")
             if before.get("outcome") not in RED or before.get("targets") != result["targets"]:
                 continue
+            # A release waiting for its own point has its count on the item that remembers it.
+            lapse = (
+                _lapse_since(item.get("failing_since"), item["targets"], run)
+                if pending
+                else _lapse(result, known, run)
+            )
             todo.append(
                 f"{version} is inside the tested range. It did not pass when last checked, on "
                 f"{code(before['date'])}, and could not be checked today: "
-                f"{OUTCOME_WORDS[outcome]}.{_lapse(result, known, run)}"
+                f"{OUTCOME_WORDS[outcome]}.{lapse}"
             )
             outcome, nodes = before["outcome"], before.get("failed_ids", [])
             if pending:
@@ -806,7 +830,7 @@ def adapter_issue(
                 marks.append([result["key"], "displaced", None, []])
             else:
                 marks.append([result["key"], outcome, before.get("cause"), nodes])
-            if _lapse(result, known, run):
+            if lapse:
                 # The same mark as on a day it ran and failed: an outage in the middle of
                 # a long failure is not news about the lapse.
                 marks.append([result["key"], "lapsed"])
@@ -837,13 +861,18 @@ def adapter_issue(
         # Remembered by this run, or by an earlier one whose point for it has not been able
         # to check it since: the failure it was remembered for is what is known.
         version = code(", ".join(f"{dist} {v}" for dist, v in item["targets"].items()))
+        lapse = _lapse_since(item.get("failing_since"), item["targets"], run)
         todo.append(
             f"{version} is inside the tested range and did not pass when it was last run, on "
             f"{code(item['failed_on'])}. A newer release has taken its place, so it is run on "
             "its own from the next run on. This closes when it passes, or when the table of "
-            "tested versions lists it under `known_bad`."
+            f"tested versions lists it under `known_bad`.{lapse}"
         )
         marks.append([item["key"], "displaced", None, []])
+        if lapse:
+            # The way out was already on the issue while the rule's own point ran the
+            # release. It does not leave for the day the release changes hands.
+            marks.append([item["key"], "lapsed"])
 
     said = info.get("said") or {}
     claim = "; ".join(
