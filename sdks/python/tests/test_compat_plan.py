@@ -192,6 +192,32 @@ def test_where_a_range_starts_is_compared_as_numbers_like_the_sdk_does(since, ve
     assert is_measured(_measured.Measured("x", ("2",), since=since), version) is claimed
 
 
+def test_the_plan_and_the_sdk_call_the_same_releases_tested():
+    """Two implementations of one rule, because the plan cannot import the package. Held
+    together over every spelling of a final release the index could serve."""
+    rows = [
+        (("2",), "", ()),
+        (("2",), "2.54", ("2.60.0",)),
+        (("0.22", "0.23"), "", ("0.23.0",)),
+        (("0.22", "0.23"), "0.22.3", ()),
+        (("1.2",), "1.2.0", ()),
+    ]
+    versions = [
+        ".".join(str(n) for n in parts)
+        for parts in (
+            [(a,) for a in (0, 1, 2, 3)]
+            + [(a, b) for a in (0, 1, 2, 3) for b in (0, 9, 22, 23, 53, 54, 60, 100)]
+            + [(a, b, c) for a in (0, 1, 2) for b in (0, 2, 22, 23, 54, 60) for c in (0, 3, 10)]
+            + [(2, 54, 0, 1), (0, 22, 3, 0)]
+        )
+    ]
+    for minors, since, bad in rows:
+        entry = _measured.Measured("x", minors, known_bad=bad, since=since)
+        row = {"minors": minors, "known_bad": bad, "since": since}
+        for version in versions:
+            assert plan.claims(row, version) is is_measured(entry, version), (row, version)
+
+
 # --- a failed release that a newer one replaced --------------------------------
 
 _WITH_023_0 = {
@@ -280,6 +306,33 @@ def test_a_remembered_pair_whose_companion_was_withdrawn_is_not_planned_and_does
     planned = plan.plan_adapter("langgraph", entries, history, _CUTOFF, items)
     assert [p["targets"] for p in planned["points"] if p["role"] == "displaced"] == [here]
     assert planned["info"]["problems"] == []
+
+    # Listing the companion's release as bad settles the pair, as the issue says it does.
+    listed = [entries[0], {**entries[1], "known_bad": ("1.1.3",)}]
+    history["langgraph-prebuilt"].append(_release("1.1.4", "2026-11-22"))
+    planned = plan.plan_adapter("langgraph", listed, history, _CUTOFF, items)
+    assert [p for p in planned["points"] if p["role"] == "displaced"] == []
+
+
+def test_the_floor_does_not_stand_in_for_a_release_that_failed_with_todays_packages():
+    """The floor installs the dependencies of the release's own time. A release that
+    failed with today's is still owed a run with today's, even when the floor is the same
+    release on the same interpreter."""
+    entries = [
+        {"distribution": "pydantic-ai-slim", "minors": ("2",), "known_bad": (), "since": "2.54"}
+    ]
+    history = {
+        "pydantic-ai-slim": [
+            _release("2.54.0", "2026-10-03"),
+            _release("2.55.0", "2026-10-09"),
+        ]
+    }
+    targets = {"pydantic-ai-slim": "2.54.0"}
+    item = {"key": "k", "targets": targets, "python": "3.10"}
+    planned = plan.plan_adapter("pydantic_ai", entries, history, _CUTOFF, [item])
+    roles = {p["role"]: p for p in planned["points"] if p["targets"] == targets}
+    assert set(roles) == {"floor", "displaced"}
+    assert roles["floor"]["cutoff"] != _CUTOFF and roles["displaced"]["cutoff"] == _CUTOFF
 
 
 def test_the_plan_is_handed_what_the_last_report_remembered(tmp_path, monkeypatch):

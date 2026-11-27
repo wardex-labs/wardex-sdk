@@ -1127,3 +1127,73 @@ def test_a_replaced_failure_survives_the_whole_path_from_results_to_the_next_pla
     code, state, points = run_day(23, set())
     assert code == 0 and state["displaced"] == {}
     assert not [p for p in points if p["role"] == "displaced"]
+
+
+def test_a_pass_on_another_interpreter_or_at_the_floor_settles_nothing(tmp_path):
+    """It failed on Python 3.10 with today's packages. The same release passing on 3.14,
+    or at the floor with the packages of its own time, says nothing about that."""
+    key = "openai_agents--displaced--0.23.1-py3.10"
+    item = {"key": key, **_remembered_item(), "python": "3.10"}
+    newest = {**_point("claim_top", "0.23.1"), "planned_python": "3.14"}
+    oldest = {**_point("claim_top_oldpy", "0.23.1"), "planned_python": "3.10"}
+    floor = {**_point("floor", "0.23.1"), "planned_python": "3.10"}
+    plan = _plan_with_table(floor, newest, oldest)
+    results = _results(_result(floor), _result(newest), _result(oldest, "install_network"))
+    before = {"displaced": {"openai_agents": [item]}}
+    state = report.next_state(before, results, _RUN, tmp_path, plan)
+    assert [kept["key"] for kept in state["displaced"]["openai_agents"]] == [key]
+    assert report.adapter_issue("openai_agents", plan, results, _RUN, state)["open"]
+
+
+def test_a_pair_is_settled_by_listing_either_of_its_releases_as_bad(tmp_path):
+    """LangGraph is tested as two distributions pinned together. The issue says listing
+    the release as bad closes it; that has to hold for the companion's release too."""
+    pair = {"langgraph": "1.2.3", "langgraph-prebuilt": "1.1.0"}
+    newer = {"langgraph": "1.2.3", "langgraph-prebuilt": "1.1.1"}
+    top = {
+        "key": "langgraph--claim_top",
+        "adapter": "langgraph",
+        "role": "claim_top",
+        "targets": newer,
+        "in_claim": True,
+    }
+    checked = {
+        "date": "2026-11-25",
+        "outcome": "fail",
+        "cause": None,
+        "targets": pair,
+        "python": "3.14",
+        "failed_ids": ["t.py::test_tree"],
+    }
+    before = {"points": {top["key"]: {"last_checked": checked}}}
+    rows = [
+        {"distribution": "langgraph", "minors": ["1.2"], "known_bad": [], "since": ""},
+        {"distribution": "langgraph-prebuilt", "minors": ["1.1"], "known_bad": [], "since": ""},
+    ]
+
+    def remembered(entries: list[dict]) -> dict:
+        plan = _plan(top)
+        plan["adapters"]["langgraph"] = {**plan["adapters"]["openai_agents"], "entries": entries}
+        return report.next_state(before, _results(_result(top)), _RUN, tmp_path, plan)["displaced"]
+
+    assert [item["targets"] for item in remembered(rows)["langgraph"]] == [pair]
+    assert remembered([rows[0], {**rows[1], "known_bad": ["1.1.0"]}]) == {}
+    assert remembered([{**rows[0], "known_bad": ["1.2.3"]}, rows[1]]) == {}
+
+
+def test_what_a_displaced_point_said_is_forgotten_when_its_release_is_settled(tmp_path):
+    """Its point passed and the release left the list. Remembered again after a later
+    failure, that old pass must not outrank the failure it is remembered for."""
+    newer, old = _point("claim_top", "0.23.2"), _displaced_point("0.23.1")
+    plan = _plan_with_table(_FLOOR, newer, old)
+    item = {"key": old["key"], **_remembered_item()}
+    passed = _results(_result(_FLOOR), _result(newer), _result(old))
+    before = {"displaced": {"openai_agents": [item]}}
+    state = report.next_state(before, passed, _RUN, tmp_path, plan)
+    assert state["displaced"] == {} and "last_checked" not in state["points"][old["key"]]
+
+    state["displaced"] = {"openai_agents": [{**item, "failed_on": "2026-11-30"}]}
+    stuck = _results(_result(_FLOOR), _result(newer), _result(old, "install_network"))
+    later = report.next_state(state, stuck, _RUN, tmp_path, plan)
+    issue = report.adapter_issue("openai_agents", plan, stuck, _RUN, later)
+    assert issue["open"] and "on `2026-11-30`" in issue["changes"][0]

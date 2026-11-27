@@ -321,9 +321,13 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
             or not entries
         ):
             continue
-        version = before["targets"].get(entries[0]["distribution"])
+        rows = {entry["distribution"]: entry for entry in entries}
         # A range narrowed past the release, or a release now listed as bad, is settled.
-        if not isinstance(version, str) or not claims(entries[0], version):
+        # Every pinned distribution is asked of its own row.
+        if not all(
+            dist in rows and isinstance(v, str) and claims(rows[dist], v)
+            for dist, v in before["targets"].items()
+        ):
             continue
         python = before.get("python") or result.get("planned_python") or ""
         item = {
@@ -345,7 +349,9 @@ def _picked_again(item: dict, results: dict[str, dict]) -> dict | None:
         same = (
             result["targets"] == item["targets"] and result.get("planned_python") == item["python"]
         )
-        if same and result["in_claim"] and result["role"] != "displaced":
+        # Not the floor: it installs the dependencies of the release's own time, and what
+        # failed was the release with today's.
+        if same and result["in_claim"] and result["role"] not in ("displaced", "floor"):
             return result
     return None
 
@@ -408,6 +414,14 @@ def next_state(
     out["displaced"] = (
         next_displaced(state, plan, results) if plan else state.get("displaced") or {}
     )
+
+    def keys(remembered: dict) -> set[str]:
+        return {item["key"] for items in remembered.values() for item in items}
+
+    for key in keys(state.get("displaced") or {}) - keys(out["displaced"]):
+        # Settled. If the release is ever remembered again, what its point said before
+        # that must not outrank the newer failure.
+        points.get(key, {}).pop("last_checked", None)
     if run["event"] == "schedule":
         out["last_scheduled"] = run["started_at"]
     out["_locks"] = locks

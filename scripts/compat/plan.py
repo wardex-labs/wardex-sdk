@@ -197,13 +197,12 @@ def _line(version: str, width: int) -> str:
 
 def claims(entry: dict, version: str) -> bool:
     """Whether the table calls final release `version` tested. The rule `is_measured` applies."""
-    parts = version.split(".")
-    two = ".".join(parts[:2])
-    if version in entry["known_bad"]:
+    parts = vkey(version)
+    if len(parts) < 2 or version in entry["known_bad"]:
         return False
     if entry.get("since") and _release(version) < _release(entry["since"]):
         return False
-    return two in entry["minors"] or parts[0] in entry["minors"]
+    return f"{parts[0]}.{parts[1]}" in entry["minors"] or str(parts[0]) in entry["minors"]
 
 
 def spelled(entry: dict) -> str:
@@ -371,10 +370,20 @@ def plan_adapter(
         if version not in claimed or python not in manifest.SUPPORTED_PYTHONS:
             continue
         pins = {dist: v for dist, v in targets.items() if dist != primary["distribution"]}
-        if any(v not in companion_finals.get(dist, {}) for dist, v in pins.items()):
+        rows = {entry["distribution"]: entry for entry in companions}
+        # Every pinned companion is held to its own row, as the primary is: listing the
+        # companion's release as bad settles the pair too.
+        if any(
+            dist not in rows or v not in _claimed(companion_finals[dist], rows[dist])
+            for dist, v in pins.items()
+        ):
             continue
-        # One of the rules above picks it again today: that point speaks for it.
-        if any(p["targets"] == targets and p["python"] == python for p in points):
+        # One of the rules above picks it again today: that point speaks for it. Not the
+        # floor, which installs the dependencies of the release's own time, not today's.
+        if any(
+            p["targets"] == targets and p["python"] == python and p["role"] != "floor"
+            for p in points
+        ):
             continue
         add("displaced", version, python, pins=pins, line=displaced_line(targets, python))
     return {"info": info, "points": points}
