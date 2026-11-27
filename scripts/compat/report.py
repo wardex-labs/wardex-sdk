@@ -26,7 +26,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from compat import kinds, model, render  # noqa: E402
+from compat import gate, kinds, model, render  # noqa: E402
 from compat.plan import claims, displaced_line  # noqa: E402
 from compat.verdict import (  # noqa: E402
     FAILED,
@@ -521,6 +521,7 @@ def _versions(state: dict, plan: dict | None, run: dict) -> dict:
         versions[release["version"]] = {
             "ref": release["ref"],
             "commit": release["commit"],
+            "override": release.get("override"),
             "date": run["date"],
             "adapters": merged(old, release["adapters"]),
         }
@@ -1281,6 +1282,33 @@ def run_info(plan: dict) -> dict:
     }
 
 
+def gate_rehearsal(plan: dict, results: dict[str, dict], run: dict) -> str:
+    """What the release gate would say of this commit, from this run's own lines.
+
+    Printed by every run, so the gate's verdict is seen daily and not for the first time
+    on the day of a release. It decides nothing here."""
+    said = ["", "### If this commit were released now", ""]
+    try:
+        decision = gate.decide(
+            records(plan, results, run),
+            commit=run["sdk_commit"],
+            today=run["date"],
+            claims=gate.claimed(gate.REPO),
+        )
+    except Exception as broken:  # noqa: BLE001 - a rehearsal must never cost the run its verdict
+        return "\n".join(
+            [*said, f"The release gate could not be rehearsed: {type(broken).__name__}"]
+        )
+    if decision["pass"]:
+        said.append(
+            "The release gate would pass: every point that speaks for a tested range passed."
+        )
+    else:
+        said.append("The release gate would stop:")
+        said += ["", *[f"- {clean(reason, 300)}" for reason in decision["reasons"]]]
+    return "\n".join(said) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--plan", required=True)
@@ -1339,6 +1367,7 @@ def main(argv: list[str] | None = None) -> int:
     text = summary(
         plan, results, reasons, gh.log if args.write else [f"(dry run) {a}" for a in gh.log]
     )
+    text += gate_rehearsal(plan, results, run)
     print(text)
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if target:

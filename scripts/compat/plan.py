@@ -510,7 +510,17 @@ def read_tag(version: str) -> dict:
         _git("show", f"{commit}:{ENUMS_PY.relative_to(REPO)}"),
     )
     tests = _git("ls-tree", "--name-only", f"{commit}:{model.TESTS_DIR}").split()
-    return {"ref": ref, "commit": commit, "table": table, "tests": sorted(tests)}
+    try:
+        override = model.parse_override(_git("show", f"{commit}:{model.OVERRIDE}"), version)
+    except subprocess.CalledProcessError:
+        override = None  # the usual case: the release went through its gate
+    return {
+        "ref": ref,
+        "commit": commit,
+        "table": table,
+        "tests": sorted(tests),
+        "override": override,
+    }
 
 
 def plan_published(version: str, tag: dict, releases: dict, cutoff: str) -> dict:
@@ -544,6 +554,7 @@ def plan_published(version: str, tag: dict, releases: dict, cutoff: str) -> dict
         "version": version,
         "ref": tag["ref"],
         "commit": tag["commit"],
+        "override": tag.get("override"),
         "points": points,
         "adapters": adapters,
     }
@@ -615,7 +626,9 @@ def build_plan(
     if "published" in kinds.due(cadence) and published:
         unplanned += [f"published: {problem}" for problem in published.get("problems", [])]
         if published.get("version"):
-            release = {k: published[k] for k in ("version", "ref", "commit", "adapters")}
+            release = {
+                k: published.get(k) for k in ("version", "ref", "commit", "override", "adapters")
+            }
             points.extend(published["points"])
             for name, info in sorted(published["adapters"].items()):
                 unplanned += [f"published: {name}: {problem}" for problem in info["problems"]]

@@ -242,6 +242,26 @@ changes a claim on its own. A release inside the range that has failed for
 fourteen days gets the `bad` command printed in its issue. A failing release
 is never answered by capping what the run installs.
 
+`scripts/compat/gate.py` answers whether a commit may be released: a whole run
+on the default branch, at exactly that commit, in the last two days, passed
+every point that speaks for a tested range, with at least two such points for
+each adapter the tree gives a range. A watching kind is not asked. It reads
+the record lines and writes nothing. Every run prints what the gate would say
+of its own commit at the end of its summary, so the verdict is seen daily and
+not first on the day of a release.
+
+```bash
+git fetch origin compat-results && git worktree add /tmp/compat-records FETCH_HEAD
+python3 scripts/compat/gate.py --commit "$(git rev-parse HEAD)" --records /tmp/compat-records
+gh workflow run compat.yml --ref main      # the proof it asks for, about ten minutes
+```
+
+A release that has to go out without that proof carries
+`scripts/compat/release-override.json` (`{"version": "<its version>",
+"reason": "<why>"}`) in its own tree. The gate lets it through and says so,
+and the page of that release says so for as long as the page exists; a file
+left behind by an earlier release names that release and excuses nothing.
+
 The test that holds an adapter's whole exported envelope to its contract lives
 in a file per adapter (`test_<adapter>_envelope.py`, contract in
 `_adapter_envelopes.py`), so each runs at its own framework's points.
