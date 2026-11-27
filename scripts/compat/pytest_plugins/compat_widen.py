@@ -17,6 +17,7 @@ That `init()` says "untested" on the real table is checked separately, at every 
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from collections.abc import Iterator
 
@@ -45,8 +46,9 @@ def widen() -> dict:
     return before
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _compat_widen() -> Iterator[None]:
+@contextlib.contextmanager
+def widened() -> Iterator[None]:
+    """The table widened for as long as the block runs, and as it was afterwards."""
     from wardex_sdk._adapters import _measured
 
     before = widen()
@@ -54,3 +56,9 @@ def _compat_widen() -> Iterator[None]:
         yield
     finally:
         _measured.MEASURED.update(before)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _compat_widen() -> Iterator[None]:
+    with widened():
+        yield

@@ -61,7 +61,10 @@ def judge(plan: dict, results: dict[str, dict]) -> list[str]:
         ]
         if len(mine) < floor:
             reasons.append(f"plan: {name} has fewer than two points")
-    if not plan["points"]:
+    # Only a run that was due to ask a red-capable question is red for asking none. A run
+    # of a cadence that holds watching kinds alone has nothing that could turn it red.
+    owed = any(kinds.is_red_capable(kind) for kind in kinds.due(plan.get("cadence", "daily")))
+    if owed and not plan["points"]:
         reasons.append("plan: no points")
     for key, result in results.items():
         if is_watching(result):

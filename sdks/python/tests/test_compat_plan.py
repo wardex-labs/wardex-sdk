@@ -625,6 +625,25 @@ def test_the_switch_measures_an_installed_release_outside_the_table(monkeypatch)
     assert MEASURED[AdapterName.OPENAI_AGENTS] == (entry,)
 
 
+def test_the_table_is_as_it_was_after_a_widened_session(monkeypatch):
+    """The plugin's session fixture is this block: widened inside, restored on the way
+    out, also when the session ends in an error."""
+    real = _measured.installed_version
+    monkeypatch.setattr(
+        _measured,
+        "installed_version",
+        lambda dist: "0.99.1" if dist == "openai-agents" else real(dist),
+    )
+    shipped = dict(MEASURED)
+    with pytest.raises(RuntimeError), compat_widen.widened():
+        (inside,) = MEASURED[AdapterName.OPENAI_AGENTS]
+        assert is_measured(inside, "0.99.1")
+        raise RuntimeError("the session broke")
+    assert dict(MEASURED) == shipped
+    text = (_REPO / "scripts/compat/pytest_plugins/compat_widen.py").read_text(encoding="utf-8")
+    assert "    with widened():\n        yield\n" in text
+
+
 def test_the_widening_plugin_reads_only_names_a_published_release_already_has():
     """A point that tests a published wardex release runs that release's own tests, so the
     plugin cannot live in the tests tree and cannot lean on anything newer than the three

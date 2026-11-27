@@ -426,7 +426,10 @@ def next_state(
         identity = points[key].get("point") or {}
         kind = identity.get("kind", "framework")
         subject = identity.get("subject") or key.split("--")[0]
-        if subject in scope.get("covers", {}).get(kind, ()):
+        # A kind nobody declares any more has no run that could cover it, so the first
+        # whole run forgets its points; otherwise they would stay on an issue for good.
+        retired = kind not in kinds.KINDS and not scope.get("partial", True)
+        if retired or subject in scope.get("covers", {}).get(kind, ()):
             del points[key]
             forgotten.append(key)
     seen = dict(state.get("kinds") or {})
@@ -510,6 +513,8 @@ def _remembered_rows(state: dict | None, subject: str, results: dict[str, dict])
         identity, last = entry.get("point"), entry.get("last") or {}
         if key in results or not identity or identity.get("subject") != subject:
             continue
+        if identity.get("kind", "framework") not in kinds.KINDS:
+            continue  # a kind that was retired asks nothing of anyone
         said, checked = last, entry.get("last_checked") or {}
         if last.get("outcome") not in GREEN | FAILED and checked.get("targets") == identity.get(
             "targets"
