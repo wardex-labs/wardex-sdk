@@ -40,8 +40,11 @@ concurrency:
 jobs:
   watch:
     name: is the daily run still running
-    # A pull request from a fork gets a read-only token and cannot open an issue.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # A pull request from a fork gets a read-only token and cannot open an issue. In a fork
+    # itself nothing is watched: the schedule this asks about does not run there.
+    if: >-
+      github.repository == 'wardex-labs/wardex-sdk'
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

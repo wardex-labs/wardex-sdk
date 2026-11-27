@@ -138,6 +138,12 @@ start, and picks for each adapter:
 | newest patch of a tested line | one per tested release line below the top one | 3.14 |
 | newest tested release | the top of the tested range | 3.14 and 3.10 |
 | newer than the tested range | the newest patch of each release line above the range, three lines at most | 3.14 |
+| failed and since replaced | a release that failed as one of the points above and is no longer picked, because a newer patch took its place | the one it failed on |
+
+The last row exists because the newest release of a line is a point only while
+it is the newest. One that fails there is still a release the README calls
+tested, so the report remembers it (`displaced` in `state.json`) and the plan
+keeps running it until it passes or the table lists it under `known_bad`.
 
 A release above the range is tested with `COMPAT_ASSUME_MEASURED=1`,
 which adds it to the table for the test session: that point asks whether the
@@ -152,8 +158,9 @@ found by a marker in its body, rewritten by every run and closed by the run
 when nothing is left to do; on a day a release could not be checked at all,
 nothing is closed. Records accumulate on the `compat-results` branch, one JSON
 line per point per run under `records/`, with the hash-locked package list of
-each point's last pass under `last-green/`. Only a run on `main` writes issues
-and records.
+each point's last pass under `last-green/`. Only a run on `main` of this
+repository writes issues and records. In a fork the schedule starts nothing,
+and a run you start by hand reports to its own summary.
 
 A failing run of an adapter's files is repeated once, whole and in the same
 order; only if that passes is the failure called flaky. A point inside the
@@ -178,7 +185,13 @@ manifest carries an upper bound, and the three test tools are pinned exactly.
 
 To widen or narrow a tested range, change the table, the test pin in
 `sdks/python/pyproject.toml` and the README's framework table in one commit.
+A range whose oldest releases fail is narrowed with `since=` (the first
+release that passes); one bad release inside a range goes under `known_bad`.
 A failing release is never answered by capping what the run installs.
+
+The test that holds an adapter's whole exported envelope to its contract lives
+in a file per adapter (`test_<adapter>_envelope.py`, contract in
+`_adapter_envelopes.py`), so each runs at its own framework's points.
 
 `.github/workflows/compat-watchdog.yml` asks the Actions run list when the
 schedule last started a run and opens an issue when two whole days have passed

@@ -791,3 +791,163 @@ def test_a_stale_schedule_alarm_names_the_day_it_went_quiet():
     assert first["open"] and second["open"]
     assert first["fingerprint"] != second["fingerprint"]
     assert watchdog.wanted("2026-11-20T00:00:00Z", _at("2026-11-21"))["fingerprint"] == "clear"
+
+
+# --- a failed release that a newer one replaced --------------------------------
+
+_ENTRY = {"distribution": "openai-agents", "minors": ["0.22", "0.23"], "known_bad": [], "since": ""}
+
+
+def _plan_with_table(*points: dict, entry: dict = _ENTRY) -> dict:
+    plan = _plan(*points)
+    plan["adapters"]["openai_agents"]["entries"] = [entry]
+    return plan
+
+
+def _displaced_point(version: str) -> dict:
+    return {**_point("displaced", version, line=f"{version}-py3.14"), "python": "3.14"}
+
+
+def _top_failed_yesterday(version: str = "0.23.1") -> dict:
+    state = _failed_yesterday(_point("claim_top", version), ["t.py::test_tree"])
+    state["points"][_TOP["key"]]["last_checked"]["python"] = "3.14"
+    return state
+
+
+def test_a_failed_release_that_a_newer_one_replaced_is_remembered_and_kept_on_the_issue(tmp_path):
+    """Yesterday the newest tested release failed. Today a newer patch is the newest and
+    passes. The old one is still a release the README calls tested, and no point runs it
+    any more: without this it would leave the issue as if it had been fixed."""
+    newer = _point("claim_top", "0.23.2")
+    plan = _plan_with_table(_FLOOR, newer)
+    results = _results(_result(_FLOOR), _result(newer))
+    assert report.judge(plan, results) == []
+
+    state = report.next_state(_top_failed_yesterday(), results, _RUN, tmp_path, plan)
+    assert state["displaced"] == {
+        "openai_agents": [
+            {
+                "key": "openai_agents--displaced--0.23.1-py3.14",
+                "targets": {"openai-agents": "0.23.1"},
+                "python": "3.14",
+                "failed_on": "2026-11-25",
+            }
+        ]
+    }
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN, state)
+    assert issue["open"]
+    (line,) = issue["changes"]
+    assert "`openai-agents 0.23.1`" in line and "did not pass when it was last run" in line
+    assert "`known_bad`" in line
+
+    again = report.next_state(state, results, _RUN, tmp_path, plan)
+    assert again["displaced"] == {}, "the plan made no point of it: it is no longer claimed"
+
+
+def test_a_release_the_range_no_longer_claims_is_not_remembered(tmp_path):
+    """Narrowing the range, or listing the release as bad, is how such a failure is
+    settled. The run that first sees the narrower table must let the issue close."""
+    newer = _point("claim_top", "0.23.2")
+    results = _results(_result(_FLOOR), _result(newer))
+    for entry in (
+        {**_ENTRY, "known_bad": ["0.23.1"]},
+        {**_ENTRY, "since": "0.23.2"},
+        {**_ENTRY, "minors": ["0.22"]},
+    ):
+        plan = _plan_with_table(_FLOOR, newer, entry=entry)
+        state = report.next_state(_top_failed_yesterday(), results, _RUN, tmp_path, plan)
+        assert state["displaced"] == {}, entry
+        assert not report.adapter_issue("openai_agents", plan, results, _RUN, state)["open"]
+
+
+@pytest.mark.parametrize("before", ["no_result", "harness_error", "install_network", "pass"])
+def test_only_a_release_that_was_run_and_failed_is_remembered(tmp_path, before):
+    """A release that could not be looked at is not known to be bad."""
+    state = _top_failed_yesterday()
+    state["points"][_TOP["key"]]["last_checked"]["outcome"] = before
+    newer = _point("claim_top", "0.23.2")
+    plan = _plan_with_table(_FLOOR, newer)
+    results = _results(_result(_FLOOR), _result(newer))
+    assert report.next_state(state, results, _RUN, tmp_path, plan)["displaced"] == {}
+
+
+def test_a_displaced_release_that_still_fails_is_red_and_says_how_it_closes(tmp_path):
+    newer, old = _point("claim_top", "0.23.2"), _displaced_point("0.23.1")
+    plan = _plan_with_table(_FLOOR, newer, old)
+    failing = _result(old, "fail", cause="no_baseline", failed_ids=["t.py::test_tree"])
+    results = _results(_result(_FLOOR), _result(newer), failing)
+    assert report.judge(plan, results) == [f"{old['key']}: tests fail"]
+
+    remembered = {"displaced": {"openai_agents": [{"key": old["key"], **_remembered_item()}]}}
+    state = report.next_state(remembered, results, _RUN, tmp_path, plan)
+    assert [item["key"] for item in state["displaced"]["openai_agents"]] == [old["key"]]
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN, state)
+    (line,) = issue["changes"]
+    assert "A newer release has taken its place, so no other point tests it." in line
+    assert "lists it under `known_bad`" in line
+    assert "failed as the newest tested release, since replaced" in issue["body"]
+
+
+def _remembered_item() -> dict:
+    return {"targets": {"openai-agents": "0.23.1"}, "python": "3.14", "failed_on": "2026-11-25"}
+
+
+@pytest.mark.parametrize(
+    ("today", "kept"),
+    [
+        ("pass", False),
+        ("flaky", False),
+        ("fail", True),
+        ("install_network", True),
+        ("no_result", True),
+    ],
+)
+def test_a_displaced_release_leaves_the_list_only_when_it_passes(tmp_path, today, kept):
+    newer, old = _point("claim_top", "0.23.2"), _displaced_point("0.23.1")
+    plan = _plan_with_table(_FLOOR, newer, old)
+    results = _results(_result(_FLOOR), _result(newer), _result(old, today))
+    remembered = {"displaced": {"openai_agents": [{"key": old["key"], **_remembered_item()}]}}
+    state = report.next_state(remembered, results, _RUN, tmp_path, plan)
+    assert bool(state["displaced"]) is kept
+
+
+def test_a_run_that_did_not_plan_an_adapter_in_full_leaves_its_list_alone(tmp_path):
+    """A run of one adapter, or a day the index could not list an adapter's releases, has
+    nothing to say about another adapter's remembered failures."""
+    remembered = {
+        "displaced": {
+            "langgraph": [{"key": "langgraph--displaced--1.2.3-1.1.0-py3.14"}],
+            "openai_agents": [{"key": "openai_agents--displaced--0.23.1-py3.14"}],
+        }
+    }
+    plan = _plan_with_table(_FLOOR, _TOP)
+    plan["adapters"]["openai_agents"]["problems"] = ["no installable release"]
+    results = _results(_result(_FLOOR), _result(_TOP))
+    state = report.next_state(remembered, results, _RUN, tmp_path, plan)
+    assert state["displaced"] == remembered["displaced"]
+
+
+def test_the_issue_says_where_a_tested_range_starts():
+    plan = _plan(_FLOOR, _TOP)
+    plan["adapters"]["openai_agents"]["said"] = {"openai-agents": "0.22.x from 0.22.3, 0.23.x"}
+    issue = report.adapter_issue("openai_agents", plan, _results(_result(_FLOOR)), _RUN)
+    assert "- Tested range: `openai-agents` 0.22.x from 0.22.3, 0.23.x" in issue["body"]
+
+
+def test_a_replaced_release_is_remembered_once_even_while_its_successor_cannot_be_checked(tmp_path):
+    """The newer release cannot be installed for days. The older one is remembered on the
+    first of them, runs, passes and is done; it must not be remembered again each day
+    because the point that replaced it has still said nothing."""
+    newer, old = _point("claim_top", "0.23.2"), _displaced_point("0.23.1")
+    plan = _plan_with_table(_FLOOR, newer)
+    stuck = _results(_result(_FLOOR), _result(newer, "install_network"))
+    first = report.next_state(_top_failed_yesterday(), stuck, _RUN, tmp_path, plan)
+    assert [item["key"] for item in first["displaced"]["openai_agents"]] == [old["key"]]
+    assert "last_checked" not in first["points"][newer["key"]]
+
+    plan = _plan_with_table(_FLOOR, newer, old)
+    passed = _results(_result(_FLOOR), _result(newer, "install_network"), _result(old))
+    second = report.next_state(first, passed, _RUN, tmp_path, plan)
+    assert second["displaced"] == {}
+    third = report.next_state(second, stuck, _RUN, tmp_path, _plan_with_table(_FLOOR, newer))
+    assert third["displaced"] == {}
