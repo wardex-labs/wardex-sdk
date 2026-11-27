@@ -153,8 +153,7 @@ ask the same question of a wardex release whose tests predate it. That
 `init()` says "untested" on the real table is checked at every point by
 `scripts/compat/attach_probe.py`.
 
-Every point has a kind, declared in `scripts/compat/kinds.py`; today there is
-one, `framework`. A kind is a row in `KINDS` and one rule in `plan.py` that
+Every point has a kind, declared in `scripts/compat/kinds.py`. A kind is a row in `KINDS` and one rule in `plan.py` that
 turns its sources into points. The plan writes into each point everything
 needed to run it (what to install, what to probe, which files, how long), and
 `point.py` follows that recipe without knowing the kind, so a new kind is new
@@ -163,6 +162,27 @@ its row: it is one name on one line of `RED_CAPABLE`. A kind that is not there
 is watching. Its points are recorded and reported in the issue under their
 own heading, and never turn the run red. Promoting a kind is adding that line,
 in a commit of its own.
+
+| Kind | What it asks | Red-capable |
+|---|---|---|
+| `framework` | does the wheel built from this commit hold on these framework releases (the table above) | yes |
+| `published` | does the newest wardex release on PyPI hold on the newest release its own table claims, and on the newest one above that | no, watching |
+
+A `published` point installs `wardex-sdk==<version>` from PyPI and runs the
+tests of that release's tag (`python-v<version>`) against the table that tag
+shipped, so it answers for what a user who types `pip install` has today. The
+same rule picks its releases and the same executor runs it; only the point's
+`sdk` field and the tree its tests come from differ. Points of a release that
+a newer one replaced stay in `state.json` as that release's history: they are
+shown on its page and no issue asks anyone to fix them.
+
+The run also writes the public pages, from `state.json` and nothing else
+(`scripts/compat/render.py`), under `site/` on the `compat-results` branch:
+one page for the default branch's build, one per published wardex release,
+and one small image per adapter and release that a README can embed. A row
+whose last pass is more than three days old is shown as when it last passed,
+never as passing. A run on a branch writes none of this; its pages are in the
+run's `compat-site-preview` artifact.
 
 The run is red in two cases only: a release inside the tested range does not
 pass, or a planned point left no result, and in both only for a point of a
@@ -203,11 +223,24 @@ level, add it to `scripts/compat/manifest.py`; `test_compat_plan.py` fails
 until the table, the manifest and the test files agree. No requirement in the
 manifest carries an upper bound, and the three test tools are pinned exactly.
 
-To widen or narrow a tested range, change the table, the test pin in
-`sdks/python/pyproject.toml` and the README's framework table in one commit.
-A range whose oldest releases fail is narrowed with `since=` (the first
-release that passes); one bad release inside a range goes under `known_bad`.
-A failing release is never answered by capping what the run installs.
+The table of tested versions is the one source of what wardex says it is
+tested on. The test pin in `sdks/python/pyproject.toml` and every version
+phrase and install line in the README are written from it by one command, and
+`test_compat_claim.py` fails when any of them says something else:
+
+```bash
+python3 scripts/compat/claim.py check                                # what disagrees, by file and line
+python3 scripts/compat/claim.py widen openai-agents 0.24             # a new release line
+python3 scripts/compat/claim.py narrow openai-agents --drop 0.22     # a line out
+python3 scripts/compat/claim.py narrow pydantic-ai-slim --since 2.54 # the first release that passes
+python3 scripts/compat/claim.py bad openai-agents 0.23.0             # one bad release inside a range
+python3 scripts/compat/claim.py sync                                 # rewrite pin and README from the table
+```
+
+A person runs these and commits the result with a CHANGELOG line; no run
+changes a claim on its own. A release inside the range that has failed for
+fourteen days gets the `bad` command printed in its issue. A failing release
+is never answered by capping what the run installs.
 
 The test that holds an adapter's whole exported envelope to its contract lives
 in a file per adapter (`test_<adapter>_envelope.py`, contract in

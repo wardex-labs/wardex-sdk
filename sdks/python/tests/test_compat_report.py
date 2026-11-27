@@ -21,7 +21,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
-from compat import kinds, model, point, report, verdict, watchdog  # noqa: E402
+from compat import kinds, model, point, render, report, verdict, watchdog  # noqa: E402
+from compat import plan as planner  # noqa: E402
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "compat"
 
@@ -33,6 +34,13 @@ def _two_kinds_that_are_not_red_capable(monkeypatch):
     weekly = kinds.Kind("weekly thing", frozenset({"weekly"}), 9, 1, "when it passes")
     monkeypatch.setitem(kinds.KINDS, "anything", daily)
     monkeypatch.setitem(kinds.KINDS, "weekly_thing", weekly)
+
+
+@pytest.fixture(autouse=True)
+def _no_published_release(monkeypatch):
+    """No test here reaches PyPI or a tag unless it says so."""
+    nothing = {"problems": [], "points": [], "adapters": {}}
+    monkeypatch.setattr(planner, "fetch_published", lambda cutoff, only=None: nothing)
 
 
 _RUN = {
@@ -1043,8 +1051,6 @@ def test_a_replaced_failure_survives_the_whole_path_from_results_to_the_next_pla
     """Three runs through `main`, with files on disk as the workflow has them: the release
     fails on both interpreters, a newer patch replaces it, and the plan of the day after
     runs it again on each interpreter it failed on."""
-    from compat import plan as planner
-
     table = [
         {"distribution": "openai-agents", "minors": ("0.22", "0.23"), "known_bad": (), "since": ""}
     ]
@@ -1922,7 +1928,8 @@ def test_every_declared_kind_has_words_and_a_way_to_close(monkeypatch):
     for name, kind in kinds.KINDS.items():
         assert kind.label and kind.cadences and kind.fresh_days > 0, name
         assert name in kinds.RED_CAPABLE or kind.closes, name
-    assert kinds.due("daily") == ("framework",)
+    assert kinds.due("daily") == ("framework", "published")
+    assert kinds.RED_CAPABLE == {"framework"}, "a new kind starts by being watched"
 
 
 # --- a kind that is retired, and a run that holds only watching kinds ------------
@@ -1970,3 +1977,300 @@ def test_a_record_line_says_when_its_point_was_only_watched():
     }
     assert lines["watched--top"]["watching"] is True and lines[_TOP["key"]]["watching"] is False
     assert lines["watched--top"]["kind"] == "anything"
+
+
+# --- the published release -------------------------------------------------------
+
+_SDK = {"origin": "pypi", "version": "0.7.0b1", "ref": "python-v0.7.0b1", "commit": "77b59d9"}
+
+
+def _published(point: dict, version: str = "0.7.0b1") -> dict:
+    """`point` as the plan makes it for the release `version` on PyPI."""
+    return {
+        **point,
+        "key": f"published--{version}--{point['key']}",
+        "kind": "published",
+        "subject": point["adapter"],
+        "watching": True,
+        "python": "3.14",
+        "sdk": {**_SDK, "version": version, "ref": f"python-v{version}"},
+    }
+
+
+def _loaded(*results: dict) -> dict:
+    """Results as `load_results` hands them on: what the plan said kept beside what ran."""
+    for result in results:
+        result["planned_sdk"] = result.get("sdk", {"origin": "build"})
+        result["planned_python"] = result.get("python", "")
+    return _results(*results)
+
+
+def _release_plan(*points: dict, version: str = "0.7.0b1") -> dict:
+    plan = _plan(_FLOOR, _TOP, *points)
+    plan["published"] = {
+        "version": version,
+        "ref": f"python-v{version}",
+        "commit": "77b59d9",
+        "adapters": {"openai_agents": dict(plan["adapters"]["openai_agents"])},
+    }
+    plan["scope"] = {
+        "cadence": "daily",
+        "covers": {"framework": ["openai_agents"], "published": ["openai_agents"]},
+        "partial": False,
+        "builds": {"published": [version]},
+    }
+    return plan
+
+
+def test_a_published_points_record_says_which_release_it_ran_even_when_it_ran_nothing(tmp_path):
+    ran, never = _published(_TOP), _published(_ABOVE)
+    measured = {"wheel": "", "wheel_sha256": "", "version": "0.7.0b1"}
+    _write(tmp_path, _result(ran, sdk=measured))
+    plan = _release_plan(ran, never)
+    results = report.load_results(plan, tmp_path)
+    lines = {line["key"]: line for line in report.records(plan, results, _RUN)}
+    for key in (ran["key"], never["key"]):
+        assert lines[key]["sdk"] == _SDK and lines[key]["kind"] == "published"
+        assert lines[key]["watching"] is True
+    assert lines[never["key"]]["tests"]["passed"] is None
+    assert lines[_TOP["key"]]["sdk"] == {"origin": "build", "version": ""}
+
+
+def test_a_failing_published_release_is_said_by_version_and_never_turns_the_run_red():
+    top, above = _published(_TOP), _published(_ABOVE)
+    plan = _release_plan(top, above)
+    nodes = ["t.py::test_tree"]
+    results = _loaded(
+        _result(_FLOOR),
+        _result(_TOP),
+        _result(top, "fail", failed_ids=nodes),
+        _result(above, "fail", failed_ids=nodes),
+    )
+    assert report.judge(plan, results) == []
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN)
+    watching = issue["body"].split("### Watching (never turns the run red)")[1]
+    assert (
+        "- published wardex release `0.7.0b1`: `openai-agents 0.23.1` fails 1 tests. Closes "
+        "when it passes, or when a newer wardex release takes its place." in watching
+    )
+    assert "- published wardex release `0.7.0b1`: `openai-agents 0.26.0` fails 1 tests." in watching
+    assert (
+        "| newest tested release | `0.7.0b1` from PyPI | `openai-agents 0.23.1` |" in issue["body"]
+    )
+    assert "| newest tested release | this commit | `openai-agents 0.23.1` |" in issue["body"]
+    assert "Nothing." in issue["body"].split("### What needs doing")[1].split("###")[0]
+
+
+def test_the_points_of_a_release_a_newer_one_replaced_are_kept_and_ask_nothing(tmp_path):
+    """They are that release's history, shown on its page. The run that plans the newer
+    release forgets nothing of the older one, and no issue asks anyone to fix it."""
+    old_top = _published(_TOP, "0.7.0b1")
+    new_top = _published(_TOP, "0.7.0b2")
+    first = _release_plan(old_top)
+    state = report.next_state(
+        {},
+        _loaded(_result(_FLOOR), _result(_TOP), _result(old_top, "fail")),
+        _RUN,
+        tmp_path,
+        first,
+    )
+    assert state["release"] == "0.7.0b1" and sorted(state["versions"]) == ["0.7.0b1", "main"]
+    assert report.adapter_issue("openai_agents", first, {}, _RUN, state)["open"]
+
+    later = _release_plan(new_top, version="0.7.0b2")
+    a_day_on = {**_RUN, "date": "2026-11-27"}
+    results = _loaded(_result(_FLOOR), _result(_TOP), _result(new_top))
+    state = report.next_state(state, results, a_day_on, tmp_path, later)
+    assert old_top["key"] in state["points"] and old_top["key"] not in state["_forget"]
+    assert state["release"] == "0.7.0b2"
+    assert sorted(state["versions"]) == ["0.7.0b1", "0.7.0b2", "main"]
+    assert state["versions"]["0.7.0b1"]["date"] == "2026-11-26", "as its last run left it"
+    issue = report.adapter_issue("openai_agents", later, results, a_day_on, state)
+    assert not issue["open"] and "`0.7.0b1` from PyPI" not in issue["body"]
+    assert "`0.7.0b2` from PyPI" in issue["body"]
+    assert [p["key"] for p in render.rows(state, "0.7.0b1")["openai_agents"]] == [old_top["key"]]
+
+
+def test_a_point_of_the_planned_release_that_is_no_longer_planned_is_forgotten(tmp_path):
+    top, above = _published(_TOP), _published(_ABOVE)
+    both = _release_plan(top, above)
+    results = _loaded(_result(_FLOOR), _result(_TOP), _result(top), _result(above))
+    state = report.next_state({}, results, _RUN, tmp_path, both)
+    only_top = _release_plan(top)
+    del results[above["key"]]
+    after = report.next_state(state, results, _RUN, tmp_path, only_top)
+    assert after["_forget"] == [above["key"]] and above["key"] not in after["points"]
+
+
+def test_what_the_pages_say_about_a_build_is_kept_per_build_and_merged_by_adapter(tmp_path):
+    plan = _release_plan(_published(_TOP))
+    state = report.next_state({}, {}, _RUN, tmp_path, plan)
+    main = state["versions"]["main"]
+    assert (main["version"], main["commit"], main["date"]) == (
+        "0.7.0b1",
+        "0123456789abcdef",
+        "2026-11-26",
+    )
+    about = main["adapters"]["openai_agents"]
+    assert about == {
+        "label": "openai-agents",
+        "evidence": "live",
+        "replay_of": None,
+        "claim": {"openai-agents": ["0.22", "0.23"]},
+        "said": None,
+        "newest": "0.26.0",
+    }
+    assert state["versions"]["0.7.0b1"]["ref"] == "python-v0.7.0b1"
+
+    state["versions"]["main"]["adapters"]["langgraph"] = {"label": "langgraph"}
+    partial = _plan(_TOP)
+    after = report.next_state(state, {}, {**_RUN, "date": "2026-11-27"}, tmp_path, partial)
+    assert sorted(after["versions"]["main"]["adapters"]) == ["langgraph", "openai_agents"]
+    assert after["release"] == "0.7.0b1", "a run that planned no release keeps the last one"
+    assert report.next_state(state, {}, _RUN, tmp_path)["versions"] == state["versions"]
+
+
+def test_what_a_watching_kind_could_not_plan_is_on_the_health_issue_and_is_not_red():
+    plan = _plan(_FLOOR, _TOP)
+    plan["unplanned"] = ["published: the newest wardex release could not be read (OSError)"]
+    results = _results(_result(_FLOOR), _result(_TOP))
+    assert report.judge(plan, results) == []
+    issue = report.health_issue(plan, results, {}, _RUN)
+    assert issue["open"] and (
+        "- Not planned, and so not run (this never turns the run red): `published: the newest "
+        "wardex release could not be read (OSError)`" in issue["body"]
+    )
+    plan["unplanned"] = []
+    assert not report.health_issue(plan, results, {}, _RUN)["open"]
+
+
+def test_a_run_that_writes_renders_the_site_and_one_that_does_not_can_preview_it(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
+    monkeypatch.setattr(report.GitHub, "do", lambda self, what, *rest: None)
+    for name in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "GITHUB_REPOSITORY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("COMPAT_SDK_VERSION", "0.7.0b1")
+    records, results_dir, preview = tmp_path / "records", tmp_path / "results", tmp_path / "preview"
+    records.mkdir()
+    top = {
+        **_published(_TOP),
+        **{k: v for k, v in _PLANNED_TOP.items() if k not in _published(_TOP)},
+    }
+    plan = _release_plan(top)
+    (tmp_path / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    for result in (_result(_FLOOR), _result(_TOP), _result(top)):
+        _write(results_dir, result)
+    argv = ["--plan", str(tmp_path / "plan.json"), "--results", str(results_dir)]
+    argv += ["--state-dir", str(records)]
+
+    assert report.main([*argv, "--preview", str(preview)]) == 0
+    assert not (records / "state.json").exists() and not (records / "site").exists()
+    wanted = ["0.7.0b1/README.md", "0.7.0b1/openai_agents.svg", "README.md", "main/README.md"]
+    made = sorted(
+        str(p.relative_to(preview / "site")) for p in (preview / "site").rglob("*") if p.is_file()
+    )
+    assert made == wanted
+
+    assert report.main([*argv, "--write"]) == 0
+    for name in wanted:
+        assert (records / "site" / name).read_bytes() == (preview / "site" / name).read_bytes()
+    cell = (records / "site/0.7.0b1/openai_agents.svg").read_text(encoding="utf-8")
+    assert "0.23.1 passes" in cell and "26 Nov" in cell
+    assert "| newest tested release | `openai-agents 0.23.1` |" in (
+        records / "site/main/README.md"
+    ).read_text(encoding="utf-8")
+
+
+# --- a proof that stays broken ---------------------------------------------------
+
+
+def test_a_release_that_fails_for_two_weeks_gets_the_command_that_stops_claiming_it(tmp_path):
+    """Nothing narrows a claim on its own. After fourteen days of failing the issue stops
+    waiting for a fix in silence: it prints the one command, and says so once."""
+    plan = _plan(_FLOOR, _TOP)
+    nodes = ["t.py::test_tree"]
+    state: dict = {}
+    seen = {}
+    for day in (10, 15, 23, 24, 25):
+        run = {**_RUN, "date": f"2026-11-{day}"}
+        outcome = "install_network" if day == 15 else "fail"
+        results = _results(_result(_FLOOR), _result(_TOP, outcome, failed_ids=nodes))
+        state = report.next_state(state, results, run, tmp_path, plan)
+        state.pop("_locks"), state.pop("_forget")
+        seen[day] = report.adapter_issue("openai_agents", plan, results, run, state)
+    assert state["points"][_TOP["key"]]["failing_since"] == {
+        "date": "2026-11-10",
+        "targets": {"openai-agents": "0.23.1"},
+    }, "a day it could not be checked does not restart the count"
+    assert "claim.py" not in seen[23]["body"]
+    assert (
+        "It has failed since `2026-11-10`, 14 days. To stop calling it tested instead: "
+        "`python3 scripts/compat/claim.py bad openai-agents 0.23.1`." in seen[24]["changes"][0]
+    )
+    assert seen[23]["fingerprint"] != seen[24]["fingerprint"], "said once, as a comment"
+    assert seen[24]["fingerprint"] == seen[25]["fingerprint"] and "15 days" in seen[25]["body"]
+
+    # An outage in the middle of a long failure is not news about the lapse: the command
+    # stays, and the fingerprint does not move there or back.
+    run = {**_RUN, "date": "2026-11-26"}
+    outage = _results(_result(_FLOOR), _result(_TOP, "install_network"))
+    state = report.next_state(state, outage, run, tmp_path, plan)
+    state.pop("_locks"), state.pop("_forget")
+    down = report.adapter_issue("openai_agents", plan, outage, run, state)
+    assert down["fingerprint"] == seen[25]["fingerprint"]
+    assert "could not be checked today" in down["changes"][0]
+    assert "claim.py bad openai-agents 0.23.1" in down["changes"][0]
+
+    passing = _results(_result(_FLOOR), _result(_TOP))
+    state = report.next_state(state, passing, {**_RUN, "date": "2026-11-26"}, tmp_path, plan)
+    assert "failing_since" not in state["points"][_TOP["key"]]
+
+
+def test_a_new_release_under_the_same_point_starts_its_own_count(tmp_path):
+    plan = _plan(_FLOOR, _TOP)
+    old = report.next_state(
+        {}, _results(_result(_TOP, "fail")), {**_RUN, "date": "2026-11-01"}, tmp_path, plan
+    )
+    newer = {**_TOP, "targets": {"openai-agents": "0.23.2"}}
+    state = report.next_state(
+        old, _results(_result(newer, "fail")), {**_RUN, "date": "2026-11-20"}, tmp_path, plan
+    )
+    assert state["points"][_TOP["key"]]["failing_since"]["date"] == "2026-11-20"
+    issue = report.adapter_issue(
+        "openai_agents", _plan(_FLOOR, newer), _results(_result(newer, "fail")), _RUN, state
+    )
+    assert "claim.py" not in issue["body"]
+
+
+def test_what_could_not_be_planned_changes_the_health_issue_once_and_a_claim_is_printed_whole(
+    tmp_path,
+):
+    plan = _plan(_FLOOR, _TOP)
+    results = _results(_result(_FLOOR), _result(_TOP))
+    quiet = report.health_issue(plan, results, {}, _RUN)["fingerprint"]
+    plan["unplanned"] = ["published: the newest wardex release could not be read (OSError)"]
+    assert report.health_issue(plan, results, {}, _RUN)["fingerprint"] != quiet
+
+    plan["claims"] = [
+        {
+            "says": "Verified against `codex-cli` 0.160.0; a | b <i> [x](y)",
+            "proof": None,
+            "why": "w",
+        }
+    ]
+    kept = report.next_state({}, results, _RUN, tmp_path, plan)["versions"]["main"]["claims"]
+    assert kept == [
+        {"says": "Verified against codex-cli 0.160.0; a  b i x(y)", "proof": "", "why": "w"}
+    ]
+    page = render.page({"versions": {"main": {"claims": kept}}}, render.MAIN, "2026-11-26")
+    assert "| Verified against codex-cli 0.160.0; a  b i x(y) | nothing yet: w |" in page
+
+
+def test_a_red_capable_question_is_not_answered_by_watching_points():
+    """However many watching points a plan holds, a run that was due to ask whether the
+    built wheel holds and planned no point for it is red."""
+    watched = {**_TOP, "key": "watched--top", "kind": "anything", "watching": True}
+    plan = {**_plan(watched), "adapters": {}}
+    assert report.judge(plan, _results(_result(watched))) == ["plan: no points"]

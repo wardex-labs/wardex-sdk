@@ -128,3 +128,48 @@ REPLAY_ONLY: dict[str, dict] = {
     "codex_exec": {"label": "codex", "replay_of": "codex-cli 0.160.0"},
     "hermes_agent": {"label": "hermes-agent", "replay_of": "Hermes Agent v0.23.3"},
 }
+
+#: Every sentence of the README that says wardex was tested, verified or measured against
+#: something outside this repository, and the kind of point that proves it on a schedule.
+#: `says` is the README's own words. `proof` is None while no scheduled run proves the
+#: sentence, and `why` then says what stands behind it instead; the page of the default
+#: branch prints this list, so an unproven sentence is public, not just unknown. A test
+#: holds the README to it both ways: a sentence here that the README no longer has, and a
+#: sentence of that kind in the README that is not here, both fail.
+CLAIMS: tuple[dict, ...] = (
+    {
+        "says": "Each adapter is tested against the framework releases in the table above.",
+        "proof": "framework",
+        "why": "",
+    },
+    {
+        "says": "Langfuse and Phoenix are tested destinations",
+        "proof": None,
+        "why": "checked by hand against a live receiver; no scheduled run starts one",
+    },
+    {
+        "says": "Hermes Agent (through a Hermes plugin; measured on v0.23.3)",
+        "proof": None,
+        "why": "replayed on every pull request from payloads recorded on that release; no "
+        "scheduled run installs Hermes",
+    },
+    {
+        "says": "Verified against `codex-cli` 0.160.0.",
+        "proof": None,
+        "why": "replayed on every pull request from output recorded on that release; no "
+        "scheduled run installs the CLI",
+    },
+    {
+        "says": "Prebuilt wheels cover Linux with glibc (x86_64, aarch64), macOS (x86_64, "
+        "arm64) and Windows (x86_64)",
+        "proof": None,
+        "why": "each wheel is built and import-checked at release; the tests run on Linux "
+        "x86_64 only",
+    },
+    {
+        "says": "Measured on one arm64 macOS machine at a load average of about 2, not a "
+        "guarantee.",
+        "proof": None,
+        "why": "one measurement on one machine, stated as such; no scheduled run repeats it",
+    },
+)

@@ -174,10 +174,23 @@ class Point:
         self.work.mkdir(parents=True, exist_ok=True)
         self.out = Path(args.out).resolve()
         self.out.mkdir(parents=True, exist_ok=True)
-        wheels = sorted(Path(args.wheel_dir).resolve().glob("wardex_sdk-*.whl"))
-        if len(wheels) != 1:
-            raise SystemExit(f"expected exactly one wardex_sdk wheel, found {len(wheels)}")
-        self.wheel = wheels[0]
+        # Which wardex the point installs, and whose tests it runs. A release from PyPI is
+        # run with the tests of its own tag, checked out beside this one.
+        self.sdk = self.point.get("sdk") or {"origin": "build"}
+        self.tree = Path(args.tests_tree).resolve() if args.tests_tree else REPO
+        if self.sdk["origin"] == "pypi":
+            if self.tree == REPO:
+                raise SystemExit("a published release is run with its own tests: --tests-tree")
+            self.wheel = None
+            self.wardex = f"wardex-sdk=={self.sdk['version']}"
+            about = {"wheel": "", "wheel_sha256": ""}
+        else:
+            wheels = sorted(Path(args.wheel_dir).resolve().glob("wardex_sdk-*.whl"))
+            if len(wheels) != 1:
+                raise SystemExit(f"expected exactly one wardex_sdk wheel, found {len(wheels)}")
+            self.wheel = wheels[0]
+            self.wardex = str(self.wheel)
+            about = {"wheel": self.wheel.name, "wheel_sha256": sha256(self.wheel)}
         self.last_green = Path(args.last_green_lock) if args.last_green_lock else None
         self.result: dict = {
             "schema": SCHEMA,
@@ -196,7 +209,7 @@ class Point:
             "runner_image": "-".join(
                 filter(None, (os.environ.get("ImageOS"), os.environ.get("ImageVersion")))
             ),
-            "sdk": {"wheel": self.wheel.name, "wheel_sha256": sha256(self.wheel)},
+            "sdk": about,
             "install": None,
             "resolved": {},
             "control_import": None,
@@ -211,7 +224,7 @@ class Point:
     # --- environment ---------------------------------------------------------
 
     def _requirements(self, optional: tuple[int, ...], *, minimal: bool = False) -> str:
-        lines = [str(self.wheel)]
+        lines = [self.wardex]
         for dist, version in self.point["targets"].items():
             lines.append(f"{dist}{self.recipe['extras'].get(dist, '')}=={version}")
         if not minimal:
@@ -310,7 +323,7 @@ class Point:
         )
         # From the repository root, as pytest runs: a source tree on the path would
         # shadow the wheel.
-        code, out, err = run([python_of(venv), "-c", probe], cwd=REPO)
+        code, out, err = run([python_of(venv), "-c", probe], cwd=self.tree)
         if code != 0:
             self.result["install"] = {"outcome": "attach_failed", "detail": err[-600:]}
             self.result["outcome"] = "attach_failed"
@@ -327,7 +340,10 @@ class Point:
             assert installed == version, f"{dist}: installed {installed}, the point is {version}"
         inside = Path(seen["file"]).resolve().is_relative_to(venv.resolve())
         print(f"wardex_sdk {seen['sdk']} imported from {seen['file']}", flush=True)
-        assert inside, "the tests would import a source tree, not the built wheel"
+        assert inside, "the tests would import a source tree, not the installed wheel"
+        if self.sdk["origin"] == "pypi":
+            wanted = self.sdk["version"]
+            assert seen["sdk"] == wanted, f"wardex {seen['sdk']} is installed, not {wanted}"
         return True
 
     # --- checks --------------------------------------------------------------
@@ -352,7 +368,7 @@ class Point:
         return self.result["attach"]["verdict"] == "ok"
 
     def files(self) -> list[str]:
-        root = REPO / model.TESTS_DIR
+        root = self.tree / model.TESTS_DIR
         dropped = {
             Path(found).name
             for pattern in getattr(self, "dropped_tests", [])
@@ -390,7 +406,7 @@ class Point:
         started = time.monotonic()
         # Never longer than what the point has left, so the last word is always a result.
         limit = int(max(60, min(self.check["suite_timeout_s"], self._left() - 60)))
-        code, out, err = run(cmd, cwd=REPO, env=env, timeout=limit)
+        code, out, err = run(cmd, cwd=self.tree, env=env, timeout=limit)
         print(out[-6000:], flush=True)
         if code not in (0, 1):
             print(err[-3000:], flush=True)
@@ -442,7 +458,7 @@ class Point:
         steps = (
             ["uv", "venv", "--python", self.point["python"], venv],
             ["uv", "pip", "sync", replay, "--python", python_of(venv), "--require-hashes", "-q"],
-            ["uv", "pip", "install", "--python", python_of(venv), "--no-deps", "-q", self.wheel],
+            ["uv", "pip", "install", "--python", python_of(venv), "--no-deps", "-q", self.wardex],
         )
         for step in steps:
             if run(step, cwd=self.work)[0] != 0:
@@ -460,8 +476,12 @@ class Point:
         self.result["counterfactual"] = {"ran": True, "passed": again["ok"], "changed": changed}
         if again["timed_out"]:
             self.result["cause"] = "not_determined"
+        elif again["ok"]:
+            self.result["cause"] = "upstream"
         else:
-            self.result["cause"] = "upstream" if again["ok"] else "ours"
+            # A release from PyPI and the tests of its tag are what they were when this point
+            # last passed, so failing on those same packages is nothing a wardex change explains.
+            self.result["cause"] = "ours" if self.sdk["origin"] == "build" else "not_determined"
 
     # --- the point -----------------------------------------------------------
 
@@ -506,7 +526,7 @@ class Point:
             "files": files,
             "excluded_files": self.excluded,
             "selection_sha256": hashlib.sha256(
-                "".join(sha256(REPO / model.TESTS_DIR / name) for name in files).encode()
+                "".join(sha256(self.tree / model.TESTS_DIR / name) for name in files).encode()
             ).hexdigest(),
             "plugins": list(self.check["plugins"]),
         }
@@ -545,6 +565,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work", required=True, help="scratch directory for environments")
     parser.add_argument("--out", required=True, help="where result.json and lock.txt go")
     parser.add_argument("--last-green-lock", help="lock.txt of this point's last pass, if any")
+    parser.add_argument(
+        "--tests-tree", help="a checkout whose tests to run, when not this one (a release's tag)"
+    )
     Point(parser.parse_args(argv)).execute()
     return 0
 
