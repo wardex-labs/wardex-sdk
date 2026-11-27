@@ -1504,6 +1504,131 @@ def test_what_a_run_did_not_run_is_never_worded_as_checked_today():
     assert not report.adapter_issue("openai_agents", plan, {}, _RUN, state)["open"]
 
 
+def test_a_failure_outlives_a_day_it_could_not_be_checked_and_a_day_it_was_not_planned(tmp_path):
+    """Three days through the state: the floor fails, then the index is down, then the
+    plan cannot cover the adapter at all. What is known on the third day is still the
+    failure of the first, and the issue must not close on it."""
+    covered = _covering({"framework": ["openai_agents"]})
+    day = lambda n: {**_RUN, "date": f"2026-11-2{n}"}  # noqa: E731
+    nodes = ["t.py::test_tree"]
+    state = report.next_state(
+        {},
+        _results(_result(_FLOOR, "fail", failed_ids=nodes), _result(_TOP)),
+        day(4),
+        tmp_path,
+        covered,
+    )
+    state.pop("_locks"), state.pop("_forget")
+    state = report.next_state(
+        state,
+        _results(_result(_FLOOR, "install_network"), _result(_TOP)),
+        day(5),
+        tmp_path,
+        covered,
+    )
+    state.pop("_locks"), state.pop("_forget")
+    assert state["points"][_FLOOR["key"]]["last"]["outcome"] == "install_network"
+
+    uncovered = _plan()
+    uncovered["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
+    uncovered["scope"] = {"cadence": "daily", "covers": {"framework": []}, "partial": False}
+    state = report.next_state(state, {}, day(6), tmp_path, uncovered)
+    issue = report.adapter_issue("openai_agents", uncovered, {}, day(6), state)
+    assert issue["open"] and issue["changes"] == [
+        "`openai-agents 0.22.0` is inside the tested range and did not pass when it was last "
+        "run, on `2026-11-24`: fails 1 tests. This run did not run it."
+    ]
+    assert "`openai-agents 0.23.1` (not run by this run)" in issue["closing"]
+
+
+def test_a_point_cannot_say_of_itself_that_it_was_not_run_today(tmp_path):
+    """Which rows are remembered is read from the state. A result that calls itself old
+    is today's result, worded as today's, and a release above the range stays listed."""
+    forged = {"as_of": "2020-01-01", "fresh_days": 9999}
+    _write(tmp_path, _result(_FLOOR))
+    _write(tmp_path, _result(_TOP, "fail", failed_ids=["t.py::test_a"], **forged))
+    _write(tmp_path, _result(_ABOVE, "fail", failed_ids=["t.py::test_b"], **forged))
+    plan = _plan(_FLOOR, _TOP, _ABOVE)
+    results = report.load_results(plan, tmp_path)
+    honest = _results(
+        _result(_FLOOR),
+        _result(_TOP, "fail", failed_ids=["t.py::test_a"]),
+        _result(_ABOVE, "fail", failed_ids=["t.py::test_b"]),
+    )
+    said = report.adapter_issue("openai_agents", plan, results, _RUN)
+    wanted = report.adapter_issue("openai_agents", plan, honest, _RUN)
+    assert said["changes"] == wanted["changes"] and said["fingerprint"] == wanted["fingerprint"]
+    assert "2020-01-01" not in said["body"] and len(said["changes"]) == 2
+    state = report.next_state({}, results, _RUN, tmp_path, plan)
+    assert state["points"][_TOP["key"]]["point"]["fresh_days"] == 3
+
+
+def test_a_remembered_release_above_the_range_is_never_called_tested():
+    plan = _plan()
+    plan["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
+    above = {**_ABOVE, "kind": "framework", "subject": "openai_agents"}
+    state = {"points": {_ABOVE["key"]: _kept(above, "fail", ["t.py::test_tree"])}}
+    issue = report.adapter_issue("openai_agents", plan, {}, _RUN, state)
+    assert not issue["open"] and "inside the tested range" not in issue["body"]
+
+
+def test_what_a_point_said_of_another_release_is_not_said_of_this_one():
+    plan = _plan()
+    plan["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
+    entry = _kept(_TOP, "install_network", [])
+    entry["last_checked"] = {
+        "date": "2026-11-20",
+        "outcome": "fail",
+        "cause": None,
+        "targets": {"openai-agents": "0.23.0"},
+        "failed_ids": ["t.py::test_tree"],
+    }
+    issue = report.adapter_issue("openai_agents", plan, {}, _RUN, {"points": {_TOP["key"]: entry}})
+    assert not issue["open"] and "2026-11-20" not in issue["body"]
+    entry["last_checked"]["targets"] = dict(_TOP["targets"])
+    again = report.adapter_issue("openai_agents", plan, {}, _RUN, {"points": {_TOP["key"]: entry}})
+    assert again["open"] and "on `2026-11-20`: fails 1 tests" in again["body"]
+
+
+def test_a_failure_that_stops_being_run_is_news_once():
+    """Today's failure and the same failure remembered are two different things to read:
+    the second says nobody is running it. The issue says so in a comment, one time."""
+    plan = _plan(_FLOOR, _TOP)
+    nodes = ["t.py::test_tree"]
+    today = report.adapter_issue(
+        "openai_agents",
+        plan,
+        _results(_result(_FLOOR), _result(_TOP, "fail", failed_ids=nodes)),
+        _RUN,
+    )
+    unplanned = _plan()
+    state = {"points": {_TOP["key"]: _kept(_TOP, "fail", nodes, "2026-11-26")}}
+    remembered = report.adapter_issue("openai_agents", unplanned, {}, _RUN, state)
+    assert today["open"] and remembered["open"]
+    assert today["fingerprint"] != remembered["fingerprint"]
+
+
+def test_the_fingerprint_does_not_depend_on_the_order_results_arrive_in():
+    plan = _plan(_FLOOR, _TOP, _ABOVE)
+    rows = [
+        _result(_FLOOR, "fail", failed_ids=["t.py::test_a"]),
+        _result(_TOP, "fail", failed_ids=["t.py::test_b"]),
+        _result(_ABOVE, "fail", failed_ids=["t.py::test_c"]),
+    ]
+    forward = report.adapter_issue("openai_agents", plan, _results(*rows), _RUN)
+    backward = report.adapter_issue("openai_agents", plan, _results(*reversed(rows)), _RUN)
+    assert forward["fingerprint"] == backward["fingerprint"]
+    assert f"<!-- compat-fingerprint: {backward['fingerprint']} -->" in backward["body"]
+
+
+def test_the_version_a_point_says_it_imported_is_cleaned_like_everything_else_it_says(tmp_path):
+    measured = {"sdk": {"wheel": "w.whl", "wheel_sha256": "ab", "version": "0.7`|<b>\n" + "9" * 90}}
+    _write(tmp_path, _result(_TOP, **measured))
+    plan = _plan(_PLANNED_TOP)
+    (line,) = report.records(plan, report.load_results(plan, tmp_path), _RUN)
+    assert len(line["sdk"]["version"]) == 40 and not re.search(r"[`|\n]", line["sdk"]["version"])
+
+
 @pytest.mark.parametrize("in_claim, said", [(True, True), (False, False)])
 def test_a_watching_point_that_could_not_be_installed_is_said_only_inside_the_range(in_claim, said):
     watched = {**_TOP, "key": "watched--top", "watching": True, "in_claim": in_claim}
@@ -1582,9 +1707,11 @@ def test_the_state_holds_a_points_words_cleaned_and_in_bounded_number(tmp_path):
     nodes[0] = "t.py::test_x`\n- [click](https://example.invalid)" + "y" * 500
     result = _result(_TOP, "fail", failed_ids=nodes)
     result["tests"]["excluded_files"] = ["a`b.py"] * 300
-    last = report.next_state({}, _results(result), _RUN, tmp_path)["points"][_TOP["key"]]["last"]
+    kept = report.next_state({}, _results(result), _RUN, tmp_path)["points"][_TOP["key"]]
+    last, checked = kept["last"], kept["last_checked"]
     assert len(last["failed_ids"]) == 200 and len(last["excluded_files"]) == 200
     assert len(last["failed_ids"][0]) <= 300
+    assert checked["failed_ids"] == last["failed_ids"], "the same words, wherever they are kept"
     assert not re.search(r"[`\n]", last["failed_ids"][0] + last["excluded_files"][0])
 
 
