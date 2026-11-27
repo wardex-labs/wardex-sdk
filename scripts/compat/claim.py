@@ -34,33 +34,32 @@ ENUMS = "sdks/python/src/wardex_sdk/_enums.py"
 PYPROJECT = "sdks/python/pyproject.toml"
 README = "README.md"
 
-_LINE = r"\d+(?:\.\d+)*\.x(?: from \d+(?:\.\d+)*)?"
-_RANGE = rf"{_LINE}(?:, {_LINE})*"
-_BOUNDS = r">=(?P<lower>\d+(?:\.\d+)*),<(?P<upper>\d+(?:\.\d+)*)"
+# White space is any run of it, a line break included: the README wraps its sentences, and
+# a phrase that wraps must still be one the table writes.
+_LINE = r"\d+(?:\.\d+)*\.x(?:\s+from\s+\d+(?:\.\d+)*)?"
+_RANGE = rf"{_LINE}(?:,\s+{_LINE})*"
+_BOUNDS = r"\s*>=\s*(?P<lower>\d+(?:\.\d+)*)\s*,\s*<\s*(?P<upper>\d+(?:\.\d+)*)\s*"
 
 
 _NUMBER = re.compile(r"\d+(?:\.\d+)*")
 
 
-def _between(lines: list[str], new: str) -> str:
-    """The release lines a table with `new` added would skip, as words, or "".
+def holes(lines: list[str]) -> str:
+    """The release lines a table of `lines` skips, as words, or "".
 
-    Only inside one prefix (0.23 to 0.25 skips 0.24). Whether 0.9 is followed by 0.10 or
-    by 1.0 is the framework's to decide, so a new prefix is taken as given."""
-    last = _vkey(new)
-    near = [_vkey(line) for line in lines if _vkey(line)[:-1] == last[:-1]]
-    if not near:
-        return ""
-    below = max((k for k in near if k < last), default=None)
-    above = min((k for k in near if k > last), default=None)
-    gap = []
-    if below is not None and last[-1] - below[-1] > 1:
-        gap += range(below[-1] + 1, last[-1])
-    if above is not None and above[-1] - last[-1] > 1:
-        gap += range(last[-1] + 1, above[-1])
-    prefix = ".".join(map(str, last[:-1]))
-    names = [f"{prefix}.{n}.x" if prefix else f"{n}.x" for n in gap]
-    return ", ".join(names)
+    A tested range is written as one pin, and a pin cannot leave a line out of its middle:
+    a table with a hole makes the install line admit releases nobody claims. Only inside
+    one prefix (0.23 and 0.25 skip 0.24). Whether 0.9 is followed by 0.10 or by 1.0 is the
+    framework's to decide, so lines of different prefixes are taken as adjacent."""
+    keys = sorted(_vkey(line) for line in lines)
+    skipped = []
+    for low, high in zip(keys, keys[1:], strict=False):
+        if low[:-1] == high[:-1]:
+            prefix = ".".join(map(str, low[:-1]))
+            skipped += [
+                f"{prefix}.{n}.x" if prefix else f"{n}.x" for n in range(low[-1] + 1, high[-1])
+            ]
+    return ", ".join(skipped)
 
 
 def _vkey(version: str) -> tuple[int, ...]:
@@ -116,7 +115,8 @@ def write_table(source: str, entry: dict) -> str:
 
 
 def _pin(dist: str) -> re.Pattern:
-    return re.compile(rf'(?P<head>"{re.escape(dist)}(?:\[[a-z0-9,_-]+\])?){_BOUNDS}(?P<tail>")')
+    name = rf"{re.escape(dist)}(?:\[[a-z0-9,_-]+\])?"
+    return re.compile(rf"(?P<head>(?P<quote>[\"']){name}){_BOUNDS}(?P<tail>(?P=quote))")
 
 
 def write_pins(text: str, entry: dict) -> str:
@@ -126,7 +126,7 @@ def write_pins(text: str, entry: dict) -> str:
 
 
 def _phrase(dist: str) -> re.Pattern:
-    return re.compile(rf"(?P<head>`{re.escape(dist)}` )(?P<range>{_RANGE})")
+    return re.compile(rf"(?P<head>`{re.escape(dist)}`\s+)(?P<range>{_RANGE})")
 
 
 def write_readme(text: str, entry: dict) -> str:
@@ -155,12 +155,16 @@ def drift(root: Path) -> list[str]:
                     f"{PYPROJECT}: {dist} is pinned >={pin[0]},<{pin[1]}; the table says "
                     f"{said}, which is >={want[0]},<{want[1]}"
                 )
+        if holes(list(entry["minors"])):
+            found.append(
+                f"{MEASURED}: {dist} skips {holes(list(entry['minors']))} between its tested "
+                "lines; a pin cannot say that, so the install line admits them"
+            )
         for match in _phrase(dist).finditer(readme):
-            if match["range"] != said:
+            wrote = " ".join(match["range"].split())
+            if wrote != said:
                 line = readme.count("\n", 0, match.start()) + 1
-                found.append(
-                    f"{README}:{line}: says `{dist}` {match['range']}; the table says {said}"
-                )
+                found.append(f"{README}:{line}: says `{dist}` {wrote}; the table says {said}")
         for match in _pin(dist).finditer(readme):
             if (match["lower"], match["upper"]) != want:
                 line = readme.count("\n", 0, match.start()) + 1
@@ -203,14 +207,6 @@ def changed(entry: dict, args: argparse.Namespace) -> dict:
                 f"{dist} is tested from {since} on; {args.line}.x lies below that. Decide where "
                 f"the range starts first: claim.py narrow {dist} --since <release>"
             )
-        between = _between(lines, args.line)
-        if between:
-            # One pin cannot leave a hole, so the install line would admit releases the
-            # table does not claim.
-            raise SystemExit(
-                f"{dist} {args.line}.x would leave {between} between the tested lines, and a "
-                f"pin cannot say that. Widen {between} first, or stop at the line before it."
-            )
         lines.append(args.line)
     elif args.command == "bad":
         if not plan.claims(entry, args.version):
@@ -225,6 +221,13 @@ def changed(entry: dict, args: argparse.Namespace) -> dict:
     else:
         since = args.since
     lines.sort(key=_vkey)
+    if holes(lines):
+        # The install line would admit releases the table does not claim.
+        raise SystemExit(
+            f"{dist} would be tested on {', '.join(f'{line}.x' for line in lines)}, which leaves "
+            f"{holes(lines)} between the tested lines, and a pin cannot say that. Change the "
+            "lines next to each other, or list single releases with `bad`."
+        )
     if since and not (since == lines[0] or since.startswith(lines[0] + ".")):
         # The range starts inside its lowest line. A start left behind by a dropped line
         # would call a whole line tested and judge it untested.

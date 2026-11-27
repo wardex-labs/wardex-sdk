@@ -1010,12 +1010,17 @@ def _file(day: str, *, yanked: bool = False) -> dict:
 @pytest.mark.parametrize(
     "served, newest",
     [
-        ({"0.6.0b2": "2026-10-01", "0.7.0b1": "2026-11-20", "0.7.0b10": "2026-11-21"}, "0.7.0b10"),
+        ({"0.6.0b2": "2026-10-01", "0.7.0b9": "2026-11-20", "0.7.0b10": "2026-11-21"}, "0.7.0b10"),
+        ({"0.9.0": "2026-10-01", "0.10.0": "2026-11-20"}, "0.10.0"),
+        (
+            {"0.7.0": "2026-10-01", "0.7.0.post1": "2026-11-20", "0.7.1.dev3": "2026-11-21"},
+            "0.7.0.post1",
+        ),
         ({"0.7.0rc1": "2026-11-01", "0.7.0": "2026-11-02", "0.7.1b1": "2026-11-03"}, "0.7.1b1"),
         ({"0.7.0": "2026-11-02", "0.7.0rc2": "2026-11-03", "0.7.0b9": "2026-11-04"}, "0.7.0"),
         ({"0.7.0b1": "2026-11-20", "0.8.0": "2026-11-27"}, "0.7.0b1"),
         (
-            {"0.7.0b1": "2026-11-20", "0.8.0.dev1": "2026-11-21", "1.0.post1": "2026-11-21"},
+            {"0.7.0b1": "2026-11-20", "0.8.0.dev1": "2026-11-21", "1.0+local": "2026-11-21"},
             "0.7.0b1",
         ),
         ({}, None),
@@ -1034,6 +1039,9 @@ def test_a_yanked_wardex_release_is_not_the_newest():
         {"version": "0.7.0b2", "files": [_file("2026-11-21", yanked=True)]},
     ]
     assert plan.newest_wardex(releases, _CUTOFF) == "0.7.0b1"
+    one_wheel_pulled = [_file("2026-11-21", yanked=True), _file("2026-11-21")]
+    releases.append({"version": "0.7.0b3", "files": one_wheel_pulled})
+    assert plan.newest_wardex(releases, _CUTOFF) == "0.7.0b3", "one file still served is enough"
 
 
 def test_the_published_release_is_run_on_the_top_of_its_own_range_and_the_newest_above_it():

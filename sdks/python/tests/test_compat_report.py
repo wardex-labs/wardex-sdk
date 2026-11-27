@@ -859,6 +859,7 @@ def test_a_failed_release_that_a_newer_one_replaced_is_remembered_and_kept_on_th
                 "targets": {"openai-agents": "0.23.1"},
                 "python": "3.14",
                 "failed_on": "2026-11-25",
+                "failing_since": "2026-11-25",
             }
         ]
     }
@@ -2274,3 +2275,63 @@ def test_a_red_capable_question_is_not_answered_by_watching_points():
     watched = {**_TOP, "key": "watched--top", "kind": "anything", "watching": True}
     plan = {**_plan(watched), "adapters": {}}
     assert report.judge(plan, _results(_result(watched))) == ["plan: no points"]
+
+
+def test_the_way_out_names_every_release_a_point_pins(tmp_path):
+    """A framework and its companion are pinned together. Which of the two broke is for a
+    person to say; a command for the first alone would list the wrong release."""
+    pair = {**_TOP, "targets": {"langgraph": "1.2.24", "langgraph-prebuilt": "1.1.3"}}
+    plan = _plan(_FLOOR, pair)
+    state = report.next_state(
+        {}, _results(_result(pair, "fail")), {**_RUN, "date": "2026-11-01"}, tmp_path, plan
+    )
+    state.pop("_locks"), state.pop("_forget")
+    run = {**_RUN, "date": "2026-11-20"}
+    results = _results(_result(_FLOOR), _result(pair, "fail"))
+    issue = report.adapter_issue("openai_agents", plan, results, run, state)
+    assert (
+        "To stop calling it tested instead: for the release that broke, "
+        "`python3 scripts/compat/claim.py bad langgraph 1.2.24` or "
+        "`python3 scripts/compat/claim.py bad langgraph-prebuilt 1.1.3`." in issue["changes"][0]
+    )
+
+
+def test_how_long_a_release_has_failed_goes_with_the_release_when_a_newer_one_replaces_it(
+    tmp_path,
+):
+    """It failed as the newest tested release for ten days and then as its own point. The
+    fourteen days are counted from the first failure, not from the day its key changed."""
+    old = {**_point("claim_top", "0.23.1"), "python": "3.14"}
+    new = {**_point("claim_top", "0.23.2"), "python": "3.14"}
+    covering = {"cadence": "daily", "covers": {"framework": ["openai_agents"]}, "partial": False}
+    state: dict = {}
+    issue = {}
+    for day in range(1, 16):
+        run = {**_RUN, "date": f"2026-11-{day:02d}"}
+        points = [_FLOOR, old if day <= 10 else new]
+        for item in (state.get("displaced") or {}).get("openai_agents", []):
+            points.append({**_point("displaced", "0.23.1"), "key": item["key"], "python": "3.14"})
+        plan = _plan_with_table(*points)
+        plan["scope"] = covering
+        results = {}
+        for planned in points:
+            failing = planned["targets"] == old["targets"]
+            result = _result(planned, "fail" if failing else "pass")
+            result["planned_python"] = planned.get("python", "3.14")
+            results[planned["key"]] = result
+        state = report.next_state(state, results, run, tmp_path, plan)
+        state.pop("_locks"), state.pop("_forget")
+        issue = report.adapter_issue("openai_agents", plan, results, run, state)
+    (item,) = state["displaced"]["openai_agents"]
+    assert item["failing_since"] == "2026-11-01"
+    assert state["points"][item["key"]]["failing_since"]["date"] == "2026-11-01"
+    assert "It has failed since `2026-11-01`, 14 days." in "\n".join(issue["changes"])
+    assert "claim.py bad openai-agents 0.23.1" in "\n".join(issue["changes"])
+
+
+def test_what_the_pages_know_of_a_release_survives_runs_of_one_adapter(tmp_path):
+    plan = _release_plan(_published(_TOP))
+    state = report.next_state({}, {}, _RUN, tmp_path, plan)
+    state["versions"]["0.7.0b1"]["adapters"]["langgraph"] = {"label": "langgraph"}
+    after = report.next_state(state, {}, {**_RUN, "date": "2026-11-27"}, tmp_path, plan)
+    assert sorted(after["versions"]["0.7.0b1"]["adapters"]) == ["langgraph", "openai_agents"]

@@ -445,7 +445,7 @@ def displaced_line(targets: dict, python: str) -> str:
 # --- the published release -------------------------------------------------------
 
 WARDEX = "wardex-sdk"
-_WARDEX_VERSION = re.compile(r"(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?")
+_WARDEX_VERSION = re.compile(r"(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?(?:\.post(\d+))?")
 _PRE_RANK = {"a": 0, "b": 1, "rc": 2, None: 3}
 
 
@@ -454,7 +454,7 @@ def _wardex_key(version: str) -> tuple | None:
     match = _WARDEX_VERSION.fullmatch(version)
     if not match:
         return None
-    return (vkey(match[1]), _PRE_RANK[match[2]], int(match[3] or 0))
+    return (vkey(match[1]), _PRE_RANK[match[2]], int(match[3] or 0), int(match[4] or 0))
 
 
 def newest_wardex(releases: list[dict], cutoff: str) -> str | None:
@@ -462,7 +462,8 @@ def newest_wardex(releases: list[dict], cutoff: str) -> str | None:
 
     Pre-releases count: what `pip install --pre wardex-sdk` gives is what a user has, and
     until a final exists a pre-release is all there is. A final, once published, outranks
-    every pre-release of the same number."""
+    every pre-release of the same number, and a post release outranks its final, because
+    that is what the installer serves. A development release is nobody's install."""
     live = [
         release["version"]
         for release in releases

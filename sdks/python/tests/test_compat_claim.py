@@ -229,16 +229,17 @@ def test_a_line_that_would_leave_a_hole_or_reach_under_a_stated_start_is_refused
     line starts there because what lies below does not pass."""
     with pytest.raises(SystemExit) as hole:
         claim.main(["widen", "openai-agents", "0.25"], root=tree)
-    assert "would leave 0.24.x between the tested lines" in str(hole.value)
+    assert "leaves 0.24.x between the tested lines" in str(hole.value)
     with pytest.raises(SystemExit) as under:
         claim.main(["widen", "pydantic-ai-slim", "1"], root=tree)
     assert "is tested from 2.54 on; 1.x lies below that" in str(under.value)
-    assert claim._between(["0.22", "0.23"], "0.24") == ""
-    assert claim._between(["0.22", "0.23"], "0.21") == ""
-    assert claim._between(["0.22", "0.25"], "0.28") == "0.26.x, 0.27.x"
-    assert claim._between(["0.22"], "0.20") == "0.21.x"
-    assert claim._between(["0.9"], "1.0") == "", "a new prefix is the framework's to number"
-    assert claim._between(["2"], "4") == "3.x"
+    assert claim.holes(["0.22", "0.23", "0.24"]) == ""
+    assert claim.holes(["0.21", "0.22", "0.23"]) == ""
+    assert claim.holes(["0.22", "0.25", "0.28"]) == "0.23.x, 0.24.x, 0.26.x, 0.27.x"
+    assert claim.holes(["0.9", "1.0"]) == "", "a new prefix is the framework's to number"
+    assert claim.holes(["0.3", "1.7"]) == "", "nothing is counted across two prefixes"
+    assert claim.holes(["0.22", "1.5", "1.7"]) == "1.6.x", "and a hole is looked for inside one"
+    assert claim.holes(["2", "4"]) == "3.x"
 
 
 def test_an_install_line_with_extras_is_held_to_the_table_like_any_other(tree):
@@ -262,3 +263,45 @@ def test_releases_listed_as_bad_are_kept_in_order_and_once(tree):
     assert _row(tree, dist)["known_bad"] == (f"{low}.9", f"{low}.10", f"{high}.1")
     with pytest.raises(SystemExit):
         claim.main(["bad", dist, f"{low}.9"], root=tree)
+
+
+def test_taking_a_line_out_of_the_middle_is_refused_like_adding_one_past_a_gap(tree):
+    assert claim.main(["widen", "openai-agents", "0.24"], root=tree) == 0
+    before = _texts(tree)
+    with pytest.raises(SystemExit) as hole:
+        claim.main(["narrow", "openai-agents", "--drop", "0.23"], root=tree)
+    assert "leaves 0.23.x between the tested lines" in str(hole.value) and _texts(tree) == before
+    assert claim.main(["narrow", "openai-agents", "--drop", "0.24"], root=tree) == 0
+    assert claim.main(["narrow", "openai-agents", "--drop", "0.22"], root=tree) == 0
+
+
+def test_a_table_someone_left_a_hole_in_is_drift(tree):
+    path = tree / claim.MEASURED
+    text = path.read_text(encoding="utf-8")
+    holed = text.replace('("0.22", "0.23")', '("0.22", "0.24")')
+    assert holed != text
+    path.write_text(holed, encoding="utf-8")
+    assert any("skips 0.23.x between its tested lines" in line for line in claim.drift(tree))
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "`{dist}`\n9.1.x, 9.2.x",
+        "`{dist}`  9.1.x,\n9.2.x",
+        "'{dist}>=9.1,<9.3'",
+        '"{dist} >= 9.1, < 9.3"',
+    ],
+)
+def test_a_claim_that_wraps_or_is_spelled_with_other_quotes_or_spaces_is_still_held(tree, written):
+    """The README wraps its sentences. A phrase or an install line that says another
+    range is drift however it is broken across lines, quoted or spaced, and `sync` writes
+    it back."""
+    dist = _a_row_with_two_lines(tree)["distribution"]
+    path = tree / claim.README
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\n" + written.format(dist=dist) + "\n", "utf-8"
+    )
+    assert len(claim.drift(tree)) == 1
+    assert claim.main(["sync"], root=tree) == 0 and claim.drift(tree) == []
+    assert "9.1" not in path.read_text(encoding="utf-8")

@@ -340,11 +340,17 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
         ):
             continue
         python = before.get("python") or result.get("planned_python") or ""
+        since = state.get("points", {}).get(key, {}).get("failing_since") or {}
         item = {
             "key": f"{result['adapter']}--displaced--{displaced_line(before['targets'], python)}",
             "targets": before["targets"],
             "python": python,
             "failed_on": before["date"],
+            # How long the release has been failing goes with the release, not with the
+            # point that happened to run it: its own point continues the same count.
+            "failing_since": since["date"]
+            if since.get("targets") == before["targets"]
+            else before["date"],
         }
         mine = kept.setdefault(result["adapter"], [])
         if all(other["key"] != item["key"] for other in mine):
@@ -422,6 +428,12 @@ def next_state(
     and the failed releases a newer one has replaced."""
     points = dict(state.get("points", {}))
     locks: dict[str, Path] = {}
+    replaced = {
+        item["key"]: item
+        for items in (state.get("displaced") or {}).values()
+        for item in items
+        if item.get("failing_since")
+    }
     for key, result in results.items():
         entry = dict(points.get(key, {}))
         tests = result.get("tests") or {}
@@ -463,7 +475,20 @@ def next_state(
         if result["outcome"] in GREEN or since.get("targets") not in (None, result["targets"]):
             entry.pop("failing_since", None)
         if result["outcome"] in FAILED:
-            entry.setdefault("failing_since", {"date": run["date"], "targets": result["targets"]})
+            # A release keeps its count when another point takes it over: the one a newer
+            # release replaced goes on from where the rule's own point left it.
+            began = [item["failing_since"] for item in (replaced.get(key),) if item] + [
+                other["failing_since"]["date"]
+                for other in state.get("points", {}).values()
+                if (other.get("failing_since") or {}).get("targets") == result["targets"]
+            ]
+            entry.setdefault(
+                "failing_since",
+                {
+                    "date": min([d for d in began if d] or [run["date"]]),
+                    "targets": result["targets"],
+                },
+            )
         # Days, not runs: a second run on the same day is the same outage seen twice.
         if result["outcome"] in NOT_OURS:
             if entry.get("not_ours_last") != run["date"]:
@@ -649,11 +674,21 @@ def _lapse(result: dict, known: dict, run: dict) -> str:
         return ""
     if days < LAPSE_NARROW_DAYS:
         return ""
-    dist, version = next(iter(result["targets"].items()))
-    command = f"python3 scripts/compat/claim.py bad {dist} {version}"
+    # One command for each release the point pins. Where it pins a framework and a
+    # companion, which of the two broke is for a person to say; naming only the first
+    # would send them to list the wrong release.
+    commands = [
+        code(f"python3 scripts/compat/claim.py bad {dist} {version}")
+        for dist, version in result["targets"].items()
+    ]
+    which = (
+        commands[0]
+        if len(commands) == 1
+        else "for the release that broke, " + " or ".join(commands)
+    )
     return (
         f" It has failed since {code(since['date'])}, {days} days. To stop calling it tested "
-        f"instead: {code(command)}."
+        f"instead: {which}."
     )
 
 
