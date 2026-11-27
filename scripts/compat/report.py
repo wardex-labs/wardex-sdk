@@ -359,6 +359,35 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
     return {adapter: items for adapter, items in sorted(kept.items()) if items}
 
 
+def _began(state: dict, result: dict) -> str | None:
+    """The first day of the failure a release is in, when another point of this build was
+    already counting it: the count goes with the release, not with the point that runs it.
+
+    A release changes hands when a newer patch replaces it (its own point takes over),
+    when that patch is withdrawn (the rule's point runs it again), and when the range
+    grows (another rule's point picks it up). The same release on the same interpreter,
+    and only on the wheel this run builds: the published wardex failing on it is another
+    question's count."""
+    if not _own(result):
+        return None
+    targets, python = result["targets"], result.get("planned_python")
+    dates = [
+        item.get("failing_since")
+        for items in (state.get("displaced") or {}).values()
+        for item in items
+        if item.get("targets") == targets and item.get("python") == python
+    ]
+    for entry in (state.get("points") or {}).values():
+        identity, since = entry.get("point") or {}, entry.get("failing_since") or {}
+        mine = (
+            not identity.get("watching")
+            and (identity.get("sdk") or {}).get("origin", "build") == "build"
+        )
+        if mine and since.get("targets") == targets and identity.get("python") == python:
+            dates.append(since.get("date"))
+    return min((day for day in dates if day), default=None)
+
+
 def _picked_again(item: dict, results: dict[str, dict]) -> dict | None:
     """The rule's point that runs a remembered release today, when one of the rules picks it
     again (the release that replaced it was withdrawn) and the plan makes no second point."""
@@ -439,12 +468,6 @@ def next_state(
     and the failed releases a newer one has replaced."""
     points = dict(state.get("points", {}))
     locks: dict[str, Path] = {}
-    replaced = {
-        item["key"]: item
-        for items in (state.get("displaced") or {}).values()
-        for item in items
-        if item.get("failing_since")
-    }
     for key, result in results.items():
         entry = dict(points.get(key, {}))
         tests = result.get("tests") or {}
@@ -486,12 +509,9 @@ def next_state(
         if result["outcome"] in GREEN or since.get("targets") not in (None, result["targets"]):
             entry.pop("failing_since", None)
         if result["outcome"] in FAILED:
-            # A release a newer one replaced keeps its count: its own point goes on from
-            # where the rule's point left it. From that item and nowhere else, because the
-            # same release failing on another wardex build is another question's count.
-            began = (replaced.get(key) or {}).get("failing_since")
             entry.setdefault(
-                "failing_since", {"date": began or run["date"], "targets": result["targets"]}
+                "failing_since",
+                {"date": _began(state, result) or run["date"], "targets": result["targets"]},
             )
         # Days, not runs: a second run on the same day is the same outage seen twice.
         if result["outcome"] in NOT_OURS:

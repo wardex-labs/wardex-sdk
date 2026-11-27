@@ -329,6 +329,7 @@ def test_a_phrase_the_table_writes_is_not_drift_for_being_wrapped(tree):
         "`{dist}`\n\n9.x of the documentation",
         "### `{dist}`\n\n9.x and later",
         "`{dist}` is described in section 9.x",
+        "`{dist}` > 9.x is not how a range is written",
         "`{dist}` {said},\n\n9.x is another paragraph",
     ],
 )
@@ -356,3 +357,16 @@ def test_a_file_keeps_the_line_endings_it_came_with(tree):
     for name in (claim.MEASURED, claim.PYPROJECT, claim.README):
         data = (tree / name).read_bytes()
         assert data.count(b"\r\n") == data.count(b"\n") > 0, name
+
+
+def test_a_range_wrapped_inside_a_quoted_paragraph_is_read_as_one_range(tree):
+    row = _a_row_with_two_lines(tree)
+    dist, said = row["distribution"], plan.spelled(row)
+    path = tree / claim.README
+    quoted = f"\n> `{dist}` " + said.replace(", ", ",\n> ", 1) + "\n"
+    path.write_text(path.read_text("utf-8") + quoted, "utf-8")
+    assert claim.drift(tree) == []
+    wrong = quoted.replace(said.split(", ")[0], "9.1.x")
+    path.write_text(path.read_text("utf-8").replace(quoted, wrong), "utf-8")
+    (found,) = claim.drift(tree)
+    assert f"says `{dist}` 9.1.x, " in found and "> " not in found

@@ -163,7 +163,7 @@ def drift(root: Path) -> list[str]:
                 "lines; a pin cannot say that, so the install line admits them"
             )
         for match in _phrase(dist).finditer(readme):
-            wrote = " ".join(match["range"].split())
+            wrote = re.sub(_GAP, " ", match["range"])
             if wrote != said:
                 line = readme.count("\n", 0, match.start()) + 1
                 found.append(f"{README}:{line}: says `{dist}` {wrote}; the table says {said}")
