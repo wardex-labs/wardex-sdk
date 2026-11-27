@@ -1381,39 +1381,274 @@ def test_a_run_does_not_close_what_a_run_it_did_not_cover_found():
     assert again["fingerprint"] == issue["fingerprint"], "no news, no comment"
 
 
-def test_a_record_line_says_its_kind_and_carries_the_point_as_it_was_planned(tmp_path):
-    planned = {
-        **_TOP,
-        "python": "3.14",
-        "kind": "framework",
-        "subject": "openai_agents",
-        "watching": False,
-        "sdk": {"origin": "build"},
-        "runner": "linux-x64",
-        "install": {"requires": ["h2"]},
-        "check": {"files": ["test_x.py"]},
-        "probe": {"imports": ["agents"]},
-        "cutoff": "2026-11-26T19:40:00Z",
-        "assume_measured": False,
-        "floats": [],
-        "budget_s": 2700,
-        "fresh_days": 3,
+_PLANNED_TOP = {
+    **_TOP,
+    "python": "3.14",
+    "kind": "framework",
+    "subject": "openai_agents",
+    "adapters": ["openai_agents"],
+    "watching": False,
+    "sdk": {"origin": "build"},
+    "runner": "linux-x64",
+    "install": {"requires": ["h2"]},
+    "check": {"files": ["test_x.py"]},
+    "probe": {"imports": ["agents"]},
+    "cutoff": "2026-11-26T19:40:00Z",
+    "assume_measured": False,
+    "floats": [],
+    "budget_s": 2700,
+    "fresh_days": 3,
+}
+
+
+def test_a_record_line_keeps_what_the_plan_said_and_what_the_point_measured_apart(tmp_path):
+    """Who the point is comes from the plan. Which interpreter ran and which wheel it
+    imported are what the point saw, and a record without them cannot be reproduced."""
+    measured = {
+        "python": "3.14.2",
+        "sdk": {"wheel": "w.whl", "wheel_sha256": "ab" * 32, "version": "0.7.0b1"},
+        "runner": "a-runner-of-its-own",
     }
-    _write(tmp_path, _result(_TOP))
-    plan = _plan(planned)
+    _write(tmp_path, _result(_TOP, **measured))
+    plan = _plan(_PLANNED_TOP)
     plan["cadence"] = "daily"
     results = report.load_results(plan, tmp_path)
     (line,) = report.records(plan, results, {**_RUN, "cadence": "daily", "scope": "all"})
-    assert (line["schema"], line["kind"], line["subject"], line["watching"]) == (
+    assert (line["schema"], line["kind"], line["subject"], line["adapters"], line["watching"]) == (
         2,
         "framework",
         "openai_agents",
+        ["openai_agents"],
         False,
     )
-    assert line["sdk"] == {"origin": "build"} and line["runner"] == "linux-x64"
-    assert line["plan"]["install"] == {"requires": ["h2"]} and line["plan"]["python"] == "3.14"
+    assert line["python"] == "3.14.2" and line["sdk_wheel_sha256"] == "ab" * 32
+    assert line["sdk"] == {"origin": "build", "version": "0.7.0b1"}
+    assert line["runner"] == "linux-x64", "the runner is the plan's to say"
+    assert line["plan"] == {
+        "python": "3.14",
+        "floats": [],
+        "cutoff": "2026-11-26T19:40:00Z",
+        "assume_measured": False,
+        "install": {"requires": ["h2"]},
+        "probe": {"imports": ["agents"]},
+        "check": {"files": ["test_x.py"]},
+        "budget_s": 2700,
+        "fresh_days": 3,
+    }
     assert line["run"]["cadence"] == "daily"
     json.dumps(line)
+
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN)
+    assert "| `3.14.2` |" in issue["body"], "the table shows the interpreter that ran"
+    state = report.next_state({}, results, _RUN, tmp_path, plan)
+    kept = state["points"][_TOP["key"]]
+    assert kept["point"]["python"] == "3.14" and kept["point"]["sdk"] == {"origin": "build"}
+    assert kept["last_checked"]["python"] == "3.14", "the interpreter line the plan asked for"
+
+
+def test_a_watching_point_does_not_make_up_the_number_of_points_an_adapter_needs():
+    """Two points is the least that tests a range. A watching point beside one framework
+    point is not the second: it cannot turn the run red, so it cannot stand for one that can."""
+    watching = {**_TOP, "key": "watched--top", "kind": "anything", "watching": True}
+    plan = _plan(_TOP, watching)
+    results = _results(_result(_TOP), _result(watching))
+    assert report.judge(plan, results) == ["plan: openai_agents has fewer than two points"]
+    assert report.judge(_plan(_TOP, _FLOOR, watching), _results(_result(_TOP))) == []
+
+
+def _kept(point: dict, outcome: str, nodes: list[str], day: str = "2026-11-22") -> dict:
+    """A state entry as a run that covered `point` left it."""
+    last = {
+        "date": day,
+        "outcome": outcome,
+        "cause": None,
+        "failed_ids": nodes,
+        "excluded_files": [],
+    }
+    return {"point": model.identity_of(point), "last": last}
+
+
+def test_what_a_run_did_not_run_is_never_worded_as_checked_today():
+    """An adapter the plan could not cover keeps its points in the state. Its issue is
+    still written, and a failure from another day must read as that day's."""
+    plan = _plan()
+    plan["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
+    above_passed = {**_ABOVE, "kind": "framework", "subject": "openai_agents"}
+    state = {
+        "points": {
+            _TOP["key"]: _kept(_TOP, "fail", ["t.py::test_tree"]),
+            _FLOOR["key"]: _kept(_FLOOR, "pass", []),
+            _ABOVE["key"]: _kept(above_passed, "pass", []),
+        }
+    }
+    issue = report.adapter_issue("openai_agents", plan, {}, _RUN, state)
+    (line,) = [line for line in issue["body"].splitlines() if line.startswith("- `openai-agents 0")]
+    assert line == (
+        "- `openai-agents 0.23.1` is inside the tested range and did not pass when it was last "
+        "run, on `2026-11-22`: fails 1 tests. This run did not run it."
+    )
+    assert "can be widened" not in issue["body"], "nobody saw that pass today"
+    assert "`t.py::test_tree`" in issue["body"] and issue["open"]
+    assert (
+        report.adapter_issue("openai_agents", plan, {}, _RUN, state)["fingerprint"]
+        == (issue["fingerprint"])
+    )
+    a_day_later = {**_RUN, "date": "2026-11-27"}
+    assert (
+        report.adapter_issue("openai_agents", plan, {}, a_day_later, state)["fingerprint"]
+        == (issue["fingerprint"])
+    ), "the same old news on a new day is not a comment"
+    assert f"<!-- compat-fingerprint: {issue['fingerprint']} -->" in issue["body"]
+
+    state["points"][_TOP["key"]]["last"]["outcome"] = "pass"
+    assert not report.adapter_issue("openai_agents", plan, {}, _RUN, state)["open"]
+
+
+@pytest.mark.parametrize("in_claim, said", [(True, True), (False, False)])
+def test_a_watching_point_that_could_not_be_installed_is_said_only_inside_the_range(in_claim, said):
+    watched = {**_TOP, "key": "watched--top", "watching": True, "in_claim": in_claim}
+    plan = _plan(_FLOOR, _TOP, watched)
+    results = _results(_result(_FLOOR), _result(_TOP), _result(watched, "not_installable"))
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN)
+    assert issue["open"] is said
+    assert ("### Watching (never turns the run red)" in issue["body"]) is said
+
+
+def test_a_watching_failure_is_news_once():
+    """It reaches the comment that says what changed, like anything else on the issue."""
+    watched = {**_TOP, "key": "watched--top", "watching": True}
+    plan = _plan(_FLOOR, _TOP, watched)
+    failing = _result(watched, "fail", failed_ids=["t.py::test_tree"])
+    issue = report.adapter_issue(
+        "openai_agents", plan, _results(_result(_FLOOR), _result(_TOP), failing), _RUN
+    )
+    (change,) = issue["changes"]
+    assert change.startswith("framework release: `openai-agents 0.23.1` fails 1 tests.")
+    assert change.endswith(f"Closes {kinds.KINDS['framework'].closes}.")
+    undeclared = {**failing, "kind": "nobody declared"}
+    said = report.adapter_issue(
+        "openai_agents", plan, _results(_result(_FLOOR), _result(_TOP), undeclared), _RUN
+    )["changes"][0]
+    assert said.startswith("nobody declared: ") and said.endswith("Closes when it passes.")
+
+
+def _covering(covers: dict, *, partial: bool = False) -> dict:
+    plan = _plan(_FLOOR, _TOP)
+    plan["scope"] = {"cadence": "daily", "covers": covers, "partial": partial}
+    return plan
+
+
+def test_a_run_forgets_only_points_of_a_kind_and_subject_it_covers(tmp_path):
+    """The subject is read from what the state kept about the point, not from its key:
+    a point of another kind may be about an adapter its key does not start with."""
+    other_kind = {**_TOP, "key": "openai_agents--weekly", "kind": "weekly_thing"}
+    other_subject = {**_TOP, "key": "openai_agents--about_langgraph", "subject": "langgraph"}
+    renamed = {**_TOP, "key": "combo--one", "subject": "openai_agents"}
+    gone = {**_TOP, "key": "openai_agents--minor_newest--0.21"}
+    state = {"points": {p["key"]: _kept(p, "pass", []) for p in (other_kind, other_subject)}}
+    state["points"].update({p["key"]: _kept(p, "pass", []) for p in (renamed, gone)})
+    state["points"]["openai_agents--before_kinds"] = {"point": None, "last": {}}
+    plan = _covering({"framework": ["openai_agents"]})
+    after = report.next_state(state, _results(_result(_FLOOR), _result(_TOP)), _RUN, tmp_path, plan)
+    assert sorted(after["_forget"]) == [
+        "combo--one",
+        "openai_agents--before_kinds",
+        "openai_agents--minor_newest--0.21",
+    ]
+    assert {"openai_agents--weekly", "openai_agents--about_langgraph"} <= set(after["points"])
+    assert not set(after["_forget"]) & set(after["points"])
+
+
+def test_a_whole_run_counts_the_points_of_each_kind_it_covers(tmp_path):
+    other = {**_TOP, "key": "watched--top", "kind": "weekly_thing", "watching": True}
+    results = _results(_result(_FLOOR), _result(_TOP), _result(other))
+    for result in results.values():
+        result.setdefault("kind", "framework")
+    plan = _covering({"framework": ["openai_agents"], "weekly_thing": ["openai_agents"]})
+    before = {"kinds": {"never_today": {"last_complete": "2026-11-01", "points": 9}}}
+    after = report.next_state(before, results, _RUN, tmp_path, plan)
+    assert after["kinds"] == {
+        "framework": {"last_complete": "2026-11-26", "points": 2},
+        "weekly_thing": {"last_complete": "2026-11-26", "points": 1},
+        "never_today": {"last_complete": "2026-11-01", "points": 9},
+    }
+    partial = _covering({"framework": ["openai_agents"]}, partial=True)
+    assert report.next_state(before, results, _RUN, tmp_path, partial)["kinds"] == before["kinds"]
+
+
+def test_the_state_holds_a_points_words_cleaned_and_in_bounded_number(tmp_path):
+    """`state.json` is public and issues are built from it on days the point did not run."""
+    nodes = [f"t.py::test_{n}" for n in range(300)]
+    nodes[0] = "t.py::test_x`\n- [click](https://example.invalid)" + "y" * 500
+    result = _result(_TOP, "fail", failed_ids=nodes)
+    result["tests"]["excluded_files"] = ["a`b.py"] * 300
+    last = report.next_state({}, _results(result), _RUN, tmp_path)["points"][_TOP["key"]]["last"]
+    assert len(last["failed_ids"]) == 200 and len(last["excluded_files"]) == 200
+    assert len(last["failed_ids"][0]) <= 300
+    assert not re.search(r"[`\n]", last["failed_ids"][0] + last["excluded_files"][0])
+
+
+def test_a_forgotten_point_takes_its_last_pass_with_it(tmp_path, monkeypatch):
+    """Through `main`, on files: the lock of a key no plan makes any more is removed with
+    its state entry, and nothing of a point the run did not cover is touched."""
+    monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
+    monkeypatch.setattr(report.GitHub, "do", lambda self, what, *rest: None)
+    for name in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "GITHUB_REPOSITORY"):
+        monkeypatch.delenv(name, raising=False)
+    records, results_dir = tmp_path / "records", tmp_path / "results"
+    (records / "last-green").mkdir(parents=True)
+    gone = {**_TOP, "key": "openai_agents--minor_newest--0.21"}
+    elsewhere = {**_TOP, "key": "langgraph--claim_top", "adapter": "langgraph"}
+    state = {
+        "schema": 2,
+        "points": {p["key"]: _kept(p, "pass", []) for p in (gone, elsewhere)},
+        "displaced": {"langgraph": [{"key": "langgraph--displaced--1", "targets": {}}]},
+        "kinds": {},
+        "last_scheduled": "2026-11-25T19:40:00Z",
+    }
+    (records / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    for key in (gone["key"], elsewhere["key"]):
+        (records / "last-green" / f"{key}.txt").write_text("a==1\n", encoding="utf-8")
+        (records / "last-green" / f"{key}.files.json").write_text("[]", encoding="utf-8")
+    plan = _covering({"framework": ["openai_agents"]}, partial=True)
+    plan["partial"] = True
+    (tmp_path / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    _write(results_dir, _result(_FLOOR))
+    _write(results_dir, _result(_TOP))
+
+    argv = ["--plan", str(tmp_path / "plan.json"), "--results", str(results_dir)]
+    argv += ["--state-dir", str(records)]
+    assert report.main(argv) == 0
+    assert (records / "last-green" / f"{gone['key']}.txt").is_file(), "a dry run writes nothing"
+
+    assert report.main([*argv, "--write"]) == 0
+    left = sorted(path.name for path in (records / "last-green").iterdir())
+    assert left == [
+        "langgraph--claim_top.files.json",
+        "langgraph--claim_top.txt",
+        "openai_agents--claim_top.files.json",
+        "openai_agents--claim_top.txt",
+        "openai_agents--floor.files.json",
+        "openai_agents--floor.txt",
+    ]
+    written = json.loads((records / "state.json").read_text())
+    assert gone["key"] not in written["points"] and elsewhere["key"] in written["points"]
+    assert "_forget" not in written and "_locks" not in written
+    assert written["displaced"]["langgraph"] and written["last_scheduled"] == "2026-11-25T19:40:00Z"
+
+
+def test_a_state_written_before_kinds_keeps_everything_it_remembered():
+    old = {
+        "schema": 1,
+        "points": {"a--floor": {"last": {"outcome": "pass"}}},
+        "displaced": {"openai_agents": [{"key": "openai_agents--displaced--1"}]},
+        "last_scheduled": "2026-11-25T19:40:00Z",
+    }
+    new = model.upgrade_state(old)
+    assert new["displaced"] == old["displaced"] and new["last_scheduled"] == old["last_scheduled"]
+    assert new["points"] == {"a--floor": {"point": None, "last": {"outcome": "pass"}}}
+    assert (new["schema"], new["kinds"]) == (2, {})
+    assert model.upgrade_state(new) is new
 
 
 def test_every_declared_kind_has_words_and_a_way_to_close():
