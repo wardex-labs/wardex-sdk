@@ -11,6 +11,7 @@ with a stand-in for the issue tracker.
 from __future__ import annotations
 
 import json
+import random
 import re
 import sys
 from datetime import datetime, timezone
@@ -1545,9 +1546,16 @@ def test_a_point_cannot_say_of_itself_that_it_was_not_run_today(tmp_path):
     """Which rows are remembered is read from the state. A result that calls itself old
     is today's result, worded as today's, and a release above the range stays listed."""
     forged = {"as_of": "2020-01-01", "fresh_days": 9999}
+    watched = {**_TOP, "key": "watched--top", "watching": True}
     _write(tmp_path, _result(_FLOOR))
     _write(tmp_path, _result(_TOP, "fail", failed_ids=["t.py::test_a"], **forged))
     _write(tmp_path, _result(_ABOVE, "fail", failed_ids=["t.py::test_b"], **forged))
+    _write(tmp_path, _result(watched, "fail", failed_ids=["t.py::test_c"], **forged))
+    with_watched = _plan(_FLOOR, _TOP, _ABOVE, watched)
+    body = report.adapter_issue(
+        "openai_agents", with_watched, report.load_results(with_watched, tmp_path), _RUN
+    )["body"]
+    assert "### Watching" in body and "(last run" not in body and "2020-01-01" not in body
     plan = _plan(_FLOOR, _TOP, _ABOVE)
     results = report.load_results(plan, tmp_path)
     honest = _results(
@@ -1570,6 +1578,127 @@ def test_a_remembered_release_above_the_range_is_never_called_tested():
     state = {"points": {_ABOVE["key"]: _kept(above, "fail", ["t.py::test_tree"])}}
     issue = report.adapter_issue("openai_agents", plan, {}, _RUN, state)
     assert not issue["open"] and "inside the tested range" not in issue["body"]
+
+
+def test_a_replaced_failure_outlives_a_day_it_could_not_be_checked_and_a_day_nothing_ran(tmp_path):
+    """Four days: the newest tested release fails, a newer patch replaces it, its own point
+    cannot install it, and then the plan cannot cover the adapter. Its point never ran
+    it, so the only thing known about it is the failure it was remembered for, and the
+    issue says that once and stays open."""
+    old = _point("claim_top", "0.23.1")
+    new = {**_point("claim_top", "0.23.2"), "python": "3.14"}
+    covering = {"cadence": "daily", "covers": {"framework": ["openai_agents"]}, "partial": False}
+    state: dict = {}
+
+    def day(n: int, plan: dict, *results: dict) -> dict:
+        nonlocal state
+        run = {**_RUN, "date": f"2026-11-2{n}"}
+        loaded = _results(*results)
+        for result in loaded.values():
+            result.setdefault("planned_python", "3.14")
+        state = report.next_state(state, loaded, run, tmp_path, plan)
+        state.pop("_locks"), state.pop("_forget")
+        return report.adapter_issue("openai_agents", plan, loaded, run, state)
+
+    first = _plan_with_table(_FLOOR, {**old, "python": "3.14"})
+    first["scope"] = covering
+    assert day(1, first, _result(_FLOOR), _result(old, "fail", failed_ids=["t.py::a"]))["open"]
+    second = _plan_with_table(_FLOOR, new)
+    second["scope"] = covering
+    assert day(2, second, _result(_FLOOR), _result(new))["open"]
+    (item,) = state["displaced"]["openai_agents"]
+    own = {**_point("displaced", "0.23.1"), "key": item["key"], "python": "3.14"}
+    third = _plan_with_table(_FLOOR, new, own)
+    third["scope"] = covering
+    outage = day(3, third, _result(_FLOOR), _result(new), _result(own, "install_network"))
+    assert outage["open"] and "could not be checked today" in outage["changes"][0]
+
+    uncovered = _plan_with_table()
+    uncovered["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
+    uncovered["scope"] = {**covering, "covers": {"framework": []}}
+    silent = day(4, uncovered)
+    assert state["displaced"]["openai_agents"] == [item]
+    assert silent["open"] and silent["changes"] == [
+        "`openai-agents 0.23.1` is inside the tested range and did not pass when it was last "
+        "run, on `2026-11-21`. A newer release has taken its place, so it is run on its own "
+        "from the next run on. This closes when it passes, or when the table of tested "
+        "versions lists it under `known_bad`."
+    ]
+
+
+def test_a_remembered_failure_is_said_once_when_its_own_point_and_the_list_both_hold_it():
+    """The displaced point failed on its own day, and the list still names the release. On
+    a day nothing ran, one line speaks for it, with the cause of the day it was checked."""
+    own = {**_point("displaced", "0.23.1"), "key": "openai_agents--displaced--0.23.1-py3.14"}
+    entry = _kept(own, "install_network", [], "2026-11-25")
+    entry["last"]["cause"] = None
+    entry["last_checked"] = {
+        "date": "2026-11-24",
+        "outcome": "fail",
+        "cause": "upstream",
+        "targets": dict(own["targets"]),
+        "failed_ids": ["t.py::test_tree"],
+    }
+    item = {**_remembered_item(), "key": own["key"]}
+    state = {"points": {own["key"]: entry}, "displaced": {"openai_agents": [item]}}
+    plan = _plan_with_table()
+    plan["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
+    issue = report.adapter_issue("openai_agents", plan, {}, _RUN, state)
+    assert len(issue["changes"]) == 1 and "on `2026-11-24`: fails 1 tests" in issue["changes"][0]
+    assert "| tests fail | a dependency release (" in issue["body"]
+
+
+@pytest.mark.parametrize("seed", range(600))
+def test_a_known_failure_keeps_its_issue_open_through_any_week(tmp_path, seed):
+    """A week of invented days: releases pass, fail, cannot be installed or leave no
+    result; a newer patch replaces the newest; on some days the plan cannot cover the
+    adapter at all. Whatever the order, a release inside the range whose last real check
+    failed is named on an open issue, and a day everything ran and passed with nothing
+    owed has nothing to do."""
+    rng = random.Random(seed)
+    covering = {"cadence": "daily", "covers": {"framework": ["openai_agents"]}, "partial": False}
+    state: dict = {}
+    last_check: dict[str, str] = {}
+    top = "0.23.1"
+    for n in range(1, 8):
+        run = {**_RUN, "date": f"2026-11-2{n}"}
+        covered = rng.random() > 0.25
+        if covered and top == "0.23.1" and rng.random() < 0.3:
+            top = "0.23.2"
+        points = []
+        if covered:
+            points = [{**_FLOOR, "python": "3.10"}, {**_point("claim_top", top), "python": "3.14"}]
+            for item in (state.get("displaced") or {}).get("openai_agents", []):
+                version = item["targets"]["openai-agents"]
+                if version != top:
+                    own = {**_point("displaced", version), "key": item["key"], "python": "3.14"}
+                    points.append(own)
+        plan = _plan_with_table(*points)
+        plan["scope"] = covering if covered else {**covering, "covers": {"framework": []}}
+        if not covered:
+            plan["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
+        results = {}
+        for planned in points:
+            outcome = rng.choice(["pass", "pass", "fail", "install_network", "no_result"])
+            nodes = ["t.py::test_tree"] if outcome == "fail" else []
+            result = _result(planned, outcome, failed_ids=nodes)
+            result["planned_python"] = planned["python"]
+            results[planned["key"]] = result
+            if outcome in ("pass", "fail"):
+                last_check[planned["targets"]["openai-agents"]] = outcome
+        state = report.next_state(state, results, run, tmp_path, plan)
+        state.pop("_locks"), state.pop("_forget")
+        issue = report.adapter_issue("openai_agents", plan, results, run, state)
+        owed = sorted(version for version, outcome in last_check.items() if outcome == "fail")
+        said = "\n".join(issue["changes"])
+        for version in owed:
+            assert f"`openai-agents {version}`" in said, (n, version, issue["changes"])
+        assert issue["open"] or not owed
+        if covered and not owed and all(r["outcome"] == "pass" for r in results.values()):
+            assert not issue["open"], (n, issue["changes"])
+        assert len(issue["changes"]) == len(set(issue["changes"]))
+        lines = [change.split("` is ")[0] for change in issue["changes"]]
+        assert len(lines) == len(set(lines)), f"day {n}: one release, one line: {issue['changes']}"
 
 
 def test_what_a_point_said_of_another_release_is_not_said_of_this_one():
