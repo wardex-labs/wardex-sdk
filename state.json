@@ -1,16 +1,24 @@
 {
  "displaced": {},
+ "kinds": {
+  "framework": {
+   "last_complete": "2026-11-27",
+   "points": 16
+  }
+ },
  "last_scheduled": null,
  "points": {
   "anthropic_agent_sdk--claim_top": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "claude-agent-sdk": "0.2.189"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -40,24 +48,46 @@
      "test_otel_bridge_usage_keys.py"
     ],
     "lock": "last-green/anthropic_agent_sdk--claim_top.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "88eb945b5b2c97cb0b33a8e4eb1626e366fda22685f553a044ff485c1a0165e8",
     "skipped_ids": [],
     "targets": {
      "claude-agent-sdk": "0.2.189"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "anthropic_agent_sdk",
+    "adapters": [
+     "anthropic_agent_sdk"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.14",
+    "role": "claim_top",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "anthropic_agent_sdk",
+    "targets": {
+     "claude-agent-sdk": "0.2.189"
+    },
+    "watching": false
+   }
   },
   "anthropic_agent_sdk--claim_top_oldpy": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "claude-agent-sdk": "0.2.189"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -87,24 +117,46 @@
      "test_otel_bridge_usage_keys.py"
     ],
     "lock": "last-green/anthropic_agent_sdk--claim_top_oldpy.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "88eb945b5b2c97cb0b33a8e4eb1626e366fda22685f553a044ff485c1a0165e8",
     "skipped_ids": [],
     "targets": {
      "claude-agent-sdk": "0.2.189"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "anthropic_agent_sdk",
+    "adapters": [
+     "anthropic_agent_sdk"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.10",
+    "role": "claim_top_oldpy",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "anthropic_agent_sdk",
+    "targets": {
+     "claude-agent-sdk": "0.2.189"
+    },
+    "watching": false
+   }
   },
   "anthropic_agent_sdk--floor": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "claude-agent-sdk": "0.2.82"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -134,25 +186,47 @@
      "test_otel_bridge_usage_keys.py"
     ],
     "lock": "last-green/anthropic_agent_sdk--floor.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "88eb945b5b2c97cb0b33a8e4eb1626e366fda22685f553a044ff485c1a0165e8",
     "skipped_ids": [],
     "targets": {
      "claude-agent-sdk": "0.2.82"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "anthropic_agent_sdk",
+    "adapters": [
+     "anthropic_agent_sdk"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.10",
+    "role": "floor",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "anthropic_agent_sdk",
+    "targets": {
+     "claude-agent-sdk": "0.2.82"
+    },
+    "watching": false
+   }
   },
   "langgraph--claim_top": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "langgraph": "1.2.24",
      "langgraph-prebuilt": "1.1.3"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -180,7 +254,7 @@
      "test_langgraph_vocabulary.py"
     ],
     "lock": "last-green/langgraph--claim_top.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "f2d278ee5100d34d0969cfeee5bafa2251239318351add4620e55787dfd355c6",
     "skipped_ids": [],
     "targets": {
@@ -188,17 +262,40 @@
      "langgraph-prebuilt": "1.1.3"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "langgraph",
+    "adapters": [
+     "langgraph"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.14",
+    "role": "claim_top",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "langgraph",
+    "targets": {
+     "langgraph": "1.2.24",
+     "langgraph-prebuilt": "1.1.3"
+    },
+    "watching": false
+   }
   },
   "langgraph--claim_top_oldpy": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "langgraph": "1.2.24"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -225,7 +322,7 @@
      "test_langgraph_vocabulary.py"
     ],
     "lock": "last-green/langgraph--claim_top_oldpy.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "f2d278ee5100d34d0969cfeee5bafa2251239318351add4620e55787dfd355c6",
     "skipped_ids": [
      "test_langgraph_control_flow.py::test_an_interrupt_through_the_async_seams_is_control_flow_too"
@@ -234,18 +331,40 @@
      "langgraph": "1.2.24"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "langgraph",
+    "adapters": [
+     "langgraph"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.10",
+    "role": "claim_top_oldpy",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "langgraph",
+    "targets": {
+     "langgraph": "1.2.24"
+    },
+    "watching": false
+   }
   },
   "langgraph--floor": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "langgraph": "1.2.0",
      "langgraph-prebuilt": "1.1.0"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -273,7 +392,7 @@
      "test_langgraph_vocabulary.py"
     ],
     "lock": "last-green/langgraph--floor.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "f2d278ee5100d34d0969cfeee5bafa2251239318351add4620e55787dfd355c6",
     "skipped_ids": [
      "test_langgraph_control_flow.py::test_an_interrupt_through_the_async_seams_is_control_flow_too"
@@ -283,17 +402,44 @@
      "langgraph-prebuilt": "1.1.0"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "langgraph",
+    "adapters": [
+     "langgraph"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.10",
+    "role": "floor",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "langgraph",
+    "targets": {
+     "langgraph": "1.2.0",
+     "langgraph-prebuilt": "1.1.0"
+    },
+    "watching": false
+   }
   },
   "openai_agents--beyond--0.24": {
    "last": {
     "cause": "new_version",
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [
+     "test_openai_agents_adapter.py::test_a_run_resumed_after_a_tool_approval_ships_under_its_own_root",
+     "test_openai_agents_silent_gaps.py::test_a_disabled_nested_run_inside_a_traced_one_loses_only_its_own_joins",
+     "test_openai_agents_silent_gaps.py::test_a_disabling_run_config_inside_an_open_trace_says_exactly_what_is_lost"
+    ],
     "outcome": "fail",
     "targets": {
      "openai-agents": "0.24.0"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": "new_version",
@@ -309,17 +455,44 @@
      "openai-agents": "0.24.0"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "openai_agents",
+    "adapters": [
+     "openai_agents"
+    ],
+    "fresh_days": 3,
+    "in_claim": false,
+    "kind": "framework",
+    "python": "3.14",
+    "role": "beyond",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "openai_agents",
+    "targets": {
+     "openai-agents": "0.24.0"
+    },
+    "watching": false
+   }
   },
   "openai_agents--beyond--0.25": {
    "last": {
     "cause": "new_version",
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [
+     "test_openai_agents_adapter.py::test_a_run_resumed_after_a_tool_approval_ships_under_its_own_root",
+     "test_openai_agents_adapter.py::test_a_streamed_input_guardrail_tripwire_reaches_the_consumer",
+     "test_openai_agents_silent_gaps.py::test_a_disabled_nested_run_inside_a_traced_one_loses_only_its_own_joins",
+     "test_openai_agents_silent_gaps.py::test_a_disabling_run_config_inside_an_open_trace_says_exactly_what_is_lost"
+    ],
     "outcome": "fail",
     "targets": {
      "openai-agents": "0.25.0"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": "new_version",
@@ -336,17 +509,44 @@
      "openai-agents": "0.25.0"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "openai_agents",
+    "adapters": [
+     "openai_agents"
+    ],
+    "fresh_days": 3,
+    "in_claim": false,
+    "kind": "framework",
+    "python": "3.14",
+    "role": "beyond",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "openai_agents",
+    "targets": {
+     "openai-agents": "0.25.0"
+    },
+    "watching": false
+   }
   },
   "openai_agents--beyond--0.26": {
    "last": {
     "cause": "new_version",
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [
+     "test_openai_agents_adapter.py::test_a_run_resumed_after_a_tool_approval_ships_under_its_own_root",
+     "test_openai_agents_adapter.py::test_a_streamed_input_guardrail_tripwire_reaches_the_consumer",
+     "test_openai_agents_silent_gaps.py::test_a_disabled_nested_run_inside_a_traced_one_loses_only_its_own_joins",
+     "test_openai_agents_silent_gaps.py::test_a_disabling_run_config_inside_an_open_trace_says_exactly_what_is_lost"
+    ],
     "outcome": "fail",
     "targets": {
      "openai-agents": "0.26.0"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": "new_version",
@@ -363,17 +563,39 @@
      "openai-agents": "0.26.0"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "openai_agents",
+    "adapters": [
+     "openai_agents"
+    ],
+    "fresh_days": 3,
+    "in_claim": false,
+    "kind": "framework",
+    "python": "3.14",
+    "role": "beyond",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "openai_agents",
+    "targets": {
+     "openai-agents": "0.26.0"
+    },
+    "watching": false
+   }
   },
   "openai_agents--claim_top": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "openai-agents": "0.23.1"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -396,24 +618,46 @@
      "test_openai_agents_wire.py"
     ],
     "lock": "last-green/openai_agents--claim_top.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "500e700a51460c522efe46d776a3b179f5672e0650a457212a479178b8a138fb",
     "skipped_ids": [],
     "targets": {
      "openai-agents": "0.23.1"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "openai_agents",
+    "adapters": [
+     "openai_agents"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.14",
+    "role": "claim_top",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "openai_agents",
+    "targets": {
+     "openai-agents": "0.23.1"
+    },
+    "watching": false
+   }
   },
   "openai_agents--claim_top_oldpy": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "openai-agents": "0.23.1"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -436,24 +680,46 @@
      "test_openai_agents_wire.py"
     ],
     "lock": "last-green/openai_agents--claim_top_oldpy.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "500e700a51460c522efe46d776a3b179f5672e0650a457212a479178b8a138fb",
     "skipped_ids": [],
     "targets": {
      "openai-agents": "0.23.1"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "openai_agents",
+    "adapters": [
+     "openai_agents"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.10",
+    "role": "claim_top_oldpy",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "openai_agents",
+    "targets": {
+     "openai-agents": "0.23.1"
+    },
+    "watching": false
+   }
   },
   "openai_agents--floor": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "openai-agents": "0.22.0"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -476,24 +742,46 @@
      "test_openai_agents_wire.py"
     ],
     "lock": "last-green/openai_agents--floor.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "500e700a51460c522efe46d776a3b179f5672e0650a457212a479178b8a138fb",
     "skipped_ids": [],
     "targets": {
      "openai-agents": "0.22.0"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "openai_agents",
+    "adapters": [
+     "openai_agents"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.10",
+    "role": "floor",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "openai_agents",
+    "targets": {
+     "openai-agents": "0.22.0"
+    },
+    "watching": false
+   }
   },
   "openai_agents--minor_newest--0.22": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "openai-agents": "0.22.3"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -516,24 +804,46 @@
      "test_openai_agents_wire.py"
     ],
     "lock": "last-green/openai_agents--minor_newest--0.22.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "500e700a51460c522efe46d776a3b179f5672e0650a457212a479178b8a138fb",
     "skipped_ids": [],
     "targets": {
      "openai-agents": "0.22.3"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "openai_agents",
+    "adapters": [
+     "openai_agents"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.14",
+    "role": "minor_newest",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "openai_agents",
+    "targets": {
+     "openai-agents": "0.22.3"
+    },
+    "watching": false
+   }
   },
   "pydantic_ai--claim_top": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "pydantic-ai-slim": "2.76.0"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -563,24 +873,46 @@
      "test_pydantic_ai_wire.py"
     ],
     "lock": "last-green/pydantic_ai--claim_top.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "f99d0b189d85614f597e048ecf6cf329cad4d9a386bc6fd121f4c7dada36d0d6",
     "skipped_ids": [],
     "targets": {
      "pydantic-ai-slim": "2.76.0"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "pydantic_ai",
+    "adapters": [
+     "pydantic_ai"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.14",
+    "role": "claim_top",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "pydantic_ai",
+    "targets": {
+     "pydantic-ai-slim": "2.76.0"
+    },
+    "watching": false
+   }
   },
   "pydantic_ai--claim_top_oldpy": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "pydantic-ai-slim": "2.54.0"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -610,24 +942,46 @@
      "test_pydantic_ai_wire.py"
     ],
     "lock": "last-green/pydantic_ai--claim_top_oldpy.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "f99d0b189d85614f597e048ecf6cf329cad4d9a386bc6fd121f4c7dada36d0d6",
     "skipped_ids": [],
     "targets": {
      "pydantic-ai-slim": "2.54.0"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "pydantic_ai",
+    "adapters": [
+     "pydantic_ai"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.10",
+    "role": "claim_top_oldpy",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "pydantic_ai",
+    "targets": {
+     "pydantic-ai-slim": "2.54.0"
+    },
+    "watching": false
+   }
   },
   "pydantic_ai--floor": {
    "last": {
     "cause": null,
     "date": "2026-11-27",
+    "excluded_files": [],
+    "failed_ids": [],
     "outcome": "pass",
     "targets": {
      "pydantic-ai-slim": "2.54.0"
     },
-    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46066526553"
+    "url": "https://github.com/wardex-labs/wardex-sdk/actions/runs/46076912255"
    },
    "last_checked": {
     "cause": null,
@@ -657,15 +1011,35 @@
      "test_pydantic_ai_wire.py"
     ],
     "lock": "last-green/pydantic_ai--floor.txt",
-    "sdk_commit": "4d690a19a7c1e8fccd90cad2ff4825fa9a3eafdc",
+    "sdk_commit": "59d8b49428f6cd478004e13187e96e1da2269553",
     "selection_sha256": "f99d0b189d85614f597e048ecf6cf329cad4d9a386bc6fd121f4c7dada36d0d6",
     "skipped_ids": [],
     "targets": {
      "pydantic-ai-slim": "2.54.0"
     }
    },
-   "not_ours_days": 0
+   "not_ours_days": 0,
+   "point": {
+    "adapter": "pydantic_ai",
+    "adapters": [
+     "pydantic_ai"
+    ],
+    "fresh_days": 3,
+    "in_claim": true,
+    "kind": "framework",
+    "python": "3.10",
+    "role": "floor",
+    "runner": "linux-x64",
+    "sdk": {
+     "origin": "build"
+    },
+    "subject": "pydantic_ai",
+    "targets": {
+     "pydantic-ai-slim": "2.54.0"
+    },
+    "watching": false
+   }
   }
  },
- "schema": 1
+ "schema": 2
 }
