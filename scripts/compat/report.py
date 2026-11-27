@@ -136,7 +136,7 @@ def load_results(plan: dict, results_dir: Path) -> dict[str, dict]:
         # the point measured (the interpreter that ran, the wheel it imported) stays its own.
         identity = model.identity_of(point)
         data.update({k: point[k] for k in ("key", "adapter", "role", "targets", "in_claim")})
-        data.update({k: identity[k] for k in ("kind", "subject", "adapters", "watching", "runner")})
+        data.update({k: v for k, v in identity.items() if k not in ("python", "sdk")})
         data["planned_python"] = point.get("python", "")
         data["planned_sdk"] = identity["sdk"]
         data["planned"] = point
@@ -394,7 +394,7 @@ def next_state(
                 "cause": result["cause"],
                 "targets": result["targets"],
                 "python": result.get("planned_python"),
-                "failed_ids": tests.get("failed_ids", []),
+                "failed_ids": [clean(node, 300) for node in tests.get("failed_ids", [])[:200]],
             }
         # Days, not runs: a second run on the same day is the same outage seen twice.
         if result["outcome"] in NOT_OURS:
@@ -510,16 +510,23 @@ def _remembered_rows(state: dict | None, subject: str, results: dict[str, dict])
         identity, last = entry.get("point"), entry.get("last") or {}
         if key in results or not identity or identity.get("subject") != subject:
             continue
+        said, checked = last, entry.get("last_checked") or {}
+        if last.get("outcome") not in GREEN | FAILED and checked.get("targets") == identity.get(
+            "targets"
+        ):
+            # Its own last run could not check it (the index was down, it would not
+            # install). What it said the last time it was checked is what is known.
+            said = checked
         rows[key] = {
             **identity,
             "key": key,
             "planned_python": identity.get("python", ""),
-            "outcome": last.get("outcome", "no_result"),
-            "cause": last.get("cause"),
-            "as_of": last.get("date", ""),
+            "outcome": said.get("outcome", "no_result"),
+            "cause": said.get("cause"),
+            "as_of": said.get("date", ""),
             "tests": {
-                "failed_ids": last.get("failed_ids", []),
-                "excluded_files": last.get("excluded_files", []),
+                "failed_ids": said.get("failed_ids", []),
+                "excluded_files": said.get("excluded_files", []),
             },
         }
     return rows
@@ -548,7 +555,10 @@ def adapter_issue(
     info = plan["adapters"][name]
     known = (state or {}).get("points", {})
     remembered = {item["key"]: item for item in (state or {}).get("displaced", {}).get(name, [])}
-    results = {**_remembered_rows(state, name, results), **results}
+    # Which rows are remembered is decided here, from the state. A field of the row cannot
+    # say so: a point job writes its own row, and it is not believed about that.
+    old = _remembered_rows(state, name, results)
+    results = {**old, **results}
     mine = [r for r in results.values() if r.get("subject", r["adapter"]) == name]
     watched = []
     todo, marks, failing, unchecked = [], [], [], []
@@ -562,7 +572,8 @@ def adapter_issue(
             what = "does not finish its tests (the run timed out, or failed outside any test)"
         else:
             what = OUTCOME_WORDS[outcome]
-        when = f" (last run {code(result['as_of'])})" if result.get("as_of") else ""
+        as_of = old[result["key"]]["as_of"] if result["key"] in old else ""
+        when = f" (last run {code(as_of)})" if as_of else ""
         if is_watching(result):
             # Reported, and never an argument for red. Said apart, so nobody reads a
             # watching failure as a broken promise or a promise as merely watched.
@@ -575,14 +586,17 @@ def adapter_issue(
             if nodes:
                 failing.append((result, nodes))
             continue
-        if result.get("as_of"):
+        if result["key"] in old:
             # Not run by this run: what it said stands, dated, and nothing new is claimed.
             # No "passes, widen the range" from a pass nobody saw today.
-            if not result["in_claim"] or outcome not in RED:
+            if not result["in_claim"]:
+                continue
+            if outcome not in RED:
+                unchecked.append(f"{version} (not run by this run)")
                 continue
             todo.append(
                 f"{version} is inside the tested range and did not pass when it was last "
-                f"run, on {code(result['as_of'])}: {what}. This run did not run it."
+                f"run, on {code(as_of)}: {what}. This run did not run it."
             )
             marks.append([result["key"], "remembered", outcome, nodes])
             if nodes:
