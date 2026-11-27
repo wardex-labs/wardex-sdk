@@ -75,6 +75,25 @@ def _age(day: str, today: str) -> int | None:
         return None
 
 
+def _recent(day: str, today: str, days: int) -> bool:
+    age = _age(day, today)
+    return age is not None and age <= days
+
+
+_WARDEX = re.compile(r"(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?(?:\.post(\d+))?")
+
+
+def _release_order(version: str) -> tuple:
+    """Newest last, for wardex's own versions: a final after its pre-releases, a post
+    release after its final. Anything else sorts first, by its text."""
+    match = _WARDEX.fullmatch(version)
+    if not match:
+        return (0, (), 0, 0, 0, version)
+    rank = {"a": 0, "b": 1, "rc": 2, None: 3}[match[2]]
+    numbers = tuple(int(part) for part in match[1].split("."))
+    return (1, numbers, rank, int(match[3] or 0), int(match[4] or 0), version)
+
+
 def status_of(entry: dict, today: str) -> dict:
     """What one remembered point says today: a word, a status and its dates.
 
@@ -103,12 +122,14 @@ def status_of(entry: dict, today: str) -> dict:
         status, words = "fail", OUTCOME_WORDS[outcome]
         if not fresh:
             words += f", not run since {day_words(ran)}"
-    elif checked.get("outcome") in FAILED:
+    elif outcome in NOT_OURS and checked.get("outcome") in FAILED:
         # Its last run could not check it. The last time it was checked it failed, and
         # that is what is known: the same thing its issue says.
         status = "fail"
         words = f"failed when last checked, on {day_words(checked.get('date', ''))}; now: {cannot}"
-    elif checked.get("outcome") in GREEN and (_age(passed, today) or days + 1) <= days:
+    elif outcome in NOT_OURS and checked.get("outcome") in GREEN and _recent(passed, today, days):
+        # Only for a release that could not be looked at. A point that left no result is
+        # a broken run, and the run is red for it: its cell must not be green beside that.
         status = "pass"
         words = f"passed on {day_words(passed)}; now: {cannot}"
     else:
@@ -334,7 +355,7 @@ def _claims(claims: list[dict]) -> list[str]:
 
 
 def index(state: dict, today: str) -> str:
-    versions = sorted(v for v in (state.get("versions") or {}) if v != MAIN)
+    versions = sorted((v for v in (state.get("versions") or {}) if v != MAIN), key=_release_order)
     lines = [
         "# wardex compatibility",
         "",

@@ -257,6 +257,8 @@ def test_a_point_that_could_not_be_checked_is_shown_as_what_it_last_said():
     assert (said["status"], said["words"][:26]) == ("pass", "passed on 27 Nov 2026; now")
     passed["last_green"]["date"] = "2026-11-20"
     assert render.status_of(passed, _TODAY)["status"] == "stale"
+    passed["last_green"]["date"] = passed["last_checked"]["date"] = _TODAY
+    assert render.status_of(passed, _TODAY)["status"] == "pass", "a pass made earlier today"
 
     other = _entry(identity, "install_network")
     other["last_checked"] = {
@@ -298,3 +300,45 @@ def test_the_site_is_never_written_through_a_link(tmp_path):
     render.write_site(records, _published(claim_top=("0.23.1", "pass", _TODAY)), _TODAY)
     assert sorted(p.name for p in elsewhere.iterdir()) == ["keep.txt"]
     assert not (records / "site").is_symlink() and (records / "site/README.md").is_file()
+
+
+@pytest.mark.parametrize("checked", ["fail", "attach_failed", "skips_changed"])
+def test_every_way_a_release_can_have_failed_is_carried_over_an_outage(checked):
+    identity = _identity("openai_agents", "claim_top", "0.23.1")
+    entry = _entry(identity, "not_installable")
+    entry["last_checked"] = {
+        "date": "2026-11-27",
+        "outcome": checked,
+        "targets": identity["targets"],
+    }
+    assert render.status_of(entry, _TODAY)["status"] == "fail"
+
+
+@pytest.mark.parametrize("outcome", ["no_result", "harness_error"])
+def test_a_point_that_left_no_result_is_never_green_whatever_it_said_yesterday(outcome):
+    """The run is red for it and its issue says it does not pass. A cell that stayed green
+    beside that would be the page contradicting the run."""
+    identity = _identity("openai_agents", "claim_top", "0.23.1")
+    entry = _entry(identity, outcome, passed="2026-11-27")
+    entry["last_green"]["targets"] = identity["targets"]
+    entry["last_checked"] = {
+        "date": "2026-11-27",
+        "outcome": "pass",
+        "targets": identity["targets"],
+    }
+    assert render.status_of(entry, _TODAY)["status"] == "stale"
+    state = _state(**{"published--top": entry})
+    entry["point"] = _identity("openai_agents", "claim_top", "0.23.1", release=_RELEASE)
+    assert _cell(state) == ("stale", "0.23.1 not proven since 27 Nov 2026")
+
+
+def test_the_index_lists_the_newest_release_first():
+    state = _state()
+    for version in ("0.9.0", "0.7.0", "0.10.0", "0.7.0b1", "0.7.0.post1", "0.7.0rc1", "0.7.0b10"):
+        state["versions"][version] = {"adapters": {}}
+    listed = [
+        line.split("]")[0].removeprefix("- [wardex ")
+        for line in render.index(state, _TODAY).splitlines()
+        if line.startswith("- [wardex")
+    ]
+    assert listed == ["0.10.0", "0.9.0", "0.7.0.post1", "0.7.0", "0.7.0rc1", "0.7.0b10", "0.7.0b1"]
