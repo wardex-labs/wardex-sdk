@@ -1,0 +1,87 @@
+name: sketch-rx
+# Temporary, on a throwaway branch: do Phoenix and a self-hosted Langfuse come up on a hosted runner,
+# and do the two hand-run end-to-end scripts pass against them with no paid key?
+on:
+  push:
+    branches: ["compat-rehearsal-rx"]
+permissions:
+  contents: read
+jobs:
+  phoenix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+        with:
+          version: "0.12.23"
+          enable-cache: false
+      - name: Phoenix up
+        run: |
+          start=$SECONDS
+          docker run -d --name phoenix -p 6006:6006 arizephoenix/phoenix:latest
+          for i in $(seq 1 90); do curl -fsS http://127.0.0.1:6006/healthz >/dev/null 2>&1 && break; sleep 2; done
+          curl -fsS http://127.0.0.1:6006/healthz && echo " <- healthz"
+          echo "seconds to ready: $((SECONDS - start))"
+          docker inspect --format '{{index .RepoDigests 0}}' arizephoenix/phoenix:latest
+          docker exec phoenix python -c "import phoenix; print('phoenix', phoenix.__version__)" || true
+      - name: the split-export script, published wheel
+        run: |
+          uv venv --python 3.12 .v && uv pip install --python .v/bin/python --prerelease allow wardex-sdk
+          .v/bin/python -c "import wardex_sdk; print('wardex', wardex_sdk.__version__)"
+          status=0; start=$SECONDS
+          WARDEX_E2E_PHOENIX=http://127.0.0.1:6006 .v/bin/python sdks/python/tests/e2e_split_export_phoenix.py || status=$?
+          echo "e2e exit: $status, seconds: $((SECONDS - start))"
+      - if: always()
+        run: docker logs phoenix 2>&1 | tail -20
+  langfuse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LANGFUSE_INIT_ORG_ID: sketch-org
+      LANGFUSE_INIT_ORG_NAME: sketch
+      LANGFUSE_INIT_PROJECT_ID: sketch-project
+      LANGFUSE_INIT_PROJECT_NAME: sketch
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-sketch-0000
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-sketch-0000
+      LANGFUSE_INIT_USER_EMAIL: sketch@example.invalid
+      LANGFUSE_INIT_USER_NAME: sketch
+      LANGFUSE_INIT_USER_PASSWORD: sketch-not-a-secret
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+        with:
+          version: "0.12.23"
+          enable-cache: false
+      - name: Langfuse up (the project's own compose file)
+        run: |
+          start=$SECONDS
+          mkdir lf && cd lf
+          curl -fsSL https://raw.githubusercontent.com/langfuse/langfuse/main/docker-compose.yml -o docker-compose.yml
+          grep -n "image:" docker-compose.yml
+          docker compose up -d 2>&1 | tail -15
+          ok=0
+          for i in $(seq 1 150); do
+            if curl -fsS http://127.0.0.1:3000/api/public/health >/dev/null 2>&1; then ok=1; break; fi
+            sleep 4
+          done
+          echo "healthy: $ok, seconds to ready: $((SECONDS - start))"
+          curl -fsS http://127.0.0.1:3000/api/public/health || true; echo
+          docker compose ps
+          docker compose images
+          free -m | head -2; df -h / | tail -1
+      - name: the pricing script, published wheel
+        run: |
+          uv venv --python 3.12 .v && uv pip install --python .v/bin/python --prerelease allow wardex-sdk
+          .v/bin/python -c "import wardex_sdk; print('wardex', wardex_sdk.__version__)"
+          status=0; start=$SECONDS
+          WARDEX_E2E_LANGFUSE=http://127.0.0.1:3000 WARDEX_E2E_LANGFUSE_PK=pk-lf-sketch-0000 \
+            WARDEX_E2E_LANGFUSE_SK=sk-lf-sketch-0000 \
+            .v/bin/python sdks/python/tests/e2e_usage_pricing_langfuse.py || status=$?
+          echo "e2e exit: $status, seconds: $((SECONDS - start))"
+      - if: always()
+        run: cd lf && docker compose logs --tail 15 langfuse-web langfuse-worker 2>&1 | tail -40
