@@ -16,11 +16,6 @@ from pathlib import Path
 
 import pytest
 
-from conftest import (
-    COMPAT_ASSUME_MEASURED,
-    assume_installed_versions_measured,
-    compat_switch_is_on,
-)
 from wardex_sdk import AdapterName
 from wardex_sdk._adapters import _measured
 from wardex_sdk._adapters._measured import MEASURED, is_measured
@@ -28,7 +23,11 @@ from wardex_sdk._adapters._measured import MEASURED, is_measured
 _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from compat import manifest, plan  # noqa: E402
+sys.path.insert(0, str(_REPO / "scripts" / "compat" / "pytest_plugins"))
+
+import compat_widen  # noqa: E402
+from compat import kinds, manifest, model, plan  # noqa: E402
+from compat import point as point_runner  # noqa: E402
 
 _TESTS = Path(__file__).parent
 _CUTOFF = "2026-11-26T00:00:00Z"
@@ -600,21 +599,7 @@ def test_no_requirement_in_the_manifest_carries_an_upper_bound():
     assert all(re.fullmatch(r"[a-z-]+==[\d.]+", tool) for tool in manifest.TOOLS)
 
 
-def test_the_switch_is_on_only_when_set_to_one():
-    """An ordinary run, where the variable is absent, must never widen the table."""
-    assert compat_switch_is_on({COMPAT_ASSUME_MEASURED: "1"})
-    assert not compat_switch_is_on({})
-    assert not compat_switch_is_on({COMPAT_ASSUME_MEASURED: "0"})
-    assert not compat_switch_is_on({COMPAT_ASSUME_MEASURED: ""})
-
-
-def test_the_switch_is_not_a_variable_init_would_warn_about():
-    """`init()` warns once about any `WARDEX_*` variable it does not read. A switch of
-    that prefix puts that warning into every test that asserts wardex said nothing."""
-    assert not COMPAT_ASSUME_MEASURED.startswith("WARDEX_")
-
-
-# --- the test-only switch a point above the range runs with -------------------
+# --- the session plugin a point above the range runs with ----------------------
 
 
 def test_the_switch_measures_an_installed_release_outside_the_table(monkeypatch):
@@ -629,7 +614,7 @@ def test_the_switch_measures_an_installed_release_outside_the_table(monkeypatch)
     (entry,) = MEASURED[AdapterName.OPENAI_AGENTS]
     assert not is_measured(entry, "0.99.1")
 
-    before = assume_installed_versions_measured()
+    before = compat_widen.widen()
     try:
         (widened,) = MEASURED[AdapterName.OPENAI_AGENTS]
         assert is_measured(widened, "0.99.1")
@@ -638,6 +623,88 @@ def test_the_switch_measures_an_installed_release_outside_the_table(monkeypatch)
     finally:
         MEASURED.update(before)
     assert MEASURED[AdapterName.OPENAI_AGENTS] == (entry,)
+
+
+def test_the_widening_plugin_reads_only_names_a_published_release_already_has():
+    """A point that tests a published wardex release runs that release's own tests, so the
+    plugin cannot live in the tests tree and cannot lean on anything newer than the three
+    names the table module has carried since it first shipped."""
+    text = (_REPO / "scripts/compat/pytest_plugins/compat_widen.py").read_text(encoding="utf-8")
+    used = set(re.findall(r"_measured\.(\w+)", text))
+    assert used == {"MEASURED", "installed_version", "is_measured"}
+    assert "compat_widen" not in (_TESTS / "conftest.py").read_text(encoding="utf-8")
+
+
+# --- kinds: one device, many questions -------------------------------------------
+
+
+def test_promotion_is_one_line_and_only_declared_kinds_can_be_promoted():
+    """Whether a kind may turn the run red is not a field of its declaration: it is one
+    name on one line of a set, so copying a neighbouring entry promotes nothing."""
+    text = (_REPO / "scripts/compat/kinds.py").read_text(encoding="utf-8")
+    (body,) = re.findall(
+        r"RED_CAPABLE: frozenset\[str\] = frozenset\(\n    \{\n(.*?)    \}\n\)", text, re.S
+    )
+    lines = [line for line in body.splitlines() if line.strip()]
+    assert [line.strip() for line in lines] == [f'"{name}",' for name in sorted(kinds.RED_CAPABLE)]
+    assert kinds.RED_CAPABLE <= set(kinds.KINDS)
+    assert "red" not in {field.lower() for field in kinds.Kind.__dataclass_fields__}
+
+
+def test_every_planned_point_says_its_kind_and_carries_its_whole_recipe():
+    points = _points(_OPENAI, _OPENAI_HISTORY)
+    spec = manifest.ADAPTERS["openai_agents"]
+    for key, planned in points.items():
+        assert (planned["kind"], planned["subject"]) == ("framework", "openai_agents"), key
+        assert planned["watching"] is False and planned["sdk"] == {"origin": "build"}, key
+        assert planned["install"]["requires"] == list(spec["requires"])
+        assert planned["install"]["tools"] == list(manifest.TOOLS)
+        assert planned["check"]["files"] == list(spec["tests"])
+        assert planned["probe"] == {"imports": list(spec["imports"]), "adapter": "openai_agents"}
+        assert planned["budget_s"] == manifest.POINT_BUDGET_S
+
+
+def test_the_executor_cannot_ask_what_kind_of_point_it_runs():
+    """It follows the recipe in the point. A new kind is new values in the same fields; if
+    the executor could read the declarations it would grow a branch per kind."""
+    for name in ("point.py", "attach_probe.py"):
+        text = (_REPO / "scripts/compat" / name).read_text(encoding="utf-8")
+        imported = set(
+            re.findall(r"^\s*(?:from compat import|import compat\.)\s*(.+)$", text, re.M)
+        )
+        assert not any(re.search(r"\b(kinds|manifest)\b", line) for line in imported), name
+        assert '["kind"]' not in text and "'kind'" not in text and '.get("kind"' not in text, name
+        for kind in kinds.KINDS:
+            assert f'"{kind}"' not in text, (name, kind)
+    assert not hasattr(point_runner, "manifest") and not hasattr(point_runner, "kinds")
+
+
+def test_a_plan_says_what_it_speaks_for(tmp_path, monkeypatch):
+    """The report forgets a point only inside what the plan covered. An adapter the index
+    would not list is not covered, and a run of one adapter covers that adapter only."""
+    whole = plan.build_plan({"openai_agents": _OPENAI}, _OPENAI_HISTORY, _CUTOFF)
+    assert whole["scope"] == {
+        "cadence": "daily",
+        "covers": {"framework": ["openai_agents"]},
+        "partial": False,
+    }
+    assert whole["schema"] == model.SCHEMA == 2
+
+    unlisted = {"openai-agents": [_release("0.30.0", "2026-11-01")]}
+    short = plan.build_plan({"openai_agents": _OPENAI}, unlisted, _CUTOFF)
+    assert short["scope"]["covers"] == {"framework": []}
+
+    monkeypatch.setattr(plan, "read_measured", lambda: {"openai_agents": _OPENAI})
+    monkeypatch.setattr(plan, "fetch_releases", lambda dist: _OPENAI_HISTORY[dist])
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    out = tmp_path / "plan.json"
+    assert plan.main(["--out", str(out), "--cutoff", _CUTOFF, "--only", "openai_agents"]) == 0
+    assert json.loads(out.read_text())["scope"]["partial"] is True
+
+
+def test_the_schedule_in_the_workflow_is_the_table_of_cadences():
+    text = (_REPO / ".github/workflows/compat.yml").read_text(encoding="utf-8")
+    assert set(re.findall(r'- cron: "([^"]+)"', text)) == set(kinds.CRONS)
 
 
 # --- a fork that inherits the workflows -----------------------------------------

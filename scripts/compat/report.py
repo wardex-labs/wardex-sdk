@@ -25,21 +25,23 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from compat import kinds, model  # noqa: E402
 from compat.plan import claims, displaced_line  # noqa: E402
+from compat.verdict import (  # noqa: E402
+    FAILED,
+    GREEN,
+    NOT_OURS,
+    OUTCOME_WORDS,
+    RED,
+    is_watching,
+    judge,
+)
 
-SCHEMA = 1
+SCHEMA = model.SCHEMA
 LABEL = "compat"
 #: The exit code of a run judged red. Its own number, so the workflow can tell a verdict
 #: from this script crashing, which leaves no verdict and must be reported as such.
 RED_EXIT = 10
-#: A release inside the tested range in one of these states turns the run red.
-RED = frozenset({"fail", "attach_failed", "no_result", "harness_error", "skips_changed"})
-#: Nothing wardex or its tests did: reported only once it has lasted two days running.
-NOT_OURS = frozenset({"install_network", "not_installable", "framework_import_error"})
-GREEN = frozenset({"pass", "flaky"})
-#: The release itself was run and did not hold. The other red states say only that it
-#: could not be looked at, which is no reason to keep running it once it is replaced.
-FAILED = frozenset({"fail", "attach_failed", "skips_changed"})
 _UNSAFE = re.compile(r"[^A-Za-z0-9 _./:\[\]()=,<>+*#-]")
 
 ROLE_WORDS = {
@@ -49,19 +51,6 @@ ROLE_WORDS = {
     "claim_top_oldpy": "newest tested release, oldest Python",
     "beyond": "newer than the tested range",
     "displaced": "failed as the newest tested release, since replaced",
-}
-OUTCOME_WORDS = {
-    "pass": "pass",
-    "flaky": "pass (a test failed once and passed when its file was run again)",
-    "fail": "tests fail",
-    "attach_failed": "the adapter did not attach as the SDK says it should",
-    "skips_changed": "the set of skipped tests changed",
-    "no_result": "no result",
-    "harness_error": "the run itself failed",
-    "install_network": "could not be installed (index or network)",
-    "not_installable": "cannot be installed on this Python",
-    "test_deps_unresolvable": "the test dependencies cannot be installed beside it",
-    "framework_import_error": "the framework does not import, with or without wardex",
 }
 CAUSE_WORDS = {
     "new_version": "the newer release",
@@ -143,8 +132,11 @@ def load_results(plan: dict, results_dir: Path) -> dict[str, dict]:
             data, problem = {}, type(error).__name__
         if problem:
             data = {"outcome": "no_result", "note": problem}
+        # Who the point is comes from the plan, never from what the point job wrote.
         data.update({k: point[k] for k in ("key", "adapter", "role", "targets", "in_claim")})
+        data.update(model.identity_of(point))
         data["planned_python"] = point.get("python", "")
+        data["planned"] = point
         data.setdefault("cause", None)
         results[key] = data
     return results
@@ -169,23 +161,6 @@ def apply_skip_rule(results: dict[str, dict], state: dict) -> None:
             result["outcome"] = "skips_changed"
 
 
-def judge(plan: dict, results: dict[str, dict]) -> list[str]:
-    """The reasons this run is red. Empty means green."""
-    reasons = [f"plan: {problem}" for problem in plan.get("problems", [])]
-    for name, info in plan["adapters"].items():
-        reasons += [f"plan: {name}: {problem}" for problem in info["problems"]]
-        if sum(1 for p in plan["points"] if p["adapter"] == name) < 2:
-            reasons.append(f"plan: {name} has fewer than two points")
-    if not plan["points"]:
-        reasons.append("plan: no points")
-    for key, result in results.items():
-        if result["outcome"] in ("no_result", "harness_error"):
-            reasons.append(f"{key}: {OUTCOME_WORDS[result['outcome']]}")
-        elif result["in_claim"] and result["outcome"] in RED:
-            reasons.append(f"{key}: {OUTCOME_WORDS[result['outcome']]}")
-    return reasons
-
-
 # --- records and state --------------------------------------------------------
 
 
@@ -204,6 +179,15 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
                 "schema": SCHEMA,
                 "run": run,
                 "cutoff": plan["cutoff"],
+                "kind": result.get("kind", "framework"),
+                "subject": result.get("subject", result["adapter"]),
+                "adapters": result.get("adapters", [result["adapter"]]),
+                "watching": is_watching(result),
+                "sdk": result.get("sdk", {"origin": "build"}),
+                "runner": result.get("runner", "linux-x64"),
+                # The point as it was planned, so the same point can be built again from this
+                # line on a later day. From the plan job, which runs no third-party code.
+                "plan": _recipe(result.get("planned")),
                 "key": key,
                 "adapter": result["adapter"],
                 "role": result["role"],
@@ -281,6 +265,14 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
             }
         )
     return lines
+
+
+def _recipe(point: dict | None) -> dict | None:
+    """The part of a planned point a record line does not already hold."""
+    if not point:
+        return None
+    kept = ("python", "floats", "cutoff", "assume_measured", "install", "probe", "check")
+    return {name: point[name] for name in (*kept, "budget_s", "fresh_days") if name in point}
 
 
 def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
@@ -366,12 +358,15 @@ def next_state(
     for key, result in results.items():
         entry = dict(points.get(key, {}))
         tests = result.get("tests") or {}
+        entry["point"] = model.identity_of({**result, "python": result.get("planned_python", "")})
         entry["last"] = {
             "date": run["date"],
             "outcome": result["outcome"],
             "cause": result["cause"],
             "targets": result["targets"],
             "url": run["url"],
+            "failed_ids": tests.get("failed_ids", []),
+            "excluded_files": tests.get("excluded_files", []),
         }
         if (entry.get("last_checked") or {}).get("targets") not in (None, result["targets"]):
             # What this point last said was about a release it no longer tests. Whether that
@@ -410,7 +405,27 @@ def next_state(
             }
             locks[key] = lock
         points[key] = entry
-    out = {"schema": SCHEMA, "points": points, "last_scheduled": state.get("last_scheduled")}
+    scope = (plan or {}).get("scope") or {}
+    for key in [key for key in points if key not in results]:
+        # A point this run was in a position to plan and did not: the question is no longer
+        # asked (the release left the range, a newer line replaced it). Anything outside
+        # what the run covers is left exactly as the run that does cover it wrote it.
+        identity = points[key].get("point") or {}
+        kind = identity.get("kind", "framework")
+        subject = identity.get("subject") or key.split("--")[0]
+        if subject in scope.get("covers", {}).get(kind, ()):
+            del points[key]
+    seen = dict(state.get("kinds") or {})
+    if not scope.get("partial", True):
+        for kind in scope.get("covers", {}):
+            mine = [r for r in results.values() if r.get("kind", "framework") == kind]
+            seen[kind] = {"last_complete": run["date"], "points": len(mine)}
+    out = {
+        "schema": SCHEMA,
+        "points": points,
+        "kinds": seen,
+        "last_scheduled": state.get("last_scheduled"),
+    }
     out["displaced"] = (
         next_displaced(state, plan, results) if plan else state.get("displaced") or {}
     )
@@ -467,6 +482,42 @@ def _fingerprint(items: list) -> str:
     return hashlib.sha256(json.dumps(items, sort_keys=True).encode()).hexdigest()[:16]
 
 
+def _remembered_rows(state: dict | None, subject: str, results: dict[str, dict]) -> dict:
+    """What the state holds about `subject` that this run did not run, as result rows.
+
+    A point of another cadence, or one this run did not cover, said what it said on the
+    day it last ran. It stays on the issue, dated, until the run that covers it says
+    otherwise: a daily run must not close what a weekly run found."""
+    rows = {}
+    for key, entry in ((state or {}).get("points") or {}).items():
+        identity, last = entry.get("point"), entry.get("last") or {}
+        if key in results or not identity or identity.get("subject") != subject:
+            continue
+        rows[key] = {
+            **identity,
+            "key": key,
+            "planned_python": identity.get("python", ""),
+            "outcome": last.get("outcome", "no_result"),
+            "cause": last.get("cause"),
+            "as_of": last.get("date", ""),
+            "tests": {
+                "failed_ids": last.get("failed_ids", []),
+                "excluded_files": last.get("excluded_files", []),
+            },
+        }
+    return rows
+
+
+def _kind_label(result: dict) -> str:
+    kind = kinds.KINDS.get(result.get("kind", "framework"))
+    return kind.label if kind else clean(result.get("kind", ""), 40)
+
+
+def _kind_closes(result: dict) -> str:
+    kind = kinds.KINDS.get(result.get("kind", "framework"))
+    return kind.closes if kind and kind.closes else "when it passes"
+
+
 def adapter_issue(
     name: str, plan: dict, results: dict[str, dict], run: dict, state: dict | None = None
 ) -> dict:
@@ -480,7 +531,9 @@ def adapter_issue(
     info = plan["adapters"][name]
     known = (state or {}).get("points", {})
     remembered = {item["key"]: item for item in (state or {}).get("displaced", {}).get(name, [])}
-    mine = [r for r in results.values() if r["adapter"] == name]
+    results = {**_remembered_rows(state, name, results), **results}
+    mine = [r for r in results.values() if r.get("subject", r["adapter"]) == name]
+    watched = []
     todo, marks, failing, unchecked = [], [], [], []
     for result in mine:
         version, outcome = code(_version(result)), result["outcome"]
@@ -492,6 +545,19 @@ def adapter_issue(
             what = "does not finish its tests (the run timed out, or failed outside any test)"
         else:
             what = OUTCOME_WORDS[outcome]
+        if is_watching(result):
+            # Reported, and never an argument for red. Said apart, so nobody reads a
+            # watching failure as a broken promise or a promise as merely watched.
+            if outcome in GREEN or (outcome in NOT_OURS and not result["in_claim"]):
+                continue
+            when = f" (last run {code(result['as_of'])})" if result.get("as_of") else ""
+            watched.append(
+                f"{_kind_label(result)}: {version} {what}{when}. Closes {_kind_closes(result)}."
+            )
+            marks.append([result["key"], "watching", outcome, nodes])
+            if nodes:
+                failing.append((result, nodes))
+            continue
         if result["in_claim"] and outcome in RED:
             cause = CAUSE_WORDS.get(result["cause"], "not determined")
             closes = (
@@ -586,6 +652,9 @@ def adapter_issue(
     body += [f"- Note: {clean(note)}" for note in info.get("notes", [])]
     body += ["", "### What needs doing", ""]
     body += [f"- {line}" for line in todo] or ["Nothing."]
+    if watched:
+        body += ["", "### Watching (never turns the run red)", ""]
+        body += [f"- {line}" for line in watched]
     body += ["", "### Points", "", *_table(mine)]
     if _left_out(mine):
         body += ["", *_left_out(mine)]
@@ -612,9 +681,9 @@ def adapter_issue(
         "key": name,
         "title": f"Compatibility: {info['label']}",
         "body": "\n".join(body) + "\n",
-        "fingerprint": _fingerprint(sorted(marks)),
-        "open": bool(todo),
-        "changes": todo,
+        "fingerprint": _fingerprint(sorted(marks, key=json.dumps)),
+        "open": bool(todo or watched),
+        "changes": [*todo, *watched],
         "closing": closing,
     }
 
@@ -847,6 +916,8 @@ def run_info(plan: dict) -> dict:
         "url": f"{env('GITHUB_SERVER_URL', 'https://github.com')}/"
         f"{env('GITHUB_REPOSITORY', '')}/actions/runs/{env('GITHUB_RUN_ID', '')}",
         "event": env("GITHUB_EVENT_NAME", ""),
+        "cadence": plan.get("cadence", "daily"),
+        "scope": "partial" if plan.get("partial") else "all",
         "ref": env("GITHUB_REF", ""),
         "started_at": started,
         "date": started[:10],
@@ -872,6 +943,7 @@ def main(argv: list[str] | None = None) -> int:
         return RED_EXIT
     state_file = state_dir / "state.json"
     state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.is_file() else {}
+    state = model.upgrade_state(state)
     run = run_info(plan)
 
     results = load_results(plan, results_dir)

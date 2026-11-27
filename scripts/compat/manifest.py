@@ -46,7 +46,6 @@ SUITE_TIMEOUT_S = 1500
 #: `compat.yml` is longer, so a point that runs out of time still writes its result.
 POINT_BUDGET_S = 2700
 
-TESTS_DIR = "sdks/python/tests"
 
 #: `targets` are the distributions the table of tested versions names, primary
 #: first. `extras` are requested on a target so the framework's own bounds on

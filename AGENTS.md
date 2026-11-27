@@ -145,20 +145,40 @@ it is the newest. One that fails there is still a release the README calls
 tested, so the report remembers it (`displaced` in `state.json`) and the plan
 keeps running it until it passes or the table lists it under `known_bad`.
 
-A release above the range is tested with `COMPAT_ASSUME_MEASURED=1`,
-which adds it to the table for the test session: that point asks whether the
-suite would pass if the release were added. That `init()` says "untested" on
-the real table is checked at every point by `scripts/compat/attach_probe.py`.
+A release above the range is tested with the `compat_widen` pytest plugin
+(`scripts/compat/pytest_plugins/`), which adds it to the table for the test
+session: that point asks whether the suite would pass if the release were
+added. The plugin lives beside the run, not in the tests tree, so a point can
+ask the same question of a wardex release whose tests predate it. That
+`init()` says "untested" on the real table is checked at every point by
+`scripts/compat/attach_probe.py`.
+
+Every point has a kind, declared in `scripts/compat/kinds.py`; today there is
+one, `framework`. A kind is a row in `KINDS` and one rule in `plan.py` that
+turns its sources into points. The plan writes into each point everything
+needed to run it (what to install, what to probe, which files, how long), and
+`point.py` follows that recipe without knowing the kind, so a new kind is new
+values in the same fields. Whether a kind may turn the run red is not part of
+its row: it is one name on one line of `RED_CAPABLE`. A kind that is not there
+is watching. Its points are recorded and reported in the issue under their
+own heading, and never turn the run red. Promoting a kind is adding that line,
+in a commit of its own.
 
 The run is red in two cases only: a release inside the tested range does not
-pass, or a planned point left no result. Everything else that needs a person
+pass, or a planned point left no result, and in both only for a point of a
+red-capable kind. Everything else that needs a person
 arrives as an issue labelled `compat`: one per adapter, one for problems with
 the run itself, and one opened by a run that ended without a verdict. Each is
 found by a marker in its body, rewritten by every run and closed by the run
 when nothing is left to do; on a day a release could not be checked at all,
 nothing is closed. Records accumulate on the `compat-results` branch, one JSON
 line per point per run under `records/`, with the hash-locked package list of
-each point's last pass under `last-green/`. Only a run on `main` of this
+each point's last pass under `last-green/`. Lines are never rewritten: a line
+written before a field existed is read with the value that field could only
+have had then (`scripts/compat/model.py`). `state.json` holds, for each point,
+who it is and what it last said, and issues are built from it, so a run speaks
+only for what it covered and leaves the rest as the run that covers it wrote
+it. Only a run on `main` of this
 repository writes issues and records. In a fork the schedule starts nothing,
 and a run you start by hand reports to its own summary.
 
