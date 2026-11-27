@@ -1065,7 +1065,7 @@ def test_a_replaced_failure_survives_the_whole_path_from_results_to_the_next_pla
             for v, d in (("0.22.0", "2026-08-19"), ("0.23.1", "2026-10-02"))
         ]
     }
-    monkeypatch.setattr(planner, "read_measured", lambda: {"openai_agents": table})
+    monkeypatch.setattr(planner, "read_measured", lambda *paths: {"openai_agents": table})
     monkeypatch.setattr(planner, "fetch_releases", lambda dist: history[dist])
     monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
     said: list[str] = []
@@ -2798,3 +2798,52 @@ def test_a_schedule_that_never_fired_is_dated_from_the_day_its_file_reached_the_
     assert watchdog.last_scheduled("o/r")[0] == "2026-11-29T00:00:00Z", "the later of the two"
     answers["runs"] = {"workflow_runs": [{"created_at": "2026-11-28T04:00:00Z"}]}
     assert watchdog.last_scheduled("o/r") == ("2026-11-28T04:00:00Z", True)
+
+
+# --- the release gate, rehearsed by every run ------------------------------------
+
+
+def _rehearsed(*results: dict, ref: str = "refs/heads/main", scope: str = "all") -> str:
+    run = {**_RUN, "ref": ref, "scope": scope, "cadence": "daily"}
+    plan = _plan(*[{k: v for k, v in r.items() if k in _FLOOR} for r in results])
+    return report.gate_rehearsal(plan, _results(*results), run)
+
+
+def test_every_run_says_what_the_release_gate_would_say_of_its_commit(monkeypatch):
+    monkeypatch.setattr(report.gate, "claimed", lambda root: {"openai_agents": 2})
+    assert "The release gate would pass" in _rehearsed(_result(_FLOOR), _result(_TOP))
+    stopped = _rehearsed(_result(_FLOOR, "fail"), _result(_TOP))
+    assert "The release gate would stop:" in stopped
+    assert (
+        "- openai_agents--floor: openai-agents 0.22.0 is inside the tested range and: " in stopped
+    )
+    branch = _rehearsed(_result(_FLOOR), _result(_TOP), ref="refs/heads/some-branch")
+    assert "no whole compatibility run on the default branch" in branch
+    assert "no whole compatibility run" in _rehearsed(
+        _result(_FLOOR), _result(_TOP), scope="partial"
+    )
+
+
+def test_a_rehearsal_that_breaks_costs_the_run_nothing(monkeypatch):
+    def broken(root):
+        raise ValueError("no table")
+
+    monkeypatch.setattr(report.gate, "claimed", broken)
+    assert "could not be rehearsed: ValueError" in _rehearsed(_result(_FLOOR), _result(_TOP))
+
+
+def test_the_page_of_a_release_that_overrode_its_gate_says_so(tmp_path):
+    plan = _release_plan(_published(_TOP))
+    plan["published"]["override"] = {"version": "0.7.0b1", "reason": "the floor fails upstream"}
+    state = report.next_state({}, {}, _RUN, tmp_path, plan)
+    page = render.page(state, "0.7.0b1", "2026-11-26")
+    assert (
+        "**This release went out without a passing compatibility gate.** The reason given in "
+        "its own tree: the floor fails upstream" in page
+    )
+    assert "without a passing compatibility gate" not in render.page(
+        state, render.MAIN, "2026-11-26"
+    )
+    plan["published"]["override"] = None
+    state = report.next_state(state, {}, _RUN, tmp_path, plan)
+    assert "without a passing" not in render.page(state, "0.7.0b1", "2026-11-26")

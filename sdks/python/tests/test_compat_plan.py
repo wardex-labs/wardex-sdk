@@ -1099,6 +1099,7 @@ def test_published_points_join_the_plan_and_their_problems_never_reach_the_verdi
         "version": "0.7.0b1",
         "ref": "python-v0.7.0b1",
         "commit": _TAG["commit"],
+        "override": None,
         "adapters": published["adapters"],
     }
     assert made["scope"]["covers"]["published"] == ["openai_agents"]
@@ -1141,7 +1142,9 @@ def test_a_day_the_release_cannot_be_read_is_said_and_never_raised(monkeypatch):
     assert plan.fetch_published(_CUTOFF)["problems"] == ["PyPI lists no wardex release"]
 
 
-def _a_tag_in_git(monkeypatch, *, held: bool, shallow: bool) -> list[tuple]:
+def _a_tag_in_git(
+    monkeypatch, *, held: bool, shallow: bool, override: str | None = None
+) -> list[tuple]:
     """`plan._git` answered from memory: a tag that is here, or one that must be fetched."""
     calls: list[tuple] = []
     fetched = {"done": held}
@@ -1159,6 +1162,10 @@ def _a_tag_in_git(monkeypatch, *, held: bool, shallow: bool) -> list[tuple]:
         if args[0] == "fetch":
             fetched["done"] = True
             return ""
+        if args[0] == "show" and args[1].endswith("release-override.json"):
+            if override is None:
+                raise plan.subprocess.CalledProcessError(128, "git")
+            return override
         if args[0] == "show":
             return measured if args[1].endswith("_measured.py") else enums
         if args[0] == "ls-tree":
@@ -1183,7 +1190,7 @@ def test_a_release_is_read_from_its_own_tag(monkeypatch):
     ]
     assert not any(call[0] == "fetch" for call in calls)
     shown = [call[-1] for call in calls if call[0] in ("show", "ls-tree")]
-    assert len(shown) == 3
+    assert len(shown) == 4 and tag["override"] is None
     assert all(path.startswith(f"{commit}:") for path in shown), "the commit, not a moving name"
 
 
@@ -1372,3 +1379,23 @@ def test_the_plan_says_which_releases_of_each_pinned_distribution_the_index_serv
     ]
     info = plan.plan_adapter("langgraph", rows, history, _CUTOFF)["info"]
     assert info["served"] == {"langgraph": ["1.2.0", "1.2.1"], "langgraph-prebuilt": ["1.1.0"]}
+
+
+def test_a_release_that_overrode_its_gate_carries_that_into_the_plan(monkeypatch):
+    """The override is in the release's own tree, so it is read from the tag like the
+    table is, and travels with the plan to the page of that release."""
+    said = json.dumps({"version": "0.7.0b1", "reason": "the floor fails upstream"})
+    _a_tag_in_git(monkeypatch, held=True, shallow=False, override=said)
+    tag = plan.read_tag("0.7.0b1")
+    assert tag["override"] == {"version": "0.7.0b1", "reason": "the floor fails upstream"}
+    made = plan.plan_published(
+        "0.7.0b1", {**_TAG, "override": tag["override"]}, _OPENAI_HISTORY, _CUTOFF
+    )
+    whole = plan.build_plan(
+        {"openai_agents": _OPENAI}, _OPENAI_HISTORY, _CUTOFF, published={"problems": [], **made}
+    )
+    assert whole["published"]["override"] == tag["override"]
+
+    stale = json.dumps({"version": "0.6.0", "reason": "an earlier release"})
+    _a_tag_in_git(monkeypatch, held=True, shallow=False, override=stale)
+    assert plan.read_tag("0.7.0b1")["override"] is None

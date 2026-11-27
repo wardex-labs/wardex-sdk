@@ -315,11 +315,15 @@ def page(state: dict, version: str, today: str) -> str:
             f"What the daily run found for `wardex-sdk=={clean(version, 40)}` as PyPI serves it, "
             f"with the tests of its own tag {code(about.get('ref', ''))}."
         )
-    lines = [
-        f"# {title}",
-        "",
-        what,
-        "",
+    lines = [f"# {title}", "", what, ""]
+    override = about.get("override") if version != MAIN else None
+    if override:
+        lines += [
+            "**This release went out without a passing compatibility gate.** The reason given "
+            f"in its own tree: {clean(override.get('reason', ''), 200)}",
+            "",
+        ]
+    lines += [
         f"Generated on {day_words(today)} from the run records on this branch; nothing here is "
         "written by hand. A row marked *watching* is run and reported and never turns the run "
         f"red. A pass older than {LAPSE_DAYS} days is shown as when it last passed, not as "

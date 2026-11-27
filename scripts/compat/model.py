@@ -11,6 +11,8 @@ Standard library only: the plan, the executor and the report import this.
 
 from __future__ import annotations
 
+import json
+
 SCHEMA = 2
 
 #: Where the suite lives inside whichever tree a point tests.
@@ -70,3 +72,25 @@ def upgrade_state(state: dict) -> dict:
         "kinds": {},
         "last_scheduled": state.get("last_scheduled"),
     }
+
+
+#: A release that goes out without a passing compatibility gate carries this file in its
+#: own tree. The gate reads it from the tree being released; the plan reads it from the
+#: release's tag, so the page of that release says so for as long as the page exists.
+OVERRIDE = "scripts/compat/release-override.json"
+
+
+def parse_override(text: str, version: str) -> dict | None:
+    """The override `text` holds for `version`, or None.
+
+    One left behind by an earlier release names that release and excuses nothing, and one
+    that gives no reason is not one."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("version") != version:
+        return None
+    reason = "".join(ch if " " <= ch <= "~" else "?" for ch in str(data.get("reason", "")))
+    reason = reason.strip()[:200]
+    return {"version": version, "reason": reason} if reason else None
