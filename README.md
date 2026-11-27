@@ -210,7 +210,7 @@ tree.
 |---|---|
 | OpenAI Agents SDK (tested on `openai-agents` 0.22.x, 0.23.x) | each run, agent, function tool, handoff and guardrail; model calls read from the wire |
 | LangGraph (tested on `langgraph` 1.2.x) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
-| Pydantic AI (tested on `pydantic-ai-slim` 2.x) | each agent run, model call and tool call, read from pydantic-ai's own OpenTelemetry spans; the model call's messages and token usage come from the wire |
+| Pydantic AI (tested on `pydantic-ai-slim` 2.x from 2.54) | each agent run, model call and tool call, read from pydantic-ai's own OpenTelemetry spans; the model call's messages and token usage come from the wire |
 | Claude Agent SDK (tested on `claude-agent-sdk` 0.2.x) | agent turns and model calls, with tool calls correlated |
 | Hermes Agent (through a Hermes plugin; measured on v0.23.3) | each turn, each model call with every HTTP attempt under it, each tool call and each subagent turn; what wardex could not see is marked |
 | Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |
@@ -398,10 +398,10 @@ emits (`invoke_agent`, `chat`, `execute_tool`, instrumentation schema version
 adapter installs and `wardex.diagnostics()` reports the adapter
 `measured=False`). It installs when your application imports pydantic-ai, or
 at `init()` if it already has.
-It is tested on `pydantic-ai-slim` 2.x as a range, last on 2.66:
+It is tested on `pydantic-ai-slim` 2.x from 2.54 on, as a range:
 
 ```bash
-pip install wardex-sdk "pydantic-ai-slim[openai]>=2,<3"
+pip install wardex-sdk "pydantic-ai-slim[openai]>=2.54,<3"
 ```
 
 ```python

@@ -17,7 +17,9 @@ a suite can be re-run and whose contract the adapter reads carries its own
 version, checked at install. A pre-release, dev, post or local version was
 never the subject of a measurement, so it is unmeasured even when its range is
 listed. A patch inside a measured range that is known to break the suite is
-listed under `known_bad`.
+listed under `known_bad`. A range whose oldest releases do not pass the suite
+carries `since`: the first release that does, and everything below it is
+unmeasured.
 
 No dependency on `packaging`: the SDK has none at runtime, and a regular
 expression over the release segment is all the comparison needs.
@@ -32,7 +34,7 @@ from .._assembly import guard
 from .._enums import AdapterName
 from ._probe import installed_distribution
 
-__all__ = ["MEASURED", "Measured", "installed_version", "is_measured", "spelled"]
+__all__ = ["MEASURED", "Measured", "installed_version", "is_measured", "ranges", "spelled"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +47,10 @@ class Measured:
 
     known_bad: tuple[str, ...] = ()
     """Exact versions inside a measured range that fail the adapter's suite."""
+
+    since: str = ""
+    """The first release of the ranges the suite passes on ("2.54"); every release below it
+    is unmeasured. Empty when the ranges are measured from their first release."""
 
 
 #: Every adapter this release ships, and what its suite was last run against
@@ -69,10 +75,11 @@ MEASURED: dict[AdapterName, tuple[Measured, ...]] = {
     # MCP listing and a failing tool gate land under the agent there, and its streamed path
     # checks input guardrails before leaving a handoff's sender; both trees are measured.
     AdapterName.OPENAI_AGENTS: (Measured("openai-agents", ("0.22", "0.23")),),
-    # The whole major: what the adapter reads is pydantic-ai's own OpenTelemetry spans at
-    # instrumentation schema version 5, versioned separately from the package and checked at
-    # install; the framework releases minors weekly. Last run against 2.66.0 (2026-11-08).
-    AdapterName.PYDANTIC_AI: (Measured("pydantic-ai-slim", ("2",)),),
+    # The whole major from 2.54 on: what the adapter reads is pydantic-ai's own OpenTelemetry
+    # spans at instrumentation schema version 5, versioned separately from the package and
+    # checked at install; the framework releases minors weekly. Below 2.54 a run cancelled
+    # while it waits on a request hook records no `chat` span, and the suite fails there.
+    AdapterName.PYDANTIC_AI: (Measured("pydantic-ai-slim", ("2",), since="2.54"),),
 }
 
 _FINAL = re.compile(r"(\d+)\.(\d+)(?:\.\d+)*")
@@ -83,13 +90,30 @@ def is_measured(entry: Measured, version: str) -> bool:
     found = _FINAL.fullmatch(version)
     if found is None or version in entry.known_bad:
         return False
+    if entry.since and _release(version) < _release(entry.since):
+        return False
     major, minor = int(found[1]), int(found[2])
     return f"{major}.{minor}" in entry.minors or str(major) in entry.minors
 
 
+def _release(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def ranges(entry: Measured) -> tuple[str, ...]:
+    """Each measured range as a person reads it: ("0.21.x", "0.22.x"), or ("2.x from 2.54",).
+
+    `since` is said on the range it falls in, which a test holds to be the lowest one."""
+    out = []
+    for minor in entry.minors:
+        starts_here = entry.since == minor or entry.since.startswith(f"{minor}.")
+        out.append(f"{minor}.x from {entry.since}" if starts_here else f"{minor}.x")
+    return tuple(out)
+
+
 def spelled(entry: Measured) -> str:
-    """The measured range as a person reads it: "0.21.x, 0.22.x"."""
-    return ", ".join(f"{minor}.x" for minor in entry.minors)
+    """The measured ranges in one phrase: "0.21.x, 0.22.x", or "2.x from 2.54"."""
+    return ", ".join(ranges(entry))
 
 
 def installed_version(distribution: str) -> str | None:

@@ -14,7 +14,7 @@ from .._assembly import DropReason, DropUnit, counters, diag_info, guard, record
 from .._config import AdaptersConfig, _non_default_adapter_options
 from .._diagnostics import AdapterStatus
 from .._enums import AdapterName, AdapterState
-from ._measured import MEASURED, Measured, installed_version, is_measured, spelled
+from ._measured import MEASURED, Measured, installed_version, is_measured, ranges, spelled
 from ._neighbors import say_what_shares_the_process
 from ._probe import probe
 from ._registry import get_registry
@@ -266,8 +266,8 @@ def _status(name: str, state: AdapterState, found: _Found, detail: str = "") -> 
     tried = state in (AdapterState.INSTALLED, AdapterState.UNSUPPORTED, AdapterState.FAILED)
     readable = [(entry, v) for entry, v in found if v is not None]
     measured = all(is_measured(entry, v) for entry, v in readable) if tried and readable else None
-    ranges = tuple(f"{minor}.x" for minor in primary.minors)
-    return AdapterStatus(name, state, primary.distribution, version, measured, ranges, detail)
+    tested = ranges(primary)
+    return AdapterStatus(name, state, primary.distribution, version, measured, tested, detail)
 
 
 def _versions_said(found: _Found) -> str:
