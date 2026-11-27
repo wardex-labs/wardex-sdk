@@ -25,6 +25,16 @@ from compat import kinds, model, point, report, verdict, watchdog  # noqa: E402
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "compat"
 
+
+@pytest.fixture(autouse=True)
+def _two_kinds_that_are_not_red_capable(monkeypatch):
+    """Kinds for these tests to watch: one of every run, one of a weekly run."""
+    daily = kinds.Kind("anything", frozenset({"daily"}), 3, 1, "when it passes")
+    weekly = kinds.Kind("weekly thing", frozenset({"weekly"}), 9, 1, "when it passes")
+    monkeypatch.setitem(kinds.KINDS, "anything", daily)
+    monkeypatch.setitem(kinds.KINDS, "weekly_thing", weekly)
+
+
 _RUN = {
     "id": "1",
     "attempt": "1",
@@ -1907,8 +1917,56 @@ def test_a_state_written_before_kinds_keeps_everything_it_remembered():
     assert model.upgrade_state(new) is new
 
 
-def test_every_declared_kind_has_words_and_a_way_to_close():
+def test_every_declared_kind_has_words_and_a_way_to_close(monkeypatch):
+    monkeypatch.undo()  # the kinds the repository declares, without the two of these tests
     for name, kind in kinds.KINDS.items():
         assert kind.label and kind.cadences and kind.fresh_days > 0, name
         assert name in kinds.RED_CAPABLE or kind.closes, name
     assert kinds.due("daily") == ("framework",)
+
+
+# --- a kind that is retired, and a run that holds only watching kinds ------------
+
+
+def test_the_points_of_a_retired_kind_ask_nothing_and_are_forgotten_by_a_whole_run(tmp_path):
+    """A kind taken out of the declarations has no run that could ever cover it. Left
+    alone, a failure it once found would keep an issue open for good."""
+    gone = {**_TOP, "key": "retired--top", "kind": "retired_kind", "watching": True}
+    state = {"points": {gone["key"]: _kept(gone, "fail", ["t.py::test_tree"])}}
+    plan = _plan(_FLOOR, _TOP)
+    results = _results(_result(_FLOOR), _result(_TOP))
+    assert not report.adapter_issue("openai_agents", plan, results, _RUN, state)["open"]
+
+    partial = _covering({"framework": ["openai_agents"]}, partial=True)
+    assert gone["key"] in report.next_state(state, results, _RUN, tmp_path, partial)["points"]
+    whole = _covering({"framework": ["openai_agents"]})
+    after = report.next_state(state, results, _RUN, tmp_path, whole)
+    assert gone["key"] not in after["points"] and after["_forget"] == [gone["key"]]
+
+    watched = {**gone, "key": "weekly--top", "kind": "weekly_thing"}
+    state = {"points": {watched["key"]: _kept(watched, "fail", ["t.py::test_tree"])}}
+    kept = report.next_state(state, results, _RUN, tmp_path, whole)
+    assert watched["key"] in kept["points"], "a declared kind's points wait for their own run"
+
+
+def test_a_run_that_holds_only_watching_kinds_is_never_red():
+    """Red needs a red-capable question. A cadence that asks none cannot be red for
+    having no points, and whatever its watching points say is not a reason either."""
+    watched = {**_TOP, "key": "weekly--top", "kind": "weekly_thing", "watching": True}
+    weekly = {**_plan(watched), "cadence": "weekly", "adapters": {}}
+    assert report.judge(weekly, _results(_result(watched, "fail"))) == []
+    assert report.judge({**weekly, "points": []}, {}) == []
+    daily = {**_plan(), "adapters": {}}
+    assert report.judge(daily, {}) == ["plan: no points"]
+    assert report.judge({**daily, "cadence": "daily"}, {}) == ["plan: no points"]
+
+
+def test_a_record_line_says_when_its_point_was_only_watched():
+    watched = {**_TOP, "key": "watched--top", "kind": "anything", "watching": True}
+    plan = _plan(_TOP, watched)
+    lines = {
+        line["key"]: line
+        for line in report.records(plan, _results(_result(_TOP), _result(watched)), _RUN)
+    }
+    assert lines["watched--top"]["watching"] is True and lines[_TOP["key"]]["watching"] is False
+    assert lines["watched--top"]["kind"] == "anything"
