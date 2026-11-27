@@ -85,13 +85,19 @@ _WARDEX = re.compile(r"(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?(?:\.post(\d+))?")
 
 def _release_order(version: str) -> tuple:
     """Newest last, for wardex's own versions: a final after its pre-releases, a post
-    release after its final. Anything else sorts first, by its text."""
+    release after its final."""
     match = _WARDEX.fullmatch(version)
-    if not match:
-        return (0, (), 0, 0, 0, version)
     rank = {"a": 0, "b": 1, "rc": 2, None: 3}[match[2]]
     numbers = tuple(int(part) for part in match[1].split("."))
-    return (1, numbers, rank, int(match[3] or 0), int(match[4] or 0), version)
+    return (numbers, rank, int(match[3] or 0), int(match[4] or 0))
+
+
+def _published_versions(state: dict) -> list[str]:
+    """The releases that get a page, oldest first. One list for the index and for the
+    files, so the index never links to a page nobody wrote."""
+    held = state.get("versions") or {}
+    safe = [v for v in held if v != MAIN and _VERSION.fullmatch(v) and _WARDEX.fullmatch(v)]
+    return sorted(safe, key=_release_order)
 
 
 def status_of(entry: dict, today: str) -> dict:
@@ -122,9 +128,9 @@ def status_of(entry: dict, today: str) -> dict:
         status, words = "fail", OUTCOME_WORDS[outcome]
         if not fresh:
             words += f", not run since {day_words(ran)}"
-    elif outcome in NOT_OURS and checked.get("outcome") in FAILED:
-        # Its last run could not check it. The last time it was checked it failed, and
-        # that is what is known: the same thing its issue says.
+    elif checked.get("outcome") in FAILED:
+        # Its last run did not check it, whatever the reason. The last time it was checked
+        # it failed, and that is what is known: the same thing its issue says.
         status = "fail"
         words = f"failed when last checked, on {day_words(checked.get('date', ''))}; now: {cannot}"
     elif outcome in NOT_OURS and checked.get("outcome") in GREEN and _recent(passed, today, days):
@@ -336,9 +342,13 @@ def _replaced(points: list[dict], items: list[dict]) -> list[str]:
     """Releases that failed and that a newer one replaced, before their own point has run:
     still inside the range, known to fail, and in no row of the table above."""
     have = {point["key"] for point in points}
+    # A rule that picks the release again speaks for it in its own row.
+    run = [point["point"].get("targets") for point in points if point["point"].get("in_claim")]
     lines = []
-    for item in items:
-        if item.get("key") in have or not isinstance(item.get("targets"), dict):
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("targets"), dict):
+            continue
+        if item.get("key") in have or item["targets"] in run:
             continue
         version = ", ".join(f"{dist} {v}" for dist, v in item["targets"].items())
         lines.append(
@@ -374,7 +384,7 @@ def _claims(claims: list[dict]) -> list[str]:
 
 
 def index(state: dict, today: str) -> str:
-    versions = sorted((v for v in (state.get("versions") or {}) if v != MAIN), key=_release_order)
+    versions = _published_versions(state)
     lines = [
         "# wardex compatibility",
         "",
@@ -390,9 +400,8 @@ def index(state: dict, today: str) -> str:
 def site(state: dict, today: str) -> dict[str, str]:
     """Every file of the site, by its path under `site/`."""
     files = {"README.md": index(state, today), "main/README.md": page(state, MAIN, today)}
-    for version, about in sorted((state.get("versions") or {}).items()):
-        if version == MAIN or not _VERSION.fullmatch(version):
-            continue
+    for version in _published_versions(state):
+        about = state["versions"][version] or {}
         files[f"{version}/README.md"] = page(state, version, today)
         grouped = rows(state, version)
         for name in sorted(set(about.get("adapters") or {}) | set(grouped)):

@@ -475,19 +475,12 @@ def next_state(
         if result["outcome"] in GREEN or since.get("targets") not in (None, result["targets"]):
             entry.pop("failing_since", None)
         if result["outcome"] in FAILED:
-            # A release keeps its count when another point takes it over: the one a newer
-            # release replaced goes on from where the rule's own point left it.
-            began = [item["failing_since"] for item in (replaced.get(key),) if item] + [
-                other["failing_since"]["date"]
-                for other in state.get("points", {}).values()
-                if (other.get("failing_since") or {}).get("targets") == result["targets"]
-            ]
+            # A release a newer one replaced keeps its count: its own point goes on from
+            # where the rule's point left it. From that item and nowhere else, because the
+            # same release failing on another wardex build is another question's count.
+            began = (replaced.get(key) or {}).get("failing_since")
             entry.setdefault(
-                "failing_since",
-                {
-                    "date": min([d for d in began if d] or [run["date"]]),
-                    "targets": result["targets"],
-                },
+                "failing_since", {"date": began or run["date"], "targets": result["targets"]}
             )
         # Days, not runs: a second run on the same day is the same outage seen twice.
         if result["outcome"] in NOT_OURS:
@@ -792,10 +785,12 @@ def adapter_issue(
             item = remembered.get(result["key"]) or next(
                 (i for i in remembered.values() if _picked_again(i, {"": result})), None
             )
+            pending = False
             if item and before.get("targets") != result["targets"]:
                 # A replaced release whose own point has not run it yet: what is known about
                 # it is the failure it was remembered for.
                 before = {"outcome": "fail", "targets": item["targets"], "date": item["failed_on"]}
+                pending = True
             unchecked.append(f"{version} ({OUTCOME_WORDS[outcome]})")
             if before.get("outcome") not in RED or before.get("targets") != result["targets"]:
                 continue
@@ -805,7 +800,12 @@ def adapter_issue(
                 f"{OUTCOME_WORDS[outcome]}.{_lapse(result, known, run)}"
             )
             outcome, nodes = before["outcome"], before.get("failed_ids", [])
-            marks.append([result["key"], outcome, before.get("cause"), nodes])
+            if pending:
+                # The same mark as on the day it was remembered: that its own point could
+                # not run it yet is no news about the release.
+                marks.append([result["key"], "displaced", None, []])
+            else:
+                marks.append([result["key"], outcome, before.get("cause"), nodes])
             if _lapse(result, known, run):
                 # The same mark as on a day it ran and failed: an outage in the middle of
                 # a long failure is not news about the lapse.

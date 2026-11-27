@@ -6,6 +6,7 @@ report writes, and each test names one thing a reader of the page relies on.
 
 from __future__ import annotations
 
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -257,6 +258,8 @@ def test_a_point_that_could_not_be_checked_is_shown_as_what_it_last_said():
     assert (said["status"], said["words"][:26]) == ("pass", "passed on 27 Nov 2026; now")
     passed["last_green"]["date"] = "2026-11-20"
     assert render.status_of(passed, _TODAY)["status"] == "stale"
+    passed["last_green"]["date"] = "2026-11-25"
+    assert render.status_of(passed, _TODAY)["status"] == "pass", "three days is still proof"
     passed["last_green"]["date"] = passed["last_checked"]["date"] = _TODAY
     assert render.status_of(passed, _TODAY)["status"] == "pass", "a pass made earlier today"
 
@@ -327,6 +330,8 @@ def test_a_point_that_left_no_result_is_never_green_whatever_it_said_yesterday(o
         "targets": identity["targets"],
     }
     assert render.status_of(entry, _TODAY)["status"] == "stale"
+    failed = {**entry, "last_checked": {**entry["last_checked"], "outcome": "fail"}}
+    assert render.status_of(failed, _TODAY)["status"] == "fail", "a known failure stays one"
     state = _state(**{"published--top": entry})
     entry["point"] = _identity("openai_agents", "claim_top", "0.23.1", release=_RELEASE)
     assert _cell(state) == ("stale", "0.23.1 not proven since 27 Nov 2026")
@@ -342,6 +347,13 @@ def test_the_index_lists_the_newest_release_first():
         if line.startswith("- [wardex")
     ]
     assert listed == ["0.10.0", "0.9.0", "0.7.0.post1", "0.7.0", "0.7.0rc1", "0.7.0b10", "0.7.0b1"]
+    more = {"0.7.0.post10": {}, "0.7.0.post2": {}, "v0.6": {}, "a b": {}, "../x": {}}
+    state["versions"].update(more)
+    again = render.index(state, _TODAY)
+    assert again.index("0.7.0.post10]") < again.index("0.7.0.post2]") < again.index("0.7.0.post1]")
+    pages = {name.split("/")[0] for name in render.site(state, _TODAY) if "/" in name} - {"main"}
+    linked = set(re.findall(r"\]\(([^/)]+)/README\.md\)", again)) - {"main"}
+    assert linked == pages and "v0.6" not in again, "the index links only pages that are written"
 
 
 def test_a_failure_waiting_for_its_own_point_is_on_the_default_branchs_page():
@@ -361,3 +373,15 @@ def test_a_failure_waiting_for_its_own_point_is_on_the_default_branchs_page():
     own = _identity("openai_agents", "displaced", "0.23.1")
     state["points"][item["key"]] = _entry(own, "fail")
     assert "took its place" not in render.page(state, render.MAIN, _TODAY), "its row says it now"
+
+    del state["points"][item["key"]]
+    again = _identity("openai_agents", "claim_top", "0.23.1")
+    state["points"]["openai_agents--claim_top"] = _entry(again, "install_network")
+    assert "took its place" not in render.page(state, render.MAIN, _TODAY), "a rule picked it again"
+
+    odd = ["not an item", {"targets": "nor this"}, {"targets": {"x": None}}]
+    state["displaced"]["openai_agents"] = odd
+    page = render.page(state, render.MAIN, _TODAY)
+    assert "- `x None` did not pass when it was last run, on an unknown day." in page
+    state["displaced"]["openai_agents"] = "not a list"
+    assert "took its place" not in render.page(state, render.MAIN, _TODAY)

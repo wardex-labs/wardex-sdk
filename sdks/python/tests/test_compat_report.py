@@ -2335,3 +2335,48 @@ def test_what_the_pages_know_of_a_release_survives_runs_of_one_adapter(tmp_path)
     state["versions"]["0.7.0b1"]["adapters"]["langgraph"] = {"label": "langgraph"}
     after = report.next_state(state, {}, {**_RUN, "date": "2026-11-27"}, tmp_path, plan)
     assert sorted(after["versions"]["0.7.0b1"]["adapters"]) == ["langgraph", "openai_agents"]
+
+
+def test_a_release_failing_on_one_wardex_build_starts_no_count_on_another(tmp_path):
+    """The published release has failed on this framework release for weeks. The day the
+    default branch first fails on it is day one for the default branch."""
+    held = _published(_TOP)
+    plan = _release_plan(held)
+    state = report.next_state(
+        {},
+        _loaded(_result(_FLOOR), _result(_TOP), _result(held, "fail")),
+        {**_RUN, "date": "2026-11-01"},
+        tmp_path,
+        plan,
+    )
+    state.pop("_locks"), state.pop("_forget")
+    run = {**_RUN, "date": "2026-11-20"}
+    results = _loaded(_result(_FLOOR), _result(_TOP, "fail"), _result(held, "fail"))
+    state = report.next_state(state, results, run, tmp_path, plan)
+    assert state["points"][_TOP["key"]]["failing_since"]["date"] == "2026-11-20"
+    assert state["points"][held["key"]]["failing_since"]["date"] == "2026-11-01"
+    issue = report.adapter_issue("openai_agents", plan, results, run, state)
+    assert "claim.py" not in issue["body"]
+
+
+def test_a_replaced_release_whose_own_point_cannot_run_yet_is_no_news(tmp_path):
+    """It was remembered yesterday. Today its own point is planned for the first time and
+    the index is down: the same thing is known as yesterday, so nobody is told again."""
+    new = {**_point("claim_top", "0.23.2"), "python": "3.14"}
+    plan = _plan_with_table(_FLOOR, new)
+    results = _results(_result(_FLOOR), _result(new))
+    for result in results.values():
+        result["planned_python"] = "3.14"
+    state = report.next_state(_top_failed_yesterday(), results, _RUN, tmp_path, plan)
+    state.pop("_locks"), state.pop("_forget")
+    remembered = report.adapter_issue("openai_agents", plan, results, _RUN, state)
+    (item,) = state["displaced"]["openai_agents"]
+    own = {**_point("displaced", "0.23.1"), "key": item["key"], "python": "3.14"}
+    plan = _plan_with_table(_FLOOR, new, own)
+    run = {**_RUN, "date": "2026-11-27"}
+    results = _results(_result(_FLOOR), _result(new), _result(own, "install_network"))
+    for result in results.values():
+        result["planned_python"] = "3.14"
+    state = report.next_state(state, results, run, tmp_path, plan)
+    waiting = report.adapter_issue("openai_agents", plan, results, run, state)
+    assert waiting["open"] and waiting["fingerprint"] == remembered["fingerprint"]
