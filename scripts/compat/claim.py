@@ -34,10 +34,11 @@ ENUMS = "sdks/python/src/wardex_sdk/_enums.py"
 PYPROJECT = "sdks/python/pyproject.toml"
 README = "README.md"
 
-# White space is any run of it, a line break included: the README wraps its sentences, and
-# a phrase that wraps must still be one the table writes.
-_LINE = r"\d+(?:\.\d+)*\.x(?:\s+from\s+\d+(?:\.\d+)*)?"
-_RANGE = rf"{_LINE}(?:,\s+{_LINE})*"
+# The README wraps its sentences, so the white space inside a phrase may hold one line
+# break. Not a blank line: that ends the paragraph, and what follows is another sentence.
+_GAP = r"(?:[ \t]+|[ \t]*\n[ \t]*)"
+_LINE = rf"\d+(?:\.\d+)*\.x(?:{_GAP}from{_GAP}\d+(?:\.\d+)*)?"
+_RANGE = rf"{_LINE}(?:,{_GAP}{_LINE})*"
 _BOUNDS = r"\s*>=\s*(?P<lower>\d+(?:\.\d+)*)\s*,\s*<\s*(?P<upper>\d+(?:\.\d+)*)\s*"
 
 
@@ -126,7 +127,7 @@ def write_pins(text: str, entry: dict) -> str:
 
 
 def _phrase(dist: str) -> re.Pattern:
-    return re.compile(rf"(?P<head>`{re.escape(dist)}`\s+)(?P<range>{_RANGE})")
+    return re.compile(rf"(?P<head>`{re.escape(dist)}`{_GAP})(?P<range>{_RANGE})")
 
 
 def write_readme(text: str, entry: dict) -> str:

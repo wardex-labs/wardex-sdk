@@ -238,6 +238,7 @@ def test_a_line_that_would_leave_a_hole_or_reach_under_a_stated_start_is_refused
     assert claim.holes(["0.22", "0.25", "0.28"]) == "0.23.x, 0.24.x, 0.26.x, 0.27.x"
     assert claim.holes(["0.9", "1.0"]) == "", "a new prefix is the framework's to number"
     assert claim.holes(["0.3", "1.7"]) == "", "nothing is counted across two prefixes"
+    assert claim.holes(["0.25", "0.22", "0.23"]) == "0.24.x", "in whatever order they come"
     assert claim.holes(["0.22", "1.5", "1.7"]) == "1.6.x", "and a hole is looked for inside one"
     assert claim.holes(["2", "4"]) == "3.x"
 
@@ -289,6 +290,7 @@ def test_a_table_someone_left_a_hole_in_is_drift(tree):
     [
         "`{dist}`\n9.1.x, 9.2.x",
         "`{dist}`  9.1.x,\n9.2.x",
+        "`{dist}` 9.1.x\n   from 9.1.4, 9.2.x",
         "'{dist}>=9.1,<9.3'",
         '"{dist} >= 9.1, < 9.3"',
     ],
@@ -304,4 +306,34 @@ def test_a_claim_that_wraps_or_is_spelled_with_other_quotes_or_spaces_is_still_h
     )
     assert len(claim.drift(tree)) == 1
     assert claim.main(["sync"], root=tree) == 0 and claim.drift(tree) == []
-    assert "9.1" not in path.read_text(encoding="utf-8")
+    after = path.read_text(encoding="utf-8")
+    assert "9.1" not in after and "9.2" not in after and "<9.3" not in after
+
+
+def test_a_phrase_the_table_writes_is_not_drift_for_being_wrapped(tree):
+    row = _a_row_with_two_lines(tree)
+    dist, said = row["distribution"], plan.spelled(row)
+    assert ", " in said
+    path = tree / claim.README
+    wrapped = f"\n`{dist}` " + said.replace(", ", ",\n", 1) + "\n"
+    path.write_text(path.read_text("utf-8") + wrapped, "utf-8")
+    assert claim.drift(tree) == []
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "`{dist}`\n\n9.x of the documentation",
+        "### `{dist}`\n\n9.x and later",
+        "`{dist}` is described in section 9.x",
+    ],
+)
+def test_a_version_like_word_in_the_next_paragraph_is_not_a_claim(tree, written):
+    """One line break inside a phrase is a wrapped sentence. A blank line ends the
+    paragraph, and what follows says something else."""
+    dist = _a_row_with_two_lines(tree)["distribution"]
+    path = tree / claim.README
+    path.write_text(path.read_text("utf-8") + "\n" + written.format(dist=dist) + "\n", "utf-8")
+    before = path.read_text("utf-8")
+    assert claim.drift(tree) == []
+    assert claim.main(["sync"], root=tree) == 0 and path.read_text("utf-8") == before
