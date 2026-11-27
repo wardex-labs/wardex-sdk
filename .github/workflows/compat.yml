@@ -7,6 +7,10 @@ name: compat
 #
 # Nothing here blocks a pull request. A framework release is not a reason for
 # an unrelated change to go red, so this runs on a schedule and on demand.
+#
+# In a fork the schedule starts nothing, and a run started by hand reports to
+# its own summary only: issues and records belong to the repository named in
+# the `if:` lines below, and a fork that inherits this file must not grow them.
 
 on:
   schedule:
@@ -39,6 +43,7 @@ env:
 jobs:
   plan:
     name: plan
+    if: github.event_name != 'schedule' || github.repository == 'wardex-labs/wardex-sdk'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -52,12 +57,15 @@ jobs:
           mkdir -p plan/last-green
           if git fetch --depth 1 origin "$RECORDS_BRANCH" 2>/dev/null; then
             git archive FETCH_HEAD last-green 2>/dev/null | tar -x -C plan || true
+            git show FETCH_HEAD:state.json > plan/state.json 2>/dev/null || rm -f plan/state.json
           fi
       - name: plan today's points
         id: plan
         env:
           ONLY: ${{ inputs.only }}
-        run: python3 scripts/compat/plan.py --out plan/plan.json ${ONLY:+--only "$ONLY"}
+        run: |
+          python3 scripts/compat/plan.py --out plan/plan.json --state plan/state.json \
+            ${ONLY:+--only "$ONLY"}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: compat-plan
@@ -66,6 +74,7 @@ jobs:
   # Built the way the release builds it, so a point tests what a user installs.
   wheel:
     name: build the wheel
+    if: github.event_name != 'schedule' || github.repository == 'wardex-labs/wardex-sdk'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -139,7 +148,8 @@ jobs:
   report:
     name: report
     needs: [plan, point]
-    if: always()
+    # Not when the plan was skipped: that is a fork's schedule, and there is nothing to judge.
+    if: always() && needs.plan.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -176,7 +186,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COMPAT_ASSIGNEE: ${{ vars.COMPAT_ASSIGNEE }}
-          WRITE: ${{ github.ref == 'refs/heads/main' && '1' || '' }}
+          WRITE: ${{ github.ref == 'refs/heads/main' && github.repository == 'wardex-labs/wardex-sdk' && '1' || '' }}
         run: |
           mkdir -p results
           export COMPAT_SDK_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' sdks/python/pyproject.toml | head -1)"
@@ -191,7 +201,7 @@ jobs:
           echo "status=$status" >> "$GITHUB_OUTPUT"
       - name: commit the records
         # Only after a verdict: a report that crashed may have written half a state file.
-        if: github.ref == 'refs/heads/main' && steps.report.outputs.judged == 'true'
+        if: github.ref == 'refs/heads/main' && github.repository == 'wardex-labs/wardex-sdk' && steps.report.outputs.judged == 'true'
         working-directory: ${{ runner.temp }}/records
         run: |
           git add -A
@@ -210,7 +220,9 @@ jobs:
   died:
     name: say so if the run died
     needs: [plan, wheel, point, report]
-    if: always() && github.ref == 'refs/heads/main' && needs.report.outputs.judged != 'true'
+    if: >-
+      always() && github.ref == 'refs/heads/main' && github.repository == 'wardex-labs/wardex-sdk'
+      && needs.plan.result != 'skipped' && needs.report.outputs.judged != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

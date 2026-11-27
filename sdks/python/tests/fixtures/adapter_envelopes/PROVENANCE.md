@@ -8,9 +8,10 @@ synthetic: a scripted model, a loopback server, canned tool output.
 
 - Produced: 2026-10-01
 - wardex-sdk: 0.6.0b1, Python 3.14.3
-- Source: `sdks/python/tests/test_adapter_envelopes.py`, which also holds the
-  contract each body is checked against on every run
-- Regenerate: `WARDEX_REGEN_ENVELOPES=1 uv run pytest sdks/python/tests/test_adapter_envelopes.py`
+- Source: `sdks/python/tests/test_<adapter>_envelope.py`, one file per adapter;
+  `_adapter_envelopes.py` holds the contract each body is checked against on
+  every run
+- Regenerate: `WARDEX_REGEN_ENVELOPES=1 uv run pytest` on those three files
 
 | File | Conversation id it states | Framework |
 |---|---|---|

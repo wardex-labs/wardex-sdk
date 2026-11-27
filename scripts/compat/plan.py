@@ -14,6 +14,9 @@ A point is one framework version on one interpreter:
 - ``claim_top``: the newest release inside the tested range, on the newest
   interpreter; ``claim_top_oldpy`` is the same question on the oldest one.
 - ``beyond``: the newest patch of each release line above the tested range.
+- ``displaced``: a release that failed while it was one of the points above and
+  has since been replaced there by a newer one. It is still inside the tested
+  range, so it keeps being run until it passes or the table lists it as bad.
 """
 
 from __future__ import annotations
@@ -60,7 +63,7 @@ def read_measured(measured_py: Path = MEASURED_PY, enums_py: Path = ENUMS_PY) ->
 
     The plan job runs before any wheel exists, and importing the package
     would load the native extension. Returns
-    ``{adapter: [{"distribution", "minors", "known_bad"}, ...]}``.
+    ``{adapter: [{"distribution", "minors", "known_bad", "since"}, ...]}``.
     """
     names: dict[str, str] = {}
     for node in ast.walk(ast.parse(enums_py.read_text(encoding="utf-8"))):
@@ -83,6 +86,7 @@ def read_measured(measured_py: Path = MEASURED_PY, enums_py: Path = ENUMS_PY) ->
                         "distribution": args[0],
                         "minors": tuple(args[1]) if len(args) > 1 else tuple(kwargs["minors"]),
                         "known_bad": tuple(kwargs.get("known_bad", ())),
+                        "since": kwargs.get("since", ""),
                     }
                 )
             table[names[key.attr]] = entries
@@ -183,15 +187,30 @@ def _line(version: str, width: int) -> str:
     return ".".join(version.split(".")[:width])
 
 
-def _claimed(finals: dict, entry: dict) -> list[str]:
-    def inside(version: str) -> bool:
-        parts = version.split(".")
-        two = ".".join(parts[:2])
-        return (two in entry["minors"] or parts[0] in entry["minors"]) and (
-            version not in entry["known_bad"]
-        )
+def claims(entry: dict, version: str) -> bool:
+    """Whether the table calls final release `version` tested. The rule `is_measured` applies."""
+    parts = version.split(".")
+    two = ".".join(parts[:2])
+    if version in entry["known_bad"]:
+        return False
+    if entry.get("since") and vkey(version) < vkey(entry["since"]):
+        return False
+    return two in entry["minors"] or parts[0] in entry["minors"]
 
-    return sorted((v for v in finals if inside(v)), key=vkey)
+
+def spelled(entry: dict) -> str:
+    """The tested range as the SDK says it to a user: "0.22.x, 0.23.x", "2.x from 2.54"."""
+    since = entry.get("since") or ""
+    return ", ".join(
+        f"{minor}.x from {since}"
+        if since == minor or since.startswith(f"{minor}.")
+        else f"{minor}.x"
+        for minor in entry["minors"]
+    )
+
+
+def _claimed(finals: dict, entry: dict) -> list[str]:
+    return sorted((v for v in finals if claims(entry, v)), key=vkey)
 
 
 def _python_for(finals: dict, version: str, prefer: str) -> str | None:
@@ -220,8 +239,13 @@ def _prerelease_ahead(releases: list[dict], finals: dict, cutoff: str) -> str | 
     return ahead[-1] if ahead else None
 
 
-def plan_adapter(name: str, entries: list[dict], releases: dict, cutoff: str) -> dict:
-    """One adapter's points and the facts the report states about it."""
+def plan_adapter(
+    name: str, entries: list[dict], releases: dict, cutoff: str, displaced: list[dict] | None = None
+) -> dict:
+    """One adapter's points and the facts the report states about it.
+
+    `displaced` is what the last report remembered: releases that failed as a
+    point and are no longer picked by the rules above."""
     spec = manifest.ADAPTERS[name]
     primary, companions = entries[0], entries[1:]
     finals = _finals(releases[primary["distribution"]], cutoff)
@@ -231,6 +255,12 @@ def plan_adapter(name: str, entries: list[dict], releases: dict, cutoff: str) ->
         "evidence": spec["evidence"],
         "replay_of": spec["replay_of"],
         "claim": {entry["distribution"]: list(entry["minors"]) for entry in entries},
+        "said": {entry["distribution"]: spelled(entry) for entry in entries},
+        # The table's own rows, so the report can ask whether a release is still claimed.
+        "entries": [
+            {**entry, "minors": list(entry["minors"]), "known_bad": list(entry["known_bad"])}
+            for entry in entries
+        ],
         "newest": max(finals, key=vkey) if finals else None,
         "prerelease_ahead": _prerelease_ahead(releases[primary["distribution"]], finals, cutoff),
         # A problem means the adapter could not be planned and turns the run red. A note is
@@ -325,11 +355,31 @@ def plan_adapter(name: str, entries: list[dict], releases: dict, cutoff: str) ->
     beyond_lines = sorted({_line(v, width) for v in above}, key=vkey)[-manifest.BEYOND_LIMIT :]
     for line in beyond_lines:
         add("beyond", [v for v in above if _line(v, width) == line][-1], newest_py, line=line)
+
+    for item in displaced or ():
+        targets, python = item.get("targets") or {}, item.get("python")
+        version = targets.get(primary["distribution"])
+        # No longer claimed (listed as bad, withdrawn, the range moved): nothing left to prove.
+        if version not in claimed or python not in manifest.SUPPORTED_PYTHONS:
+            continue
+        pins = {dist: v for dist, v in targets.items() if dist != primary["distribution"]}
+        if any(v not in companion_finals.get(dist, {}) for dist, v in pins.items()):
+            continue
+        # One of the rules above picks it again today: that point speaks for it.
+        if any(p["targets"] == targets and p["python"] == python for p in points):
+            continue
+        add("displaced", version, python, pins=pins, line=displaced_line(targets, python))
     return {"info": info, "points": points}
 
 
-def build_plan(measured: dict, releases: dict, cutoff: str) -> dict:
+def displaced_line(targets: dict, python: str) -> str:
+    """The last part of a displaced point's key: the release and the interpreter it failed on."""
+    return "-".join([*targets.values(), f"py{python}"])
+
+
+def build_plan(measured: dict, releases: dict, cutoff: str, state: dict | None = None) -> dict:
     adapters, points, problems = {}, [], []
+    remembered = (state or {}).get("displaced") or {}
     for name, entries in sorted(measured.items()):
         if not entries:
             if name not in manifest.REPLAY_ONLY:
@@ -338,7 +388,7 @@ def build_plan(measured: dict, releases: dict, cutoff: str) -> dict:
         if name not in manifest.ADAPTERS:
             problems.append(f"{name} is in the table of tested versions but not in the manifest")
             continue
-        planned = plan_adapter(name, entries, releases, cutoff)
+        planned = plan_adapter(name, entries, releases, cutoff, remembered.get(name))
         adapters[name] = planned["info"]
         points.extend(planned["points"])
     return {
@@ -356,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="where to write plan.json")
     parser.add_argument("--cutoff", help="UTC instant (ISO 8601); default now")
     parser.add_argument("--only", help="plan one adapter only")
+    parser.add_argument("--state", help="state.json of the records branch, when there is one")
     args = parser.parse_args(argv)
 
     cutoff = iso(parse_iso(args.cutoff)) if args.cutoff else iso(datetime.now(timezone.utc))
@@ -367,7 +418,9 @@ def main(argv: list[str] | None = None) -> int:
         for entries in measured.values()
         for entry in entries
     }
-    plan = build_plan(measured, releases, cutoff)
+    state_file = Path(args.state) if args.state else None
+    state = json.loads(state_file.read_text("utf-8")) if state_file and state_file.is_file() else {}
+    plan = build_plan(measured, releases, cutoff, state)
     # A plan of one adapter says nothing about the others; the report must not read it
     # as the whole run.
     plan["partial"] = bool(args.only)

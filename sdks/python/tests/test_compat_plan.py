@@ -156,6 +156,103 @@ def test_a_whole_major_claim_has_no_per_line_points_and_looks_above_by_major():
     }
 
 
+def test_a_range_tested_from_a_release_on_has_its_floor_there():
+    """The table can say a range is tested from one release on. Nothing below it is a
+    point, because nothing below it is claimed."""
+    entries = [
+        {"distribution": "pydantic-ai-slim", "minors": ("2",), "known_bad": (), "since": "2.54"}
+    ]
+    history = {
+        "pydantic-ai-slim": [
+            _release("2.0.0", "2026-06-23"),
+            _release("2.53.0", "2026-10-02"),
+            _release("2.54.0", "2026-10-03"),
+            _release("2.74.0", "2026-11-25", python=">=3.11"),
+        ]
+    }
+    points = _points(entries, history, "pydantic_ai")
+    assert {key: p["targets"]["pydantic-ai-slim"] for key, p in points.items()} == {
+        "pydantic_ai--floor": "2.54.0",
+        "pydantic_ai--claim_top": "2.74.0",
+        "pydantic_ai--claim_top_oldpy": "2.54.0",
+    }
+    assert plan.claims(entries[0], "2.54.0")
+    assert not plan.claims(entries[0], "2.53.0")
+
+
+# --- a failed release that a newer one replaced --------------------------------
+
+_WITH_023_0 = {
+    "openai-agents": [
+        _release("0.22.0", "2026-08-19"),
+        _release("0.23.0", "2026-09-30"),
+        _release("0.23.1", "2026-10-02"),
+    ]
+}
+
+
+def _remembered(version: str, python: str = "3.14") -> dict:
+    targets = {"openai-agents": version}
+    return {
+        "key": f"openai_agents--displaced--{plan.displaced_line(targets, python)}",
+        "targets": targets,
+        "python": python,
+        "failed_on": "2026-11-25",
+    }
+
+
+def test_a_failed_release_that_a_newer_one_replaced_keeps_a_point_of_its_own():
+    """The newest release of a line is a point only while it is the newest. One that
+    failed there is still inside the range the README calls tested, so it stays a point."""
+    item = _remembered("0.23.0")
+    planned = plan.plan_adapter("openai_agents", _OPENAI, _WITH_023_0, _CUTOFF, [item])
+    (point,) = [p for p in planned["points"] if p["role"] == "displaced"]
+    assert point["key"] == item["key"] == "openai_agents--displaced--0.23.0-py3.14"
+    assert point["targets"] == {"openai-agents": "0.23.0"}
+    assert (point["python"], point["in_claim"], point["assume_measured"]) == ("3.14", True, False)
+    assert point["cutoff"] == _CUTOFF
+
+    whole = plan.build_plan(
+        {"openai_agents": _OPENAI}, _WITH_023_0, _CUTOFF, {"displaced": {"openai_agents": [item]}}
+    )
+    assert item["key"] in {p["key"] for p in whole["points"]}
+
+
+@pytest.mark.parametrize(
+    ("entries", "item"),
+    [
+        ([{**_OPENAI[0], "known_bad": ("0.23.0",)}], _remembered("0.23.0")),
+        ([{**_OPENAI[0], "since": "0.23.1"}], _remembered("0.23.0")),
+        (_OPENAI, _remembered("0.21.9")),
+        (_OPENAI, _remembered("0.23.7")),
+        (_OPENAI, _remembered("0.23.0", python="2.7")),
+        (_OPENAI, {"key": "x", "targets": {}, "python": "3.14"}),
+    ],
+    ids=[
+        "listed-as-bad",
+        "range-starts-later",
+        "outside-the-range",
+        "not-on-the-index",
+        "no-such-interpreter",
+        "names-no-release",
+    ],
+)
+def test_a_remembered_release_that_is_no_longer_claimed_is_not_planned(entries, item):
+    planned = plan.plan_adapter("openai_agents", entries, _WITH_023_0, _CUTOFF, [item])
+    assert [p for p in planned["points"] if p["role"] == "displaced"] == []
+    assert planned["info"]["problems"] == []
+
+
+def test_a_remembered_release_a_rule_picks_again_gets_no_second_point():
+    planned = plan.plan_adapter(
+        "openai_agents", _OPENAI, _WITH_023_0, _CUTOFF, [_remembered("0.23.1")]
+    )
+    assert [p["key"] for p in planned["points"] if p["targets"] == {"openai-agents": "0.23.1"}] == [
+        "openai_agents--claim_top",
+        "openai_agents--claim_top_oldpy",
+    ]
+
+
 def test_a_point_falls_back_to_the_nearest_interpreter_its_release_admits():
     entries = [{"distribution": "pydantic-ai-slim", "minors": ("2",), "known_bad": ()}]
     history = {
@@ -289,12 +386,26 @@ def test_the_plan_reads_the_table_the_sdk_ships():
                 "distribution": entry.distribution,
                 "minors": entry.minors,
                 "known_bad": entry.known_bad,
+                "since": entry.since,
             }
             for entry in entries
         ]
         for name, entries in MEASURED.items()
     }
     assert plan.read_measured() == shipped
+
+
+def test_the_plan_spells_a_tested_range_as_the_sdk_does():
+    """The issue and the line `init()` prints name the same range, in the same words."""
+    made = [
+        _measured.Measured("x", ("0.22", "0.23")),
+        _measured.Measured("x", ("0.22", "0.23"), since="0.22.3"),
+        _measured.Measured("x", ("2",), since="2.54"),
+        *(entry for entries in MEASURED.values() for entry in entries),
+    ]
+    for entry in made:
+        row = {"minors": entry.minors, "since": entry.since}
+        assert plan.spelled(row) == _measured.spelled(entry), entry
 
 
 def test_every_adapter_in_the_table_is_run_or_named_as_replay_only():
@@ -314,7 +425,6 @@ _SEVERAL = (
     "exercises several frameworks in one process, so no single-framework environment holds it"
 )
 _NOT_AT_A_POINT = {
-    "test_adapter_envelopes.py": _SEVERAL,
     "test_adapter_install_on_import.py": _SEVERAL,
     "test_adapter_registry.py": _SEVERAL,
     "test_strict_mode.py": _SEVERAL,
@@ -409,6 +519,56 @@ def test_the_switch_measures_an_installed_release_outside_the_table(monkeypatch)
     finally:
         MEASURED.update(before)
     assert MEASURED[AdapterName.OPENAI_AGENTS] == (entry,)
+
+
+# --- a fork that inherits the workflows -----------------------------------------
+
+_UPSTREAM = "github.repository == 'wardex-labs/wardex-sdk'"
+
+
+def _jobs(workflow: str) -> dict[str, str]:
+    """`job id -> its text`, read as text: the suite has no YAML parser on its floor."""
+    text = (_REPO / ".github/workflows" / workflow).read_text(encoding="utf-8")
+    parts = re.split(r"^  ([a-z_]+):\n", text.split("\njobs:\n")[1], flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+def test_the_upstream_the_workflows_name_is_the_repository_the_package_names():
+    urls = (_REPO / "sdks/python/pyproject.toml").read_text(encoding="utf-8")
+    assert 'Repository = "https://github.com/wardex-labs/wardex-sdk"' in urls
+
+
+def test_a_fork_starts_no_scheduled_run_and_writes_no_issue_or_record():
+    """A fork inherits the workflow files and their schedules. It must not grow issues
+    and a records branch of its own, and a run a contributor starts there by hand still
+    has to work, reporting to its own summary."""
+    jobs = _jobs("compat.yml")
+    for name in ("plan", "wheel"):
+        assert f"    if: github.event_name != 'schedule' || {_UPSTREAM}\n" in jobs[name], name
+    assert "needs: [plan, wheel]" in jobs["point"], "skipped with the plan"
+    assert "if: always() && needs.plan.result != 'skipped'" in jobs["report"]
+    (write,) = re.findall(r"WRITE: \$\{\{ (.*) \}\}", jobs["report"])
+    assert write == f"github.ref == 'refs/heads/main' && {_UPSTREAM} && '1' || ''"
+    (commit,) = re.findall(r"if: (.*steps\.report\.outputs\.judged == 'true')", jobs["report"])
+    assert _UPSTREAM in commit
+    died = " ".join(jobs["died"].split("steps:")[0].split())
+    assert f"github.ref == 'refs/heads/main' && {_UPSTREAM}" in died
+    assert "needs.plan.result != 'skipped'" in died
+
+    watch = " ".join(_jobs("compat-watchdog.yml")["watch"].split("steps:")[0].split())
+    assert f"if: >- {_UPSTREAM} &&" in watch
+
+
+def test_only_the_report_and_the_two_alarm_jobs_may_write():
+    """A point runs framework code published the same day. Nothing but the jobs that
+    install nothing may hold a token that can write."""
+    writers = {
+        name
+        for workflow in ("compat.yml", "compat-watchdog.yml")
+        for name, text in _jobs(workflow).items()
+        if re.search(r"^      \w+: write$", text, flags=re.M)
+    }
+    assert writers == {"report", "died", "watch"}
 
 
 # --- the release workflow's list of what it publishes ---------------------------

@@ -22,6 +22,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from compat.plan import claims, displaced_line  # noqa: E402
+
 SCHEMA = 1
 LABEL = "compat"
 #: The exit code of a run judged red. Its own number, so the workflow can tell a verdict
@@ -32,6 +37,9 @@ RED = frozenset({"fail", "attach_failed", "no_result", "harness_error", "skips_c
 #: Nothing wardex or its tests did: reported only once it has lasted two days running.
 NOT_OURS = frozenset({"install_network", "not_installable", "framework_import_error"})
 GREEN = frozenset({"pass", "flaky"})
+#: The release itself was run and did not hold. The other red states say only that it
+#: could not be looked at, which is no reason to keep running it once it is replaced.
+FAILED = frozenset({"fail", "attach_failed", "skips_changed"})
 _UNSAFE = re.compile(r"[^A-Za-z0-9 _./:\[\]()=,<>+*#-]")
 
 ROLE_WORDS = {
@@ -40,6 +48,7 @@ ROLE_WORDS = {
     "claim_top": "newest tested release",
     "claim_top_oldpy": "newest tested release, oldest Python",
     "beyond": "newer than the tested range",
+    "displaced": "failed as the newest tested release, since replaced",
 }
 OUTCOME_WORDS = {
     "pass": "pass",
@@ -135,6 +144,7 @@ def load_results(plan: dict, results_dir: Path) -> dict[str, dict]:
         if problem:
             data = {"outcome": "no_result", "note": problem}
         data.update({k: point[k] for k in ("key", "adapter", "role", "targets", "in_claim")})
+        data["planned_python"] = point.get("python", "")
         data.setdefault("cause", None)
         results[key] = data
     return results
@@ -273,8 +283,60 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
     return lines
 
 
-def next_state(state: dict, results: dict[str, dict], run: dict, results_dir: Path) -> dict:
-    """The small file the next run reads: each point's last record, last check and last pass."""
+def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
+    """Releases inside the tested range that failed and that no rule picks any more.
+
+    The newest release of a line is a point only while it is the newest. One
+    that fails there and is then replaced by a newer patch would drop out of
+    every later run while the README still calls it tested. It is remembered
+    here and the next plan makes it a point of its own. It leaves the list when
+    that point passes, or when the plan stops making the point: the table lists
+    the release as bad, the range no longer holds it, or the index withdrew it.
+    """
+    kept: dict[str, list[dict]] = {}
+    for adapter, items in (state.get("displaced") or {}).items():
+        info = plan["adapters"].get(adapter)
+        if info is None or info["problems"]:
+            # A run that did not plan this adapter in full has no say about its list.
+            kept[adapter] = list(items)
+            continue
+        for item in items:
+            result = results.get(item["key"])
+            if result is not None and result["outcome"] not in GREEN:
+                kept.setdefault(adapter, []).append(item)
+    for key, result in sorted(results.items()):
+        before = state.get("points", {}).get(key, {}).get("last_checked") or {}
+        entries = plan["adapters"].get(result["adapter"], {}).get("entries") or []
+        if (
+            not result["in_claim"]
+            or result["role"] == "displaced"
+            or before.get("outcome") not in FAILED
+            or before.get("targets") == result["targets"]
+            or not entries
+        ):
+            continue
+        version = before["targets"].get(entries[0]["distribution"])
+        # A range narrowed past the release, or a release now listed as bad, is settled.
+        if not isinstance(version, str) or not claims(entries[0], version):
+            continue
+        python = before.get("python") or result.get("planned_python") or ""
+        item = {
+            "key": f"{result['adapter']}--displaced--{displaced_line(before['targets'], python)}",
+            "targets": before["targets"],
+            "python": python,
+            "failed_on": before["date"],
+        }
+        mine = kept.setdefault(result["adapter"], [])
+        if all(other["key"] != item["key"] for other in mine):
+            mine.append(item)
+    return {adapter: items for adapter, items in sorted(kept.items()) if items}
+
+
+def next_state(
+    state: dict, results: dict[str, dict], run: dict, results_dir: Path, plan: dict | None = None
+) -> dict:
+    """The small file the next run reads: each point's last record, last check and last pass,
+    and the failed releases a newer one has replaced."""
     points = dict(state.get("points", {}))
     locks: dict[str, Path] = {}
     for key, result in results.items():
@@ -287,6 +349,10 @@ def next_state(state: dict, results: dict[str, dict], run: dict, results_dir: Pa
             "targets": result["targets"],
             "url": run["url"],
         }
+        if (entry.get("last_checked") or {}).get("targets") not in (None, result["targets"]):
+            # What this point last said was about a release it no longer tests. Whether that
+            # release is still owed a run was settled by `next_displaced`, once.
+            del entry["last_checked"]
         if result["outcome"] in GREEN | RED and result["outcome"] != "no_result":
             # The last day this point was actually passed or failed. A later day on which it
             # could not be installed says nothing new, and must not erase what this said.
@@ -295,6 +361,7 @@ def next_state(state: dict, results: dict[str, dict], run: dict, results_dir: Pa
                 "outcome": result["outcome"],
                 "cause": result["cause"],
                 "targets": result["targets"],
+                "python": result.get("planned_python"),
                 "failed_ids": tests.get("failed_ids", []),
             }
         # Days, not runs: a second run on the same day is the same outage seen twice.
@@ -319,6 +386,9 @@ def next_state(state: dict, results: dict[str, dict], run: dict, results_dir: Pa
             locks[key] = lock
         points[key] = entry
     out = {"schema": SCHEMA, "points": points, "last_scheduled": state.get("last_scheduled")}
+    out["displaced"] = (
+        next_displaced(state, plan, results) if plan else state.get("displaced") or {}
+    )
     if run["event"] == "schedule":
         out["last_scheduled"] = run["started_at"]
     out["_locks"] = locks
@@ -389,10 +459,18 @@ def adapter_issue(
             what = OUTCOME_WORDS[outcome]
         if result["in_claim"] and outcome in RED:
             cause = CAUSE_WORDS.get(result["cause"], "not determined")
+            closes = (
+                "This closes when it passes again, or when the tested range no longer claims it."
+            )
+            if result["role"] == "displaced":
+                closes = (
+                    "A newer release has taken its place, so no other point tests it. This "
+                    "closes when it passes again, or when the table of tested versions lists "
+                    "it under `known_bad`."
+                )
             todo.append(
                 f"{version} is inside the tested range and does not pass: {what}. "
-                f"Cause: {cause}. This closes when it passes again, "
-                "or when the tested range no longer claims it."
+                f"Cause: {cause}. {closes}"
             )
         elif result["in_claim"] and outcome not in GREEN:
             # Not checked today. What it said when it last was checked still stands.
@@ -425,8 +503,22 @@ def adapter_issue(
         if nodes:
             failing.append((result, nodes))
 
+    for item in (state or {}).get("displaced", {}).get(name, []):
+        if item["key"] in results:
+            continue
+        # Remembered by this run; the next plan is the first to make it a point.
+        version = code(", ".join(f"{dist} {v}" for dist, v in item["targets"].items()))
+        todo.append(
+            f"{version} is inside the tested range and did not pass when it was last run, on "
+            f"{code(item['failed_on'])}. A newer release has taken its place, so it is run on "
+            "its own from the next run on. This closes when it passes, or when the table of "
+            "tested versions lists it under `known_bad`."
+        )
+        marks.append([item["key"], "displaced", None, []])
+
+    said = info.get("said") or {}
     claim = "; ".join(
-        f"{code(dist)} " + ", ".join(f"{line}.x" for line in lines)
+        f"{code(dist)} " + clean(said.get(dist) or ", ".join(f"{line}.x" for line in lines), 80)
         for dist, lines in info["claim"].items()
     )
     body = [
@@ -743,7 +835,7 @@ def main(argv: list[str] | None = None) -> int:
     results = load_results(plan, results_dir)
     apply_skip_rule(results, state)
     reasons = judge(plan, results)
-    new_state = next_state(state, results, run, results_dir)
+    new_state = next_state(state, results, run, results_dir, plan)
     locks = new_state.pop("_locks")
 
     gh = GitHub(os.environ.get("GITHUB_REPOSITORY", ""), write=args.write)
