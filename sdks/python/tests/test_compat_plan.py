@@ -31,6 +31,13 @@ from compat import point as point_runner  # noqa: E402
 
 _TESTS = Path(__file__).parent
 _CUTOFF = "2026-11-26T00:00:00Z"
+_NOTHING_PUBLISHED = {"problems": [], "points": [], "adapters": {}}
+
+
+@pytest.fixture(autouse=True)
+def _no_published_release(monkeypatch):
+    """No test here reaches PyPI or a tag unless it says so."""
+    monkeypatch.setattr(plan, "fetch_published", lambda cutoff, only=None: _NOTHING_PUBLISHED)
 
 
 def _release(version: str, day: str, *, python: str = ">=3.10", yanked: bool = False) -> dict:
@@ -738,7 +745,9 @@ def test_a_kind_that_is_not_red_capable_is_planned_watching(monkeypatch):
     assert again["watching"] is False
 
 
-def _runner(tmp_path, planned: dict, monkeypatch) -> tuple[point_runner.Point, list]:
+def _runner(
+    tmp_path, planned: dict, monkeypatch, tests_tree: str | None = None
+) -> tuple[point_runner.Point, list]:
     """A point runner over one planned point, with every command it would run captured."""
     (tmp_path / "dist").mkdir()
     (tmp_path / "dist" / "wardex_sdk-0.0.0-py3-none-any.whl").write_bytes(b"not a wheel")
@@ -751,11 +760,13 @@ def _runner(tmp_path, planned: dict, monkeypatch) -> tuple[point_runner.Point, l
         work=str(tmp_path / "work"),
         out=str(tmp_path / "out"),
         last_green_lock=None,
+        tests_tree=tests_tree,
     )
     ran: list = []
 
     def run(cmd, *, cwd=None, env=None, timeout=900):
-        ran.append({"cmd": [str(part) for part in cmd], "env": env, "timeout": timeout})
+        call = {"cmd": [str(part) for part in cmd], "env": env, "timeout": timeout, "cwd": cwd}
+        ran.append(call)
         return 0, "", ""
 
     monkeypatch.setattr(point_runner, "run", run)
@@ -848,6 +859,7 @@ def test_the_executor_cannot_ask_what_kind_of_point_it_runs(tmp_path, monkeypatc
         lines = runner._requirements((0,)).replace(str(where), "<work>")
         for call in ran:
             call["cmd"] = [part.replace(str(where), "<work>") for part in call["cmd"]]
+            call["cwd"] = str(call["cwd"]).replace(str(where), "<work>")
             call.pop("timeout")
         return [lines, ran]
 
@@ -873,8 +885,10 @@ def test_a_plan_says_what_it_speaks_for(tmp_path, monkeypatch):
         "cadence": "daily",
         "covers": {"framework": ["openai_agents"]},
         "partial": False,
+        "builds": {},
     }
     assert whole["schema"] == model.SCHEMA == 2
+    assert whole["published"] is None and whole["unplanned"] == []
 
     unlisted = {"openai-agents": [_release("0.30.0", "2026-11-01")]}
     short = plan.build_plan({"openai_agents": _OPENAI}, unlisted, _CUTOFF)
@@ -971,3 +985,363 @@ def test_the_release_publishes_exactly_the_artifacts_its_build_matrix_uploads():
     assert len(built) == 5
     assert set(re.findall(r"name: (wheels-[\w.-]+)", publish)) == built
     assert "pattern:" not in publish
+
+
+# --- the published release -------------------------------------------------------
+
+_TAG = {
+    "ref": "python-v0.7.0b1",
+    "commit": "77b59d9" + "0" * 33,
+    "table": {
+        "openai_agents": _OPENAI,
+        "codex_exec": [],
+        "an_adapter_this_checkout_dropped": [
+            {"distribution": "gone", "minors": ("1",), "known_bad": ()}
+        ],
+    },
+    "tests": ["conftest.py", "test_openai_agents_adapter.py", "test_unrelated.py"],
+}
+
+
+def _file(day: str, *, yanked: bool = False) -> dict:
+    return {"uploaded": f"{day}T12:00:00Z", "yanked": yanked, "requires_python": ">=3.10"}
+
+
+@pytest.mark.parametrize(
+    "served, newest",
+    [
+        ({"0.6.0b2": "2026-10-01", "0.7.0b1": "2026-11-20", "0.7.0b10": "2026-11-21"}, "0.7.0b10"),
+        ({"0.7.0rc1": "2026-11-01", "0.7.0": "2026-11-02", "0.7.1b1": "2026-11-03"}, "0.7.1b1"),
+        ({"0.7.0": "2026-11-02", "0.7.0rc2": "2026-11-03", "0.7.0b9": "2026-11-04"}, "0.7.0"),
+        ({"0.7.0b1": "2026-11-20", "0.8.0": "2026-11-27"}, "0.7.0b1"),
+        (
+            {"0.7.0b1": "2026-11-20", "0.8.0.dev1": "2026-11-21", "1.0.post1": "2026-11-21"},
+            "0.7.0b1",
+        ),
+        ({}, None),
+    ],
+)
+def test_the_newest_wardex_release_counts_pre_releases_and_ranks_a_final_above_them(served, newest):
+    """What `pip install --pre` gives is what a user has, and so far every release is one.
+    A release uploaded after the run's instant does not exist for the run."""
+    releases = [{"version": v, "files": [_file(day)]} for v, day in served.items()]
+    assert plan.newest_wardex(releases, _CUTOFF) == newest
+
+
+def test_a_yanked_wardex_release_is_not_the_newest():
+    releases = [
+        {"version": "0.7.0b1", "files": [_file("2026-11-20")]},
+        {"version": "0.7.0b2", "files": [_file("2026-11-21", yanked=True)]},
+    ]
+    assert plan.newest_wardex(releases, _CUTOFF) == "0.7.0b1"
+
+
+def test_the_published_release_is_run_on_the_top_of_its_own_range_and_the_newest_above_it():
+    """Two points an adapter: the newest release the release's own table claims, and the
+    newest one above that range. Picked by the rule that plans a framework point; what
+    differs is in the point, which is why the executor needs no branch for it."""
+    made = plan.plan_published("0.7.0b1", _TAG, _OPENAI_HISTORY, _CUTOFF)
+    assert sorted(made["adapters"]) == ["openai_agents"], "only what both sides know"
+    top, above = made["points"]
+    assert (top["key"], above["key"]) == (
+        "published--0.7.0b1--openai_agents--claim_top",
+        "published--0.7.0b1--openai_agents--beyond--0.26",
+    )
+    assert (top["targets"], above["targets"]) == (
+        {"openai-agents": "0.23.1"},
+        {"openai-agents": "0.26.1"},
+    )
+    assert (top["in_claim"], above["in_claim"]) == (True, False)
+    assert (top["assume_measured"], above["assume_measured"]) == (False, True)
+    framework = {p["key"]: p for p in _points(_OPENAI, _OPENAI_HISTORY).values()}
+    for point, twin in ((top, "openai_agents--claim_top"), (above, "openai_agents--beyond--0.26")):
+        assert (point["kind"], point["subject"], point["watching"]) == (
+            "published",
+            "openai_agents",
+            True,
+        )
+        assert point["sdk"] == {
+            "origin": "pypi",
+            "version": "0.7.0b1",
+            "ref": "python-v0.7.0b1",
+            "commit": _TAG["commit"],
+        }
+        assert point["fresh_days"] == kinds.KINDS["published"].fresh_days
+        same = ("install", "probe", "check", "python", "cutoff", "role", "adapter", "budget_s")
+        assert {k: point[k] for k in same} == {k: framework[twin][k] for k in same}
+
+
+def test_a_release_whose_tag_holds_none_of_an_adapters_tests_is_said_and_not_run():
+    tag = {**_TAG, "tests": ["conftest.py", "test_unrelated.py"]}
+    made = plan.plan_published("0.7.0b1", tag, _OPENAI_HISTORY, _CUTOFF)
+    assert made["points"] == []
+    assert made["adapters"]["openai_agents"]["problems"] == [
+        "the tag python-v0.7.0b1 holds none of its test files"
+    ]
+
+
+def test_published_points_join_the_plan_and_their_problems_never_reach_the_verdict():
+    published = {"problems": [], **plan.plan_published("0.7.0b1", _TAG, _OPENAI_HISTORY, _CUTOFF)}
+    made = plan.build_plan(
+        {"openai_agents": _OPENAI}, _OPENAI_HISTORY, _CUTOFF, published=published
+    )
+    keys = [p["key"] for p in made["points"]]
+    assert keys[-2:] == [p["key"] for p in published["points"]] and len(keys) == len(set(keys))
+    assert made["published"] == {
+        "version": "0.7.0b1",
+        "ref": "python-v0.7.0b1",
+        "commit": _TAG["commit"],
+        "adapters": published["adapters"],
+    }
+    assert made["scope"]["covers"]["published"] == ["openai_agents"]
+    assert made["scope"]["builds"] == {"published": ["0.7.0b1"]}
+    assert made["problems"] == [] and made["unplanned"] == []
+
+    broken = {**_TAG, "tests": []}
+    cannot = {"problems": [], **plan.plan_published("0.7.0b1", broken, _OPENAI_HISTORY, _CUTOFF)}
+    made = plan.build_plan({"openai_agents": _OPENAI}, _OPENAI_HISTORY, _CUTOFF, published=cannot)
+    assert made["problems"] == [], "a watching kind that cannot be planned is not a red run"
+    assert made["unplanned"] == [
+        "published: openai_agents: the tag python-v0.7.0b1 holds none of its test files"
+    ]
+    assert made["scope"]["covers"]["published"] == [], "and it forgets nothing"
+
+    unread = {"problems": ["the newest wardex release could not be read (OSError)"]}
+    made = plan.build_plan({"openai_agents": _OPENAI}, _OPENAI_HISTORY, _CUTOFF, published=unread)
+    assert made["published"] is None and "published" not in made["scope"]["covers"]
+    assert made["unplanned"] == ["published: the newest wardex release could not be read (OSError)"]
+
+    weekly = plan.build_plan(
+        {"openai_agents": _OPENAI}, _OPENAI_HISTORY, _CUTOFF, cadence="weekly", published=published
+    )
+    assert weekly["points"] == [] and weekly["published"] is None
+
+
+def test_a_day_the_release_cannot_be_read_is_said_and_never_raised(monkeypatch):
+    monkeypatch.undo()
+
+    def down(distribution):
+        raise OSError("no route")
+
+    monkeypatch.setattr(plan, "fetch_releases", down)
+    assert plan.fetch_published(_CUTOFF) == {
+        "problems": ["the newest wardex release could not be read (OSError)"],
+        "points": [],
+        "adapters": {},
+    }
+    monkeypatch.setattr(plan, "fetch_releases", lambda distribution: [])
+    assert plan.fetch_published(_CUTOFF)["problems"] == ["PyPI lists no wardex release"]
+
+
+def _a_tag_in_git(monkeypatch, *, held: bool, shallow: bool) -> list[tuple]:
+    """`plan._git` answered from memory: a tag that is here, or one that must be fetched."""
+    calls: list[tuple] = []
+    fetched = {"done": held}
+    measured = (_REPO / "sdks/python/src/wardex_sdk/_adapters/_measured.py").read_text("utf-8")
+    enums = (_REPO / "sdks/python/src/wardex_sdk/_enums.py").read_text("utf-8")
+
+    def git(*args: str) -> str:
+        calls.append(args)
+        if args[0] == "rev-parse" and "--is-shallow-repository" in args:
+            return "true\n" if shallow else "false\n"
+        if args[0] == "rev-parse":
+            if not fetched["done"]:
+                raise plan.subprocess.CalledProcessError(1, "git")
+            return "c0ffee" + "0" * 34 + "\n"
+        if args[0] == "fetch":
+            fetched["done"] = True
+            return ""
+        if args[0] == "show":
+            return measured if args[1].endswith("_measured.py") else enums
+        if args[0] == "ls-tree":
+            return "test_b.py\nconftest.py\ntest_a.py\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(plan, "_git", git)
+    return calls
+
+
+def test_a_release_is_read_from_its_own_tag(monkeypatch):
+    """Its table and its test files, at the tag's commit: the README a user of that release
+    reads is that tag's, whatever this checkout says today."""
+    calls = _a_tag_in_git(monkeypatch, held=True, shallow=False)
+    tag = plan.read_tag("0.7.0b1")
+    commit = "c0ffee" + "0" * 34
+    assert (tag["ref"], tag["commit"]) == ("python-v0.7.0b1", commit)
+    assert tag["table"] == plan.read_measured() and tag["tests"] == [
+        "conftest.py",
+        "test_a.py",
+        "test_b.py",
+    ]
+    assert not any(call[0] == "fetch" for call in calls)
+    shown = [call[-1] for call in calls if call[0] in ("show", "ls-tree")]
+    assert len(shown) == 3
+    assert all(path.startswith(f"{commit}:") for path in shown), "the commit, not a moving name"
+
+
+@pytest.mark.parametrize("shallow", [True, False])
+def test_a_tag_the_checkout_does_not_hold_is_fetched_without_cutting_a_full_clone(
+    monkeypatch, shallow
+):
+    calls = _a_tag_in_git(monkeypatch, held=False, shallow=shallow)
+    assert plan.read_tag("0.7.0b1")["commit"].startswith("c0ffee")
+    (fetch,) = [call for call in calls if call[0] == "fetch"]
+    assert fetch[-2:] == ("origin", "refs/tags/python-v0.7.0b1:refs/tags/python-v0.7.0b1")
+    assert ("--depth" in fetch) is shallow
+
+
+def test_the_matrix_tells_a_point_job_whose_tests_to_check_out(tmp_path, monkeypatch):
+    published = {"problems": [], **plan.plan_published("0.7.0b1", _TAG, _OPENAI_HISTORY, _CUTOFF)}
+    monkeypatch.setattr(plan, "fetch_published", lambda cutoff, only=None: published)
+    monkeypatch.setattr(plan, "read_measured", lambda: {"openai_agents": _OPENAI})
+    monkeypatch.setattr(plan, "fetch_releases", lambda dist: _OPENAI_HISTORY[dist])
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert plan.main(["--out", str(tmp_path / "plan.json"), "--cutoff", _CUTOFF]) == 0
+    matrix = json.loads(output.read_text().removeprefix("matrix="))["include"]
+    trees = {row["key"]: row["tree"] for row in matrix}
+    assert trees["openai_agents--claim_top"] == ""
+    assert trees["published--0.7.0b1--openai_agents--claim_top"] == _TAG["commit"]
+    assert all(set(row) == {"key", "python", "tree"} for row in matrix)
+
+
+def _published_point(role: str = "claim_top") -> dict:
+    made = plan.plan_published("0.7.0b1", _TAG, _OPENAI_HISTORY, _CUTOFF)
+    return next(p for p in made["points"] if p["role"] == role)
+
+
+def test_a_published_point_installs_the_release_from_pypi_and_runs_its_tags_tests(
+    tmp_path, monkeypatch
+):
+    tree = tmp_path / "tag"
+    (tree / "sdks/python/tests").mkdir(parents=True)
+    for name in ("test_openai_agents_adapter.py", "test_langgraph_adapter.py"):
+        (tree / "sdks/python/tests" / name).write_text("", encoding="utf-8")
+    runner, ran = _runner(tmp_path, _published_point(), monkeypatch, tests_tree=str(tree))
+    (tmp_path / "dist" / "wardex_sdk-0.0.0-py3-none-any.whl").unlink()
+
+    wanted = runner._requirements(()).splitlines()
+    assert wanted[0] == "wardex-sdk==0.7.0b1" and "openai-agents==0.23.1" in wanted
+    assert not any(line.endswith(".whl") for line in wanted)
+    assert runner.result["sdk"] == {"wheel": "", "wheel_sha256": ""}
+
+    assert runner.files() == ["test_openai_agents_adapter.py"], "only what the tag holds"
+    runner.pytest(tmp_path / "venv", runner.files(), "first")
+    runner.control_import(tmp_path / "venv")
+    assert ran[0]["cwd"] == tree.resolve() and ran[0]["cmd"][3] == (
+        "sdks/python/tests/test_openai_agents_adapter.py"
+    )
+
+
+def test_a_published_point_is_never_run_with_this_checkouts_tests(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit, match="its own tests"):
+        _runner(tmp_path, _published_point(), monkeypatch)
+
+
+def test_a_published_point_that_imports_another_wardex_than_planned_is_a_broken_harness(
+    tmp_path, monkeypatch
+):
+    tree = tmp_path / "tag"
+    tree.mkdir()
+    planned = _published_point()
+    runner, _ = _runner(tmp_path, planned, monkeypatch, tests_tree=str(tree))
+    venv = tmp_path / "venv"
+
+    def seen(version: str):
+        about = {
+            "python": "3.14.2",
+            "sdk": version,
+            "file": str(venv / "lib/wardex_sdk/__init__.py"),
+            "dists": {"openai-agents": "0.23.1"},
+        }
+        return lambda cmd, **kwargs: (0, json.dumps(about), "")
+
+    monkeypatch.setattr(point_runner, "run", seen("0.7.0b1"))
+    assert runner._verify(venv) is True and runner.result["sdk"]["version"] == "0.7.0b1"
+    monkeypatch.setattr(point_runner, "run", seen("0.7.0b2"))
+    with pytest.raises(AssertionError, match="wardex 0.7.0b2 is installed, not 0.7.0b1"):
+        runner._verify(venv)
+
+
+def test_a_run_of_one_adapter_plans_the_published_points_of_that_adapter_only(monkeypatch):
+    monkeypatch.undo()
+    table = {
+        "openai_agents": _OPENAI,
+        "langgraph": [{"distribution": "langgraph", "minors": ("1.2",), "known_bad": ()}],
+    }
+    tag = {
+        **_TAG,
+        "table": table,
+        "tests": ["test_openai_agents_adapter.py", "test_langgraph_adapter.py"],
+    }
+    history = {**_OPENAI_HISTORY, "langgraph": [_release("1.2.0", "2026-08-01")]}
+    history["wardex-sdk"] = [{"version": "0.7.0b1", "files": [_file("2026-11-20")]}]
+    asked: list[str] = []
+
+    def releases(distribution: str) -> list[dict]:
+        asked.append(distribution)
+        return history[distribution]
+
+    monkeypatch.setattr(plan, "fetch_releases", releases)
+    monkeypatch.setattr(plan, "read_tag", lambda version: {**tag, "table": dict(table)})
+    one = plan.fetch_published(_CUTOFF, "openai_agents")
+    assert sorted(one["adapters"]) == ["openai_agents"] and "langgraph" not in asked
+    assert sorted(plan.fetch_published(_CUTOFF)["adapters"]) == ["langgraph", "openai_agents"]
+
+
+def test_a_published_point_is_probed_and_fingerprinted_in_its_own_tree(tmp_path, monkeypatch):
+    tree = tmp_path / "tag"
+    (tree / "sdks/python/tests").mkdir(parents=True)
+    (tree / "sdks/python/tests/test_openai_agents_adapter.py").write_text("# the tag's", "utf-8")
+    runner, _ = _runner(tmp_path, _published_point(), monkeypatch, tests_tree=str(tree))
+    venv = tmp_path / "venv"
+    seen: list = []
+
+    def run(cmd, *, cwd=None, env=None, timeout=900):
+        seen.append({"cmd": [str(part) for part in cmd], "cwd": cwd})
+        about = {"python": "3.14.2", "sdk": "0.7.0b1", "dists": {"openai-agents": "0.23.1"}}
+        about["file"] = str(venv / "lib/wardex_sdk/__init__.py")
+        return 0, json.dumps(about), ""
+
+    monkeypatch.setattr(point_runner, "run", run)
+    assert runner._verify(venv) is True
+    assert seen[0]["cwd"] == tree.resolve(), "probed where the tests will run"
+
+    monkeypatch.setattr(point_runner.Point, "install", lambda self, venv: True)
+    monkeypatch.setattr(point_runner.Point, "control_import", lambda self, venv: True)
+    monkeypatch.setattr(point_runner.Point, "attach", lambda self, venv: True)
+    passed = {"ok": True, "exit_code": 0, "seconds": 1.0, "failed_ids": [], "skipped_ids": []}
+    monkeypatch.setattr(point_runner.Point, "pytest", lambda self, venv, files, tag: dict(passed))
+    runner.deadline = point_runner.time.monotonic() + 600
+    runner._steps(venv)
+    here = _REPO / "sdks/python/tests/test_openai_agents_adapter.py"
+    theirs = point_runner.sha256(tree / "sdks/python/tests/test_openai_agents_adapter.py")
+    assert point_runner.sha256(here) != theirs
+    wanted = point_runner.hashlib.sha256(theirs.encode()).hexdigest()
+    assert runner.result["tests"]["selection_sha256"] == wanted
+
+
+def test_a_published_point_that_fails_is_replayed_with_the_release_and_never_blamed_on_wardex(
+    tmp_path, monkeypatch
+):
+    """The wheel from PyPI and the tests of its tag are what they were at the last pass.
+    If the packages of that pass fail too, no wardex change explains it."""
+    tree = tmp_path / "tag"
+    tree.mkdir()
+    runner, ran = _runner(tmp_path, _published_point(), monkeypatch, tests_tree=str(tree))
+    lock = tmp_path / "last-green.txt"
+    lock.write_text("openai-agents==0.23.1 \\\n    --hash=sha256:" + "a" * 64 + "\n", "utf-8")
+    (runner.out / "lock.txt").write_text(lock.read_text("utf-8"), "utf-8")
+    runner.last_green = lock
+    verdicts = iter([False, True])
+
+    def replay(self, venv, files, tag):
+        return {"ok": next(verdicts), "timed_out": False}
+
+    monkeypatch.setattr(point_runner.Point, "pytest", replay)
+    runner.counterfactual(["test_a.py"], ["test_a.py::test_x"])
+    install = next(call["cmd"] for call in ran if "--no-deps" in call["cmd"])
+    assert install[-1] == "wardex-sdk==0.7.0b1"
+    assert runner.result["cause"] == "not_determined"
+    runner.counterfactual(["test_a.py"], ["test_a.py::test_x"])
+    assert runner.result["cause"] == "upstream"

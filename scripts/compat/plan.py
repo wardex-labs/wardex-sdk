@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -73,14 +75,21 @@ def read_measured(measured_py: Path = MEASURED_PY, enums_py: Path = ENUMS_PY) ->
     would load the native extension. Returns
     ``{adapter: [{"distribution", "minors", "known_bad", "since"}, ...]}``.
     """
+    return parse_measured(
+        measured_py.read_text(encoding="utf-8"), enums_py.read_text(encoding="utf-8")
+    )
+
+
+def parse_measured(measured_source: str, enums_source: str) -> dict:
+    """`read_measured` on source text, so a release's table can be read from its tag."""
     names: dict[str, str] = {}
-    for node in ast.walk(ast.parse(enums_py.read_text(encoding="utf-8"))):
+    for node in ast.walk(ast.parse(enums_source)):
         if isinstance(node, ast.ClassDef) and node.name == "AdapterName":
             for stmt in node.body:
                 if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant):
                     names[stmt.targets[0].id] = stmt.value.value
     table: dict[str, list[dict]] = {}
-    for node in ast.walk(ast.parse(measured_py.read_text(encoding="utf-8"))):
+    for node in ast.walk(ast.parse(measured_source)):
         target = getattr(node, "target", None) or (getattr(node, "targets", None) or [None])[0]
         if not (isinstance(target, ast.Name) and target.id == "MEASURED"):
             continue
@@ -99,7 +108,7 @@ def read_measured(measured_py: Path = MEASURED_PY, enums_py: Path = ENUMS_PY) ->
                 )
             table[names[key.attr]] = entries
     if not table:
-        raise ValueError(f"no MEASURED table found in {measured_py}")
+        raise ValueError("no MEASURED table found")
     return table
 
 
@@ -216,7 +225,9 @@ def spelled(entry: dict) -> str:
     )
 
 
-def compile_point(base: dict, *, kind: str, subject: str, spec: dict) -> dict:
+def compile_point(
+    base: dict, *, kind: str, subject: str, spec: dict, sdk: dict | None = None
+) -> dict:
     """The one place a planned point is finished: its kind, whether it may turn the run
     red, and the whole recipe the executor follows.
 
@@ -230,7 +241,8 @@ def compile_point(base: dict, *, kind: str, subject: str, spec: dict) -> dict:
         "adapters": [base["adapter"]],
         "watching": not kinds.is_red_capable(kind),
         "runner": "linux-x64",
-        "sdk": {"origin": "build"},
+        # Which wardex the point installs: the wheel this run built, or a release from PyPI.
+        "sdk": dict(sdk) if sdk else {"origin": "build"},
         "install": {
             "extras": dict(spec["extras"]),
             "requires": list(spec["requires"]),
@@ -430,6 +442,128 @@ def displaced_line(targets: dict, python: str) -> str:
     return "-".join([*targets.values(), f"py{python}"])
 
 
+# --- the published release -------------------------------------------------------
+
+WARDEX = "wardex-sdk"
+_WARDEX_VERSION = re.compile(r"(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?")
+_PRE_RANK = {"a": 0, "b": 1, "rc": 2, None: 3}
+
+
+def _wardex_key(version: str) -> tuple | None:
+    """Order for wardex's own versions, pre-releases included: a final outranks its betas."""
+    match = _WARDEX_VERSION.fullmatch(version)
+    if not match:
+        return None
+    return (vkey(match[1]), _PRE_RANK[match[2]], int(match[3] or 0))
+
+
+def newest_wardex(releases: list[dict], cutoff: str) -> str | None:
+    """The newest wardex release PyPI serves at `cutoff`.
+
+    Pre-releases count: what `pip install --pre wardex-sdk` gives is what a user has, and
+    until a final exists a pre-release is all there is. A final, once published, outranks
+    every pre-release of the same number."""
+    live = [
+        release["version"]
+        for release in releases
+        if _wardex_key(release["version"])
+        and any(not f["yanked"] and f["uploaded"] <= cutoff for f in release["files"])
+    ]
+    return max(live, key=_wardex_key, default=None)
+
+
+def _git(*args: str) -> str:
+    done = subprocess.run(  # noqa: S603
+        ["git", "-C", str(REPO), *args],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout
+
+
+def read_tag(version: str) -> dict:
+    """What the tag of a published release holds: its commit, its table of tested
+    versions and the names of its test files.
+
+    A release is judged by its own table and its own tests, read from its tag and never
+    from this checkout: the README a user of that release reads is that tag's."""
+    ref = f"python-v{version}"
+    try:
+        commit = _git("rev-parse", "--verify", "--quiet", f"refs/tags/{ref}^{{commit}}").strip()
+    except subprocess.CalledProcessError:
+        # A workflow checkout holds one commit. Deepened only when it is already shallow:
+        # `--depth` on a full clone would cut its history.
+        shallow = _git("rev-parse", "--is-shallow-repository").strip() == "true"
+        depth = ["--depth", "1"] if shallow else []
+        _git("fetch", "--quiet", *depth, "origin", f"refs/tags/{ref}:refs/tags/{ref}")
+        commit = _git("rev-parse", "--verify", f"refs/tags/{ref}^{{commit}}").strip()
+    table = parse_measured(
+        _git("show", f"{commit}:{MEASURED_PY.relative_to(REPO)}"),
+        _git("show", f"{commit}:{ENUMS_PY.relative_to(REPO)}"),
+    )
+    tests = _git("ls-tree", "--name-only", f"{commit}:{model.TESTS_DIR}").split()
+    return {"ref": ref, "commit": commit, "table": table, "tests": sorted(tests)}
+
+
+def plan_published(version: str, tag: dict, releases: dict, cutoff: str) -> dict:
+    """The newest published wardex on the newest release its own table claims, and on the
+    newest release above that range.
+
+    The same rule that plans a framework point picks the releases, from the table the
+    release shipped with. What differs is in the point: the wheel comes from PyPI, and
+    the tests are the ones in the release's tag, where the executor looks the manifest's
+    file patterns up. A file this checkout has and the tag has not is simply not there:
+    the release never claimed to pass it."""
+    points, adapters = [], {}
+    sdk = {"origin": "pypi", "version": version, "ref": tag["ref"], "commit": tag["commit"]}
+    for name, entries in sorted(tag["table"].items()):
+        if not entries or name not in manifest.ADAPTERS:
+            continue
+        spec = manifest.ADAPTERS[name]
+        planned = plan_adapter(name, entries, releases, cutoff)
+        info = adapters[name] = planned["info"]
+        if not any(
+            fnmatch.fnmatch(held, pattern) for held in tag["tests"] for pattern in spec["tests"]
+        ):
+            info["problems"].append(f"the tag {tag['ref']} holds none of its test files")
+            continue
+        chosen = [p for p in planned["points"] if p["role"] == "claim_top"]
+        chosen += [p for p in planned["points"] if p["role"] == "beyond"][-1:]
+        for picked in chosen:
+            base = {**picked, "key": f"published--{version}--{picked['key']}"}
+            points.append(compile_point(base, kind="published", subject=name, spec=spec, sdk=sdk))
+    return {
+        "version": version,
+        "ref": tag["ref"],
+        "commit": tag["commit"],
+        "points": points,
+        "adapters": adapters,
+    }
+
+
+def fetch_published(cutoff: str, only: str | None = None) -> dict:
+    """`plan_published` on what PyPI and the release's tag say now. Never raises: a day the
+    release cannot be read is a day its points are not planned, and that is said."""
+    try:
+        version = newest_wardex(fetch_releases(WARDEX), cutoff)
+        if version is None:
+            return {"problems": ["PyPI lists no wardex release"], "points": [], "adapters": {}}
+        tag = read_tag(version)
+        if only:
+            tag["table"] = {name: rows for name, rows in tag["table"].items() if name == only}
+        releases = {
+            entry["distribution"]: fetch_releases(entry["distribution"])
+            for name, entries in tag["table"].items()
+            if name in manifest.ADAPTERS
+            for entry in entries
+        }
+        return {"problems": [], **plan_published(version, tag, releases, cutoff)}
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        said = f"the newest wardex release could not be read ({type(error).__name__})"
+        return {"problems": [said], "points": [], "adapters": {}}
+
+
 def build_plan(
     measured: dict,
     releases: dict,
@@ -438,6 +572,7 @@ def build_plan(
     *,
     cadence: str = "daily",
     partial: bool = False,
+    published: dict | None = None,
 ) -> dict:
     adapters, points, problems = {}, [], []
     remembered = (state or {}).get("displaced") or {}
@@ -464,7 +599,25 @@ def build_plan(
         "cadence": cadence,
         "covers": {"framework": covered} if due else {},
         "partial": partial,
+        "builds": {},
     }
+    # What a watching kind could not plan. Said on the health issue and never a reason for
+    # red: `problems` above is read by the verdict, this is not.
+    unplanned: list[str] = []
+    release = None
+    if "published" in kinds.due(cadence) and published:
+        unplanned += [f"published: {problem}" for problem in published.get("problems", [])]
+        if published.get("version"):
+            release = {k: published[k] for k in ("version", "ref", "commit", "adapters")}
+            points.extend(published["points"])
+            for name, info in sorted(published["adapters"].items()):
+                unplanned += [f"published: {name}: {problem}" for problem in info["problems"]]
+            scope["covers"]["published"] = sorted(
+                name for name, info in published["adapters"].items() if not info["problems"]
+            )
+            # Points of an older release are that release's history. A run that plans this
+            # one forgets nothing of theirs.
+            scope["builds"]["published"] = [published["version"]]
     return {
         "schema": SCHEMA,
         "cutoff": cutoff,
@@ -472,9 +625,12 @@ def build_plan(
         "scope": scope,
         "partial": partial,
         "adapters": adapters,
+        "published": release,
+        "claims": [dict(claim) for claim in manifest.CLAIMS],
         "replay_only": manifest.REPLAY_ONLY,
         "points": points,
         "problems": problems,
+        "unplanned": unplanned,
     }
 
 
@@ -499,14 +655,25 @@ def main(argv: list[str] | None = None) -> int:
     state = json.loads(state_file.read_text("utf-8")) if state_file and state_file.is_file() else {}
     # A plan of one adapter says nothing about the others; the report must not read it
     # as the whole run.
-    plan = build_plan(measured, releases, cutoff, state, partial=bool(args.only))
+    published = fetch_published(cutoff, args.only)
+    plan = build_plan(
+        measured, releases, cutoff, state, partial=bool(args.only), published=published
+    )
     Path(args.out).write_text(json.dumps(plan, indent=1, sort_keys=True), encoding="utf-8")
     for point in plan["points"]:
         targets = ", ".join(f"{d}=={v}" for d, v in point["targets"].items())
         print(f"{point['key']:<44} py{point['python']:<5} {targets}")
     for problem in plan["problems"]:
         print(f"problem: {problem}", file=sys.stderr)
-    matrix = {"include": [{"key": p["key"], "python": p["python"]} for p in plan["points"]]}
+    for problem in plan["unplanned"]:
+        print(f"not planned: {problem}", file=sys.stderr)
+    # `tree` is the commit whose tests the point runs when that is not this checkout.
+    matrix = {
+        "include": [
+            {"key": p["key"], "python": p["python"], "tree": p["sdk"].get("commit", "")}
+            for p in plan["points"]
+        ]
+    }
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with open(output, "a", encoding="utf-8") as handle:

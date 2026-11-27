@@ -110,6 +110,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # A published wardex release is run with the tests of its own tag. The plan
+      # names the tag's commit; the scripts that run the point stay this checkout's.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: matrix.tree != ''
+        with:
+          ref: ${{ matrix.tree }}
+          path: tests-tree
+          persist-credentials: false
       - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           # Pinned: the installer is a test tool, and a tool's release must not
@@ -127,13 +135,17 @@ jobs:
       - name: run the point
         env:
           KEY: ${{ matrix.key }}
+          TREE: ${{ matrix.tree }}
         run: |
-          last_green=()
+          more=()
           if [ -f "plan/last-green/$KEY.txt" ]; then
-            last_green=(--last-green-lock "plan/last-green/$KEY.txt")
+            more+=(--last-green-lock "plan/last-green/$KEY.txt")
+          fi
+          if [ -n "$TREE" ]; then
+            more+=(--tests-tree tests-tree)
           fi
           python3 scripts/compat/point.py --plan plan/plan.json --key "$KEY" \
-            --wheel-dir dist --work "$RUNNER_TEMP/point" --out "out" "${last_green[@]}"
+            --wheel-dir dist --work "$RUNNER_TEMP/point" --out "out" "${more[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
@@ -192,13 +204,22 @@ jobs:
           export COMPAT_SDK_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' sdks/python/pyproject.toml | head -1)"
           status=0
           python3 scripts/compat/report.py --plan plan/plan.json --results results \
-            --state-dir "$RUNNER_TEMP/records" ${WRITE:+--write} || status=$?
+            --state-dir "$RUNNER_TEMP/records" --preview "$RUNNER_TEMP/preview" \
+            ${WRITE:+--write} || status=$?
           # 0 is green and 10 is a verdict of red. Anything else is this step
           # crashing: no verdict, and the `died` job says so.
           if [ "$status" = 0 ] || [ "$status" = 10 ]; then
             echo "judged=true" >> "$GITHUB_OUTPUT"
           fi
           echo "status=$status" >> "$GITHUB_OUTPUT"
+      # The pages as this run would leave them. A run on a branch writes nothing to the
+      # records branch, so this is where its pages can be read.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: compat-site-preview
+          path: ${{ runner.temp }}/preview
+          if-no-files-found: ignore
       - name: commit the records
         # Only after a verdict: a report that crashed may have written half a state file.
         if: github.ref == 'refs/heads/main' && github.repository == 'wardex-labs/wardex-sdk' && steps.report.outputs.judged == 'true'

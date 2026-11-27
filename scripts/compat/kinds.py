@@ -48,6 +48,16 @@ KINDS: dict[str, Kind] = {
         min_points=2,
         closes="when it passes again, or when the tested range no longer claims it",
     ),
+    # The newest wardex release on PyPI, installed from PyPI and run with the tests and the
+    # table of its own tag: what a user who types `pip install` has today, as opposed to
+    # what the default branch would give them.
+    "published": Kind(
+        label="published wardex release",
+        cadences=frozenset({"daily"}),
+        fresh_days=3,
+        min_points=1,
+        closes="when it passes, or when a newer wardex release takes its place",
+    ),
 }
 
 #: The cron lines of `compat.yml` and the cadence each one starts. A test holds the

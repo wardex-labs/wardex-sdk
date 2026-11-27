@@ -20,12 +20,13 @@ import os
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from compat import kinds, model  # noqa: E402
+from compat import kinds, model, render  # noqa: E402
 from compat.plan import claims, displaced_line  # noqa: E402
 from compat.verdict import (  # noqa: E402
     FAILED,
@@ -42,6 +43,10 @@ LABEL = "compat"
 #: The exit code of a run judged red. Its own number, so the workflow can tell a verdict
 #: from this script crashing, which leaves no verdict and must be reported as such.
 RED_EXIT = 10
+#: A release inside the tested range that has failed on this many days running is no
+#: longer waiting for a fix: its issue starts printing the command that stops claiming it.
+#: Nothing narrows a claim on its own.
+LAPSE_NARROW_DAYS = 14
 _UNSAFE = re.compile(r"[^A-Za-z0-9 _./:\[\]()=,<>+*#-]")
 
 ROLE_WORDS = {
@@ -186,10 +191,7 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
                 "subject": result.get("subject", result["adapter"]),
                 "adapters": result.get("adapters", [result["adapter"]]),
                 "watching": is_watching(result),
-                "sdk": {
-                    **result.get("planned_sdk", {"origin": "build"}),
-                    "version": clean((result.get("sdk") or {}).get("version", ""), 40),
-                },
+                "sdk": _sdk(result),
                 "runner": result.get("runner", "linux-x64"),
                 # The point as it was planned, so the same point can be built again from this
                 # line on a later day. From the plan job, which runs no third-party code.
@@ -273,6 +275,16 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
     return lines
 
 
+def _sdk(result: dict) -> dict:
+    """Which wardex a point ran: where it came from, as planned, and the version it imported.
+
+    A point that never got as far as importing it still says which release it was for."""
+    planned = result.get("planned_sdk") or {"origin": "build"}
+    measured = (result.get("sdk") or {}).get("version", "")
+    said = {name: clean(value, 80) for name, value in planned.items()}
+    return {**said, "version": clean(measured or planned.get("version", ""), 40)}
+
+
 def _recipe(point: dict | None) -> dict | None:
     """The part of a planned point a record line does not already hold."""
     if not point:
@@ -354,6 +366,55 @@ def _picked_again(item: dict, results: dict[str, dict]) -> dict | None:
     return None
 
 
+_ABOUT = ("label", "evidence", "replay_of", "claim", "said", "newest")
+
+
+def _prose(text: object) -> str:
+    """A sentence for a page: printable, bounded, and with nothing that is table or markup
+    syntax. Code marks are dropped and the words kept, where `clean` would print `?`."""
+    kept = "".join(ch for ch in str(text) if " " <= ch <= "~" and ch not in "`|<>[]")
+    return kept[:240]
+
+
+def _versions(state: dict, plan: dict | None, run: dict) -> dict:
+    """What the pages say about each wardex build besides its points: which build it is,
+    and each adapter's range and evidence as that build states them.
+
+    Kept per build because a page is rendered on days its build was not planned. A run of
+    one adapter updates that adapter and leaves the others as they were."""
+    versions = {name: dict(about) for name, about in (state.get("versions") or {}).items()}
+    if not plan:
+        return versions
+
+    def merged(old: dict, adapters: dict) -> dict:
+        kept = dict(old.get("adapters") or {})
+        for name, info in adapters.items():
+            kept[name] = {field: info.get(field) for field in _ABOUT}
+        return kept
+
+    main = versions.get("main") or {}
+    versions["main"] = {
+        "version": run["sdk_version"],
+        "commit": run["sdk_commit"],
+        "date": run["date"],
+        "adapters": merged(main, plan["adapters"]),
+        "claims": [
+            {name: _prose(claim.get(name) or "") for name in ("says", "proof", "why")}
+            for claim in plan.get("claims", main.get("claims") or [])
+        ],
+    }
+    release = plan.get("published")
+    if release:
+        old = versions.get(release["version"]) or {}
+        versions[release["version"]] = {
+            "ref": release["ref"],
+            "commit": release["commit"],
+            "date": run["date"],
+            "adapters": merged(old, release["adapters"]),
+        }
+    return versions
+
+
 def next_state(
     state: dict, results: dict[str, dict], run: dict, results_dir: Path, plan: dict | None = None
 ) -> dict:
@@ -396,6 +457,13 @@ def next_state(
                 "python": result.get("planned_python"),
                 "failed_ids": [clean(node, 300) for node in tests.get("failed_ids", [])[:200]],
             }
+        # The first day of the failure this release is in now. A day it could not be checked
+        # neither starts nor ends one; a pass, or another release under this key, ends it.
+        since = entry.get("failing_since") or {}
+        if result["outcome"] in GREEN or since.get("targets") not in (None, result["targets"]):
+            entry.pop("failing_since", None)
+        if result["outcome"] in FAILED:
+            entry.setdefault("failing_since", {"date": run["date"], "targets": result["targets"]})
         # Days, not runs: a second run on the same day is the same outage seen twice.
         if result["outcome"] in NOT_OURS:
             if entry.get("not_ours_last") != run["date"]:
@@ -429,6 +497,12 @@ def next_state(
         # A kind nobody declares any more has no run that could cover it, so the first
         # whole run forgets its points; otherwise they would stay on an issue for good.
         retired = kind not in kinds.KINDS and not scope.get("partial", True)
+        # A point about another wardex release than the one this run planned is that
+        # release's history, kept for its page.
+        build = (identity.get("sdk") or {}).get("version")
+        builds = scope.get("builds", {}).get(kind)
+        if not retired and build is not None and builds is not None and build not in builds:
+            continue
         if retired or subject in scope.get("covers", {}).get(kind, ()):
             del points[key]
             forgotten.append(key)
@@ -442,7 +516,11 @@ def next_state(
         "points": points,
         "kinds": seen,
         "last_scheduled": state.get("last_scheduled"),
+        "release": state.get("release"),
+        "versions": _versions(state, plan, run),
     }
+    if (plan or {}).get("published"):
+        out["release"] = plan["published"]["version"]
     out["displaced"] = (
         next_displaced(state, plan, results) if plan else state.get("displaced") or {}
     )
@@ -471,11 +549,28 @@ def _version(result: dict) -> str:
     return ", ".join(f"{dist} {version}" for dist, version in result["targets"].items())
 
 
+def _planned_sdk(result: dict) -> dict:
+    """Where a row's wardex came from, whether the row is of this run or remembered."""
+    planned = result.get("planned_sdk")
+    return planned if planned is not None else result.get("sdk") or {"origin": "build"}
+
+
+def _wardex(result: dict) -> str:
+    sdk = _planned_sdk(result)
+    if sdk.get("origin", "build") == "build":
+        return "this commit"
+    return f"{code(sdk.get('version', ''), 40)} from PyPI"
+
+
 def _table(rows: list[dict]) -> list[str]:
-    lines = ["| Point | Version | Python | Result | Cause |", "|---|---|---|---|---|"]
+    lines = [
+        "| Point | wardex | Version | Python | Result | Cause |",
+        "|---|---|---|---|---|---|",
+    ]
     for result in rows:
         lines.append(
-            f"| {ROLE_WORDS.get(result['role'], clean(result['role']))} | {code(_version(result))} "
+            f"| {ROLE_WORDS.get(result['role'], clean(result['role']))} | {_wardex(result)} "
+            f"| {code(_version(result))} "
             f"| {code(result.get('python') or '-')} | {OUTCOME_WORDS[result['outcome']]} "
             f"| {CAUSE_WORDS.get(result['cause'], '')} |"
         )
@@ -515,6 +610,11 @@ def _remembered_rows(state: dict | None, subject: str, results: dict[str, dict])
             continue
         if identity.get("kind", "framework") not in kinds.KINDS:
             continue  # a kind that was retired asks nothing of anyone
+        build = (identity.get("sdk") or {}).get("version")
+        if build is not None and build != (state or {}).get("release"):
+            # A wardex release a newer one replaced. Its points are history, shown on its
+            # own page; nobody is asked to do anything about them.
+            continue
         said, checked = last, entry.get("last_checked") or {}
         if last.get("outcome") not in GREEN | FAILED and checked.get("targets") == identity.get(
             "targets"
@@ -537,9 +637,33 @@ def _remembered_rows(state: dict | None, subject: str, results: dict[str, dict])
     return rows
 
 
+def _lapse(result: dict, known: dict, run: dict) -> str:
+    """What a release that has failed for two weeks adds to its item: the way out that is
+    not a fix. The README goes on calling the release tested until a person runs it."""
+    since = known.get(result["key"], {}).get("failing_since") or {}
+    if since.get("targets") != result["targets"]:
+        return ""
+    try:
+        days = (date.fromisoformat(run["date"]) - date.fromisoformat(since["date"])).days
+    except (KeyError, TypeError, ValueError):
+        return ""
+    if days < LAPSE_NARROW_DAYS:
+        return ""
+    dist, version = next(iter(result["targets"].items()))
+    command = f"python3 scripts/compat/claim.py bad {dist} {version}"
+    return (
+        f" It has failed since {code(since['date'])}, {days} days. To stop calling it tested "
+        f"instead: {code(command)}."
+    )
+
+
 def _kind_label(result: dict) -> str:
     kind = kinds.KINDS.get(result.get("kind", "framework"))
-    return kind.label if kind else clean(result.get("kind", ""), 40)
+    label = kind.label if kind else clean(result.get("kind", ""), 40)
+    sdk = _planned_sdk(result)
+    if sdk.get("origin", "build") != "build":
+        label += f" {code(sdk.get('version', ''), 40)}"
+    return label
 
 
 def _kind_closes(result: dict) -> str:
@@ -622,8 +746,11 @@ def adapter_issue(
                 )
             todo.append(
                 f"{version} is inside the tested range and does not pass: {what}. "
-                f"Cause: {cause}. {closes}"
+                f"Cause: {cause}. {closes}{_lapse(result, known, run)}"
             )
+            if _lapse(result, known, run):
+                # Said once, as a comment, on the day the command first appears.
+                marks.append([result["key"], "lapsed"])
         elif result["in_claim"] and outcome not in GREEN:
             # Not checked today. What it said when it last was checked still stands.
             before = known.get(result["key"], {}).get("last_checked") or {}
@@ -640,10 +767,14 @@ def adapter_issue(
             todo.append(
                 f"{version} is inside the tested range. It did not pass when last checked, on "
                 f"{code(before['date'])}, and could not be checked today: "
-                f"{OUTCOME_WORDS[outcome]}."
+                f"{OUTCOME_WORDS[outcome]}.{_lapse(result, known, run)}"
             )
             outcome, nodes = before["outcome"], before.get("failed_ids", [])
             marks.append([result["key"], outcome, before.get("cause"), nodes])
+            if _lapse(result, known, run):
+                # The same mark as on a day it ran and failed: an outage in the middle of
+                # a long failure is not news about the lapse.
+                marks.append([result["key"], "lapsed"])
             continue
         elif not result["in_claim"] and outcome in ("fail", "attach_failed", "skips_changed"):
             todo.append(
@@ -754,6 +885,9 @@ def health_issue(plan: dict, results: dict[str, dict], state: dict, run: dict) -
         for problem in info["problems"]:
             todo.append(f"{code(info['label'])}: {code(problem)}")
             marks.append([name, problem])
+    for problem in plan.get("unplanned", []):
+        todo.append(f"Not planned, and so not run (this never turns the run red): {code(problem)}")
+        marks.append(["unplanned", problem])
     for key, result in sorted(results.items()):
         outcome = result["outcome"]
         streak = state.get("points", {}).get(key, {}).get("not_ours_days", 0)
@@ -989,6 +1123,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--results", required=True, help="one directory per point artifact")
     parser.add_argument("--state-dir", required=True, help="a checkout of the records branch")
     parser.add_argument("--write", action="store_true", help="write records and issues")
+    parser.add_argument("--preview", help="a directory to render the public pages into")
     args = parser.parse_args(argv)
 
     state_dir, results_dir = Path(args.state_dir), Path(args.results)
@@ -1032,6 +1167,10 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(files), encoding="utf-8"
             )
         state_file.write_text(json.dumps(new_state, indent=1, sort_keys=True), encoding="utf-8")
+        render.write_site(state_dir, new_state, run["date"])
+    if args.preview:
+        # What the pages would say after this run, for a run that writes nothing.
+        render.write_site(Path(args.preview), new_state, run["date"])
 
     text = summary(
         plan, results, reasons, gh.log if args.write else [f"(dry run) {a}" for a in gh.log]
