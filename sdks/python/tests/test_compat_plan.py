@@ -210,7 +210,7 @@ def test_the_plan_and_the_sdk_call_the_same_releases_tested():
             + [(a, b, c) for a in (0, 1, 2) for b in (0, 2, 22, 23, 54, 60) for c in (0, 3, 10)]
             + [(2, 54, 0, 1), (0, 22, 3, 0)]
         )
-    ]
+    ] + ["02.54", "2.054.0", "0.022.3", "00.23.1"]
     for minors, since, bad in rows:
         entry = _measured.Measured("x", minors, known_bad=bad, since=since)
         row = {"minors": minors, "known_bad": bad, "since": since}
@@ -312,6 +312,13 @@ def test_a_remembered_pair_whose_companion_was_withdrawn_is_not_planned_and_does
     history["langgraph-prebuilt"].append(_release("1.1.4", "2026-11-22"))
     planned = plan.plan_adapter("langgraph", listed, history, _CUTOFF, items)
     assert [p for p in planned["points"] if p["role"] == "displaced"] == []
+
+    # A pair remembered before the table stopped naming its companion: skipped, not a crash.
+    stray = [{"key": "k", "targets": {"langgraph": "1.2.0", "gone-from-the-table": "1.0"}}]
+    stray[0]["python"] = "3.14"
+    planned = plan.plan_adapter("langgraph", entries, history, _CUTOFF, stray)
+    assert [p for p in planned["points"] if p["role"] == "displaced"] == []
+    assert planned["info"]["problems"] == []
 
 
 def test_the_floor_does_not_stand_in_for_a_release_that_failed_with_todays_packages():
