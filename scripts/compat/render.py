@@ -324,10 +324,29 @@ def page(state: dict, version: str, today: str) -> str:
     adapters = about.get("adapters") or {}
     for name in sorted(grouped):
         lines += _section(name, adapters.get(name) or {}, grouped[name], today)
+        if version == MAIN:
+            lines += _replaced(grouped[name], (state.get("displaced") or {}).get(name) or [])
     if not grouped:
         lines += ["No point of this build has been run yet.", ""]
     lines += _claims(about.get("claims") or [])
     return "\n".join(lines)
+
+
+def _replaced(points: list[dict], items: list[dict]) -> list[str]:
+    """Releases that failed and that a newer one replaced, before their own point has run:
+    still inside the range, known to fail, and in no row of the table above."""
+    have = {point["key"] for point in points}
+    lines = []
+    for item in items:
+        if item.get("key") in have or not isinstance(item.get("targets"), dict):
+            continue
+        version = ", ".join(f"{dist} {v}" for dist, v in item["targets"].items())
+        lines.append(
+            f"- {code(version)} did not pass when it was last run, on "
+            f"{day_words(item.get('failed_on', '')) or 'an unknown day'}. A newer release took "
+            "its place; it is run on its own from the next run on."
+        )
+    return [*lines, ""] if lines else []
 
 
 def _claims(claims: list[dict]) -> list[str]:

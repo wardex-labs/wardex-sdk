@@ -342,3 +342,22 @@ def test_the_index_lists_the_newest_release_first():
         if line.startswith("- [wardex")
     ]
     assert listed == ["0.10.0", "0.9.0", "0.7.0.post1", "0.7.0", "0.7.0rc1", "0.7.0b10", "0.7.0b1"]
+
+
+def test_a_failure_waiting_for_its_own_point_is_on_the_default_branchs_page():
+    """Between the day a newer release replaces a failing one and the day its own point
+    first runs, no row holds it. The page must not look clean in that gap."""
+    state = _state(
+        **{"openai_agents--claim_top": _entry(_identity("openai_agents", "claim_top", "0.23.2"))}
+    )
+    item = {"key": "openai_agents--displaced--0.23.1-py3.14", "failed_on": "2026-11-27"}
+    item["targets"] = {"openai-agents": "0.23.1"}
+    state["displaced"] = {"openai_agents": [item]}
+    page = render.page(state, render.MAIN, _TODAY)
+    assert (
+        "- `openai-agents 0.23.1` did not pass when it was last run, on 27 Nov 2026. A newer "
+        "release took its place; it is run on its own from the next run on." in page
+    )
+    own = _identity("openai_agents", "displaced", "0.23.1")
+    state["points"][item["key"]] = _entry(own, "fail")
+    assert "took its place" not in render.page(state, render.MAIN, _TODAY), "its row says it now"
