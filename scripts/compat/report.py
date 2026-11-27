@@ -341,17 +341,11 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
         ):
             continue
         python = before.get("python") or result.get("planned_python") or ""
-        since = state.get("points", {}).get(key, {}).get("failing_since") or {}
         item = {
             "key": f"{result['adapter']}--displaced--{displaced_line(before['targets'], python)}",
             "targets": before["targets"],
             "python": python,
             "failed_on": before["date"],
-            # How long the release has been failing goes with the release, not with the
-            # point that happened to run it: its own point continues the same count.
-            "failing_since": since["date"]
-            if since.get("targets") == before["targets"]
-            else before["date"],
         }
         mine = kept.setdefault(result["adapter"], [])
         if all(other["key"] != item["key"] for other in mine):
@@ -359,33 +353,66 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
     return {adapter: items for adapter, items in sorted(kept.items()) if items}
 
 
-def _began(state: dict, result: dict) -> str | None:
-    """The first day of the failure a release is in, when another point of this build was
-    already counting it: the count goes with the release, not with the point that runs it.
+def release_id(adapter: str, targets: dict, python: object) -> str:
+    """One release on one interpreter, as the key its failure is counted under."""
+    return f"{adapter}|{python or ''}|" + json.dumps(targets, sort_keys=True)
 
-    A release changes hands when a newer patch replaces it (its own point takes over),
-    when that patch is withdrawn (the rule's point runs it again), and when the range
-    grows (another rule's point picks it up). The same release on the same interpreter,
-    and only on the wheel this run builds: the published wardex failing on it is another
-    question's count."""
-    if not _own(result):
-        return None
-    targets, python = result["targets"], result.get("planned_python")
-    dates = [
-        item.get("failing_since")
-        for items in (state.get("displaced") or {}).values()
+
+def _counted(result: dict) -> bool:
+    """Whether a result counts toward how long its release has been failing on this build.
+
+    A red-capable point of the wheel this run built, inside the range, with today's
+    packages. Not the floor, which installs the release with the packages of its own
+    time: failing there and failing with today's are two findings, each with its own
+    first day. Not a published wardex either: that is another build's count."""
+    return _own(result) and result["in_claim"] and result["role"] != "floor"
+
+
+def next_failing(state: dict, results: dict[str, dict], run: dict) -> dict[str, str]:
+    """For each release and interpreter failing on this build, the first day of the failure
+    it is in now.
+
+    Kept by release and not by point, because a release changes hands: a newer patch
+    replaces it and its own point takes over, that patch is withdrawn and the rule's point
+    runs it again, the range grows and another rule's point picks it up. Whoever runs it,
+    it has been failing since the same day. A failure by any point that runs it keeps or
+    starts the count; a pass with no failure beside it ends it; a day nobody could check
+    it changes nothing."""
+    failing = dict(state.get("failing") or {})
+    said: dict[str, set[str]] = {}
+    for result in results.values():
+        if _counted(result):
+            release = release_id(result["adapter"], result["targets"], result.get("planned_python"))
+            said.setdefault(release, set()).add(result["outcome"])
+    for release, outcomes in said.items():
+        if outcomes & FAILED:
+            failing.setdefault(release, run["date"])
+        elif outcomes & GREEN:
+            failing.pop(release, None)
+    return failing
+
+
+def _still_asked(failing: dict, plan: dict | None, results: dict, displaced: dict) -> dict:
+    """`failing` without the releases nobody asks about any more: no point runs them and
+    no list remembers them, in an adapter this run planned in full. A release that left the
+    range, or was listed as bad, takes its count with it."""
+    if not plan:
+        return failing
+    asked = {
+        release_id(r["adapter"], r["targets"], r.get("planned_python")) for r in results.values()
+    }
+    asked |= {
+        release_id(adapter, item["targets"], item.get("python"))
+        for adapter, items in displaced.items()
         for item in items
-        if item.get("targets") == targets and item.get("python") == python
-    ]
-    for entry in (state.get("points") or {}).values():
-        identity, since = entry.get("point") or {}, entry.get("failing_since") or {}
-        mine = (
-            not identity.get("watching")
-            and (identity.get("sdk") or {}).get("origin", "build") == "build"
-        )
-        if mine and since.get("targets") == targets and identity.get("python") == python:
-            dates.append(since.get("date"))
-    return min((day for day in dates if day), default=None)
+        if isinstance(item.get("targets"), dict)
+    }
+    whole = {name for name, info in plan["adapters"].items() if not info["problems"]}
+    return {
+        release: day
+        for release, day in failing.items()
+        if release in asked or release.split("|", 1)[0] not in whole
+    }
 
 
 def _picked_again(item: dict, results: dict[str, dict]) -> dict | None:
@@ -468,6 +495,7 @@ def next_state(
     and the failed releases a newer one has replaced."""
     points = dict(state.get("points", {}))
     locks: dict[str, Path] = {}
+    failing = next_failing(state, results, run)
     for key, result in results.items():
         entry = dict(points.get(key, {}))
         tests = result.get("tests") or {}
@@ -506,13 +534,19 @@ def next_state(
         # The first day of the failure this release is in now. A day it could not be checked
         # neither starts nor ends one; a pass, or another release under this key, ends it.
         since = entry.get("failing_since") or {}
-        if result["outcome"] in GREEN or since.get("targets") not in (None, result["targets"]):
+        if _counted(result):
+            # Counted by release, so the count survives the release changing hands.
+            release = release_id(result["adapter"], result["targets"], result.get("planned_python"))
             entry.pop("failing_since", None)
-        if result["outcome"] in FAILED:
-            entry.setdefault(
-                "failing_since",
-                {"date": _began(state, result) or run["date"], "targets": result["targets"]},
-            )
+            if release in failing:
+                entry["failing_since"] = {"date": failing[release], "targets": result["targets"]}
+        else:
+            if result["outcome"] in GREEN or since.get("targets") not in (None, result["targets"]):
+                entry.pop("failing_since", None)
+            if result["outcome"] in FAILED:
+                entry.setdefault(
+                    "failing_since", {"date": run["date"], "targets": result["targets"]}
+                )
         # Days, not runs: a second run on the same day is the same outage seen twice.
         if result["outcome"] in NOT_OURS:
             if entry.get("not_ours_last") != run["date"]:
@@ -573,6 +607,7 @@ def next_state(
     out["displaced"] = (
         next_displaced(state, plan, results) if plan else state.get("displaced") or {}
     )
+    out["failing"] = _still_asked(failing, plan, results, out["displaced"])
 
     def keys(remembered: dict) -> set[str]:
         return {item["key"] for items in remembered.values() for item in items}
@@ -686,6 +721,10 @@ def _remembered_rows(state: dict | None, subject: str, results: dict[str, dict])
     return rows
 
 
+def _item_id(adapter: str, item: dict) -> str:
+    return release_id(adapter, item["targets"], item.get("python"))
+
+
 def _lapse(result: dict, known: dict, run: dict) -> str:
     """What a release that has failed for two weeks adds to its item: the way out that is
     not a fix. The README goes on calling the release tested until a person runs it."""
@@ -750,6 +789,7 @@ def adapter_issue(
     info = plan["adapters"][name]
     known = (state or {}).get("points", {})
     remembered = {item["key"]: item for item in (state or {}).get("displaced", {}).get(name, [])}
+    counted = (state or {}).get("failing") or {}
     # Which rows are remembered is decided here, from the state. A field of the row cannot
     # say so: a point job writes its own row, and it is not believed about that.
     old = _remembered_rows(state, name, results)
@@ -834,7 +874,7 @@ def adapter_issue(
                 continue
             # A release waiting for its own point has its count on the item that remembers it.
             lapse = (
-                _lapse_since(item.get("failing_since"), item["targets"], run)
+                _lapse_since(counted.get(_item_id(name, item)), item["targets"], run)
                 if pending
                 else _lapse(result, known, run)
             )
@@ -881,7 +921,7 @@ def adapter_issue(
         # Remembered by this run, or by an earlier one whose point for it has not been able
         # to check it since: the failure it was remembered for is what is known.
         version = code(", ".join(f"{dist} {v}" for dist, v in item["targets"].items()))
-        lapse = _lapse_since(item.get("failing_since"), item["targets"], run)
+        lapse = _lapse_since(counted.get(_item_id(name, item)), item["targets"], run)
         todo.append(
             f"{version} is inside the tested range and did not pass when it was last run, on "
             f"{code(item['failed_on'])}. A newer release has taken its place, so it is run on "
