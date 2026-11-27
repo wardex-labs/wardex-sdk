@@ -35,8 +35,9 @@ PYPROJECT = "sdks/python/pyproject.toml"
 README = "README.md"
 
 # The README wraps its sentences, so the white space inside a phrase may hold one line
-# break. Not a blank line: that ends the paragraph, and what follows is another sentence.
-_GAP = r"(?:[ \t]+|[ \t]*\n[ \t]*)"
+# break, with the quote marks of a quoted paragraph after it. Not a blank line: that ends
+# the paragraph, and what follows is another sentence.
+_GAP = r"(?:[ \t]+|[ \t]*\r?\n[ \t>]*)"
 _LINE = rf"\d+(?:\.\d+)*\.x(?:{_GAP}from{_GAP}\d+(?:\.\d+)*)?"
 _RANGE = rf"{_LINE}(?:,{_GAP}{_LINE})*"
 _BOUNDS = r"\s*>=\s*(?P<lower>\d+(?:\.\d+)*)\s*,\s*<\s*(?P<upper>\d+(?:\.\d+)*)\s*"
@@ -248,10 +249,11 @@ def apply(root: Path, entry: dict) -> list[str]:
     touched = []
     for name, write in ((MEASURED, write_table), (PYPROJECT, write_pins), (README, write_readme)):
         path = root / name
-        before = path.read_text(encoding="utf-8")
+        # Bytes in, bytes out: a file keeps the line endings it came with.
+        before = path.read_bytes().decode("utf-8")
         after = write(before, entry)
         if after != before:
-            path.write_text(after, encoding="utf-8")
+            path.write_bytes(after.encode("utf-8"))
             touched.append(name)
     return touched
 
