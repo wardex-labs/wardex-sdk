@@ -8,8 +8,13 @@ permissions:
   contents: read
 jobs:
   phoenix:
+    name: phoenix (${{ matrix.auth }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        auth: [default, off]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -20,22 +25,34 @@ jobs:
           enable-cache: false
       - name: Phoenix up
         run: |
-          start=$SECONDS
-          docker run -d --name phoenix -p 6006:6006 arizephoenix/phoenix:latest
+          extra=""; [ "${{ matrix.auth }}" = off ] && extra="-e PHOENIX_ENABLE_AUTH=false"
+          docker run -d --name phoenix -p 6006:6006 $extra arizephoenix/phoenix:latest
           for i in $(seq 1 90); do curl -fsS http://127.0.0.1:6006/healthz >/dev/null 2>&1 && break; sleep 2; done
-          curl -fsS http://127.0.0.1:6006/healthz && echo " <- healthz"
-          echo "seconds to ready: $((SECONDS - start))"
-          docker inspect --format '{{index .RepoDigests 0}}' arizephoenix/phoenix:latest
           docker exec phoenix python -c "import phoenix; print('phoenix', phoenix.__version__)" || true
+          docker exec phoenix env | grep -i "^PHOENIX" || echo "no PHOENIX_ variables set in the image"
+          for path in /v1/projects /v1/traces; do
+            echo "GET $path -> $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6006$path)"
+          done
+          echo "POST /v1/traces (empty protobuf) -> $(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/x-protobuf' --data-binary '' http://127.0.0.1:6006/v1/traces)"
       - name: the split-export script, published wheel
         run: |
           uv venv --python 3.12 .v && uv pip install --python .v/bin/python --prerelease allow wardex-sdk
-          .v/bin/python -c "import wardex_sdk; print('wardex', wardex_sdk.__version__)"
-          status=0; start=$SECONDS
+          status=0
           WARDEX_E2E_PHOENIX=http://127.0.0.1:6006 .v/bin/python sdks/python/tests/e2e_split_export_phoenix.py || status=$?
-          echo "e2e exit: $status, seconds: $((SECONDS - start))"
-      - if: always()
-        run: docker logs phoenix 2>&1 | tail -20
+          echo "e2e exit: $status"
+      - name: what a user following the README sees
+        if: always()
+        run: |
+          cat > hello.py <<'PY'
+          import urllib.request, json, wardex_sdk as wardex
+          wardex.init()
+          with wardex.span("readme-check"):
+              pass
+          wardex.flush() if hasattr(wardex, "flush") else None
+          wardex.close()
+          PY
+          WARDEX_ENDPOINT=http://127.0.0.1:6006 .v/bin/python hello.py 2>&1 | tail -15 || true
+          docker logs phoenix 2>&1 | grep -E "v1/traces|401|403" | tail -8
   langfuse:
     runs-on: ubuntu-latest
     timeout-minutes: 30
