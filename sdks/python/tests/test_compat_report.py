@@ -20,7 +20,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
-from compat import point, report, watchdog  # noqa: E402
+from compat import kinds, model, point, report, verdict, watchdog  # noqa: E402
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "compat"
 
 _RUN = {
     "id": "1",
@@ -82,7 +84,14 @@ def _result(point: dict, outcome: str = "pass", **more) -> dict:
         "failed_ids": more.pop("failed_ids", []),
         "skipped_ids": more.pop("skipped_ids", []),
     }
-    return {**point, "schema": 1, "outcome": outcome, "cause": None, "tests": tests, **more}
+    return {
+        **point,
+        "schema": report.SCHEMA,
+        "outcome": outcome,
+        "cause": None,
+        "tests": tests,
+        **more,
+    }
 
 
 def _results(*results: dict) -> dict:
@@ -388,7 +397,7 @@ def test_the_outage_streak_counts_days_not_runs_and_resets_on_anything_else(tmp_
 
 def test_a_record_line_holds_only_plain_data_about_its_point():
     line = report.records(_plan(_TOP), _results(_result(_TOP)), _RUN)[0]
-    assert line["schema"] == 1
+    assert line["schema"] == report.SCHEMA == 2
     assert line["run"]["sdk_commit"] == _RUN["sdk_commit"]
     assert (line["key"], line["outcome"], line["in_claim"]) == (_TOP["key"], "pass", True)
     json.dumps(line)
@@ -1066,7 +1075,7 @@ def test_a_replaced_failure_survives_the_whole_path_from_results_to_the_next_pla
         for planned in points:
             failed = planned["role"] in failing
             result = {
-                "schema": 1,
+                "schema": report.SCHEMA,
                 "key": planned["key"],
                 "adapter": planned["adapter"],
                 "targets": planned["targets"],
@@ -1212,3 +1221,203 @@ def test_what_a_displaced_point_said_is_forgotten_when_its_release_is_settled(tm
     later = report.next_state(state, stuck, _RUN, tmp_path, plan)
     issue = report.adapter_issue("openai_agents", plan, stuck, _RUN, later)
     assert issue["open"] and "on `2026-11-30`" in issue["changes"][0]
+
+
+# --- kinds: what was written before them stays readable ---------------------------
+
+
+def test_a_record_line_written_before_kinds_reads_as_what_it_was():
+    """Lines on the records branch are never rewritten. A line from before kinds existed
+    is read with the only values its new fields could have had then, and every field it
+    did have comes back untouched."""
+    text = (_FIXTURES / "records-schema-1.jsonl").read_text(encoding="utf-8")
+    for raw in text.splitlines():
+        old = json.loads(raw)
+        assert old["schema"] == 1
+        new = model.read_record(old)
+        assert {name: new[name] for name in old if name != "run"} == {
+            name: value for name, value in old.items() if name != "run"
+        }
+        assert {name: new["run"][name] for name in old["run"]} == old["run"]
+        assert (new["kind"], new["watching"], new["sdk"]) == (
+            "framework",
+            False,
+            {"origin": "build"},
+        )
+        assert (new["subject"], new["adapters"]) == (old["adapter"], [old["adapter"]])
+        assert new["run"]["cadence"] == "daily" and new["plan"] is None
+        assert json.loads(raw) == old, "reading does not edit the line"
+    line = report.records(_plan(_TOP), _results(_result(_TOP)), _RUN)[0]
+    assert model.read_record(line) is line
+
+
+def test_the_state_written_before_kinds_is_carried_over_whole(tmp_path):
+    """The first run after kinds land reads the state the last run before them wrote.
+    Every point keeps what it said, its last pass and its lock, and gains who it is."""
+    old = json.loads((_FIXTURES / "state-schema-1.json").read_text(encoding="utf-8"))
+    kept = json.loads(json.dumps(old))
+    state = model.upgrade_state(old)
+    assert old == kept, "upgrading does not edit what was read"
+    assert state["schema"] == 2 and set(state["points"]) == set(old["points"])
+    for key, entry in state["points"].items():
+        assert entry["point"] is None
+        assert {name: entry[name] for name in old["points"][key]} == old["points"][key]
+    assert model.upgrade_state(state) is state
+
+    floor = {**_point("floor", "0.22.0"), "python": "3.10"}
+    top = {**_point("claim_top", "0.23.1"), "python": "3.14"}
+    plan = _plan(floor, top)
+    plan["scope"] = {
+        "cadence": "daily",
+        "covers": {"framework": ["openai_agents"]},
+        "partial": False,
+    }
+    _write(tmp_path, _result(floor))
+    _write(tmp_path, _result(top))
+    after = report.next_state(state, report.load_results(plan, tmp_path), _RUN, tmp_path, plan)
+    mine = after["points"]["openai_agents--floor"]
+    assert mine["last_green"]["date"] == _RUN["date"]
+    assert mine["point"]["kind"] == "framework" and mine["point"]["python"] == "3.10"
+    # Planned today, kept. Covered and no longer planned, forgotten. Another adapter's,
+    # which this plan did not cover, exactly as it was.
+    assert "openai_agents--beyond--0.26" not in after["points"]
+    assert after["points"]["langgraph--floor"] == state["points"]["langgraph--floor"]
+    assert after["kinds"] == {"framework": {"last_complete": _RUN["date"], "points": 2}}
+
+
+def test_a_run_of_one_adapter_forgets_nothing_and_completes_no_kind(tmp_path):
+    state = model.upgrade_state(json.loads((_FIXTURES / "state-schema-1.json").read_text()))
+    plan = _plan(_TOP)
+    plan["scope"] = {
+        "cadence": "daily",
+        "covers": {"framework": ["openai_agents"]},
+        "partial": True,
+    }
+    after = report.next_state(state, _results(_result(_TOP)), _RUN, tmp_path, plan)
+    assert "openai_agents--floor" not in after["points"], "its own adapter is covered"
+    assert "pydantic_ai--floor" in after["points"] and after["kinds"] == {}
+    untouched = report.next_state(state, _results(_result(_TOP)), _RUN, tmp_path)
+    assert set(untouched["points"]) == set(state["points"]), "no plan, no say"
+
+
+# --- kinds: watching is never an argument for red ---------------------------------
+
+
+@pytest.mark.parametrize("outcome", sorted(verdict.OUTCOME_WORDS))
+@pytest.mark.parametrize("in_claim", [True, False])
+def test_a_watching_point_cannot_turn_the_run_red_whatever_it_says(outcome, in_claim):
+    watching = {**_TOP, "key": "watched--top", "kind": "anything", "watching": True}
+    watching["in_claim"] = in_claim
+    plan = _plan(_FLOOR, _TOP, watching)
+    results = _results(_result(_FLOOR), _result(_TOP), _result(watching, outcome))
+    assert report.judge(plan, results) == []
+    counted = {**watching, "watching": False}
+    reasons = report.judge(
+        plan, _results(_result(_FLOOR), _result(_TOP), _result(counted, outcome))
+    )
+    red = outcome in ("no_result", "harness_error") or (in_claim and outcome in verdict.RED)
+    assert bool(reasons) is red
+
+
+def test_only_the_plan_decides_whether_a_point_is_watching(tmp_path):
+    """A point job runs third-party code. What it writes about itself is not believed:
+    who it is and whether it may turn the run red come from the plan."""
+    lying = {**_result(_TOP, "fail"), "watching": True, "kind": "bench", "subject": "nobody"}
+    _write(tmp_path, lying)
+    plan = _plan({**_TOP, "kind": "framework", "subject": "openai_agents", "watching": False})
+    (loaded,) = report.load_results(plan, tmp_path).values()
+    assert (loaded["kind"], loaded["subject"], loaded["watching"]) == (
+        "framework",
+        "openai_agents",
+        False,
+    )
+    assert report.judge(plan, {loaded["key"]: loaded}) != []
+
+
+def test_a_watching_failure_is_said_apart_and_keeps_the_issue_open_on_a_green_run():
+    watched = {**_point("claim_top", "0.23.1"), "key": "watched--top", "watching": True}
+    plan = _plan(_FLOOR, _TOP, watched)
+    nodes = ["t.py::test_tree"]
+    results = _results(_result(_FLOOR), _result(_TOP), _result(watched, "fail", failed_ids=nodes))
+    assert report.judge(plan, results) == []
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN)
+    assert issue["open"] and issue["fingerprint"] != "clear"
+    assert "### Watching (never turns the run red)" in issue["body"]
+    needs, watching = issue["body"].split("### Watching (never turns the run red)")
+    assert "Nothing." in needs.split("### What needs doing")[1]
+    assert "framework release: `openai-agents 0.23.1` fails 1 tests" in watching
+    assert "`t.py::test_tree`" in issue["body"]
+
+    passing = _results(_result(_FLOOR), _result(_TOP), _result(watched))
+    assert not report.adapter_issue("openai_agents", plan, passing, _RUN)["open"]
+
+
+def test_a_run_does_not_close_what_a_run_it_did_not_cover_found():
+    """Issues are read from everything the state knows about a subject. A point of
+    another cadence said what it said on the day it ran, and stays said, dated, until
+    the run that covers it says otherwise."""
+    weekly = {**_point("claim_top", "0.23.1"), "key": "weekly--top", "watching": True}
+    weekly["kind"], weekly["subject"] = "anything", "openai_agents"
+    state = {
+        "points": {
+            "weekly--top": {
+                "point": model.identity_of(weekly),
+                "last": {
+                    "date": "2026-11-22",
+                    "outcome": "fail",
+                    "cause": None,
+                    "failed_ids": ["t.py::test_weekly"],
+                    "excluded_files": [],
+                },
+            }
+        }
+    }
+    plan = _plan(_FLOOR, _TOP)
+    results = _results(_result(_FLOOR), _result(_TOP))
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN, state)
+    assert issue["open"] and "(last run `2026-11-22`)" in issue["body"]
+    assert "`t.py::test_weekly`" in issue["body"]
+    again = report.adapter_issue("openai_agents", plan, results, _RUN, state)
+    assert again["fingerprint"] == issue["fingerprint"], "no news, no comment"
+
+
+def test_a_record_line_says_its_kind_and_carries_the_point_as_it_was_planned(tmp_path):
+    planned = {
+        **_TOP,
+        "python": "3.14",
+        "kind": "framework",
+        "subject": "openai_agents",
+        "watching": False,
+        "sdk": {"origin": "build"},
+        "runner": "linux-x64",
+        "install": {"requires": ["h2"]},
+        "check": {"files": ["test_x.py"]},
+        "probe": {"imports": ["agents"]},
+        "cutoff": "2026-11-26T19:40:00Z",
+        "assume_measured": False,
+        "floats": [],
+        "budget_s": 2700,
+        "fresh_days": 3,
+    }
+    _write(tmp_path, _result(_TOP))
+    plan = _plan(planned)
+    plan["cadence"] = "daily"
+    results = report.load_results(plan, tmp_path)
+    (line,) = report.records(plan, results, {**_RUN, "cadence": "daily", "scope": "all"})
+    assert (line["schema"], line["kind"], line["subject"], line["watching"]) == (
+        2,
+        "framework",
+        "openai_agents",
+        False,
+    )
+    assert line["sdk"] == {"origin": "build"} and line["runner"] == "linux-x64"
+    assert line["plan"]["install"] == {"requires": ["h2"]} and line["plan"]["python"] == "3.14"
+    assert line["run"]["cadence"] == "daily"
+    json.dumps(line)
+
+
+def test_every_declared_kind_has_words_and_a_way_to_close():
+    for name, kind in kinds.KINDS.items():
+        assert kind.label and kind.cadences and kind.fresh_days > 0, name
+        assert name in kinds.RED_CAPABLE or kind.closes, name
+    assert kinds.due("daily") == ("framework",)

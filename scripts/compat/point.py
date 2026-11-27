@@ -2,7 +2,12 @@
 
 A point is one framework version on one interpreter, in an environment that
 holds the built wheel, that framework and nothing another adapter needs. The
-steps run in a fixed order and each failure has one name, so the report can
+plan wrote everything this needs into the point itself: what to install, what
+to probe, which files to run, how long it may take. This module follows that
+recipe and never asks what kind of point it is running, so a new kind of point
+is new values in the same fields and never a branch here. A test holds that.
+
+The steps run in a fixed order and each failure has one name, so the report can
 tell "the new release changed what wardex records" from "PyPI was down":
 
 1. resolve and install, at the point's cutoff instant;
@@ -38,11 +43,13 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from compat import manifest  # noqa: E402
+from compat import model  # noqa: E402
 
-SCHEMA = 1
+SCHEMA = model.SCHEMA
 REPO = Path(__file__).resolve().parents[2]
 PROBE = Path(__file__).with_name("attach_probe.py")
+#: Session plugins a point's check may name; loaded with `-p`, from here and nowhere else.
+PYTEST_PLUGINS = Path(__file__).with_name("pytest_plugins")
 _NO_SOLUTION = ("No solution found", "not satisfiable", "requirements are unsatisfiable")
 
 
@@ -161,7 +168,8 @@ class Point:
         plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         self.point = next(p for p in plan["points"] if p["key"] == args.key)
         self.run_cutoff = plan["cutoff"]
-        self.spec = manifest.ADAPTERS[self.point["adapter"]]
+        self.recipe = self.point["install"]
+        self.probe, self.check = self.point["probe"], self.point["check"]
         self.work = Path(args.work).resolve()
         self.work.mkdir(parents=True, exist_ok=True)
         self.out = Path(args.out).resolve()
@@ -180,8 +188,8 @@ class Point:
             "in_claim": self.point["in_claim"],
             "cutoff": self.point["cutoff"],
             "uploaded": self.point["uploaded"],
-            "evidence": self.spec["evidence"],
-            "replay_of": self.spec["replay_of"],
+            "evidence": self.check["evidence"],
+            "replay_of": self.check["replay_of"],
             "isolated": True,
             "os": platform.system().lower(),
             "arch": platform.machine().lower(),
@@ -205,13 +213,15 @@ class Point:
     def _requirements(self, optional: tuple[int, ...], *, minimal: bool = False) -> str:
         lines = [str(self.wheel)]
         for dist, version in self.point["targets"].items():
-            lines.append(f"{dist}{self.spec['extras'].get(dist, '')}=={version}")
+            lines.append(f"{dist}{self.recipe['extras'].get(dist, '')}=={version}")
         if not minimal:
-            lines += [f"{dist}{self.spec['extras'].get(dist, '')}" for dist in self.point["floats"]]
-            lines += self.spec["requires"]
+            lines += [
+                f"{dist}{self.recipe['extras'].get(dist, '')}" for dist in self.point["floats"]
+            ]
+            lines += self.recipe["requires"]
             for index in optional:
-                lines += self.spec["optional"][index]["requires"]
-        lines += manifest.TOOLS
+                lines += self.recipe["optional"][index]["requires"]
+        lines += self.recipe["tools"]
         return "\n".join(lines) + "\n"
 
     def _compile(self, venv: Path, requirements: str, lock: Path, *, refresh: bool = False):
@@ -222,7 +232,7 @@ class Point:
         cmd += ["--exclude-newer", self.point["cutoff"]]
         if self.point["cutoff"] != self.run_cutoff:
             # The test tools are today's, whatever the era of the framework under them.
-            for tool in manifest.TOOLS:
+            for tool in self.recipe["tools"]:
                 cmd += ["--exclude-newer-package", f"{tool.split('==')[0]}={self.run_cutoff}"]
         if refresh:
             for dist in self.point["targets"]:
@@ -244,7 +254,7 @@ class Point:
             self.result["install"] = {"outcome": "install_network", "detail": err[-600:]}
             return False
         lock = self.out / "lock.txt"
-        every = tuple(range(len(self.spec["optional"])))
+        every = tuple(range(len(self.recipe["optional"])))
         kept, detail = every, ""
         for attempt in range(3):
             code, _, err = self._compile(venv, self._requirements(every), lock, refresh=attempt > 0)
@@ -280,11 +290,11 @@ class Point:
             self.result["install"] = {"outcome": "install_network", "detail": err[-600:]}
             return False
         dropped = [i for i in every if i not in kept]
-        self.dropped_tests = [t for i in dropped for t in self.spec["optional"][i]["tests"]]
+        self.dropped_tests = [t for i in dropped for t in self.recipe["optional"][i]["tests"]]
         self.result["install"] = {
             "outcome": "ok",
             "detail": "",
-            "dropped_optional": [list(self.spec["optional"][i]["requires"]) for i in dropped],
+            "dropped_optional": [list(self.recipe["optional"][i]["requires"]) for i in dropped],
         }
         self.result["lock_sha256"] = sha256(lock)
         return self._verify(venv)
@@ -323,14 +333,14 @@ class Point:
     # --- checks --------------------------------------------------------------
 
     def control_import(self, venv: Path) -> bool:
-        statement = "import " + ", ".join(self.spec["imports"])
+        statement = "import " + ", ".join(self.probe["imports"])
         code, _, err = run([python_of(venv), "-c", statement], cwd=self.work, timeout=120)
         self.result["control_import"] = "ok" if code == 0 else err.strip().splitlines()[-1][:300]
         return code == 0
 
     def attach(self, venv: Path) -> bool:
         code, out, err = run(
-            [python_of(venv), PROBE, self.point["adapter"], ",".join(self.spec["imports"])],
+            [python_of(venv), PROBE, self.probe["adapter"], ",".join(self.probe["imports"])],
             cwd=self.work,
             timeout=120,
         )
@@ -342,7 +352,7 @@ class Point:
         return self.result["attach"]["verdict"] == "ok"
 
     def files(self) -> list[str]:
-        root = REPO / manifest.TESTS_DIR
+        root = REPO / model.TESTS_DIR
         dropped = {
             Path(found).name
             for pattern in getattr(self, "dropped_tests", [])
@@ -351,7 +361,7 @@ class Point:
         chosen = sorted(
             {
                 Path(found).name
-                for pattern in self.spec["tests"]
+                for pattern in self.check["files"]
                 for found in glob.glob(str(root / pattern))
             }
             - dropped
@@ -365,18 +375,21 @@ class Point:
         Counts and test ids come from the JUnit report, never from parsing output."""
         junit = self.work / f"junit-{tag}.xml"
         junit.unlink(missing_ok=True)
-        cmd = [python_of(venv), "-m", "pytest", *(f"{manifest.TESTS_DIR}/{name}" for name in files)]
-        cmd += ["-q", "-p", "no:cacheprovider", f"--timeout={manifest.TEST_TIMEOUT_S}"]
+        cmd = [python_of(venv), "-m", "pytest", *(f"{model.TESTS_DIR}/{name}" for name in files)]
+        cmd += ["-q", "-p", "no:cacheprovider", f"--timeout={self.check['test_timeout_s']}"]
         cmd += [f"--junitxml={junit}", "-o", "junit_family=xunit1"]
-        for plugin in manifest.PLUGINS:
+        for plugin in self.check["plugins"]:
             cmd += ["-p", plugin]
         env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
         env.pop("PYTHONPATH", None)
         if self.point["assume_measured"]:
-            env["COMPAT_ASSUME_MEASURED"] = "1"
+            # The plugin directory is the whole path: a source tree on it would shadow the
+            # installed wheel.
+            cmd += ["-p", "compat_widen"]
+            env["PYTHONPATH"] = str(PYTEST_PLUGINS)
         started = time.monotonic()
         # Never longer than what the point has left, so the last word is always a result.
-        limit = int(max(60, min(manifest.SUITE_TIMEOUT_S, self._left() - 60)))
+        limit = int(max(60, min(self.check["suite_timeout_s"], self._left() - 60)))
         code, out, err = run(cmd, cwd=REPO, env=env, timeout=limit)
         print(out[-6000:], flush=True)
         if code not in (0, 1):
@@ -454,7 +467,7 @@ class Point:
 
     def execute(self) -> None:
         started = time.monotonic()
-        self.deadline = started + manifest.POINT_BUDGET_S
+        self.deadline = started + self.point["budget_s"]
         venv = self.work / "venv"
         try:
             self._steps(venv)
@@ -493,9 +506,9 @@ class Point:
             "files": files,
             "excluded_files": self.excluded,
             "selection_sha256": hashlib.sha256(
-                "".join(sha256(REPO / manifest.TESTS_DIR / name) for name in files).encode()
+                "".join(sha256(REPO / model.TESTS_DIR / name) for name in files).encode()
             ).hexdigest(),
-            "plugins": list(manifest.PLUGINS),
+            "plugins": list(self.check["plugins"]),
         }
         if first["ok"]:
             result["outcome"] = "pass"

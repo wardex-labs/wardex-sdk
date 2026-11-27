@@ -35,9 +35,9 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from compat import manifest  # noqa: E402
+from compat import kinds, manifest, model  # noqa: E402
 
-SCHEMA = 1
+SCHEMA = model.SCHEMA
 REPO = Path(__file__).resolve().parents[2]
 MEASURED_PY = REPO / "sdks/python/src/wardex_sdk/_adapters/_measured.py"
 ENUMS_PY = REPO / "sdks/python/src/wardex_sdk/_enums.py"
@@ -216,6 +216,45 @@ def spelled(entry: dict) -> str:
     )
 
 
+def compile_point(base: dict, *, kind: str, subject: str, spec: dict) -> dict:
+    """The one place a planned point is finished: its kind, whether it may turn the run
+    red, and the whole recipe the executor follows.
+
+    The executor reads the point and nothing else, so everything a kind's declaration
+    says about installing and checking is copied in here. That is what keeps it from
+    ever asking what kind of point it is running."""
+    return {
+        **base,
+        "kind": kind,
+        "subject": subject,
+        "adapters": [base["adapter"]],
+        "watching": not kinds.is_red_capable(kind),
+        "runner": "linux-x64",
+        "sdk": {"origin": "build"},
+        "install": {
+            "extras": dict(spec["extras"]),
+            "requires": list(spec["requires"]),
+            "optional": [
+                {"requires": list(extra["requires"]), "tests": list(extra["tests"])}
+                for extra in spec["optional"]
+            ],
+            "tools": list(manifest.TOOLS),
+        },
+        "probe": {"imports": list(spec["imports"]), "adapter": base["adapter"]},
+        "check": {
+            "how": "suite",
+            "files": list(spec["tests"]),
+            "plugins": list(manifest.PLUGINS),
+            "test_timeout_s": manifest.TEST_TIMEOUT_S,
+            "suite_timeout_s": manifest.SUITE_TIMEOUT_S,
+            "evidence": spec["evidence"],
+            "replay_of": spec["replay_of"],
+        },
+        "budget_s": manifest.POINT_BUDGET_S,
+        "fresh_days": kinds.KINDS[kind].fresh_days,
+    }
+
+
 def _claimed(finals: dict, entry: dict) -> list[str]:
     return sorted((v for v in finals if claims(entry, v)), key=vkey)
 
@@ -323,22 +362,19 @@ def plan_adapter(
         if role == "floor":
             window = timedelta(days=manifest.FLOOR_WINDOW_DAYS)
             point_cutoff = min(cutoff, iso(parse_iso(max(stamps.values())) + window))
-        points.append(
-            {
-                "key": "--".join(filter(None, (name, role, line))),
-                "adapter": name,
-                "role": role,
-                "targets": targets,
-                "floats": [
-                    e["distribution"] for e in companions if e["distribution"] not in targets
-                ],
-                "python": python,
-                "in_claim": in_claim,
-                "cutoff": point_cutoff,
-                "assume_measured": not in_claim,
-                "uploaded": stamps,
-            }
-        )
+        base = {
+            "key": "--".join(filter(None, (name, role, line))),
+            "adapter": name,
+            "role": role,
+            "targets": targets,
+            "floats": [e["distribution"] for e in companions if e["distribution"] not in targets],
+            "python": python,
+            "in_claim": in_claim,
+            "cutoff": point_cutoff,
+            "assume_measured": not in_claim,
+            "uploaded": stamps,
+        }
+        points.append(compile_point(base, kind="framework", subject=name, spec=spec))
 
     add("floor", floor, oldest_py, pins=companion_pins(0))
     lines = sorted({_line(v, width) for v in claimed}, key=vkey)
@@ -394,7 +430,15 @@ def displaced_line(targets: dict, python: str) -> str:
     return "-".join([*targets.values(), f"py{python}"])
 
 
-def build_plan(measured: dict, releases: dict, cutoff: str, state: dict | None = None) -> dict:
+def build_plan(
+    measured: dict,
+    releases: dict,
+    cutoff: str,
+    state: dict | None = None,
+    *,
+    cadence: str = "daily",
+    partial: bool = False,
+) -> dict:
     adapters, points, problems = {}, [], []
     remembered = (state or {}).get("displaced") or {}
     for name, entries in sorted(measured.items()):
@@ -408,9 +452,22 @@ def build_plan(measured: dict, releases: dict, cutoff: str, state: dict | None =
         planned = plan_adapter(name, entries, releases, cutoff, remembered.get(name))
         adapters[name] = planned["info"]
         points.extend(planned["points"])
+    # What this run speaks for. A kind is covered for the subjects it planned in full; the
+    # report drops what it remembers of a covered subject's points that are no longer
+    # planned, and touches nothing outside the cover. A day the index would not list an
+    # adapter's releases covers nothing of that adapter, so it forgets nothing either.
+    covered = sorted(name for name, info in adapters.items() if not info["problems"])
+    scope = {
+        "cadence": cadence,
+        "covers": {"framework": covered} if "framework" in kinds.due(cadence) else {},
+        "partial": partial,
+    }
     return {
         "schema": SCHEMA,
         "cutoff": cutoff,
+        "cadence": cadence,
+        "scope": scope,
+        "partial": partial,
         "adapters": adapters,
         "replay_only": manifest.REPLAY_ONLY,
         "points": points,
@@ -437,10 +494,9 @@ def main(argv: list[str] | None = None) -> int:
     }
     state_file = Path(args.state) if args.state else None
     state = json.loads(state_file.read_text("utf-8")) if state_file and state_file.is_file() else {}
-    plan = build_plan(measured, releases, cutoff, state)
     # A plan of one adapter says nothing about the others; the report must not read it
     # as the whole run.
-    plan["partial"] = bool(args.only)
+    plan = build_plan(measured, releases, cutoff, state, partial=bool(args.only))
     Path(args.out).write_text(json.dumps(plan, indent=1, sort_keys=True), encoding="utf-8")
     for point in plan["points"]:
         targets = ", ".join(f"{d}=={v}" for d, v in point["targets"].items())
