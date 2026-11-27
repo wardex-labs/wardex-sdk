@@ -97,7 +97,11 @@ def is_measured(entry: Measured, version: str) -> bool:
 
 
 def _release(version: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in version.split("."))
+    """A final release as numbers, trailing zeros dropped: "2.54" and "2.54.0" are one release."""
+    parts = [int(part) for part in version.split(".")]
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
 
 
 def ranges(entry: Measured) -> tuple[str, ...]:

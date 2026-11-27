@@ -839,6 +839,7 @@ def test_a_failed_release_that_a_newer_one_replaced_is_remembered_and_kept_on_th
     (line,) = issue["changes"]
     assert "`openai-agents 0.23.1`" in line and "did not pass when it was last run" in line
     assert "`known_bad`" in line
+    assert issue["fingerprint"] != "clear", "an open issue that reads as having nothing to say"
 
     again = report.next_state(state, results, _RUN, tmp_path, plan)
     assert again["displaced"] == {}, "the plan made no point of it: it is no longer claimed"
@@ -951,3 +952,178 @@ def test_a_replaced_release_is_remembered_once_even_while_its_successor_cannot_b
     assert second["displaced"] == {}
     third = report.next_state(second, stuck, _RUN, tmp_path, _plan_with_table(_FLOOR, newer))
     assert third["displaced"] == {}
+
+
+@pytest.mark.parametrize("today", sorted(report.NOT_OURS | {"test_deps_unresolvable"}))
+def test_a_displaced_release_that_cannot_be_checked_stays_on_the_issue(tmp_path, today):
+    """Its own point has never run it, so that point has said nothing yet. What is known is
+    the failure it was remembered for, and a day it cannot be installed must not close the
+    issue over it. Nor may each such day post a comment."""
+    newer, old = _point("claim_top", "0.23.2"), _displaced_point("0.23.1")
+    plan = _plan_with_table(_FLOOR, newer, old)
+    results = _results(_result(_FLOOR), _result(newer), _result(old, today))
+    remembered = {"displaced": {"openai_agents": [{"key": old["key"], **_remembered_item()}]}}
+    assert report.judge(plan, results) == []
+
+    state = report.next_state(remembered, results, _RUN, tmp_path, plan)
+    issue = report.adapter_issue("openai_agents", plan, results, _RUN, state)
+    assert issue["open"] and state["displaced"]
+    (line,) = issue["changes"]
+    assert "did not pass when last checked, on `2026-11-25`, and could not be checked today" in line
+
+    tomorrow = report.next_state(state, results, _RUN, tmp_path, plan)
+    again = report.adapter_issue("openai_agents", plan, results, _RUN, tomorrow)
+    assert again["open"] and again["fingerprint"] == issue["fingerprint"]
+
+
+def test_a_day_the_run_itself_broke_does_not_erase_a_failure(tmp_path):
+    """The release failed. The next day the harness broke on it, which says nothing about
+    the release. The day after, a newer patch replaced it: it is still owed a run."""
+    plan = _plan_with_table(_FLOOR, _TOP)
+    broke = _results(_result(_FLOOR), _result(_TOP, "harness_error"))
+    state = report.next_state(_top_failed_yesterday(), broke, _RUN, tmp_path, plan)
+    assert state["points"][_TOP["key"]]["last_checked"]["outcome"] == "fail"
+
+    newer = _point("claim_top", "0.23.2")
+    plan = _plan_with_table(_FLOOR, newer)
+    after = report.next_state(
+        state, _results(_result(_FLOOR), _result(newer)), _RUN, tmp_path, plan
+    )
+    assert [item["targets"] for item in after["displaced"]["openai_agents"]] == [
+        {"openai-agents": "0.23.1"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("today", "kept", "open_"),
+    [("pass", False, False), ("fail", False, True), ("install_network", True, True)],
+)
+def test_a_remembered_release_a_rule_picks_again_is_settled_only_by_a_run(
+    tmp_path, today, kept, open_
+):
+    """The patch that replaced it was withdrawn, so the newest-release rule picks the old
+    one again and the plan makes no second point. A pass ends it; a failure is on that
+    point's own record from then on; a day it cannot be installed settles nothing."""
+    again = {**_point("claim_top", "0.23.1"), "planned_python": "3.14"}
+    plan = _plan_with_table(_FLOOR, again)
+    results = _results(
+        _result(_FLOOR),
+        _result(again, today, failed_ids=["t.py::test_tree"] if today == "fail" else []),
+    )
+    key = "openai_agents--displaced--0.23.1-py3.14"
+    remembered = {"displaced": {"openai_agents": [{"key": key, **_remembered_item()}]}}
+    state = report.next_state(remembered, results, _RUN, tmp_path, plan)
+    assert bool(state["displaced"]) is kept
+    assert report.adapter_issue("openai_agents", plan, results, _RUN, state)["open"] is open_
+
+
+def test_a_replaced_failure_survives_the_whole_path_from_results_to_the_next_plan(
+    tmp_path, monkeypatch
+):
+    """Three runs through `main`, with files on disk as the workflow has them: the release
+    fails on both interpreters, a newer patch replaces it, and the plan of the day after
+    runs it again on each interpreter it failed on."""
+    from compat import plan as planner
+
+    table = [
+        {"distribution": "openai-agents", "minors": ("0.22", "0.23"), "known_bad": (), "since": ""}
+    ]
+    history = {
+        "openai-agents": [
+            {
+                "version": v,
+                "files": [
+                    {"uploaded": f"{d}T12:00:00Z", "yanked": False, "requires_python": ">=3.10"}
+                ],
+            }
+            for v, d in (("0.22.0", "2026-08-19"), ("0.23.1", "2026-10-02"))
+        ]
+    }
+    monkeypatch.setattr(planner, "read_measured", lambda: {"openai_agents": table})
+    monkeypatch.setattr(planner, "fetch_releases", lambda dist: history[dist])
+    monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
+    said: list[str] = []
+    monkeypatch.setattr(report.GitHub, "do", lambda self, what, *rest: said.append(what))
+    for name in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "GITHUB_REPOSITORY"):
+        monkeypatch.delenv(name, raising=False)
+    records = tmp_path / "records"
+    records.mkdir()
+
+    def run_day(day: int, failing: set[str]) -> tuple[int, dict, list[dict]]:
+        work = tmp_path / f"day{day}"
+        work.mkdir()
+        stamp = f"2026-11-{day:02d}T19:40:00Z"
+        argv = [
+            "--out",
+            str(work / "plan.json"),
+            "--cutoff",
+            stamp,
+            "--state",
+            str(records / "state.json"),
+        ]
+        assert planner.main(argv) == 0
+        points = json.loads((work / "plan.json").read_text())["points"]
+        for planned in points:
+            failed = planned["role"] in failing
+            result = {
+                "schema": 1,
+                "key": planned["key"],
+                "adapter": planned["adapter"],
+                "targets": planned["targets"],
+                "outcome": "fail" if failed else "pass",
+                "cause": None,
+                "tests": {
+                    "failed_ids": ["t.py::test_tree"] if failed else [],
+                    "skipped_ids": [],
+                    "files": ["t.py"],
+                    "passed": 1,
+                    "failed": int(failed),
+                    "errors": 0,
+                    "skipped": 0,
+                },
+            }
+            _write(work / "results", result)
+        argv = [
+            "--plan",
+            str(work / "plan.json"),
+            "--results",
+            str(work / "results"),
+            "--state-dir",
+            str(records),
+            "--write",
+        ]
+        code = report.main(argv)
+        return code, json.loads((records / "state.json").read_text()), points
+
+    code, state, _ = run_day(20, {"claim_top", "claim_top_oldpy"})
+    assert code == report.RED_EXIT and state["displaced"] == {}
+    assert state["points"]["openai_agents--claim_top"]["last_checked"]["python"] == "3.14"
+
+    history["openai-agents"].append(
+        {
+            "version": "0.23.2",
+            "files": [
+                {"uploaded": "2026-11-21T08:00:00Z", "yanked": False, "requires_python": ">=3.10"}
+            ],
+        }
+    )
+    said.clear()
+    code, state, points = run_day(21, set())
+    assert code == 0 and not [p for p in points if p["role"] == "displaced"]
+    assert said == ["open Compatibility: openai-agents"], "green, and the issue still says so"
+    assert sorted(item["key"] for item in state["displaced"]["openai_agents"]) == [
+        "openai_agents--displaced--0.23.1-py3.10",
+        "openai_agents--displaced--0.23.1-py3.14",
+    ]
+
+    code, state, points = run_day(22, {"displaced"})
+    assert {p["key"]: p["python"] for p in points if p["role"] == "displaced"} == {
+        "openai_agents--displaced--0.23.1-py3.10": "3.10",
+        "openai_agents--displaced--0.23.1-py3.14": "3.14",
+    }
+    assert code == report.RED_EXIT and len(state["displaced"]["openai_agents"]) == 2
+
+    table[0]["known_bad"] = ("0.23.1",)
+    code, state, points = run_day(23, set())
+    assert code == 0 and state["displaced"] == {}
+    assert not [p for p in points if p["role"] == "displaced"]
