@@ -132,10 +132,13 @@ def load_results(plan: dict, results_dir: Path) -> dict[str, dict]:
             data, problem = {}, type(error).__name__
         if problem:
             data = {"outcome": "no_result", "note": problem}
-        # Who the point is comes from the plan, never from what the point job wrote.
+        # Who the point is comes from the plan, never from what the point job wrote. What
+        # the point measured (the interpreter that ran, the wheel it imported) stays its own.
+        identity = model.identity_of(point)
         data.update({k: point[k] for k in ("key", "adapter", "role", "targets", "in_claim")})
-        data.update(model.identity_of(point))
+        data.update({k: identity[k] for k in ("kind", "subject", "adapters", "watching", "runner")})
         data["planned_python"] = point.get("python", "")
+        data["planned_sdk"] = identity["sdk"]
         data["planned"] = point
         data.setdefault("cause", None)
         results[key] = data
@@ -183,7 +186,10 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
                 "subject": result.get("subject", result["adapter"]),
                 "adapters": result.get("adapters", [result["adapter"]]),
                 "watching": is_watching(result),
-                "sdk": result.get("sdk", {"origin": "build"}),
+                "sdk": {
+                    **result.get("planned_sdk", {"origin": "build"}),
+                    "version": clean((result.get("sdk") or {}).get("version", ""), 40),
+                },
                 "runner": result.get("runner", "linux-x64"),
                 # The point as it was planned, so the same point can be built again from this
                 # line on a later day. From the plan job, which runs no third-party code.
@@ -358,15 +364,21 @@ def next_state(
     for key, result in results.items():
         entry = dict(points.get(key, {}))
         tests = result.get("tests") or {}
-        entry["point"] = model.identity_of({**result, "python": result.get("planned_python", "")})
+        entry["point"] = model.identity_of(
+            {
+                **result,
+                "python": result.get("planned_python", ""),
+                "sdk": result.get("planned_sdk", {"origin": "build"}),
+            }
+        )
         entry["last"] = {
             "date": run["date"],
             "outcome": result["outcome"],
             "cause": result["cause"],
             "targets": result["targets"],
             "url": run["url"],
-            "failed_ids": tests.get("failed_ids", []),
-            "excluded_files": tests.get("excluded_files", []),
+            "failed_ids": [clean(node, 300) for node in tests.get("failed_ids", [])[:200]],
+            "excluded_files": [clean(name) for name in tests.get("excluded_files", [])[:200]],
         }
         if (entry.get("last_checked") or {}).get("targets") not in (None, result["targets"]):
             # What this point last said was about a release it no longer tests. Whether that
@@ -406,6 +418,7 @@ def next_state(
             locks[key] = lock
         points[key] = entry
     scope = (plan or {}).get("scope") or {}
+    forgotten: list[str] = []
     for key in [key for key in points if key not in results]:
         # A point this run was in a position to plan and did not: the question is no longer
         # asked (the release left the range, a newer line replaced it). Anything outside
@@ -415,6 +428,7 @@ def next_state(
         subject = identity.get("subject") or key.split("--")[0]
         if subject in scope.get("covers", {}).get(kind, ()):
             del points[key]
+            forgotten.append(key)
     seen = dict(state.get("kinds") or {})
     if not scope.get("partial", True):
         for kind in scope.get("covers", {}):
@@ -441,6 +455,9 @@ def next_state(
     if run["event"] == "schedule":
         out["last_scheduled"] = run["started_at"]
     out["_locks"] = locks
+    # A forgotten point's lock goes with it. A key that is planned again later starts with
+    # no last pass at all, instead of with a lock the state knows nothing about.
+    out["_forget"] = forgotten
     return out
 
 
@@ -545,16 +562,29 @@ def adapter_issue(
             what = "does not finish its tests (the run timed out, or failed outside any test)"
         else:
             what = OUTCOME_WORDS[outcome]
+        when = f" (last run {code(result['as_of'])})" if result.get("as_of") else ""
         if is_watching(result):
             # Reported, and never an argument for red. Said apart, so nobody reads a
             # watching failure as a broken promise or a promise as merely watched.
             if outcome in GREEN or (outcome in NOT_OURS and not result["in_claim"]):
                 continue
-            when = f" (last run {code(result['as_of'])})" if result.get("as_of") else ""
             watched.append(
                 f"{_kind_label(result)}: {version} {what}{when}. Closes {_kind_closes(result)}."
             )
             marks.append([result["key"], "watching", outcome, nodes])
+            if nodes:
+                failing.append((result, nodes))
+            continue
+        if result.get("as_of"):
+            # Not run by this run: what it said stands, dated, and nothing new is claimed.
+            # No "passes, widen the range" from a pass nobody saw today.
+            if not result["in_claim"] or outcome not in RED:
+                continue
+            todo.append(
+                f"{version} is inside the tested range and did not pass when it was last "
+                f"run, on {code(result['as_of'])}: {what}. This run did not run it."
+            )
+            marks.append([result["key"], "remembered", outcome, nodes])
             if nodes:
                 failing.append((result, nodes))
             continue
@@ -629,9 +659,10 @@ def adapter_issue(
         f"{code(dist)} " + clean(said.get(dist) or ", ".join(f"{line}.x" for line in lines), 80)
         for dist, lines in info["claim"].items()
     )
+    fingerprint = _fingerprint(sorted(marks, key=json.dumps))
     body = [
         f"<!-- compat-key: {name} -->",
-        f"<!-- compat-fingerprint: {_fingerprint(sorted(marks))} -->",
+        f"<!-- compat-fingerprint: {fingerprint} -->",
         f"The daily compatibility run tests the wardex adapter for {code(info['label'])} against "
         "exact framework releases, each in an environment that holds only this framework. "
         "Every run rewrites this issue, and it closes itself when nothing below needs doing.",
@@ -681,7 +712,7 @@ def adapter_issue(
         "key": name,
         "title": f"Compatibility: {info['label']}",
         "body": "\n".join(body) + "\n",
-        "fingerprint": _fingerprint(sorted(marks, key=json.dumps)),
+        "fingerprint": fingerprint,
         "open": bool(todo or watched),
         "changes": [*todo, *watched],
         "closing": closing,
@@ -950,7 +981,7 @@ def main(argv: list[str] | None = None) -> int:
     apply_skip_rule(results, state)
     reasons = judge(plan, results)
     new_state = next_state(state, results, run, results_dir, plan)
-    locks = new_state.pop("_locks")
+    locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
 
     gh = GitHub(os.environ.get("GITHUB_REPOSITORY", ""), write=args.write)
     wanted = wanted_issues(plan, results, new_state, run)
@@ -966,6 +997,9 @@ def main(argv: list[str] | None = None) -> int:
             for line in records(plan, results, run):
                 handle.write(json.dumps(line, sort_keys=True) + "\n")
         (state_dir / "last-green").mkdir(exist_ok=True)
+        for key in forgotten:
+            for suffix in (".txt", ".files.json"):
+                (state_dir / "last-green" / f"{key}{suffix}").unlink(missing_ok=True)
         for key, lock in locks.items():
             (state_dir / "last-green" / f"{key}.txt").write_bytes(lock.read_bytes())
             files = new_state["points"][key]["last_green"]["files"]

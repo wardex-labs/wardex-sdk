@@ -651,32 +651,199 @@ def test_promotion_is_one_line_and_only_declared_kinds_can_be_promoted():
     assert "red" not in {field.lower() for field in kinds.Kind.__dataclass_fields__}
 
 
-def test_every_planned_point_says_its_kind_and_carries_its_whole_recipe():
-    points = _points(_OPENAI, _OPENAI_HISTORY)
-    spec = manifest.ADAPTERS["openai_agents"]
+def _history_for(name: str) -> tuple[list[dict], dict]:
+    """A table row per target of `name` and two invented releases of each."""
+    entries = [
+        {"distribution": dist, "minors": ("1.0",), "known_bad": (), "since": ""}
+        for dist in manifest.ADAPTERS[name]["targets"]
+    ]
+    history = {
+        entry["distribution"]: [_release("1.0.0", "2026-08-01"), _release("1.0.1", "2026-11-01")]
+        for entry in entries
+    }
+    return entries, history
+
+
+@pytest.mark.parametrize("name", sorted(manifest.ADAPTERS))
+def test_every_planned_point_says_its_kind_and_carries_its_whole_recipe(name):
+    """The executor reads the point and nothing else, so whatever the manifest says about
+    an adapter has to be in every one of its points, whole."""
+    entries, history = _history_for(name)
+    spec = manifest.ADAPTERS[name]
+    points = _points(entries, history, name)
+    assert len(points) >= 2
     for key, planned in points.items():
-        assert (planned["kind"], planned["subject"]) == ("framework", "openai_agents"), key
+        assert (planned["kind"], planned["subject"], planned["adapters"]) == (
+            "framework",
+            name,
+            [name],
+        ), key
         assert planned["watching"] is False and planned["sdk"] == {"origin": "build"}, key
-        assert planned["install"]["requires"] == list(spec["requires"])
-        assert planned["install"]["tools"] == list(manifest.TOOLS)
-        assert planned["check"]["files"] == list(spec["tests"])
-        assert planned["probe"] == {"imports": list(spec["imports"]), "adapter": "openai_agents"}
+        assert planned["runner"] == "linux-x64"
+        assert planned["install"] == {
+            "extras": dict(spec["extras"]),
+            "requires": list(spec["requires"]),
+            "optional": [
+                {"requires": list(extra["requires"]), "tests": list(extra["tests"])}
+                for extra in spec["optional"]
+            ],
+            "tools": list(manifest.TOOLS),
+        }
+        assert planned["probe"] == {"imports": list(spec["imports"]), "adapter": name}
+        assert planned["check"] == {
+            "how": "suite",
+            "files": list(spec["tests"]),
+            "plugins": list(manifest.PLUGINS),
+            "test_timeout_s": manifest.TEST_TIMEOUT_S,
+            "suite_timeout_s": manifest.SUITE_TIMEOUT_S,
+            "evidence": spec["evidence"],
+            "replay_of": spec["replay_of"],
+        }
         assert planned["budget_s"] == manifest.POINT_BUDGET_S
+        assert planned["fresh_days"] == kinds.KINDS["framework"].fresh_days
 
 
-def test_the_executor_cannot_ask_what_kind_of_point_it_runs():
+def test_a_kind_that_is_not_red_capable_is_planned_watching(monkeypatch):
+    """The stamp the whole verdict leans on. A new kind is watching because its name is
+    not on the list, without anyone remembering to say so."""
+    entries, history = _history_for("openai_agents")
+    (base,) = [p for p in _points(entries, history).values() if p["role"] == "claim_top"]
+    spec = manifest.ADAPTERS["openai_agents"]
+    watching = kinds.Kind("a new question", frozenset({"daily"}), 5, 1, "when it passes")
+    monkeypatch.setitem(kinds.KINDS, "new_question", watching)
+    made = plan.compile_point(base, kind="new_question", subject="openai_agents", spec=spec)
+    assert made["watching"] is True and made["kind"] == "new_question"
+    assert made["fresh_days"] == 5, "how long its proof lasts is the kind's to say"
+    monkeypatch.setattr(kinds, "RED_CAPABLE", kinds.RED_CAPABLE | {"new_question"})
+    again = plan.compile_point(base, kind="new_question", subject="openai_agents", spec=spec)
+    assert again["watching"] is False
+
+
+def _runner(tmp_path, planned: dict, monkeypatch) -> tuple[point_runner.Point, list]:
+    """A point runner over one planned point, with every command it would run captured."""
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "wardex_sdk-0.0.0-py3-none-any.whl").write_bytes(b"not a wheel")
+    made = {"cutoff": _CUTOFF, "points": [planned]}
+    (tmp_path / "plan.json").write_text(json.dumps(made), encoding="utf-8")
+    args = point_runner.argparse.Namespace(
+        plan=str(tmp_path / "plan.json"),
+        key=planned["key"],
+        wheel_dir=str(tmp_path / "dist"),
+        work=str(tmp_path / "work"),
+        out=str(tmp_path / "out"),
+        last_green_lock=None,
+    )
+    ran: list = []
+
+    def run(cmd, *, cwd=None, env=None, timeout=900):
+        ran.append({"cmd": [str(part) for part in cmd], "env": env, "timeout": timeout})
+        return 0, "", ""
+
+    monkeypatch.setattr(point_runner, "run", run)
+    made_point = point_runner.Point(args)
+    made_point.deadline = point_runner.time.monotonic() + planned["budget_s"]
+    return made_point, ran
+
+
+def _planned(role: str, adapter: str = "pydantic_ai") -> dict:
+    entries, history = _history_for(adapter)
+    history[entries[0]["distribution"]].append(_release("1.1.0", "2026-11-20"))
+    points = plan.plan_adapter(adapter, entries, history, _CUTOFF)["points"]
+    return next(p for p in points if p["role"] == role)
+
+
+def test_the_executor_runs_the_recipe_the_point_carries(tmp_path, monkeypatch):
+    """Not the manifest's, and not a constant of its own: change the point and the commands
+    change with it."""
+    planned = _planned("claim_top")
+    planned["check"].update(test_timeout_s=7, suite_timeout_s=91, plugins=["one.plugin", "two"])
+    planned["install"]["tools"] = ["pytest==1.2.3"]
+    planned["probe"]["imports"] = ["a_module", "another"]
+    runner, ran = _runner(tmp_path, planned, monkeypatch)
+
+    runner.pytest(tmp_path / "venv", ["test_a.py", "test_b.py"], "first")
+    (call,) = ran
+    cmd = call["cmd"]
+    assert cmd[3:5] == ["sdks/python/tests/test_a.py", "sdks/python/tests/test_b.py"]
+    assert "--timeout=7" in cmd and call["timeout"] == 91
+    assert [cmd[i + 1] for i, part in enumerate(cmd) if part == "-p"] == [
+        "no:cacheprovider",
+        "one.plugin",
+        "two",
+    ]
+    assert "PYTHONPATH" not in call["env"] and call["env"]["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+
+    wanted = runner._requirements((0, 1))
+    assert "pydantic-ai-slim[openai]==1.0.1" in wanted.splitlines() and "pytest==1.2.3" in wanted
+    for requirement in ("opentelemetry-sdk", "fastmcp-slim[client]>=4.1", "boto3"):
+        assert requirement in wanted.splitlines()
+    assert "boto3" not in runner._requirements((0,)).splitlines()
+
+    ran.clear()
+    runner.control_import(tmp_path / "venv")
+    assert ran[0]["cmd"][-1] == "import a_module, another"
+
+    runner.dropped_tests = ["test_pydantic_ai_mcp.py"]
+    assert "test_pydantic_ai_mcp.py" not in runner.files()
+    assert "test_pydantic_ai_adapter.py" in runner.files()
+    assert runner.excluded == ["test_pydantic_ai_mcp.py"]
+
+
+def test_the_widening_plugin_is_loaded_only_for_a_point_that_asks_for_it(tmp_path, monkeypatch):
+    """And from the run's own plugin directory, which is the whole of PYTHONPATH there: a
+    source tree on the path would shadow the installed wheel."""
+    planned = _planned("beyond", "openai_agents")
+    assert planned["assume_measured"] is True
+    runner, ran = _runner(tmp_path, planned, monkeypatch)
+    runner.pytest(tmp_path / "venv", ["test_a.py"], "first")
+    cmd, env = ran[0]["cmd"], ran[0]["env"]
+    assert cmd[cmd.index("compat_widen") - 1] == "-p"
+    assert env["PYTHONPATH"] == str(_REPO / "scripts/compat/pytest_plugins")
+    assert (_REPO / "scripts/compat/pytest_plugins/compat_widen.py").is_file()
+
+
+def test_a_point_runs_out_of_time_by_its_own_budget(tmp_path, monkeypatch):
+    planned = _planned("claim_top")
+    planned["budget_s"] = 200
+    runner, ran = _runner(tmp_path, planned, monkeypatch)
+    runner.deadline = 0.0
+    steps = lambda self, venv: self.pytest(venv, ["test_a.py"], "first")  # noqa: E731
+    monkeypatch.setattr(point_runner.Point, "_steps", steps)
+    runner.execute()
+    assert 60 <= ran[0]["timeout"] <= 140, "what the point has left, less a minute to write up"
+
+
+def test_the_executor_cannot_ask_what_kind_of_point_it_runs(tmp_path, monkeypatch):
     """It follows the recipe in the point. A new kind is new values in the same fields; if
-    the executor could read the declarations it would grow a branch per kind."""
+    the executor read the kind it would grow a branch per kind. Held by running it: a point
+    with no kind at all, and one of a kind nobody declared, run the same commands."""
+
+    def commands(change) -> list:
+        planned = _planned("claim_top", "langgraph")
+        change(planned)
+        where = tmp_path / str(len(list(tmp_path.iterdir())))
+        where.mkdir()
+        runner, ran = _runner(where, planned, monkeypatch)
+        runner.pytest(where / "venv", runner.files(), "first")
+        runner.control_import(where / "venv")
+        lines = runner._requirements((0,)).replace(str(where), "<work>")
+        for call in ran:
+            call["cmd"] = [part.replace(str(where), "<work>") for part in call["cmd"]]
+            call.pop("timeout")
+        return [lines, ran]
+
+    def strip(planned: dict) -> None:
+        for name in ("kind", "subject", "adapters", "watching", "runner", "sdk", "fresh_days"):
+            del planned[name]
+
+    def disguise(planned: dict) -> None:
+        planned.update(kind="nobody_declared", subject="someone:else", watching=True)
+
+    assert commands(lambda planned: None) == commands(strip) == commands(disguise)
     for name in ("point.py", "attach_probe.py"):
         text = (_REPO / "scripts/compat" / name).read_text(encoding="utf-8")
-        imported = set(
-            re.findall(r"^\s*(?:from compat import|import compat\.)\s*(.+)$", text, re.M)
-        )
+        imported = re.findall(r"^\s*(?:from compat import|import compat\.)\s*(.+)$", text, re.M)
         assert not any(re.search(r"\b(kinds|manifest)\b", line) for line in imported), name
-        assert '["kind"]' not in text and "'kind'" not in text and '.get("kind"' not in text, name
-        for kind in kinds.KINDS:
-            assert f'"{kind}"' not in text, (name, kind)
-    assert not hasattr(point_runner, "manifest") and not hasattr(point_runner, "kinds")
 
 
 def test_a_plan_says_what_it_speaks_for(tmp_path, monkeypatch):
@@ -700,6 +867,13 @@ def test_a_plan_says_what_it_speaks_for(tmp_path, monkeypatch):
     out = tmp_path / "plan.json"
     assert plan.main(["--out", str(out), "--cutoff", _CUTOFF, "--only", "openai_agents"]) == 0
     assert json.loads(out.read_text())["scope"]["partial"] is True
+
+
+def test_a_run_of_a_cadence_the_kind_is_not_part_of_plans_none_of_its_points():
+    """Such a run has nothing to say about an adapter, and so nothing to close."""
+    weekly = plan.build_plan({"openai_agents": _OPENAI}, _OPENAI_HISTORY, _CUTOFF, cadence="weekly")
+    assert (weekly["points"], weekly["adapters"]) == ([], {})
+    assert weekly["scope"]["covers"] == {} and weekly["cadence"] == "weekly"
 
 
 def test_the_schedule_in_the_workflow_is_the_table_of_cadences():

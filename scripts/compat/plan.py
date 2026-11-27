@@ -441,7 +441,10 @@ def build_plan(
 ) -> dict:
     adapters, points, problems = {}, [], []
     remembered = (state or {}).get("displaced") or {}
-    for name, entries in sorted(measured.items()):
+    # A run of a cadence the framework kind is not part of plans none of its points and so
+    # has nothing to say about an adapter's issue: it must not close what it did not run.
+    due = "framework" in kinds.due(cadence)
+    for name, entries in sorted(measured.items() if due else ()):
         if not entries:
             if name not in manifest.REPLAY_ONLY:
                 problems.append(f"{name} has no tested versions and no replay entry")
@@ -459,7 +462,7 @@ def build_plan(
     covered = sorted(name for name, info in adapters.items() if not info["problems"])
     scope = {
         "cadence": cadence,
-        "covers": {"framework": covered} if "framework" in kinds.due(cadence) else {},
+        "covers": {"framework": covered} if due else {},
         "partial": partial,
     }
     return {

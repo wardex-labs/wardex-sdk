@@ -51,7 +51,15 @@ def judge(plan: dict, results: dict[str, dict]) -> list[str]:
     floor = kinds.KINDS["framework"].min_points
     for name, info in plan["adapters"].items():
         reasons += [f"plan: {name}: {problem}" for problem in info["problems"]]
-        if sum(1 for p in plan["points"] if p["adapter"] == name) < floor:
+        # Only its own framework points count. A watching point beside one framework point
+        # must not make up the number, or a kind that cannot turn the run red could hide
+        # that a tested range went untested.
+        mine = [
+            p
+            for p in plan["points"]
+            if p["adapter"] == name and p.get("kind", "framework") == "framework"
+        ]
+        if len(mine) < floor:
             reasons.append(f"plan: {name} has fewer than two points")
     if not plan["points"]:
         reasons.append("plan: no points")
