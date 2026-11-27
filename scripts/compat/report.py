@@ -562,6 +562,7 @@ def adapter_issue(
     mine = [r for r in results.values() if r.get("subject", r["adapter"]) == name]
     watched = []
     todo, marks, failing, unchecked = [], [], [], []
+    spoken: set[str] = set()
     for result in mine:
         version, outcome = code(_version(result)), result["outcome"]
         tests = result.get("tests") or {}
@@ -598,6 +599,7 @@ def adapter_issue(
                 f"{version} is inside the tested range and did not pass when it was last "
                 f"run, on {code(as_of)}: {what}. This run did not run it."
             )
+            spoken.add(result["key"])
             marks.append([result["key"], "remembered", outcome, nodes])
             if nodes:
                 failing.append((result, nodes))
@@ -655,10 +657,14 @@ def adapter_issue(
         if nodes:
             failing.append((result, nodes))
 
+    today = {key: result for key, result in results.items() if key not in old}
     for item in remembered.values():
-        if item["key"] in results or _picked_again(item, results):
+        # Spoken for already: by its own point or the point of a rule that picked it again,
+        # run today, or by the row above that remembers its own point failing.
+        if item["key"] in today or item["key"] in spoken or _picked_again(item, today):
             continue
-        # Remembered by this run; the next plan is the first to make it a point.
+        # Remembered by this run, or by an earlier one whose point for it has not been able
+        # to check it since: the failure it was remembered for is what is known.
         version = code(", ".join(f"{dist} {v}" for dist, v in item["targets"].items()))
         todo.append(
             f"{version} is inside the tested range and did not pass when it was last run, on "
