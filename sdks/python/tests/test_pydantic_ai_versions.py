@@ -16,7 +16,7 @@ from pydantic_ai.models.test import TestModel
 
 import wardex_sdk as wardex
 from _pydantic_ai_support import extras, one, user_owned
-from wardex_sdk._adapters._measured import MEASURED, installed_version, spelled
+from wardex_sdk._adapters._measured import MEASURED, installed_version, ranges, spelled
 from wardex_sdk._assembly import counters
 from wardex_sdk._config import AdaptersConfig
 from wardex_sdk._enums import AdapterName, AdapterState
@@ -56,7 +56,7 @@ def test_a_release_outside_the_measured_major_installs_and_says_so_once(
         status = _status()
         assert status.state is AdapterState.INSTALLED
         assert (status.version, status.measured) == (outside, False)
-        assert status.measured_versions == tuple(f"{line}.x" for line in entry.minors)
+        assert status.measured_versions == ranges(entry)
         lines = [line for line in capsys.readouterr().err.splitlines() if "pydantic_ai" in line]
         assert len(lines) == 1
         assert f"pydantic-ai-slim {outside} (tested: {spelled(entry)})" in lines[0]

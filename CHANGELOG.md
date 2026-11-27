@@ -5,6 +5,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The Pydantic AI adapter is tested on `pydantic-ai-slim` 2.54 and later,
+  not on all of 2.x.** Its suite fails on 2.0 through 2.53: a run cancelled
+  while its model call waits on a request hook records no `chat` span there.
+  On those releases the adapter still installs and records, and now says once
+  that the release is untested, as it does on any release outside the table;
+  `wardex.diagnostics()` reports it `measured=False`.
+
 ## [0.7.0b1] - 2026-11-25
 
 ### Changed (breaking)

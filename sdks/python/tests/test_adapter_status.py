@@ -25,7 +25,14 @@ import wardex_sdk as wardex
 from wardex_sdk import AdapterName, AdapterState, _hub
 from wardex_sdk._adapters import _ADAPTERS, install_configured_adapters
 from wardex_sdk._adapters._base import AdapterInterface
-from wardex_sdk._adapters._measured import MEASURED, Measured, installed_version, is_measured
+from wardex_sdk._adapters._measured import (
+    MEASURED,
+    Measured,
+    installed_version,
+    is_measured,
+    ranges,
+    spelled,
+)
 from wardex_sdk._adapters._probe import Probe
 from wardex_sdk._adapters._registry import get_registry
 from wardex_sdk._assembly import counters
@@ -474,6 +481,56 @@ def test_every_shipped_adapter_has_a_row_in_the_table():
     assert set(MEASURED) == set(AdapterName)
 
 
+@pytest.mark.parametrize(
+    ("version", "measured"),
+    [
+        ("2.54.0", True),
+        ("2.54", True),
+        ("2.76.1", True),
+        ("2.53.9", False),
+        ("2.0.0", False),
+        ("3.0.0", False),
+        ("2.60.0", False),
+    ],
+    ids=["first", "two-part", "later", "just-below", "oldest", "next-major", "bad"],
+)
+def test_a_range_tested_from_a_release_on_leaves_everything_below_it_unmeasured(version, measured):
+    """A range whose oldest releases fail the suite is claimed from the first one that
+    passes. Below it the adapter still installs and says the release is untested."""
+    entry = Measured("x", ("2",), known_bad=("2.60.0",), since="2.54")
+    assert is_measured(entry, version) is measured
+
+
+def test_the_range_is_spelled_with_where_it_starts():
+    assert spelled(Measured("x", ("0.22", "0.23"))) == "0.22.x, 0.23.x"
+    assert spelled(Measured("x", ("2",), since="2.54")) == "2.x from 2.54"
+    assert ranges(Measured("x", ("0.22", "0.23"), since="0.22.3")) == (
+        "0.22.x from 0.22.3",
+        "0.23.x",
+    )
+
+
+def test_a_range_starts_inside_its_lowest_tested_line():
+    """`since` cuts the bottom off the lowest line. Naming a release of a higher line
+    would leave a whole line below it listed as tested and judged untested."""
+    for entries in MEASURED.values():
+        for entry in entries:
+            if not entry.since:
+                continue
+            lowest = min(entry.minors, key=lambda m: tuple(map(int, m.split("."))))
+            assert entry.since == lowest or entry.since.startswith(f"{lowest}."), entry
+            assert any(entry.since in said for said in ranges(entry))
+
+
+def test_the_readme_states_each_tested_range_as_the_table_spells_it():
+    """The framework table in the README and the line `init()` prints on an untested
+    release are the same claim. Spelled by one function, so they cannot say two things."""
+    readme = (_PYPROJECT.parents[2] / "README.md").read_text(encoding="utf-8")
+    for entries in MEASURED.values():
+        for entry in entries[:1]:
+            assert f"(tested on `{entry.distribution}` {spelled(entry)})" in readme
+
+
 def _test_pins() -> dict[str, tuple[str, str]]:
     """`name -> (lower, upper)` for every `"name>=lower,<upper"` in the test group.
 
@@ -497,17 +554,17 @@ def test_the_test_pins_are_exactly_the_table_of_tested_versions():
     """The suite has to run against what the table says was tested, and
     nothing else: a pin wider than the table lets CI drift onto a release the
     table calls untested, and one narrower leaves a tested claim unexercised.
-    Each distribution's pin is `>=` its lowest tested minor and `<` the minor
-    after its highest."""
+    Each distribution's pin is `>=` its lowest tested minor, or the release its
+    range starts at, and `<` the minor after its highest."""
     pins = _test_pins()
     for entries in MEASURED.values():
         for entry in entries:
             assert entry.distribution in pins, f"{entry.distribution} has no test pin"
             lower, upper = pins[entry.distribution]
             minors = sorted(entry.minors, key=lambda m: tuple(map(int, m.split("."))))
-            assert (lower, upper) == (minors[0], _minor_after(minors[-1])), (
+            assert (lower, upper) == (entry.since or minors[0], _minor_after(minors[-1])), (
                 f"{entry.distribution}: the pin says >={lower},<{upper} but the table "
-                f"says {', '.join(minors)}"
+                f"says {spelled(entry)}"
             )
 
 

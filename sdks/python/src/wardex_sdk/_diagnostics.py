@@ -26,8 +26,9 @@ class AdapterStatus:
     `version`: True or False when it was checked, None when there was nothing to
     check (the adapter is not installed, or its framework is a CLI whose
     version is not read at `init()`). `measured_versions` is what was tested,
-    as "0.22.x". `detail` is the line wardex said about this adapter, if it
-    said one, so the reason is readable after stderr has scrolled away.
+    as "0.22.x", or "2.x from 2.54" for a range tested from one release on.
+    `detail` is the line wardex said about this adapter, if it said one, so
+    the reason is readable after stderr has scrolled away.
     """
 
     name: str
