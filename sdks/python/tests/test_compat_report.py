@@ -2760,3 +2760,40 @@ def test_not_every_failing_point_that_leaves_the_plan_is_owed_a_run(tmp_path, le
     top = {**_TOP, "python": "3.14"}
     after = _one_day(state, "2026-11-02", tmp_path, (top, "pass"))
     assert after["displaced"] == {} and after["failing"] == {}
+
+
+def test_a_schedule_that_never_fired_is_dated_from_the_day_its_file_reached_the_default_branch(
+    monkeypatch,
+):
+    """GitHub registers a workflow when it first sees the file on any branch. A rehearsal
+    on a branch days before the merge must not count as days the schedule stayed silent."""
+    answers = {
+        "runs": {"workflow_runs": []},
+        "registered": "2026-11-26T03:17:24.000+09:00",
+        "commits": [
+            {"commit": {"committer": {"date": "2026-11-27T20:45:01Z"}}},
+            {"commit": {"committer": {"date": "2026-11-27T17:46:37Z"}}},
+        ],
+    }
+
+    def get(repo: str, path: str):
+        if path.startswith("actions/workflows/compat.yml/runs"):
+            return answers["runs"]
+        if path.startswith("commits?path=.github/workflows/compat.yml"):
+            return answers["commits"]
+        assert path == "actions/workflows/compat.yml"
+        return {"created_at": answers["registered"]}
+
+    monkeypatch.setattr(watchdog, "_get", get)
+    since, ever = watchdog.last_scheduled("o/r")
+    assert (since, ever) == ("2026-11-27T17:46:37Z", False)
+    assert not watchdog.wanted(since, _at("2026-11-28"), ever=False)["open"]
+    assert watchdog.wanted(since, _at("2026-11-30"), ever=False)["open"]
+
+    answers["commits"] = []
+    assert watchdog.last_scheduled("o/r") == ("2026-11-25T18:17:24Z", False), "said in UTC"
+    answers["registered"] = "2026-11-29T00:00:00Z"
+    answers["commits"] = [{"commit": {"committer": {"date": "2026-11-27T17:46:37Z"}}}]
+    assert watchdog.last_scheduled("o/r")[0] == "2026-11-29T00:00:00Z", "the later of the two"
+    answers["runs"] = {"workflow_runs": [{"created_at": "2026-11-28T04:00:00Z"}]}
+    assert watchdog.last_scheduled("o/r") == ("2026-11-28T04:00:00Z", True)
