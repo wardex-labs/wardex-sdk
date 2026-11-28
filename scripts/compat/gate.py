@@ -8,6 +8,8 @@ question of them: did the newest whole run on the default branch, at exactly
 this commit, in the last two days, pass every point that speaks for a claim
 this tree makes? Which runs there were is read from the list the report keeps
 in `state.json` beside the lines, so a run that wrote no line is still a run.
+A run that died before its report, or whose records could not be pushed, is in
+neither place and decides nothing: the run before it at that commit does.
 A point of a watching kind is not asked. It writes nothing and
 needs no permission beyond reading two branches.
 
@@ -169,10 +171,10 @@ def read_runs(records: Path) -> list | None:
     return runs if isinstance(runs, list) else None
 
 
-def _entry_ok(entry: object) -> bool:
+def entry_ok(entry: object) -> bool:
     """Whether an entry of the list of runs is what the report writes."""
     return (
-        run_of({"run": entry}) is not None
+        run_of({"run": entry}) is not None  # which also says it is an object
         and isinstance(entry.get("red"), bool)
         and _count(entry.get("points"), least=0)
         and _attempt({"run": entry}) is not None
@@ -243,7 +245,7 @@ def decide(
             "the records hold no list of their runs (`state.json`); a run of the "
             "compatibility workflow on the default branch writes one"
         )
-    if not all(isinstance(entry, dict) and _entry_ok(entry) for entry in runs):
+    if not all(entry_ok(entry) for entry in runs):
         return _stop("the list of runs in `state.json` of the records cannot be read")
     oldest = (date.fromisoformat(today) - timedelta(days=MAX_AGE_DAYS)).isoformat()
 
@@ -253,6 +255,20 @@ def decide(
 
     listed = [entry for entry in runs if asked(entry)]
     known = {run_of({"run": entry}) for entry in runs}
+    wanted = {run_of({"run": entry}) for entry in listed}
+    astray = sorted(
+        {
+            line["run"]["id"]
+            for line in lines
+            if asked(line["run"]) and run_of(line) in known and run_of(line) not in wanted
+        }
+    )
+    if astray:
+        # Lines that put themselves at this commit, under a run the list puts elsewhere.
+        return _stop(
+            "the records hold lines that do not agree with the list of runs about which "
+            f"run they are of ({code(astray[0])})"
+        )
     unlisted = sorted({line["run"]["id"] for line in lines if run_of(line) not in known})
     if unlisted and any(asked(line["run"]) for line in lines if run_of(line) not in known):
         # Lines that say they are of a whole run at this commit, of a run the list does not

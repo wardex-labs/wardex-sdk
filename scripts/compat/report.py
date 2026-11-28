@@ -531,6 +531,7 @@ def _versions(state: dict, plan: dict | None, run: dict) -> dict:
 #: How long the list of runs remembers a run. The release gate reads the last two days.
 RUN_LIST_DAYS = 7
 _RUN_KEPT = ("id", "attempt", "started_at", "date", "scope", "ref", "sdk_commit", "url")
+_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def run_list(before: object, run: dict) -> list[dict]:
@@ -542,19 +543,27 @@ def run_list(before: object, run: dict) -> list[dict]:
     gate reads such an entry as one it cannot use."""
     entry = {field: run.get(field) for field in _RUN_KEPT}
     entry.update({field: run[field] for field in ("red", "points") if field in run})
-    try:
-        oldest = (date.fromisoformat(run["date"]) - timedelta(days=RUN_LIST_DAYS)).isoformat()
-    except (TypeError, ValueError, KeyError):
-        oldest = ""
-    kept = [
-        old
-        for old in (before if isinstance(before, list) else [])
-        if isinstance(old, dict)
-        and isinstance(old.get("date"), str)
-        and old["date"] >= oldest
-        and (old.get("id"), old.get("attempt")) != (entry["id"], entry["attempt"])
-    ]
-    return [*kept, entry][-200:]
+    today = run["date"]
+    oldest = (date.fromisoformat(today) - timedelta(days=RUN_LIST_DAYS)).isoformat()
+    # A state from before the list existed has none, and that is a list of nothing. Anything
+    # else that is not a list is damage, and is kept as that.
+    held = [] if before is None else before if isinstance(before, list) else [before]
+    kept = []
+    for old in held:
+        if gate.entry_ok(old) and _DAY.fullmatch(old["date"]) and old["date"] <= today:
+            mine = (old["id"], old["attempt"]) == (entry["id"], entry["attempt"])
+            if old["date"] >= oldest and not mine:
+                kept.append(old)
+            continue
+        # Not an entry this function writes. It may have been the run that said a commit
+        # is not fit to release, so it is not dropped by the next run that comes along: it
+        # stays, as something the gate cannot read, for as long as an entry would.
+        seen = old.get("unreadable_since") if isinstance(old, dict) else None
+        if not (isinstance(seen, str) and _DAY.fullmatch(seen) and seen <= today):
+            seen = today
+        if seen >= oldest:
+            kept.append({"unreadable_since": seen})
+    return [*kept, entry]
 
 
 def next_state(
