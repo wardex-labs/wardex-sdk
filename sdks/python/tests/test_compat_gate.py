@@ -346,15 +346,14 @@ def test_an_adapter_with_no_row_in_the_table_is_not_a_claim(monkeypatch):
     assert gate.claimed(_REPO) == {"langgraph": 2}
 
 
-def test_a_missing_or_unreadable_attempt_is_the_first(tmp_path):
+def test_a_line_that_does_not_say_its_attempt_is_of_the_first():
     """Lines written before attempts were recorded, beside a later attempt of the same
     run: the later attempt is still what the run says."""
-    old, garbled, second = _run(attempt=None), _run(attempt="x"), _run(attempt="2")
-    for first in (old, garbled):
-        red = [_line("floor", "fail", run=first), _line("claim_top", run=first)]
-        green = [_line("floor", run=second), _line("claim_top", run=second)]
-        assert _decide(*red, *green)["pass"] is True
-        assert _decide(*green, *red)["pass"] is True
+    old, second = _run(attempt=None), _run(attempt=2)
+    red = [_line("floor", "fail", run=old), _line("claim_top", run=old)]
+    green = [_line("floor", run=second), _line("claim_top", run=second)]
+    assert _decide(*red, *green)["pass"] is True
+    assert _decide(*green, *red)["pass"] is True
 
 
 def test_a_point_that_says_both_did_not_pass_whichever_line_comes_last():
@@ -437,31 +436,84 @@ def test_nothing_a_record_line_holds_is_markup_in_what_the_gate_prints():
     )
 
 
-@pytest.mark.parametrize(
-    "damage",
-    [
-        {"targets": ["openai-agents"]},
-        {"outcome": ["pass"]},
-        {"outcome": "passed"},
-        {"subject": ["x"]},
-    ],
-)
-def test_a_damaged_line_of_the_deciding_run_stops_the_release_and_is_not_a_crash(damage):
-    decision = _decide(_line("floor"), _line("claim_top"), _line("minor_newest", **damage))
-    if "targets" in damage or "subject" in damage:
-        assert decision["pass"] is True, "nothing the verdict reads was damaged"
+_DAMAGE = [
+    ("targets", ["openai-agents"]),
+    ("targets", {"openai-agents": 7}),
+    ("outcome", ["pass"]),
+    ("outcome", "passed"),
+    ("outcome", None),
+    ("subject", ["x"]),
+    ("kind", 3),
+    ("key", {"a": 1}),
+    ("watching", "false"),
+    ("watching", 0),
+    ("in_claim", "no"),
+    ("in_claim", None),
+    ("run.red", 0),
+    ("run.red", "false"),
+    ("run.red", []),
+    ("run.attempt", "x"),
+    ("run.attempt", float("inf")),
+    ("run.attempt", True),
+    ("run.attempt", 0),
+    ("run.attempt", "0"),
+    ("run.attempt", [1]),
+]
+
+
+@pytest.mark.parametrize(("field", "value"), _DAMAGE, ids=[f"{f}={v!r}" for f, v in _DAMAGE])
+def test_a_line_of_the_wrong_shape_stops_the_release_and_is_never_guessed_at(field, value):
+    """Every field the verdict reads is held to the type the report writes. Read loosely,
+    `"watching": "false"` hides a failure and `"red": 0` is a green run."""
+    bad = _line("minor_newest", "fail" if field in ("watching", "in_claim") else "pass")
+    if field.startswith("run."):
+        bad["run"] = {**bad["run"], field[4:]: value}
     else:
-        assert decision["reasons"] == [
-            "`openai_agents--minor_newest`: a result this gate cannot read"
-        ]
-    beyond = _decide(_line("floor"), _line("claim_top"), _line("beyond", outcome="?"))
-    assert beyond["pass"] is False, "a result nobody can read is not a failure above the range"
+        bad[field] = value
+    decision = _decide(_line("floor"), _line("claim_top"), bad)
+    assert decision["pass"] is False and len(decision["reasons"]) == 1
+    assert decision["reasons"][0].endswith(f": a line of this run cannot be read ({field})")
+    assert decision["reasons"][0].count("`") == 2
+    assert "**STOP.**" in gate.words(decision, None, _COMMIT)
+
+
+def test_a_line_of_another_run_can_be_any_shape():
+    """Only the run that decides is held to the shape: a damaged line of a branch run or
+    of another commit is not this release's business."""
+    elsewhere = _line("floor", "fail", run=_run(ref="refs/heads/x"), watching="?", targets=3)
+    older = {"run": {"sdk_commit": "f" * 40, "scope": "all", "ref": "refs/heads/main"}}
+    nothing = {"run": "not a run"}
+    assert _decide(_line("floor"), _line("claim_top"), elsewhere, older, nothing)["pass"] is True
+
+
+def test_a_gate_that_cannot_decide_stops_and_says_so(tmp_path, monkeypatch, capsys):
+    green = _records(tmp_path / "green", _TODAY, _line("floor"), _line("claim_top"))
+
+    def broken(root=None):
+        raise RecursionError("the table of tested versions could not be read")
+
+    monkeypatch.setattr(gate, "REPO", _tree(tmp_path / "tree", "0.7.0b2", None))
+    monkeypatch.setattr(gate, "claimed", broken)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    code = gate.main(["--commit", _COMMIT, "--records", str(green), "--today", _TODAY])
+    assert code == gate.STOP_EXIT
+    assert (
+        "- the gate could not read what it decides from (RecursionError)" in capsys.readouterr().out
+    )
+
+
+def test_an_override_nested_past_reason_is_no_override_and_no_crash(tmp_path):
+    tree = _tree(tmp_path / "tree", "0.7.0b2", "[" * 200_000)
+    assert gate.read_override(tree, "0.7.0b2") is None
+    assert "does not apply" in gate.rejected_override(tree, "0.7.0b2")
 
 
 def test_a_records_file_with_bytes_that_are_not_text_keeps_its_good_lines(tmp_path):
     _records(tmp_path, _TODAY, _line("floor"), _line("claim_top"))
     day = tmp_path / "records/2026/12/03.jsonl"
-    day.write_bytes(day.read_bytes() + b"\xff\xfe not text\n" + b'{"run": {}, "targets": 3}\n')
+    more = b"\xff\xfe not text\n" + b'{"run": {}, "targets": 3}\n' + b"[" * 200_000 + b"\n"
+    more += b'{"run": {}, "schema": "two"}\n'
+    day.write_bytes(day.read_bytes() + more)
     lines = gate.read_lines(tmp_path, _TODAY)
     assert [line.get("key") for line in lines][:2] == [
         "openai_agents--floor",
@@ -501,6 +553,12 @@ def test_a_reason_is_printed_as_written_in_any_language_and_never_as_markup(tmp_
         monkeypatch, tmp_path / "1", red, override={"version": "0.7.0b2", "reason": korean}
     )
     assert code == 0 and f"Reason given: `{korean}`." in said
+    # Characters that print as nothing, or turn the line around, are not kept either.
+    hidden = "the floor\u202e fails\u200b upstream"
+    code, said = _main(
+        monkeypatch, tmp_path / "0", red, override={"version": "0.7.0b2", "reason": hidden}
+    )
+    assert code == 0 and "Reason given: `the floor fails upstream`." in said
     loud = "ok** **PASS** see https://e.invalid/x _x_ ~~y~~ @someone"
     code, said = _main(
         monkeypatch, tmp_path / "2", red, override={"version": "0.7.0b2", "reason": loud}
