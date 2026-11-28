@@ -36,9 +36,10 @@ from compat.verdict import FAILED, GREEN, NOT_OURS, OUTCOME_WORDS  # noqa: E402
 LAPSE_DAYS = 3
 
 MAIN = "main"
-#: First word of a cell drawn from the default branch's build for a version PyPI does not
-#: serve yet.
-UNPUBLISHED = "unpublished"
+#: First words of a cell drawn from the default branch's build, for a version whose
+#: published release the run has not run. It says whose result the cell is and nothing
+#: about PyPI: a run that could not read the index did not learn that a release is missing.
+FROM_MAIN = "from main"
 REPO_URL = "https://github.com/wardex-labs/wardex-sdk"
 RECORDS_BRANCH = "compat-results"
 
@@ -103,18 +104,20 @@ def _published_versions(state: dict) -> list[str]:
     return sorted(safe, key=_release_order)
 
 
-def unpublished(state: dict) -> str:
+def unreleased(state: dict) -> str:
     """The version string of the default branch while no release of that number has a
     page, else "".
 
     The README of a tree points its cells at the pages of its own version. Between the
-    commit that sets a new version and the first run that finds it on PyPI those pages
-    would not exist, so they are drawn from the default branch's build and say so."""
+    commit that sets a new version and the first run that runs that release from PyPI
+    those pages would not exist, so they are drawn from the default branch's build and say
+    so. Compared without case, as a folder on some file systems is."""
     held = state.get("versions") or {}
     version = (held.get(MAIN) or {}).get("version")
-    if not isinstance(version, str) or version in held:
+    if not isinstance(version, str) or version.lower() in {str(key).lower() for key in held}:
         return ""
-    return version if _VERSION.fullmatch(version) else ""
+    # No longer than what a title and a link print of it.
+    return version if _VERSION.fullmatch(version) and len(version) <= 40 else ""
 
 
 def status_of(entry: dict, today: str) -> dict:
@@ -323,13 +326,13 @@ def page(state: dict, version: str, today: str, *, standing_in_for: str = "") ->
     about = (state.get("versions") or {}).get(version) or {}
     grouped = rows(state, version)
     if version == MAIN and standing_in_for:
-        title = f"Compatibility of wardex {clean(standing_in_for, 40)}, not published yet"
+        title = f"Compatibility of wardex {clean(standing_in_for, 40)}, before its release is run"
         what = (
-            f"When the daily run last looked, PyPI did not serve "
-            f"`wardex-sdk=={clean(standing_in_for, 40)}`. Until it does, this page shows what "
-            f"the run found for wardex built from `main`, whose version string that is (commit "
-            f"{code(str(about.get('commit', ''))[:10])}). No row here is a result of the "
-            "published wheel."
+            f"The daily run has not yet run `wardex-sdk=={clean(standing_in_for, 40)}` as PyPI "
+            "serves it: it is not published, or no run since has planned it. Until one has, "
+            "this page shows what the run found for wardex built from `main`, whose version "
+            f"string that is (commit {code(str(about.get('commit', ''))[:10])}). No row here is "
+            "a result of the published wheel."
         )
     elif version == MAIN:
         title = "Compatibility of the default branch"
@@ -433,10 +436,11 @@ def index(state: dict, today: str) -> str:
         "",
         "- [the default branch](main/README.md)",
     ]
-    coming = unpublished(state)
+    coming = unreleased(state)
     if coming:
         lines.append(
-            f"- [wardex {clean(coming, 40)}, not published yet]({clean(coming, 40)}/README.md)"
+            f"- [wardex {clean(coming, 40)}, before its release is run]"
+            f"({clean(coming, 40)}/README.md)"
         )
     lines += [f"- [wardex {clean(v, 40)}]({clean(v, 40)}/README.md)" for v in reversed(versions)]
     return "\n".join(lines) + "\n"
@@ -454,7 +458,7 @@ def site(state: dict, today: str) -> dict[str, str]:
                 continue
             status, words = cell_words(grouped.get(name, []), today)
             files[f"{version}/{name}.svg"] = svg_cell(status, words)
-    coming = unpublished(state)
+    coming = unreleased(state)
     if coming:
         about = state["versions"][MAIN]
         files[f"{coming}/README.md"] = page(state, MAIN, today, standing_in_for=coming)
@@ -463,7 +467,7 @@ def site(state: dict, today: str) -> dict[str, str]:
             if not _NAME.fullmatch(name):
                 continue
             status, words = cell_words(grouped.get(name, []), today)
-            files[f"{coming}/{name}.svg"] = svg_cell(status, f"{UNPUBLISHED} · {words}")
+            files[f"{coming}/{name}.svg"] = svg_cell(status, f"{FROM_MAIN} · {words}")
     return files
 
 
