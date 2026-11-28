@@ -101,7 +101,7 @@ def parse_override(text: str, version: str) -> dict | None:
     that gives no reason is not one."""
     try:
         data = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):  # not JSON, or nested past what a file should be
         return None
     if not isinstance(data, dict) or data.get("version") != version:
         return None

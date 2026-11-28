@@ -317,7 +317,7 @@ def page(state: dict, version: str, today: str) -> str:
         )
     lines = [f"# {title}", "", what, ""]
     override = about.get("override") if version != MAIN else None
-    if override:
+    if isinstance(override, dict):
         lines += [
             "**This release carried an override of the compatibility gate**, which lets a "
             "release go out without a recent pass for what it says it is tested on. The reason "
