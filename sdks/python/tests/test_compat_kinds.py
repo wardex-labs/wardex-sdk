@@ -1931,3 +1931,10 @@ def test_a_point_that_can_turn_the_run_red_keeps_no_watched_word(tmp_path):
     promoted = {**passing, key: {**passing[key], "watching": False}}
     after = report.next_state(state, promoted, _RUN, tmp_path, made)
     assert "last_said" not in after["points"][key]
+    # The next day the run broke, and the day after no point of it was planned: the issue
+    # says what the point last said, which is that it passed.
+    broke = {**promoted, key: _result(promoted[key], "harness_error")}
+    later = report.next_state(after, broke, {**_RUN, "id": "2"}, tmp_path, made)
+    unplanned = {k: r for k, r in promoted.items() if r.get("subject") != "hermes_agent"}
+    issue = report.adapter_issue("hermes_agent", made, unplanned, _RUN, later)
+    assert "did not pass" not in issue["body"] and "fails" not in issue["body"]
