@@ -164,8 +164,16 @@ def test_the_gate_reads_the_last_days_of_the_records_and_skips_what_is_not_a_lin
     _records(tmp_path, "2026-12-02", _line("floor"), _line("claim_top"))
     _records(tmp_path, "2026-11-30", _line("too_old"))
     (tmp_path / "records/2026/12/03.jsonl").write_text('not json\n[1]\n{"schema": 1}\n', "utf-8")
+    with (tmp_path / "records/2026/12/03.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_line("after_the_bad_lines")) + "\n")
+    _records(tmp_path, "2026-12-01", _line("two_days_ago"))
     lines = gate.read_lines(tmp_path, _TODAY)
-    assert [line["key"] for line in lines] == ["openai_agents--floor", "openai_agents--claim_top"]
+    assert sorted(line["key"] for line in lines) == [
+        "openai_agents--after_the_bad_lines",
+        "openai_agents--claim_top",
+        "openai_agents--floor",
+        "openai_agents--two_days_ago",
+    ]
     assert gate.read_lines(tmp_path / "nowhere", _TODAY) == []
 
 
@@ -210,6 +218,13 @@ def test_an_override_is_for_one_version_and_has_to_say_why(tmp_path):
     silent = {"version": "0.7.0b2", "reason": "  "}
     assert gate.read_override(_tree(tmp_path / "d", "0.7.0b2", silent), "0.7.0b2") is None
     assert gate.read_override(_tree(tmp_path / "e", "0.7.0b2", ["0.7.0b2"]), "0.7.0b2") is None
+    for n, nothing in enumerate([None, False, 0, ["because"], {"why": "x"}, "``", "[]<>|"]):
+        said = {"version": "0.7.0b2", "reason": nothing}
+        tree = _tree(tmp_path / f"n{n}", "0.7.0b2", said)
+        assert gate.read_override(tree, "0.7.0b2") is None, nothing
+    marked = {"version": "0.7.0b2", "reason": "see [the issue](https://e.invalid) `now`\n## x"}
+    kept = gate.read_override(_tree(tmp_path / "m", "0.7.0b2", marked), "0.7.0b2")
+    assert kept == {"version": "0.7.0b2", "reason": "see ?the issue?(https://e.invalid) ?now??## x"}
 
 
 def _main(monkeypatch, tmp_path, records: Path, *, override: object = None) -> tuple[int, str]:
@@ -252,3 +267,66 @@ def test_the_gate_passes_stops_and_is_overridden_out_loud(tmp_path, monkeypatch,
         monkeypatch, tmp_path / "5", green, override={"version": "0.7.0b2", "reason": reason}
     )
     assert code == 0 and "OVERRIDDEN" not in said, "an override nobody needed is not mentioned"
+
+
+def test_a_run_two_days_old_still_proves_and_one_three_days_old_does_not():
+    for day, proven in (("2026-12-03", True), ("2026-12-01", True), ("2026-11-30", False)):
+        run = _run(day)
+        assert _decide(_line("floor", run=run), _line("claim_top", run=run))["pass"] is proven, day
+
+
+def test_the_last_attempt_of_a_run_is_what_the_run_says():
+    """A run whose failed jobs were run again writes its lines a second time, under the
+    same run and the same instant. What it said the first time is no longer what it says,
+    whichever order the lines are read in."""
+    first, second = _run(attempt="1"), _run(attempt="2")
+    red = [_line("floor", "harness_error", run=first), _line("claim_top", run=first)]
+    green = [_line("floor", run=second), _line("claim_top", run=second)]
+    assert _decide(*red, *green)["pass"] is True
+    assert _decide(*green, *red)["pass"] is True
+    went_red = [_line("floor", "fail", run=second), _line("claim_top", run=second)]
+    passed_first = [_line("floor", run=first), _line("claim_top", run=first)]
+    assert _decide(*passed_first, *went_red)["pass"] is False
+    assert _decide(_line("floor", run=_run(attempt=None)), _line("claim_top"))["pass"] is True
+
+
+def test_a_point_recorded_twice_is_one_point():
+    """Two points is the least that proves a range. One point written twice is still one,
+    and a point that says pass on one line and fail on another did not pass."""
+    once = _line("floor")
+    assert _decide(once, once)["reasons"] == [
+        "openai_agents: 1 passing points inside its tested range, 2 are needed"
+    ]
+    across = [_line("floor", run=_run(attempt="1")), _line("floor", run=_run(attempt="2"))]
+    assert _decide(*across)["pass"] is False, "nor is the same point of two attempts two"
+    mixed = _decide(_line("floor"), _line("claim_top"), _line("claim_top", "fail"))
+    assert mixed["pass"] is False and "openai_agents--claim_top" in mixed["reasons"][0]
+
+
+def test_only_a_framework_point_proves_a_tested_range():
+    other = _line("claim_top", kind="something_else")
+    other["key"] = "something_else--top"
+    decision = _decide(_line("floor"), other)
+    assert decision["reasons"] == [
+        "openai_agents: 1 passing points inside its tested range, 2 are needed"
+    ]
+
+
+def test_a_commit_is_matched_whole_and_a_tree_with_no_claims_proves_nothing():
+    lines = [_line("floor"), _line("claim_top")]
+    short = gate.decide(lines, commit=_COMMIT[:12], today=_TODAY, claims=_CLAIMS)
+    assert short["pass"] is False and "the whole commit id is needed" in short["reasons"][0]
+    whole = gate.decide(lines, commit="f" * 40, today=_TODAY, claims=_CLAIMS)
+    assert whole["pass"] is False and "whole commit id" not in whole["reasons"][0]
+    empty = gate.decide(lines, commit=_COMMIT, today=_TODAY, claims={})
+    assert empty == {
+        "pass": False,
+        "run": None,
+        "reasons": ["this tree gives no adapter a tested range"],
+    }
+
+
+def test_an_adapter_with_no_row_in_the_table_is_not_a_claim(monkeypatch):
+    table = {"openai_agents": [], "langgraph": [{"distribution": "langgraph"}], "not_run": [{}]}
+    monkeypatch.setattr(gate.plan, "read_measured", lambda *paths: table)
+    assert gate.claimed(_REPO) == {"langgraph": 2}

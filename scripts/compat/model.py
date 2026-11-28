@@ -91,6 +91,10 @@ def parse_override(text: str, version: str) -> dict | None:
         return None
     if not isinstance(data, dict) or data.get("version") != version:
         return None
-    reason = "".join(ch if " " <= ch <= "~" else "?" for ch in str(data.get("reason", "")))
+    reason = data.get("reason")
+    if not isinstance(reason, str):
+        return None
+    # Words only: the reason is printed on a public page.
+    reason = "".join(ch if " " <= ch <= "~" and ch not in "`|<>[]" else "?" for ch in reason)
     reason = reason.strip()[:200]
-    return {"version": version, "reason": reason} if reason else None
+    return {"version": version, "reason": reason} if reason.strip("? ") else None
