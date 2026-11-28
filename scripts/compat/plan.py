@@ -584,6 +584,306 @@ def fetch_published(cutoff: str, only: str | None = None) -> dict:
         return {"problems": [said], "points": [], "adapters": {}}
 
 
+# --- the other things a run looks at ------------------------------------------------
+#
+# Each rule below turns a declaration of the manifest and what the plan read from outside
+# into points of one kind. They build on the newest tested point the framework rule made
+# for an adapter (its release, its interpreter, the instant it was resolved at), so a
+# combination is the frameworks a user installs together today, not a second opinion on
+# which release is the newest. A rule returns its points, the subjects it planned in
+# full, and what it could not plan. Nothing it cannot plan turns a run red.
+
+_BASE = "key adapter role targets floats python in_claim cutoff assume_measured uploaded".split()
+_SHA = re.compile(r"[0-9a-f]{40}")
+_TAG = re.compile(r"v\d+(?:\.\d+){1,3}")
+_NO_SPEC = {
+    "extras": {},
+    "requires": (),
+    "optional": (),
+    "imports": (),
+    "tests": (),
+    "evidence": "live",
+    "replay_of": None,
+}
+
+
+def _base(point: dict, **change: object) -> dict:
+    """The part of a compiled point a rule decides, to compile another point from."""
+    return {**{name: json.loads(json.dumps(point[name])) for name in _BASE}, **change}
+
+
+def _unique(items: list) -> list:
+    return list(dict.fromkeys(items))
+
+
+def _driven(point: dict, script: str, args: list[str], evidence: str) -> dict:
+    """`point`, checked by a script of the tests tree that writes its own verdict."""
+    point["check"] = {
+        **point["check"],
+        "how": "driver",
+        "driver": script,
+        "args": list(args),
+        "files": [],
+        "suite_timeout_s": manifest.DRIVER_TIMEOUT_S,
+        "evidence": evidence,
+        "replay_of": None if evidence == "cli-live" else point["check"]["replay_of"],
+    }
+    return point
+
+
+def plan_combination(tops: dict[str, dict]) -> dict:
+    """The frameworks of each declared set in one environment, every member at its newest
+    tested release, with every member's tests and every member's attach probe."""
+    points, covered, problems = [], [], []
+    for name, declared in manifest.COMBINATIONS.items():
+        members = list(declared["members"])
+        missing = [member for member in members if member not in tops]
+        if missing:
+            problems.append(f"{name}: no newest tested point for {', '.join(missing)}")
+            continue
+        first, rest = tops[members[0]], [tops[member] for member in members[1:]]
+        if len({point["python"] for point in (first, *rest)}) != 1:
+            problems.append(f"{name}: its members do not share an interpreter")
+            continue
+        specs = [manifest.ADAPTERS[member] for member in members]
+        targets = {d: v for point in (first, *rest) for d, v in point["targets"].items()}
+        base = _base(
+            first,
+            key=f"combination--{name}",
+            targets=targets,
+            uploaded={d: s for point in (first, *rest) for d, s in point["uploaded"].items()},
+            floats=[
+                d
+                for d in _unique([d for p in (first, *rest) for d in p["floats"]])
+                if d not in targets
+            ],
+        )
+        replayed = next((spec for spec in specs if spec["evidence"] != "live"), None)
+        spec = {
+            "extras": {d: e for spec in specs for d, e in spec["extras"].items()},
+            "requires": _unique([r for spec in specs for r in spec["requires"]]),
+            "optional": [extra for spec in specs for extra in spec["optional"]],
+            "imports": _unique([i for spec in specs for i in spec["imports"]]),
+            "tests": _unique([t for spec in specs for t in spec["tests"]]),
+            "evidence": replayed["evidence"] if replayed else "live",
+            "replay_of": replayed["replay_of"] if replayed else None,
+        }
+        point = compile_point(base, kind="combination", subject=name, spec=spec)
+        point["adapters"] = members
+        point["probe"]["adapters"] = [
+            {"adapter": member, "imports": list(manifest.ADAPTERS[member]["imports"])}
+            for member in members
+        ]
+        points.append(point)
+        covered.append(name)
+    return {"points": points, "covered": covered, "problems": problems}
+
+
+def plan_neighbour(tops: dict[str, dict]) -> dict:
+    """An adapter's newest tested release with another instrumentation library installed,
+    checked by the driver that compares the tree alone and beside it."""
+    points, covered, problems = [], [], []
+    for name, declared in manifest.NEIGHBOURS.items():
+        adapter = declared["adapter"]
+        if adapter not in tops:
+            problems.append(f"{name}: no newest tested point for {adapter}")
+            continue
+        spec = manifest.ADAPTERS[adapter]
+        beside = {
+            **spec,
+            "requires": (*spec["requires"], *declared["requires"]),
+            "optional": (),
+            "tests": (),
+        }
+        base = _base(tops[adapter], key=f"neighbour--{name}")
+        point = compile_point(base, kind="neighbour", subject=adapter, spec=beside)
+        args = [name, "--out", "{out}/driver.json"]
+        points.append(_driven(point, manifest.NEIGHBOUR_DRIVER, args, spec["evidence"]))
+        covered.append(adapter)
+    return {"points": points, "covered": _unique(covered), "problems": problems}
+
+
+def plan_prerelease(measured: dict, adapters: dict, releases: dict, cutoff: str) -> dict:
+    """The newest pre-release ahead of the newest final, for each adapter that has one."""
+    points, covered, problems = [], [], []
+    for name, info in sorted(adapters.items()):
+        version = info.get("prerelease_ahead")
+        covered.append(name)
+        if not version:
+            continue
+        primary, companions = measured[name][0], measured[name][1:]
+        release = next(r for r in releases[primary["distribution"]] if r["version"] == version)
+        live = [f for f in release["files"] if not f["yanked"] and f["uploaded"] <= cutoff]
+        order = tuple(reversed(manifest.SUPPORTED_PYTHONS))
+        python = next(
+            (py for py in order if any(admits(f["requires_python"], py) for f in live)), None
+        )
+        if python is None:
+            problems.append(f"{name}: {version} admits no supported interpreter")
+            covered.pop()
+            continue
+        base = {
+            "key": f"prerelease--{name}",
+            "adapter": name,
+            "role": "prerelease",
+            "targets": {primary["distribution"]: version},
+            "floats": [entry["distribution"] for entry in companions],
+            "python": python,
+            "in_claim": False,
+            "cutoff": cutoff,
+            "assume_measured": True,
+            "uploaded": {primary["distribution"]: min(f["uploaded"] for f in live)},
+        }
+        spec = manifest.ADAPTERS[name]
+        points.append(compile_point(base, kind="prerelease", subject=name, spec=spec))
+    return {"points": points, "covered": covered, "problems": problems}
+
+
+def _two(listed: dict[str, str], claimed: str, order) -> tuple[list[tuple], list[str]]:  # noqa: ANN001
+    """The release a sentence names and the newest one beside it, from `{release: when}`."""
+    chosen, problems = [], []
+    if claimed in listed:
+        chosen.append(("claim_top", claimed, True))
+    else:
+        problems.append(f"{claimed}, the release named as tested, is not listed")
+    newest = max(listed, key=order, default=None)
+    if newest and newest != claimed:
+        chosen.append(("beyond", newest, False))
+    return chosen, problems
+
+
+def plan_cli(tops: dict[str, dict], facts: dict, cutoff: str) -> dict:
+    """The programs the adapters record, run for real against the loopback stand-in."""
+    points, covered, problems = [], [], []
+    for subject, declared in manifest.CLI.items():
+        args = [declared["program"], "--out", "{out}/driver.json"]
+        if "adapter" in declared:
+            if declared["adapter"] not in tops:
+                problems.append(f"{subject}: no newest tested point for {declared['adapter']}")
+                continue
+            spec = {**manifest.ADAPTERS[declared["adapter"]], "optional": (), "tests": ()}
+            base = _base(tops[declared["adapter"]], key=f"cli--{subject}")
+            point = compile_point(base, kind="cli", subject=subject, spec=spec)
+            points.append(_driven(point, manifest.CLI_DRIVER, args, "cli-live"))
+            covered.append(subject)
+            continue
+        package = declared["npm"]
+        listed = (facts.get("npm") or {}).get(package)
+        if listed is None:
+            problems.append(f"{subject}: the npm registry could not be read for {package}")
+            continue
+        stable = {
+            entry["version"]: entry["uploaded"]
+            for entry in listed
+            if _FINAL.fullmatch(entry["version"]) and entry["uploaded"] <= cutoff
+        }
+        chosen, missing = _two(stable, declared["claimed"], vkey)
+        problems += [f"{subject}: {package} {problem}" for problem in missing]
+        for role, version, in_claim in chosen:
+            base = {
+                "key": f"cli--{subject}--{role}",
+                "adapter": subject,
+                "role": role,
+                "targets": {package: version},
+                "floats": [],
+                "python": manifest.PYTHONS[1],
+                "in_claim": in_claim,
+                "cutoff": cutoff,
+                "assume_measured": False,
+                "uploaded": {package: stable[version]},
+            }
+            point = compile_point(base, kind="cli", subject=subject, spec=_NO_SPEC)
+            point["install"]["npm"] = {package: version}
+            point["probe"] = {"imports": [], "adapter": None}
+            points.append(_driven(point, manifest.CLI_DRIVER, args, "cli-live"))
+        if not missing:
+            covered.append(subject)
+    return {"points": points, "covered": covered, "problems": problems}
+
+
+def plan_hermes(facts: dict, cutoff: str) -> dict:
+    """The Hermes smoke against the release tag the README names and against the newest."""
+    declared = manifest.HERMES
+    listed = (facts.get("github_releases") or {}).get(declared["repository"])
+    if listed is None:
+        said = f"the releases of {declared['repository']} could not be read"
+        return {"points": [], "covered": [], "problems": [said]}
+    finals = {
+        entry["tag"]: entry["published"]
+        for entry in listed
+        if not entry["prerelease"] and _TAG.fullmatch(entry["tag"]) and entry["published"] <= cutoff
+    }
+    # The newest by when it was published, not by its number: the repository has carried
+    # more than one numbering, and a tag of an older scheme sorts above every newer release.
+    chosen, problems = _two(finals, declared["claimed"], lambda tag: (finals[tag], tag))
+    points = []
+    for role, tag, in_claim in chosen:
+        base = {
+            "key": f"hermes--{role}",
+            "adapter": declared["subject"],
+            "role": role,
+            "targets": {"hermes-agent": tag},
+            "floats": [],
+            "python": declared["python"],
+            "in_claim": in_claim,
+            "cutoff": cutoff,
+            "assume_measured": False,
+            "uploaded": {"hermes-agent": finals[tag]},
+        }
+        point = compile_point(base, kind="hermes", subject=declared["subject"], spec=_NO_SPEC)
+        # The driver builds Hermes's own environment and installs the wheel into it.
+        point["install"]["how"] = "self"
+        point["probe"] = {"imports": [], "adapter": None}
+        args = ["--tag", "{target}", "--wheel", "{wheel}", "--work", "{work}/hermes"]
+        args += ["--out", "{out}/driver.json"]
+        points.append(_driven(point, manifest.HERMES_DRIVER, args, "live"))
+    covered = [declared["subject"]] if not problems else []
+    return {"points": points, "covered": covered, "problems": problems}
+
+
+def plan_devbranch(measured: dict, tops: dict[str, dict], facts: dict) -> dict:
+    """Each declared framework at the head commit of its default branch, with the
+    adapter's own tests. The head is what the plan read; the point names the commit."""
+    points, covered, problems = [], [], []
+    for name, declared in manifest.DEV_BRANCHES.items():
+        head = (facts.get("heads") or {}).get(declared["repository"])
+        if not isinstance(head, str) or not _SHA.fullmatch(head):
+            problems.append(f"{name}: the head of {declared['repository']} could not be read")
+            continue
+        if name not in tops:
+            problems.append(f"{name}: no newest tested point to take its environment from")
+            continue
+        sources = {
+            dist: f"git+{declared['repository']}@{head}" + (f"#subdirectory={sub}" if sub else "")
+            for dist, sub in declared["sources"].items()
+        }
+        base = _base(
+            tops[name],
+            key=f"devbranch--{name}",
+            role="devbranch",
+            targets={dist: f"head-{head[:10]}" for dist in sources},
+            floats=[e["distribution"] for e in measured[name] if e["distribution"] not in sources],
+            in_claim=False,
+            assume_measured=True,
+            uploaded={},
+        )
+        spec = manifest.ADAPTERS[name]
+        point = compile_point(base, kind="devbranch", subject=name, spec=spec)
+        point["install"]["sources"] = sources
+        points.append(point)
+        covered.append(name)
+    return {"points": points, "covered": covered, "problems": problems}
+
+
+def subjects() -> dict[str, dict]:
+    """Every subject an issue can be about, and what to call it. An adapter is one; so is
+    a set of frameworks run together, and so is a program that has no tested range."""
+    named = {name: {"label": spec["label"]} for name, spec in manifest.ADAPTERS.items()}
+    named.update({name: {"label": spec["label"]} for name, spec in manifest.REPLAY_ONLY.items()})
+    named.update({name: {"label": spec["label"]} for name, spec in manifest.COMBINATIONS.items()})
+    return named
+
+
 def build_plan(
     measured: dict,
     releases: dict,
@@ -593,23 +893,34 @@ def build_plan(
     cadence: str = "daily",
     partial: bool = False,
     published: dict | None = None,
+    facts: dict | None = None,
 ) -> dict:
     adapters, points, problems = {}, [], []
     remembered = (state or {}).get("displaced") or {}
     # A run of a cadence the framework kind is not part of plans none of its points and so
     # has nothing to say about an adapter's issue: it must not close what it did not run.
+    # Its other rules still build on the newest tested point of each adapter, so those are
+    # worked out either way and kept out of the plan.
     due = "framework" in kinds.due(cadence)
-    for name, entries in sorted(measured.items() if due else ()):
+    tops: dict[str, dict] = {}
+    for name, entries in sorted(measured.items()):
         if not entries:
-            if name not in manifest.REPLAY_ONLY:
+            if due and name not in manifest.REPLAY_ONLY:
                 problems.append(f"{name} has no tested versions and no replay entry")
             continue
         if name not in manifest.ADAPTERS:
-            problems.append(f"{name} is in the table of tested versions but not in the manifest")
+            if due:
+                problems.append(
+                    f"{name} is in the table of tested versions but not in the manifest"
+                )
             continue
         planned = plan_adapter(name, entries, releases, cutoff, remembered.get(name))
-        adapters[name] = planned["info"]
-        points.extend(planned["points"])
+        top = [p for p in planned["points"] if p["role"] == "claim_top"]
+        if top:
+            tops[name] = top[0]
+        if due:
+            adapters[name] = planned["info"]
+            points.extend(planned["points"])
     # What this run speaks for. A kind is covered for the subjects it planned in full; the
     # report drops what it remembers of a covered subject's points that are no longer
     # planned, and touches nothing outside the cover. A day the index would not list an
@@ -640,6 +951,23 @@ def build_plan(
             # Points of an older release are that release's history. A run that plans this
             # one forgets nothing of theirs.
             scope["builds"]["published"] = [published["version"]]
+    # The other rules. A run of one adapter asks only about that adapter's tested range,
+    # and so does a plan made without what the rules read from outside (`facts` is None).
+    rules = {
+        "combination": lambda: plan_combination(tops),
+        "neighbour": lambda: plan_neighbour(tops),
+        "prerelease": lambda: plan_prerelease(measured, adapters, releases, cutoff),
+        "cli": lambda: plan_cli(tops, facts or {}, cutoff),
+        "hermes": lambda: plan_hermes(facts or {}, cutoff),
+        "devbranch": lambda: plan_devbranch(measured, tops, facts or {}),
+    }
+    for kind in kinds.due(cadence) if not partial and facts is not None else ():
+        if kind not in rules:
+            continue
+        made = rules[kind]()
+        points.extend(made["points"])
+        unplanned += [f"{kind}: {problem}" for problem in made["problems"]]
+        scope["covers"][kind] = sorted(made["covered"])
     return {
         "schema": SCHEMA,
         "cutoff": cutoff,
@@ -649,11 +977,104 @@ def build_plan(
         "adapters": adapters,
         "published": release,
         "claims": [dict(claim) for claim in manifest.CLAIMS],
+        "subjects": subjects(),
         "replay_only": manifest.REPLAY_ONLY,
         "points": points,
         "problems": problems,
         "unplanned": unplanned,
     }
+
+
+def _get(url: str, headers: dict | None = None) -> object:
+    """One JSON document, tried three times."""
+    request = urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+                return json.load(response)
+        except (OSError, ValueError):
+            if attempt == 2:
+                raise
+            time.sleep(15 * (attempt + 1))
+    return None
+
+
+def fetch_npm(package: str) -> list[dict]:
+    """Every version the npm registry lists for `package`, with when it was published."""
+    listed = _get("https://registry.npmjs.org/" + package.replace("/", "%2F"))["time"]
+    return [
+        {"version": version, "uploaded": str(when)[:19] + "Z"}
+        for version, when in listed.items()
+        if version not in ("created", "modified")
+    ]
+
+
+def fetch_github_releases(repository: str) -> list[dict]:
+    """The releases of a public repository, newest first as the API lists them.
+
+    The run's own read-only token is sent when there is one: without it the request is
+    counted against the address the runner shares with everyone else's."""
+    token = os.environ.get("GH_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    listed = _get(f"https://api.github.com/repos/{repository}/releases?per_page=50", headers)
+    return [
+        {
+            "tag": str(entry["tag_name"]),
+            "published": str(entry["published_at"])[:19] + "Z",
+            "prerelease": bool(entry["prerelease"] or entry["draft"]),
+        }
+        for entry in listed
+    ]
+
+
+def fetch_head(repository: str) -> str:
+    """The commit a repository's default branch points at now."""
+    done = subprocess.run(  # noqa: S603
+        ["git", "ls-remote", repository, "HEAD"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    return done.stdout.split()[0]
+
+
+def fetch_facts(cadence: str) -> dict:
+    """What the rules of the kinds due read from outside PyPI. Never raises: a source that
+    cannot be read is left out, and the rule that needed it says so."""
+    facts: dict = {"npm": {}, "github_releases": {}, "heads": {}}
+    wanted = kinds.due(cadence)
+    failed = (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError)
+    if "cli" in wanted:
+        for declared in manifest.CLI.values():
+            if "npm" in declared:
+                try:
+                    facts["npm"][declared["npm"]] = fetch_npm(declared["npm"])
+                except failed:
+                    pass
+    if "hermes" in wanted:
+        try:
+            repository = manifest.HERMES["repository"]
+            facts["github_releases"][repository] = fetch_github_releases(repository)
+        except failed:
+            pass
+    if "devbranch" in wanted:
+        for declared in manifest.DEV_BRANCHES.values():
+            try:
+                facts["heads"][declared["repository"]] = fetch_head(declared["repository"])
+            except failed:
+                pass
+    return facts
+
+
+def cadence_of(asked: str | None, schedule: str | None) -> str:
+    """The cadence of this run: the one asked for, else the one of the cron line that
+    started it, else the daily one (a run started by hand)."""
+    if asked:
+        if asked not in set(kinds.CRONS.values()):
+            raise SystemExit(f"no such cadence: {asked!r}")
+        return asked
+    return kinds.CRONS.get(schedule or "", "daily")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -662,7 +1083,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cutoff", help="UTC instant (ISO 8601); default now")
     parser.add_argument("--only", help="plan one adapter only")
     parser.add_argument("--state", help="state.json of the records branch, when there is one")
+    parser.add_argument("--cadence", help="daily or weekly; default from the schedule")
     args = parser.parse_args(argv)
+    cadence = cadence_of(args.cadence, os.environ.get("COMPAT_SCHEDULE"))
 
     cutoff = iso(parse_iso(args.cutoff)) if args.cutoff else iso(datetime.now(timezone.utc))
     measured = read_measured()
@@ -677,9 +1100,16 @@ def main(argv: list[str] | None = None) -> int:
     state = json.loads(state_file.read_text("utf-8")) if state_file and state_file.is_file() else {}
     # A plan of one adapter says nothing about the others; the report must not read it
     # as the whole run.
-    published = fetch_published(cutoff, args.only)
+    published = fetch_published(cutoff, args.only) if "published" in kinds.due(cadence) else None
     plan = build_plan(
-        measured, releases, cutoff, state, partial=bool(args.only), published=published
+        measured,
+        releases,
+        cutoff,
+        state,
+        cadence=cadence,
+        partial=bool(args.only),
+        published=published,
+        facts=None if args.only else fetch_facts(cadence),
     )
     Path(args.out).write_text(json.dumps(plan, indent=1, sort_keys=True), encoding="utf-8")
     for point in plan["points"]:

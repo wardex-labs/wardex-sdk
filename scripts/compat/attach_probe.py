@@ -12,7 +12,21 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import re
 import sys
+
+
+def about(lines: list[str], distributions: list[str]) -> list[str]:
+    """The lines that name one of `distributions` as a whole name.
+
+    A line about another package whose name ends in a framework's (an instrumentation
+    library for it, which wardex also has something to say about) is not a line about
+    that framework's release, and must not count as the adapter speaking on a tested one."""
+    names = [
+        re.compile(rf"(?<![A-Za-z0-9._-]){re.escape(name)}(?![A-Za-z0-9_-])")
+        for name in distributions
+    ]
+    return [line for line in lines if any(name.search(line) for name in names)]
 
 
 def main(adapter: str, modules: list[str]) -> int:
@@ -43,7 +57,7 @@ def main(adapter: str, modules: list[str]) -> int:
         and is_measured(entry, versions[entry.distribution])
         for entry in entries
     )
-    about = [line for line in said if any(entry.distribution in line for entry in entries)]
+    spoken = about(said, [entry.distribution for entry in entries])
     print(
         json.dumps(
             {
@@ -51,7 +65,7 @@ def main(adapter: str, modules: list[str]) -> int:
                 "version": status.version,
                 "measured": status.measured,
                 "in_table": in_table,
-                "lines_said": len(about),
+                "lines_said": len(spoken),
                 "detail": status.detail[:300],
             }
         )

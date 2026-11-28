@@ -273,6 +273,8 @@ _ROLE_WORDS = {
     "claim_top_oldpy": "newest tested release, oldest Python",
     "beyond": "newer than the tested range",
     "displaced": "tested release a newer one replaced",
+    "prerelease": "pre-release ahead of the newest release",
+    "devbranch": "head of the default branch",
 }
 
 
@@ -429,6 +431,9 @@ def _claims(claims: list[dict]) -> list[str]:
         kind = kinds.KINDS.get(claim.get("proof") or "")
         if kind:
             proof = f"{kind.label} points, {' and '.join(sorted(kind.cadences))}"
+            if not kinds.is_red_capable(claim["proof"]):
+                # Run and reported, and not yet what turns a run red when it fails.
+                proof += " (watching)"
         else:
             proof = f"nothing yet: {clean(claim.get('why') or 'no scheduled run', 200)}"
         lines.append(f"| {clean(claim.get('says', ''), 200)} | {proof} |")
