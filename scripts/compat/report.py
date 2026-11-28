@@ -20,7 +20,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -528,6 +528,35 @@ def _versions(state: dict, plan: dict | None, run: dict) -> dict:
     return versions
 
 
+#: How long the list of runs remembers a run. The release gate reads the last two days.
+RUN_LIST_DAYS = 7
+_RUN_KEPT = ("id", "attempt", "started_at", "date", "scope", "ref", "sdk_commit", "url")
+
+
+def run_list(before: object, run: dict) -> list[dict]:
+    """The runs that wrote records, this one last: what the release gate takes as the
+    list of runs there were. A run that planned no point writes no line, and is here.
+
+    One entry per run and attempt. `red` and `points` are there once the run has a
+    verdict; a state built before that (a preview) lists the run without them, and the
+    gate reads such an entry as one it cannot use."""
+    entry = {field: run.get(field) for field in _RUN_KEPT}
+    entry.update({field: run[field] for field in ("red", "points") if field in run})
+    try:
+        oldest = (date.fromisoformat(run["date"]) - timedelta(days=RUN_LIST_DAYS)).isoformat()
+    except (TypeError, ValueError, KeyError):
+        oldest = ""
+    kept = [
+        old
+        for old in (before if isinstance(before, list) else [])
+        if isinstance(old, dict)
+        and isinstance(old.get("date"), str)
+        and old["date"] >= oldest
+        and (old.get("id"), old.get("attempt")) != (entry["id"], entry["attempt"])
+    ]
+    return [*kept, entry][-200:]
+
+
 def next_state(
     state: dict, results: dict[str, dict], run: dict, results_dir: Path, plan: dict | None = None
 ) -> dict:
@@ -641,6 +670,7 @@ def next_state(
         "last_scheduled": state.get("last_scheduled"),
         "release": state.get("release"),
         "versions": _versions(state, plan, run),
+        "runs": run_list(state.get("runs"), run),
     }
     if (plan or {}).get("published"):
         out["release"] = plan["published"]["version"]
@@ -1305,6 +1335,7 @@ def gate_rehearsal(plan: dict, results: dict[str, dict], run: dict) -> str:
             commit=run["sdk_commit"],
             today=run["date"],
             claims=gate.claimed(gate.REPO),
+            runs=run_list([], run),
         )
     except Exception as broken:  # noqa: BLE001 - a rehearsal must never cost the run its verdict
         return "\n".join(
