@@ -17,10 +17,17 @@ on:
     # Off the hour: scheduled runs queue behind everyone who wrote `0 * * * *`,
     # and this repository's on-the-hour schedule has started 8 to 11 hours late.
     - cron: "23 19 * * *"
+    # The weekly run: the kinds that ask about what is not released yet (the head of a
+    # framework's default branch). `scripts/compat/kinds.py` says which cron is which.
+    - cron: "47 5 * * 1"
   workflow_dispatch:
     inputs:
       only:
         description: "Run one adapter only (its name in the table of tested versions)"
+        required: false
+        default: ""
+      cadence:
+        description: "Which run this is: daily (the default) or weekly"
         required: false
         default: ""
 
@@ -63,9 +70,16 @@ jobs:
         id: plan
         env:
           ONLY: ${{ inputs.only }}
+          CADENCE: ${{ inputs.cadence }}
+          # The cron line that started the run, when one did: it says which run this is.
+          COMPAT_SCHEDULE: ${{ github.event.schedule }}
+          # Read-only, and only to ask the GitHub API which releases a public
+          # repository has without being counted with everyone else on the runner's
+          # address. The job has no permission beyond reading this repository.
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/compat/plan.py --out plan/plan.json --state plan/state.json \
-            ${ONLY:+--only "$ONLY"}
+            ${ONLY:+--only "$ONLY"} ${CADENCE:+--cadence "$CADENCE"}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: compat-plan

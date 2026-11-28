@@ -56,6 +56,8 @@ ROLE_WORDS = {
     "claim_top_oldpy": "newest tested release, oldest Python",
     "beyond": "newer than the tested range",
     "displaced": "failed as the newest tested release, since replaced",
+    "prerelease": "pre-release ahead of the newest release",
+    "devbranch": "head of the default branch",
 }
 CAUSE_WORDS = {
     "new_version": "the newer release",
@@ -246,6 +248,9 @@ def records(plan: dict, results: dict[str, dict], run: dict) -> list[dict]:
                     and (v is None or isinstance(v, (str, bool, int)))
                 },
                 "install_outcome": clean((result.get("install") or {}).get("outcome", "")),
+                # What the installer said when it refused: for frameworks that cannot be
+                # installed together, this is the finding.
+                "install_detail": _refusal(result, 400),
                 "rerun_passed": (result.get("rerun") or {}).get("passed") is True
                 if result.get("rerun")
                 else None,
@@ -688,6 +693,7 @@ def next_state(
         points[key] = entry
     scope = (plan or {}).get("scope") or {}
     forgotten: list[str] = []
+    retired_failing: list[dict] = []
     for key in [key for key in points if key not in results]:
         # A point this run was in a position to plan and did not: the question is no longer
         # asked (the release left the range, a newer line replaced it). Anything outside
@@ -705,6 +711,18 @@ def next_state(
         if not retired and build is not None and builds is not None and build not in builds:
             continue
         if retired or subject in scope.get("covers", {}).get(kind, ()):
+            last = points[key].get("last") or {}
+            if (
+                retired
+                and identity.get("in_claim")
+                and not identity.get("watching")
+                and last.get("outcome") in RED
+            ):
+                # A check that could turn the run red, failing inside a claim, is going away
+                # with its kind. The issue it kept open says so when it closes.
+                retired_failing.append(
+                    {"subject": subject, "key": key, "kind": kind, "date": last.get("date")}
+                )
             del points[key]
             forgotten.append(key)
     seen = dict(state.get("kinds") or {})
@@ -720,6 +738,8 @@ def next_state(
         "release": state.get("release"),
         "versions": _versions(state, plan, run),
         "runs": run_list(state.get("runs"), run),
+        # Of this run only: the next run has nothing left to retire.
+        "retired": retired_failing,
     }
     if (plan or {}).get("published"):
         out["release"] = plan["published"]["version"]
@@ -736,7 +756,7 @@ def next_state(
         # that must not outrank the newer failure.
         if key in points:
             points[key] = {k: v for k, v in points[key].items() if k != "last_checked"}
-    if run["event"] == "schedule":
+    if run["event"] == "schedule" and run.get("cadence", kinds.ISSUE_WRITER) == kinds.ISSUE_WRITER:
         out["last_scheduled"] = run["started_at"]
     out["_locks"] = locks
     # A forgotten point's lock goes with it. A key that is planned again later starts with
@@ -772,9 +792,9 @@ def _table(rows: list[dict]) -> list[str]:
     ]
     for result in rows:
         lines.append(
-            f"| {ROLE_WORDS.get(result['role'], clean(result['role']))} | {_wardex(result)} "
+            f"| {_point_words(result)} | {_wardex(result)} "
             f"| {code(_version(result))} "
-            f"| {code(result.get('python') or '-')} | {OUTCOME_WORDS[result['outcome']]} "
+            f"| {code(result.get('python') or '-')} | {_outcome_words(result)} "
             f"| {CAUSE_WORDS.get(result['cause'], '')} |"
         )
     return lines
@@ -890,6 +910,55 @@ def _kind_label(result: dict) -> str:
     return label
 
 
+#: What an issue says of a subject that is not an adapter with a tested range.
+_NO_RANGE = {
+    "evidence": "live",
+    "replay_of": None,
+    "claim": {},
+    "said": {},
+    "newest": None,
+    "prerelease_ahead": None,
+    "notes": [],
+    "problems": [],
+}
+
+
+def subject_info(name: str, plan: dict) -> dict:
+    """What is known about a subject: the adapter's facts when it is one the plan worked
+    out, else its name alone. A set of frameworks run together is a subject, and so is a
+    program with no tested range; neither has a row in the table of tested versions."""
+    info = plan["adapters"].get(name)
+    if info:
+        return info
+    label = ((plan.get("subjects") or {}).get(name) or {}).get("label")
+    return {**_NO_RANGE, "label": label if isinstance(label, str) and label else name}
+
+
+def _outcome_words(result: dict) -> str:
+    """What a row's outcome is called. Several frameworks that will not install are not a
+    matter of the interpreter: they cannot be installed together."""
+    if result["outcome"] == "not_installable" and len(result.get("adapters") or []) > 1:
+        return "cannot be installed together"
+    return OUTCOME_WORDS[result["outcome"]]
+
+
+def _refusal(result: dict, limit: int) -> str:
+    """What the installer said when it refused, on one line."""
+    detail = (result.get("install") or {}).get("detail", "")
+    return clean(" ".join(str(detail).split()), limit)
+
+
+def _point_words(result: dict) -> str:
+    """What a row is, in the table of an issue or a summary: its role, and its kind when
+    that is not the plain question of a framework release."""
+    role = ROLE_WORDS.get(result["role"], clean(result["role"]))
+    built = _planned_sdk(result).get("origin", "build") == "build"
+    if result.get("kind", "framework") == "framework" or not built:
+        # A release from PyPI is told apart by the column that says which wardex it is.
+        return role
+    return f"{_kind_label(result)}: {role}"
+
+
 def _kind_closes(result: dict) -> str:
     kind = kinds.KINDS.get(result.get("kind", "framework"))
     return kind.closes if kind and kind.closes else "when it passes"
@@ -905,7 +974,7 @@ def adapter_issue(
     checked today (the index was down, it would not install), is still failing
     as far as anyone knows: it stays on the list, worded as such.
     """
-    info = plan["adapters"][name]
+    info = subject_info(name, plan)
     known = (state or {}).get("points", {})
     remembered = {item["key"]: item for item in (state or {}).get("displaced", {}).get(name, [])}
     counted = (state or {}).get("failing") or {}
@@ -926,7 +995,10 @@ def adapter_issue(
         elif outcome == "fail":
             what = "does not finish its tests (the run timed out, or failed outside any test)"
         else:
-            what = OUTCOME_WORDS[outcome]
+            what = _outcome_words(result)
+            said = _refusal(result, 300)
+            if outcome == "not_installable" and said:
+                what += f" (the installer said: {said})"
         as_of = old[result["key"]]["as_of"] if result["key"] in old else ""
         when = f" (last run {code(as_of)})" if as_of else ""
         if is_watching(result):
@@ -1060,15 +1132,27 @@ def adapter_issue(
         for dist, lines in info["claim"].items()
     )
     fingerprint = _fingerprint(sorted(marks, key=json.dumps))
+    if info["claim"]:
+        about = [
+            f"The daily compatibility run tests the wardex adapter for {code(info['label'])} "
+            "against exact framework releases, each in an environment that holds only this "
+            "framework. Every run rewrites this issue, and it closes itself when nothing below "
+            "needs doing.",
+            "",
+            f"- Tested range: {claim}",
+            f"- Newest release on PyPI: {code(info['newest'])}",
+        ]
+    else:
+        about = [
+            f"What the compatibility run finds for {code(info['label'])}, which has no row of "
+            "its own in the table of tested versions. Every daily run rewrites this issue, and "
+            "it closes itself when nothing below needs doing.",
+            "",
+        ]
     body = [
         f"<!-- compat-key: {name} -->",
         f"<!-- compat-fingerprint: {fingerprint} -->",
-        f"The daily compatibility run tests the wardex adapter for {code(info['label'])} against "
-        "exact framework releases, each in an environment that holds only this framework. "
-        "Every run rewrites this issue, and it closes itself when nothing below needs doing.",
-        "",
-        f"- Tested range: {claim}",
-        f"- Newest release on PyPI: {code(info['newest'])}",
+        *about,
         f"- Last run: {code(run['date'])}, wardex {code(run['sdk_version'])} at "
         f"{code(run['sdk_commit'][:10])} ([run]({run['url']}))",
     ]
@@ -1079,7 +1163,9 @@ def adapter_issue(
             "program behaves the same."
         )
     if info["prerelease_ahead"]:
-        body.append(f"- A pre-release exists and is not run: {code(info['prerelease_ahead'])}")
+        body.append(
+            f"- A pre-release ahead of the newest release exists: {code(info['prerelease_ahead'])}"
+        )
     body += [f"- Note: {clean(note)}" for note in info.get("notes", [])]
     body += ["", "### What needs doing", ""]
     body += [f"- {line}" for line in todo] or ["Nothing."]
@@ -1104,6 +1190,14 @@ def adapter_issue(
     )
     if unchecked:
         closing += " Not checked today: " + "; ".join(unchecked) + "."
+    for item in (state or {}).get("retired") or []:
+        if isinstance(item, dict) and item.get("subject") == name:
+            # Not fixed: no longer asked. Said, so a closed issue is not read as a pass.
+            closing += (
+                f" The check {code(item.get('key', ''))} was failing when it was last run "
+                f"({code(item.get('date', ''))}) and is no longer run: its kind "
+                f"({code(item.get('kind', ''))}) was retired. That is not a pass."
+            )
     closing += (
         " If a change to wardex is what fixed it, a wardex release published before that "
         "commit does not contain the fix. Closing."
@@ -1153,6 +1247,36 @@ def health_issue(plan: dict, results: dict[str, dict], state: dict, run: dict) -
         else:
             continue
         marks.append([key, outcome])
+    mine = list(marks)
+    cadence = plan.get("cadence", kinds.ISSUE_WRITER)
+    # What a run of another cadence found wrong with itself, as it left it in the state:
+    # that run writes no issue, so this is where it is said.
+    for other, kept in sorted((state.get("health") or {}).items()):
+        if other == cadence or not isinstance(kept, dict):
+            continue
+        for mark in kept.get("marks") or []:
+            if not (isinstance(mark, list) and len(mark) == 2):
+                continue
+            todo.append(
+                f"From the {clean(other, 20)} run of {code(kept.get('date', ''))}: "
+                f"{code(mark[0])}: {code(mark[1])}"
+            )
+            marks.append([f"{other}:{mark[0]}", str(mark[1])])
+    # And whether the other cadences run at all: a schedule that stopped says nothing.
+    for name, kind in kinds.KINDS.items():
+        if cadence in kind.cadences:
+            continue
+        last = ((state.get("kinds") or {}).get(name) or {}).get("last_complete")
+        try:
+            age = (date.fromisoformat(run["date"]) - date.fromisoformat(last)).days
+        except (TypeError, ValueError):
+            continue  # never completed yet: there is no day to count from
+        if age > kind.fresh_days:
+            todo.append(
+                f"No whole run has run the {kind.label} points since {code(last)} "
+                f"({age} days). Their schedule may have stopped."
+            )
+            marks.append([name, "stale"])
     body = [
         "<!-- compat-key: health -->",
         f"<!-- compat-fingerprint: {_fingerprint(sorted(marks))} -->",
@@ -1176,6 +1300,8 @@ def health_issue(plan: dict, results: dict[str, dict], state: dict, run: dict) -
         "fingerprint": _fingerprint(sorted(marks)),
         "open": bool(todo),
         "changes": todo,
+        # This run's own problems, for the state of a run that writes no issue.
+        "marks": [[str(a), str(b)] for a, b in mine],
     }
 
 
@@ -1214,7 +1340,20 @@ def wanted_issues(plan: dict, results: dict[str, dict], state: dict, run: dict) 
     A run of one adapter knows nothing about the others, so it has no say
     about the two issues that speak for the whole run and must not close them.
     """
-    wanted = [adapter_issue(name, plan, results, run, state) for name in sorted(plan["adapters"])]
+    if plan.get("cadence", kinds.ISSUE_WRITER) != kinds.ISSUE_WRITER:
+        # One run writes issues. What this one found is in the state, and is on the issue,
+        # dated, the next time that run reports.
+        return []
+    subjects = set(plan["adapters"])
+    if not plan.get("partial"):
+        # Also what is not an adapter of the plan: a subject with a result today, or with
+        # a point the state still remembers (a kind another cadence runs, a set of frameworks).
+        subjects |= {r.get("subject", r["adapter"]) for r in results.values()}
+        for entry in (state.get("points") or {}).values():
+            identity = entry.get("point") or {}
+            if identity.get("kind", "framework") in kinds.KINDS and identity.get("subject"):
+                subjects.add(identity["subject"])
+    wanted = [adapter_issue(name, plan, results, run, state) for name in sorted(subjects)]
     if not plan.get("partial"):
         wanted += [health_issue(plan, results, state, run), died_issue()]
     return wanted
@@ -1326,8 +1465,10 @@ def sync_issue(gh: GitHub, wanted: dict, existing: list[dict], assignee: str = "
 def summary(plan: dict, results: dict[str, dict], reasons: list[str], actions: list[str]) -> str:
     lines = ["## Compatibility run", ""]
     lines.append("**Red:** " + "; ".join(clean(r) for r in reasons) if reasons else "**Green.**")
-    for name, info in sorted(plan["adapters"].items()):
-        mine = [r for r in results.values() if r["adapter"] == name]
+    subjects = set(plan["adapters"]) | {r.get("subject", r["adapter"]) for r in results.values()}
+    for name in sorted(subjects):
+        info = subject_info(name, plan)
+        mine = [r for r in results.values() if r.get("subject", r["adapter"]) == name]
         lines += ["", f"### {clean(info['label'])}", "", *_table(mine)]
         if _left_out(mine):
             lines += ["", *_left_out(mine)]
@@ -1434,6 +1575,15 @@ def main(argv: list[str] | None = None) -> int:
     run["points"] = len(results)
     new_state = next_state(state, results, run, results_dir, plan)
     locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
+    # What each cadence other than the one that writes issues last found wrong with itself.
+    health = {k: v for k, v in (state.get("health") or {}).items() if isinstance(v, dict)}
+    cadence = plan.get("cadence", kinds.ISSUE_WRITER)
+    if not plan.get("partial"):
+        health.pop(cadence, None)
+        if cadence != kinds.ISSUE_WRITER:
+            own = health_issue(plan, results, new_state, run)["marks"]
+            health[cadence] = {"date": run["date"], "marks": own}
+    new_state["health"] = health
 
     gh = GitHub(os.environ.get("GITHUB_REPOSITORY", ""), write=args.write)
     wanted = wanted_issues(plan, results, new_state, run)
