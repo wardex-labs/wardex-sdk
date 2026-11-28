@@ -4,9 +4,11 @@
 
 Run by the release workflow before anything is published, in the tree being
 released. It reads the record lines the compatibility run wrote and asks one
-question of them: did a whole run on the default branch, at exactly this
-commit, in the last two days, pass every point that speaks for a claim this
-tree makes? A point of a watching kind is not asked. It writes nothing and
+question of them: did the newest whole run on the default branch, at exactly
+this commit, in the last two days, pass every point that speaks for a claim
+this tree makes? Which runs there were is read from the list the report keeps
+in `state.json` beside the lines, so a run that wrote no line is still a run.
+A point of a watching kind is not asked. It writes nothing and
 needs no permission beyond reading two branches.
 
 Exit 0 lets the release go on. Exit 20 stops it and prints what is missing and
@@ -135,7 +137,13 @@ def damage(line: dict) -> str:
         "key": isinstance(line.get("key"), str),
         # A word the report writes, and no other: anything else is not a result.
         "outcome": isinstance(line.get("outcome"), str) and line["outcome"] in OUTCOME_WORDS,
-        "watching": isinstance(line.get("watching", False), bool),
+        # Whether a line is watched follows from its kind, and is never its own to say: a
+        # failing line that calls itself watched would otherwise ask not to be counted.
+        "watching": isinstance(line.get("watching", False), bool)
+        and (
+            not isinstance(line.get("kind"), str)
+            or line.get("watching", False) is (not kinds.is_red_capable(line["kind"]))
+        ),
         "in_claim": isinstance(line.get("in_claim"), bool),
         "kind": isinstance(line.get("kind"), str),
         "subject": isinstance(line.get("subject"), str),
@@ -148,10 +156,33 @@ def damage(line: dict) -> str:
     return ", ".join(name for name, ok in held.items() if not ok)
 
 
-def _not_whole(spoken: list[dict]) -> str:
+def read_runs(records: Path) -> list | None:
+    """The list of runs the report keeps in `state.json`, or None when there is none.
+
+    The lines say what each point of a run found. Only this list says which runs there
+    were: a run that planned no point at all wrote no line, and a run whose every line is
+    gone looks, from the lines alone, like a run that never happened."""
+    try:
+        runs = json.loads((records / "state.json").read_text(encoding="utf-8"))["runs"]
+    except Exception:  # noqa: BLE001 - missing, not text, not JSON, not an object, no list
+        return None
+    return runs if isinstance(runs, list) else None
+
+
+def _entry_ok(entry: object) -> bool:
+    """Whether an entry of the list of runs is what the report writes."""
+    return (
+        run_of({"run": entry}) is not None
+        and isinstance(entry.get("red"), bool)
+        and _count(entry.get("points"), least=0)
+        and _attempt({"run": entry}) is not None
+    )
+
+
+def _not_whole(entry: dict, spoken: list[dict]) -> str:
     """Why a run's last attempt, every point of it passing, is still not proof, or ""."""
-    runs = [line["run"] for line in spoken]
-    if any(run.get("red") is True for run in runs):
+    stamps = [line["run"] for line in spoken]
+    if entry["red"]:
         # A run is also red for what its plan could not make a point of: a tested release
         # that admits no supported interpreter, an adapter the index would not list. No
         # line holds that, and a release needs the run to have been green.
@@ -159,87 +190,106 @@ def _not_whole(spoken: list[dict]) -> str:
             "the run ended red for a reason no point holds (its plan could not cover "
             "something the tree says is tested); see the run"
         )
-    if not all(run.get("red") is False and run.get("points") is not None for run in runs):
-        # Lines written before a run recorded how it ended. Passing lines alone are not
-        # proof that it ended green, so they are not taken for it.
-        return "the run's lines do not say how it ended; run it again at this commit"
     held = len({line["key"] for line in spoken})
-    planned = sorted({run["points"] for run in runs})
-    if planned != [held]:
+    if held != entry["points"]:
         # A line that is gone cannot say what it said.
-        said = " or ".join(str(number) for number in planned)
         return (
-            f"the run planned {said} points and {held} have a line; a line is missing or was added"
+            f"the run planned {entry['points']} points and {held} have a line; a line is "
+            "missing or was added"
         )
+    if not all(run.get("red") is False and run.get("points") == held for run in stamps):
+        return "the run's lines do not agree with the list of runs about how it ended"
     return ""
 
 
-def _count(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+def _count(value: object, least: int = 1) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= least
 
 
-def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]) -> dict:
+def _stop(*reasons: str, run: str | None = None) -> dict:
+    return {"pass": False, "reasons": list(reasons), "run": run}
+
+
+def decide(
+    lines: list[dict], *, commit: str, today: str, claims: dict[str, int], runs: list | None
+) -> dict:
     """`{"pass", "reasons", "run"}` for releasing `commit` on `today`.
 
-    The newest whole run on the default branch at exactly `commit` decides, and of that
-    run its last attempt: a run whose failed jobs were run again writes its lines a second
-    time, and what it said the first time is no longer what it says. A point recorded
-    twice is one point, and passes only if every line of it does. A run with a line whose
-    shape is wrong decides nothing: the release stops, and the line is named. So does a
-    run that does not hold a line for every point it planned, and any line in the days
-    read that does not say which run it belongs to: the line that is missing or cannot be
-    read may be the one that said a point failed."""
-    stop = {"pass": False, "run": None}
+    `runs` is the report's list of the runs it wrote records for, `lines` what those runs
+    found. The newest whole run on the default branch at exactly `commit` decides, and of
+    that run its last attempt: a run whose failed jobs were run again writes its lines a
+    second time, and what it said the first time is no longer what it says. A point
+    recorded twice is one point, and passes only if every line of it does.
+
+    Nothing damaged is read into a pass. A line of the days read that does not say which
+    run it is of, a line of the deciding run whose shape is wrong, a run that does not
+    hold a line for every point it planned, and lines of a run the list does not know
+    each stop the release: the line that is missing or cannot be read may be the one that
+    said a point failed."""
     if not claims:
         # A tree that gives no adapter a tested range has nothing a pass could prove,
         # which is more likely a table that could not be read than a release with no claims.
-        return {**stop, "reasons": ["this tree gives no adapter a tested range"]}
+        return _stop("this tree gives no adapter a tested range")
     lost = [line for line in lines if run_of(line) is None]
     if lost:
         where = lost[0].get("unreadable") if isinstance(lost[0], dict) else None
-        return {
-            **stop,
-            "reasons": [
-                f"{len(lost)} line(s) in the records of the last {MAX_AGE_DAYS} days cannot be "
-                f"read{f' (the first is {code(where)})' if where else ''}; whichever run they "
-                "belong to, it cannot be taken as whole"
-            ],
-        }
+        return _stop(
+            f"{len(lost)} line(s) in the records of the last {MAX_AGE_DAYS} days cannot be "
+            f"read{f' (the first is {code(where)})' if where else ''}; whichever run they "
+            "belong to, it cannot be taken as whole"
+        )
+    if runs is None:
+        return _stop(
+            "the records hold no list of their runs (`state.json`); a run of the "
+            "compatibility workflow on the default branch writes one"
+        )
+    if not all(isinstance(entry, dict) and _entry_ok(entry) for entry in runs):
+        return _stop("the list of runs in `state.json` of the records cannot be read")
     oldest = (date.fromisoformat(today) - timedelta(days=MAX_AGE_DAYS)).isoformat()
-    runs: dict[tuple, list[dict]] = {}
-    for line in lines:
-        run = line["run"]
+
+    def asked(run: dict) -> bool:
         whole = run["scope"] == "all" and run["ref"] == MAIN_REF
-        if whole and run["sdk_commit"] == commit and run["date"] >= oldest:
-            runs.setdefault(run_of(line), []).append(line)
-    if not runs:
+        return whole and run["sdk_commit"] == commit and run["date"] >= oldest
+
+    listed = [entry for entry in runs if asked(entry)]
+    known = {run_of({"run": entry}) for entry in runs}
+    unlisted = sorted({line["run"]["id"] for line in lines if run_of(line) not in known})
+    if unlisted and any(asked(line["run"]) for line in lines if run_of(line) not in known):
+        # Lines that say they are of a whole run at this commit, of a run the list does not
+        # hold: the list or the lines were changed after the report wrote them.
+        return _stop(
+            f"the records hold lines of a run the list of runs does not know ({code(unlisted[0])})"
+        )
+    if not listed:
         short = "" if len(commit) >= 40 else " (the whole commit id is needed, not a prefix)"
-        return {
-            **stop,
-            "reasons": [
-                f"no whole compatibility run on the default branch at {commit[:10]} in the "
-                f"last {MAX_AGE_DAYS} days{short}"
-            ],
-        }
-    newest = runs[max(runs)]
-    url = _url(newest[0]["run"].get("url"))
+        return _stop(
+            f"no whole compatibility run on the default branch at {commit[:10]} in the "
+            f"last {MAX_AGE_DAYS} days{short}"
+        )
+    newest = max(run_of({"run": entry}) for entry in listed)
+    entry = max(
+        (entry for entry in listed if run_of({"run": entry}) == newest),
+        key=lambda entry: _attempt({"run": entry}),
+    )
+    url = _url(entry.get("url"))
+    mine = [line for line in lines if run_of(line) == newest]
     damaged = [
         f"{code(line.get('key', ''), 120)}: a line of this run cannot be read ({damage(line)})"
-        for line in newest
+        for line in mine
         if damage(line)
     ]
     # One run is one ref, one commit, one scope, one day. A line that carries this run's
     # start and id and says otherwise is not a line of another run.
     damaged += [
-        f"{code(line.get('key', ''), 120)}: a line of this run does not agree with the rest "
-        "about which run it is"
-        for line in lines
-        if run_of(line) == max(runs) and not any(line is kept for kept in newest)
+        f"{code(line.get('key', ''), 120)}: a line of this run does not agree with the list "
+        "of runs about which run it is"
+        for line in mine
+        if any(line["run"][field] != entry[field] for field in _RUN_FIELDS)
     ]
     if damaged:
-        return {"pass": False, "reasons": sorted(damaged), "run": url}
-    last = max(_attempt(line) for line in newest)
-    spoken = [line for line in newest if _attempt(line) == last]
+        return _stop(*sorted(damaged), run=url)
+    last = _attempt({"run": entry})
+    spoken = [line for line in mine if _attempt(line) == last]
     points: dict[str, list[dict]] = {}
     for line in spoken:
         if not line.get("watching", False):
@@ -268,14 +318,14 @@ def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]
         )
         if proves and len(subjects) == 1:
             proving[said[0]["subject"]] = proving.get(said[0]["subject"], 0) + 1
+    if not reasons and _not_whole(entry, spoken):
+        return _stop(_not_whole(entry, spoken), run=url)
     for name, need in sorted(claims.items()):
         if proving.get(name, 0) < need:
             reasons.append(
                 f"{name}: {proving.get(name, 0)} passing points inside its tested range, "
                 f"{need} are needed"
             )
-    if not reasons and _not_whole(spoken):
-        reasons.append(_not_whole(spoken))
     return {"pass": not reasons, "reasons": reasons, "run": url}
 
 
@@ -380,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
             commit=args.commit,
             today=today,
             claims=claimed(REPO),
+            runs=read_runs(Path(args.records)),
         )
     except Exception as broken:  # noqa: BLE001 - a gate that cannot decide stops, and says so
         decision = {

@@ -74,8 +74,41 @@ def _stamped(lines: tuple) -> list:
     return out
 
 
+_LISTED = ("id", "attempt", "started_at", "date", "scope", "ref", "sdk_commit", "url")
+
+
+def _listed(lines: list) -> list[dict]:
+    """The list of runs the report would have kept for `lines`: one entry per run and
+    attempt, with the colour and the count its lines carry."""
+    entries: dict[tuple, dict] = {}
+    for line in lines:
+        if gate.run_of(line) is None:
+            continue
+        run = line["run"]
+        entry = {field: run.get(field) for field in _LISTED}
+        entry.update(red=run.get("red") is True, points=run.get("points") or 0)
+        if gate._attempt(line) is None:
+            # The list is the report's own and is not what a test of a damaged line damages.
+            entry["attempt"] = None
+        if not gate._count(entry["points"], least=0):
+            entry["points"] = 0
+        entries.setdefault((gate.run_of(line), str(run.get("attempt"))), entry)
+    return list(entries.values())
+
+
+def _judge(lines: list, runs: list | None = None, **more) -> dict:
+    """`gate.decide` on lines exactly as given, with the list of runs they imply."""
+    runs = _listed(lines) if runs is None else runs
+    return gate.decide(
+        lines, commit=_COMMIT, today=more.pop("today", _TODAY), claims=_CLAIMS, runs=runs, **more
+    )
+
+
 def _decide(*lines: dict, claims: dict | None = None, today: str = _TODAY) -> dict:
-    return gate.decide(_stamped(lines), commit=_COMMIT, today=today, claims=claims or _CLAIMS)
+    stamped = _stamped(lines)
+    return gate.decide(
+        stamped, commit=_COMMIT, today=today, claims=claims or _CLAIMS, runs=_listed(stamped)
+    )
 
 
 def test_a_commit_whose_every_claim_passed_yesterday_may_be_released():
@@ -178,6 +211,9 @@ def _records(tmp_path: Path, day: str, *lines: dict) -> Path:
     with (folder / f"{number}.jsonl").open("a", encoding="utf-8") as handle:
         for line in _stamped(lines):
             handle.write(json.dumps(line) + "\n")
+    state = tmp_path / "state.json"
+    before = json.loads(state.read_text("utf-8"))["runs"] if state.is_file() else []
+    state.write_text(json.dumps({"schema": 2, "runs": before + _listed(_stamped(lines))}), "utf-8")
     return tmp_path
 
 
@@ -215,16 +251,12 @@ def test_a_line_nobody_can_read_stops_the_release_and_is_named(tmp_path, garbage
     failed, and a truncated line says nothing about what it held."""
     _records(tmp_path, _TODAY, _line("floor"), _line("claim_top"))
     day = tmp_path / "records/2026/12/03.jsonl"
-    assert (
-        gate.decide(
-            gate.read_lines(tmp_path, _TODAY), commit=_COMMIT, today=_TODAY, claims=_CLAIMS
-        )["pass"]
-        is True
-    )
+    runs = gate.read_runs(tmp_path)
+    assert _judge(gate.read_lines(tmp_path, _TODAY), runs)["pass"] is True
     day.write_bytes(day.read_bytes() + garbage + b"\n")
     lines = gate.read_lines(tmp_path, _TODAY)
     assert lines[-1] == {"unreadable": "records/2026/12/03.jsonl:3"}
-    decision = gate.decide(lines, commit=_COMMIT, today=_TODAY, claims=_CLAIMS)
+    decision = _judge(lines, runs)
     assert decision == {
         "pass": False,
         "run": None,
@@ -238,10 +270,12 @@ def test_a_line_nobody_can_read_stops_the_release_and_is_named(tmp_path, garbage
 
 def test_a_line_that_left_its_run_stops_the_release():
     """A green run with one point that could not be installed is stopped by that point.
-    Damage that moves the point's line out of the run must not be what lets it pass."""
+    Damage that moves the point's line out of the run must not be what lets it pass. The
+    list of runs is what the report wrote; the lines are what is left of them."""
     blocked = _line("minor_newest", "install_network")
-    assert _decide(_line("floor"), _line("claim_top"), blocked)["pass"] is False
     whole = _stamped((_line("floor"), _line("claim_top"), blocked))
+    runs = _listed(whole)
+    assert _judge(whole, runs)["pass"] is False
     for field, value in [
         ("scope", "partial"),
         ("ref", "refs/heads/x"),
@@ -249,42 +283,123 @@ def test_a_line_that_left_its_run_stops_the_release():
         ("date", "2020-01-01"),
     ]:
         moved = {**whole[2], "run": {**whole[2]["run"], field: value}}
-        decision = gate.decide([*whole[:2], moved], commit=_COMMIT, today=_TODAY, claims=_CLAIMS)
+        decision = _judge([*whole[:2], moved], runs)
         assert decision["pass"] is False, field
-        assert "does not agree with the rest about which run it is" in decision["reasons"][0]
+        assert (
+            "does not agree with the list of runs about which run it is" in decision["reasons"][0]
+        )
     for field in ("scope", "id", "started_at"):
         lost = {**whole[2], "run": {**whole[2]["run"], field: None}}
-        decision = gate.decide([*whole[:2], lost], commit=_COMMIT, today=_TODAY, claims=_CLAIMS)
+        decision = _judge([*whole[:2], lost], runs)
         assert decision["pass"] is False and "cannot be read" in decision["reasons"][0]
-    # Gone altogether, or under another run's name: the run planned three and holds two.
-    renamed = {**whole[2], "run": {**whole[2]["run"], "id": "1"}}
-    for lines in (whole[:2], [*whole[:2], renamed]):
-        decision = gate.decide(lines, commit=_COMMIT, today=_TODAY, claims=_CLAIMS)
-        assert decision["reasons"] == [
-            "the run planned 3 points and 2 have a line; a line is missing or was added"
-        ]
-    newer = {**whole[2], "run": {**whole[2]["run"], "id": "8"}}
-    assert (
-        gate.decide([*whole[:2], newer], commit=_COMMIT, today=_TODAY, claims=_CLAIMS)["pass"]
-        is False
-    ), "a line that makes itself the newest run is a run that did not pass"
+    # Gone altogether, or under the name of a run the list knows: three planned, two here.
+    missing = ["the run planned 3 points and 2 have a line; a line is missing or was added"]
+    assert _judge(whole[:2], runs)["reasons"] == missing
+    other = _stamped((_line("floor", run=_run(run_id="1", commit="f" * 40)),))
+    renamed = {**whole[2], "run": other[0]["run"]}
+    assert _judge([*whole[:2], *other, renamed], [*runs, *_listed(other)])["reasons"] == missing
+    # Under the name of a run nobody listed, at this commit: the lines were changed.
+    unknown = {**whole[2], "run": {**whole[2]["run"], "id": "8"}}
+    assert _judge([*whole[:2], unknown], runs)["reasons"] == [
+        "the records hold lines of a run the list of runs does not know (`8`)"
+    ]
     green = _stamped((_line("floor"), _line("claim_top"), _line("minor_newest")))
     added = [*green, {**green[0], "key": "x--added"}]
-    assert gate.decide(added, commit=_COMMIT, today=_TODAY, claims=_CLAIMS)["reasons"] == [
+    assert _judge(added, _listed(green))["reasons"] == [
         "the run planned 3 points and 4 have a line; a line is missing or was added"
     ]
     uneven = [green[0], green[1], {**green[2], "run": {**green[2]["run"], "points": 2}}]
-    assert gate.decide(uneven, commit=_COMMIT, today=_TODAY, claims=_CLAIMS)["reasons"] == [
-        "the run planned 2 or 3 points and 3 have a line; a line is missing or was added"
+    assert _judge(uneven, _listed(green))["reasons"] == [
+        "the run's lines do not agree with the list of runs about how it ended"
     ]
-    uneven[2] = {**green[2], "run": {**green[2]["run"], "points": 4}}
-    assert gate.decide(uneven, commit=_COMMIT, today=_TODAY, claims=_CLAIMS)["reasons"] == [
-        "the run planned 3 or 4 points and 3 have a line; a line is missing or was added"
-    ]
-    uncounted = _run(points=None)
-    assert _decide(_line("floor", run=uncounted), _line("claim_top", run=uncounted))["reasons"] == [
-        "the run's lines do not say how it ended; run it again at this commit"
-    ]
+    silent = [{**line, "run": {**line["run"], "red": None}} for line in green]
+    assert _judge(silent, _listed(green))["pass"] is False
+
+
+def test_the_newest_run_is_the_one_that_started_last_whatever_its_id():
+    early, late = _run(run_id="9"), _run(run_id="10")
+    late["started_at"] = f"{_TODAY}T21:00:00Z"
+    green = [_line("floor", run=early), _line("claim_top", run=early)]
+    red = [_line("floor", "fail", run=late), _line("claim_top", run=late)]
+    assert _decide(*green, *red)["pass"] is False
+    assert _decide(*red, *green)["pass"] is False
+    early["started_at"], late["started_at"] = late["started_at"], early["started_at"]
+    assert _decide(*green, *red)["pass"] is True
+
+
+def test_lines_of_a_run_the_list_does_not_hold_matter_only_at_this_commit():
+    """Records written before the list existed, or by a run of another commit or of a
+    branch: not this release's business. At this commit they mean the list was changed."""
+    green = _stamped((_line("floor"), _line("claim_top")))
+    old = _stamped((_line("floor", "fail", run=_run(run_id="3", commit="f" * 40)),))
+    branch = _stamped((_line("floor", "fail", run=_run(run_id="4", ref="refs/heads/x")),))
+    assert _judge([*green, *old, *branch], _listed(green))["pass"] is True
+    here = _stamped((_line("floor", "fail", run=_run(run_id="5")),))
+    assert "does not know (`5`)" in _judge([*green, *here], _listed(green))["reasons"][0]
+
+
+def test_a_run_that_wrote_no_line_is_still_the_newest_run():
+    """The newest run at the commit planned no point at all: the index would not list a
+    release, so it ended red and wrote nothing. An older green run at the same commit is
+    not what the commit last said."""
+    morning = _run(run_id="1")
+    green = _stamped((_line("floor", run=morning), _line("claim_top", run=morning)))
+    assert _judge(green)["pass"] is True
+    evening = {
+        **{field: _run(run_id="2").get(field) for field in _LISTED},
+        "started_at": f"{_TODAY}T21:00:00Z",
+        "red": True,
+        "points": 0,
+    }
+    decision = _judge(green, [*_listed(green), evening])
+    assert decision == {
+        "pass": False,
+        "run": "https://example.invalid/runs/2",
+        "reasons": [
+            "the run ended red for a reason no point holds (its plan could not cover "
+            "something the tree says is tested); see the run"
+        ],
+    }
+    # And a run of one line whose line is gone is a run with a line missing, not no run.
+    lone = _stamped((_line("floor", "no_result", run={**_run(run_id="3"), "red": True}),))
+    lone[0]["run"]["started_at"] = f"{_TODAY}T22:00:00Z"
+    listed = [*_listed(green), *_listed(lone)]
+    assert _judge([*green, *lone], listed)["pass"] is False
+    assert _judge(green, listed)["pass"] is False, "its only line deleted"
+    assert _judge(green, _listed(green))["pass"] is True
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        None,
+        [3],
+        [{"id": "7"}],
+        "not a list",
+    ],
+    ids=["none", "number", "half", "text"],
+)
+def test_records_without_a_readable_list_of_runs_prove_nothing(tmp_path, runs):
+    lines = _stamped((_line("floor"), _line("claim_top")))
+    decision = gate.decide(lines, commit=_COMMIT, today=_TODAY, claims=_CLAIMS, runs=runs)
+    assert decision["pass"] is False and "list of" in decision["reasons"][0]
+    for field, value in [
+        ("red", "no"),
+        ("red", None),
+        ("points", "2"),
+        ("points", -1),
+        ("attempt", "x"),
+    ]:
+        entry = {**_listed(lines)[0], field: value}
+        assert _judge(lines, [entry])["reasons"] == [
+            "the list of runs in `state.json` of the records cannot be read"
+        ], field
+    _records(tmp_path / "a", _TODAY, *lines)
+    assert gate.read_runs(tmp_path / "a") == _listed(lines)
+    assert gate.read_runs(tmp_path / "nowhere") is None
+    for text in ("{not json", "[]", '{"runs": 3}', "{}"):
+        (tmp_path / "a/state.json").write_text(text, encoding="utf-8")
+        assert gate.read_runs(tmp_path / "a") is None
 
 
 def test_a_line_written_before_kinds_cannot_let_a_release_through(tmp_path):
@@ -292,9 +407,7 @@ def test_a_line_written_before_kinds_cannot_let_a_release_through(tmp_path):
     old = {k: v for k, v in _line("floor").items() if k not in ("schema", "kind", "watching")}
     old["run"] = {k: v for k, v in old["run"].items() if k not in ("scope", "cadence")}
     _records(tmp_path, _TODAY, {**old, "schema": 1}, {**old, "schema": 1, "key": "x--claim_top"})
-    decision = gate.decide(
-        gate.read_lines(tmp_path, _TODAY), commit=_COMMIT, today=_TODAY, claims=_CLAIMS
-    )
+    decision = _judge(gate.read_lines(tmp_path, _TODAY), gate.read_runs(tmp_path))
     assert decision["pass"] is False and decision["run"] is None
 
 
@@ -426,7 +539,10 @@ def test_a_point_recorded_twice_is_one_point():
     assert mixed["pass"] is False and "openai_agents--claim_top" in mixed["reasons"][0]
 
 
-def test_only_a_framework_point_proves_a_tested_range():
+def test_only_a_framework_point_proves_a_tested_range(monkeypatch):
+    """Also once another kind may turn the run red: what the README's ranges claim is
+    proven by framework points and by nothing else."""
+    monkeypatch.setattr(gate.kinds, "RED_CAPABLE", frozenset({"framework", "something_else"}))
     other = _line("claim_top", kind="something_else")
     other["key"] = "something_else--top"
     decision = _decide(_line("floor"), other)
@@ -437,11 +553,14 @@ def test_only_a_framework_point_proves_a_tested_range():
 
 def test_a_commit_is_matched_whole_and_a_tree_with_no_claims_proves_nothing():
     lines = [_line("floor"), _line("claim_top")]
-    short = gate.decide(lines, commit=_COMMIT[:12], today=_TODAY, claims=_CLAIMS)
+    lines = _stamped(lines)
+    runs = _listed(lines)
+    assert gate.decide(lines, commit=_COMMIT, today=_TODAY, claims=_CLAIMS, runs=runs)["pass"]
+    short = gate.decide(lines, commit=_COMMIT[:12], today=_TODAY, claims=_CLAIMS, runs=runs)
     assert short["pass"] is False and "the whole commit id is needed" in short["reasons"][0]
-    whole = gate.decide(lines, commit="f" * 40, today=_TODAY, claims=_CLAIMS)
+    whole = gate.decide(lines, commit="f" * 40, today=_TODAY, claims=_CLAIMS, runs=runs)
     assert whole["pass"] is False and "whole commit id" not in whole["reasons"][0]
-    empty = gate.decide(lines, commit=_COMMIT, today=_TODAY, claims={})
+    empty = gate.decide(lines, commit=_COMMIT, today=_TODAY, claims={}, runs=runs)
     assert empty == {
         "pass": False,
         "run": None,
@@ -517,15 +636,19 @@ def test_an_override_file_that_does_not_apply_is_said_not_ignored(tmp_path, monk
 
 
 def test_lines_that_do_not_say_how_their_run_ended_prove_nothing():
-    """Lines written before a run recorded its colour. Passing lines alone are not proof
-    that the run was green, so the gate does not take them for it."""
-    silent = {k: v for k, v in _run().items() if k != "red"}
-    decision = _decide(_line("floor", run=silent), _line("claim_top", run=silent))
-    assert decision["reasons"] == [
-        "the run's lines do not say how it ended; run it again at this commit"
-    ]
-    half = _decide(_line("floor"), _line("claim_top", run=silent))
-    assert half["pass"] is False
+    """The list says the run ended green with two points. Lines that do not say so
+    themselves are not the lines that run wrote, and passing lines alone are not proof."""
+    said = _stamped((_line("floor"), _line("claim_top")))
+    runs = _listed(said)
+    assert _judge(said, runs)["pass"] is True
+    for missing in ("red", "points"):
+        quiet = [
+            {**line, "run": {k: v for k, v in line["run"].items() if k != missing}} for line in said
+        ]
+        for lines in (quiet, [said[0], quiet[1]]):
+            assert _judge(lines, runs)["reasons"] == [
+                "the run's lines do not agree with the list of runs about how it ended"
+            ], missing
 
 
 def test_nothing_a_record_line_holds_is_markup_in_what_the_gate_prints():
@@ -556,6 +679,7 @@ _DAMAGE = [
     ("key", {"a": 1}),
     ("watching", "false"),
     ("watching", 0),
+    ("watching", True),
     ("in_claim", "no"),
     ("in_claim", None),
     ("run.red", 0),

@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
-from compat import kinds, model, point, render, report, verdict, watchdog  # noqa: E402
+from compat import gate, kinds, model, point, render, report, verdict, watchdog  # noqa: E402
 from compat import plan as planner  # noqa: E402
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "compat"
@@ -2900,3 +2900,69 @@ def test_a_run_writes_its_colour_on_every_line_it_records(tmp_path, monkeypatch,
     code, red = lines_of(problem, "red")
     assert code == report.RED_EXIT and [line["run"]["red"] for line in red] == [True, True]
     assert all(line["outcome"] == "pass" for line in red), "no line of its own says why"
+
+
+def test_the_gate_reads_what_the_report_wrote_and_a_run_with_no_point_is_still_a_run(
+    tmp_path, monkeypatch
+):
+    """The report and the gate, end to end, on one records folder. A whole run on the
+    default branch passes the gate. A later run at the same commit that could plan no
+    point at all writes no line; the list of runs is what makes it the newest run."""
+    monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
+    monkeypatch.setattr(report.GitHub, "do", lambda self, what, *rest: None)
+    for name in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "GITHUB_REPOSITORY"):
+        monkeypatch.delenv(name, raising=False)
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    monkeypatch.setenv("GITHUB_SHA", commit)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    records = tmp_path / "records"
+    records.mkdir()
+
+    def run(plan: dict, run_id: str, *results: dict) -> int:
+        monkeypatch.setenv("GITHUB_RUN_ID", run_id)
+        work = tmp_path / run_id
+        (work / "results").mkdir(parents=True, exist_ok=True)
+        (work / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        for result in results:
+            _write(work / "results", result)
+        argv = ["--plan", str(work / "plan.json"), "--results", str(work / "results")]
+        return report.main([*argv, "--state-dir", str(records), "--write"])
+
+    def decided() -> dict:
+        return gate.decide(
+            gate.read_lines(records, "2026-11-26"),
+            commit=commit,
+            today="2026-11-26",
+            claims={"openai_agents": 2},
+            runs=gate.read_runs(records),
+        )
+
+    morning = {**_plan(_FLOOR, _TOP), "partial": False}
+    assert run(morning, "1", _result(_FLOOR), _result(_TOP)) == 0
+    listed = gate.read_runs(records)
+    assert [(e["id"], e["attempt"], e["red"], e["points"]) for e in listed] == [
+        ("1", "1", False, 2)
+    ]
+    assert listed[0]["scope"] == "all" and listed[0]["ref"] == "refs/heads/main"
+    assert decided()["pass"] is True
+
+    # Later the same day the index lists nothing: no point, a red run, not one line.
+    evening = {**_plan(), "partial": False, "cutoff": "2026-11-26T21:00:00Z"}
+    evening["adapters"] = {"openai_agents": {**morning["adapters"]["openai_agents"]}}
+    evening["adapters"]["openai_agents"]["problems"] = ["no release could be listed"]
+    assert run(evening, "2") == report.RED_EXIT
+    assert [(e["id"], e["red"], e["points"]) for e in gate.read_runs(records)] == [
+        ("1", False, 2),
+        ("2", True, 0),
+    ]
+    assert len(gate.read_lines(records, "2026-11-26")) == 2, "the second run wrote no line"
+    stopped = decided()
+    assert stopped["pass"] is False and "ended red" in stopped["reasons"][0]
+
+    # The same run again is one entry, and a run a week old leaves the list.
+    assert run(evening, "2") == report.RED_EXIT
+    assert len(gate.read_runs(records)) == 2
+    later = report.run_list(gate.read_runs(records), {**_RUN, "date": "2026-12-04", "id": "9"})
+    assert [entry["id"] for entry in later] == ["9"]
+    assert report.run_list("not a list", {**_RUN, "id": "9"})[-1]["id"] == "9"
