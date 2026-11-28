@@ -2804,7 +2804,7 @@ def test_a_schedule_that_never_fired_is_dated_from_the_day_its_file_reached_the_
 
 
 def _rehearsed(*results: dict, ref: str = "refs/heads/main", scope: str = "all") -> str:
-    run = {**_RUN, "ref": ref, "scope": scope, "cadence": "daily"}
+    run = {**_RUN, "ref": ref, "scope": scope, "cadence": "daily", "red": False}
     plan = _plan(*[{k: v for k, v in r.items() if k in _FLOOR} for r in results])
     return report.gate_rehearsal(plan, _results(*results), run)
 
@@ -2815,7 +2815,8 @@ def test_every_run_says_what_the_release_gate_would_say_of_its_commit(monkeypatc
     stopped = _rehearsed(_result(_FLOOR, "fail"), _result(_TOP))
     assert "The release gate would stop:" in stopped
     assert (
-        "- openai_agents--floor: openai-agents 0.22.0 is inside the tested range and: " in stopped
+        "- `openai_agents--floor`: `openai-agents 0.22.0` is inside the tested range and: tests "
+        "fail\n" in stopped
     )
     for elsewhere in (
         _rehearsed(_result(_FLOOR), _result(_TOP), ref="refs/heads/some-branch"),
@@ -2838,18 +2839,26 @@ def test_the_page_of_a_release_that_overrode_its_gate_says_so(tmp_path):
     state = report.next_state({}, {}, _RUN, tmp_path, plan)
     page = render.page(state, "0.7.0b1", "2026-11-26")
     assert (
-        "**This release went out without a passing compatibility gate.** The reason given in "
-        "its own tree: the floor fails upstream" in page
+        "**This release carried an override of the compatibility gate**, which lets a release "
+        "go out without a recent pass for what it says it is tested on. The reason given in "
+        "its own tree: `the floor fails upstream`\n" in page
     )
-    assert "without a passing compatibility gate" not in render.page(
-        state, render.MAIN, "2026-11-26"
-    )
+    assert "override of the compatibility gate" not in render.page(state, render.MAIN, "2026-11-26")
+    # In the words it was given, in any language, and never as markup: the state file is
+    # read back from a branch, so the page cleans the reason again and quotes it.
+    for reason, shown in (
+        ("상위 프레임워크 버그로 측정 불가", "`상위 프레임워크 버그로 측정 불가`"),
+        ("a` | <b> [x](https://e.invalid) **PASS**", "`a b x (https://e.invalid) **PASS**`"),
+    ):
+        plan["published"]["override"] = {"version": "0.7.0b1", "reason": reason}
+        state = report.next_state(state, {}, _RUN, tmp_path, plan)
+        assert f"its own tree: {shown}\n" in render.page(state, "0.7.0b1", "2026-11-26")
     plan["published"]["override"] = None
     state = report.next_state(state, {}, _RUN, tmp_path, plan)
-    assert "without a passing" not in render.page(state, "0.7.0b1", "2026-11-26")
+    assert "override of the compatibility gate" not in render.page(state, "0.7.0b1", "2026-11-26")
 
 
-def test_a_run_writes_its_colour_on_every_line_it_records(tmp_path, monkeypatch):
+def test_a_run_writes_its_colour_on_every_line_it_records(tmp_path, monkeypatch, capsys):
     """The release gate reads lines and nothing else. A run that was red because its plan
     could not cover a tested release has no line that says so, unless every line does."""
     monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
@@ -2870,6 +2879,7 @@ def test_a_run_writes_its_colour_on_every_line_it_records(tmp_path, monkeypatch)
 
     code, green = lines_of(_plan(_FLOOR, _TOP), "green")
     assert code == 0 and [line["run"]["red"] for line in green] == [False, False]
+    assert "### If this commit were released now" in capsys.readouterr().out, "in every summary"
     problem = _plan(_FLOOR, _TOP)
     problem["adapters"]["openai_agents"]["problems"] = ["0.22.0 admits no supported interpreter"]
     code, red = lines_of(problem, "red")

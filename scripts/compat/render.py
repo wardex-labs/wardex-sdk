@@ -27,7 +27,7 @@ from xml.sax.saxutils import escape
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from compat import kinds  # noqa: E402
+from compat import kinds, model  # noqa: E402
 from compat.verdict import FAILED, GREEN, NOT_OURS, OUTCOME_WORDS  # noqa: E402
 
 # A pass older than this proves nothing about today: the row says when it last
@@ -319,8 +319,9 @@ def page(state: dict, version: str, today: str) -> str:
     override = about.get("override") if version != MAIN else None
     if override:
         lines += [
-            "**This release went out without a passing compatibility gate.** The reason given "
-            f"in its own tree: {clean(override.get('reason', ''), 200)}",
+            "**This release carried an override of the compatibility gate**, which lets a "
+            "release go out without a recent pass for what it says it is tested on. The reason "
+            f"given in its own tree: {model.quoted(override.get('reason', ''))}",
             "",
         ]
     lines += [

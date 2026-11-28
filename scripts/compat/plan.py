@@ -512,8 +512,10 @@ def read_tag(version: str) -> dict:
     tests = _git("ls-tree", "--name-only", f"{commit}:{model.TESTS_DIR}").split()
     try:
         override = model.parse_override(_git("show", f"{commit}:{model.OVERRIDE}"), version)
-    except subprocess.CalledProcessError:
-        override = None  # the usual case: the release went through its gate
+    except (subprocess.CalledProcessError, ValueError):
+        # No file is the usual case: the release went through its gate. A file that is
+        # not text is no override either, and must not cost the release its points.
+        override = None
     return {
         "ref": ref,
         "commit": commit,
