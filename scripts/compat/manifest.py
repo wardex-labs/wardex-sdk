@@ -129,6 +129,96 @@ REPLAY_ONLY: dict[str, dict] = {
     "hermes_agent": {"label": "hermes-agent", "replay_of": "Hermes Agent v0.23.3"},
 }
 
+#: Frameworks run together in one environment, each at its newest tested release. Chosen
+#: on two grounds: the pair shares packages, so one's pins decide what the other gets
+#: (openai-agents and pydantic-ai share `openai` and `mcp`); or wardex itself ties them
+#: together (which adapter an MCP tool call belongs to depends on which are installed).
+#: The last one is every framework at once, the environment the pull-request jobs use.
+COMBINATIONS: dict[str, dict] = {
+    "openai_agents__pydantic_ai": {
+        "label": "openai-agents + pydantic-ai",
+        "members": ("openai_agents", "pydantic_ai"),
+    },
+    "openai_agents__langgraph": {
+        "label": "openai-agents + langgraph",
+        "members": ("openai_agents", "langgraph"),
+    },
+    "all_frameworks": {
+        "label": "every framework together",
+        "members": ("openai_agents", "langgraph", "anthropic_agent_sdk", "pydantic_ai"),
+    },
+}
+
+#: Other instrumentation libraries a user may have on in the same process. `requires` is
+#: what turning one on needs beyond the adapter's own environment. The driver runs the
+#: adapter's conformance workload alone and beside the library and compares the trees.
+NEIGHBOURS: dict[str, dict] = {
+    "openinference_openai_agents": {
+        "label": "OpenInference (openai-agents)",
+        "adapter": "openai_agents",
+        "requires": ("openinference-instrumentation-openai-agents", "opentelemetry-sdk"),
+    },
+    "openinference_langchain": {
+        "label": "OpenInference (LangChain)",
+        "adapter": "langgraph",
+        "requires": ("openinference-instrumentation-langchain", "opentelemetry-sdk", "langchain"),
+    },
+    "logfire_pydantic_ai": {
+        "label": "Logfire",
+        "adapter": "pydantic_ai",
+        "requires": ("logfire",),
+    },
+}
+NEIGHBOUR_DRIVER = "e2e_neighbour.py"
+
+#: The programs run for real. `adapter` with a tested range: the program comes inside that
+#: framework's wheel, at the newest tested release. `npm`: the program is an npm package;
+#: `claimed` is the release the README names, and the newest release is run beside it.
+CLI: dict[str, dict] = {
+    "anthropic_agent_sdk": {
+        "label": "claude",
+        "program": "claude",
+        "adapter": "anthropic_agent_sdk",
+    },
+    "codex_exec": {
+        "label": "codex",
+        "program": "codex",
+        "npm": "@openai/codex",
+        "claimed": "0.160.0",
+    },
+}
+CLI_DRIVER = "e2e_cli_live.py"
+
+#: Hermes Agent has no package on PyPI: it is run from a release tag of its repository.
+#: `claimed` is the tag the README names; the newest release tag is run beside it.
+HERMES: dict = {
+    "subject": "hermes_agent",
+    "label": "hermes-agent",
+    "repository": "NousResearch/hermes-agent",
+    "claimed": "v0.23.3",
+    "python": "3.14",
+}
+HERMES_DRIVER = "e2e_hermes_tag.py"
+
+#: Frameworks whose default branch is run weekly at its head. Two only: openai-agents
+#: releases about monthly and has never published a pre-release, so its branch is the only
+#: early view there is; LangGraph's branch moves several packages at once. `sources` maps
+#: each distribution to its folder in the repository ("" for the root).
+DEV_BRANCHES: dict[str, dict] = {
+    "openai_agents": {
+        "repository": "https://github.com/openai/openai-agents-python",
+        "sources": {"openai-agents": ""},
+    },
+    "langgraph": {
+        "repository": "https://github.com/langchain-ai/langgraph",
+        "sources": {"langgraph": "libs/langgraph", "langgraph-prebuilt": "libs/prebuilt"},
+    },
+}
+
+#: Seconds a point that runs a driver may take. The Hermes smoke is the longest: about six
+#: minutes from an empty directory.
+DRIVER_TIMEOUT_S = 1500
+
 #: Every sentence of the README that says wardex was tested, verified or measured against
 #: something outside this repository, and the kind of point that proves it on a schedule.
 #: `says` is the README's own words. `proof` is None while no scheduled run proves the
@@ -149,15 +239,13 @@ CLAIMS: tuple[dict, ...] = (
     },
     {
         "says": "Hermes Agent (through a Hermes plugin; measured on v0.23.3)",
-        "proof": None,
-        "why": "replayed on every pull request from payloads recorded on that release; no "
-        "scheduled run installs Hermes",
+        "proof": "hermes",
+        "why": "",
     },
     {
         "says": "Verified against `codex-cli` 0.160.0.",
-        "proof": None,
-        "why": "replayed on every pull request from output recorded on that release; no "
-        "scheduled run installs the CLI",
+        "proof": "cli",
+        "why": "",
     },
     {
         "says": "Prebuilt wheels cover Linux with glibc (x86_64, aarch64), macOS (x86_64, "

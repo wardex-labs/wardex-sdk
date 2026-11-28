@@ -167,6 +167,12 @@ in a commit of its own.
 |---|---|---|
 | `framework` | does the wheel built from this commit hold on these framework releases (the table above) | yes |
 | `published` | does the newest wardex release on PyPI hold on the newest release its own table claims, and on the newest one above that | no, watching |
+| `combination` | do the frameworks of a declared set install together at their newest tested releases, and do all their tests pass in that one environment | no, watching |
+| `neighbour` | is the tree wardex records the same with another instrumentation library on in the same process, and did that library record its own spans | no, watching |
+| `prerelease` | does the adapter's suite pass on the newest pre-release ahead of the newest final, when there is one | no, watching |
+| `cli` | run for real against a stand-in for the model API on a loopback port, is the program's run recorded as the README says (`claude` as it ships inside the newest tested `claude-agent-sdk`; `codex` at the release the README names and at the newest) | no, watching |
+| `hermes` | does the Hermes smoke pass on the release tag the README names and on the newest release tag | no, watching |
+| `devbranch` | does the adapter's suite pass at the head of the framework's default branch (openai-agents, LangGraph), weekly | no, watching |
 
 A `published` point installs `wardex-sdk==<version>` from PyPI and runs the
 tests of that release's tag (`python-v<version>`) against the table that tag
@@ -175,6 +181,22 @@ same rule picks its releases and the same executor runs it; only the point's
 `sdk` field and the tree its tests come from differ. Points of a release that
 a newer one replaced stay in `state.json` as that release's history: they are
 shown on its page and no issue asks anyone to fix them.
+
+The sets of frameworks, the other instrumentation libraries, the programs and
+the branches are declared in `scripts/compat/manifest.py`. Three of these
+kinds are checked by a driver instead of a test suite: a script under
+`sdks/python/tests/` that pytest does not collect (`e2e_neighbour.py`,
+`e2e_cli_live.py`, `e2e_hermes_tag.py`), run by the same executor, which reads
+the verdict the script writes. Each runs by hand with one command; its first
+lines say which. None uses a key or leaves the machine it runs on.
+
+A run has a cadence: the daily one, or the weekly one that runs the
+development branches on Mondays (`CRONS` in `kinds.py` says which cron line is
+which; `gh workflow run compat.yml -f cadence=weekly` starts one by hand).
+Only the daily run writes issues. What a weekly run found is kept in
+`state.json` and is on the issue, with its date, the next time the daily run
+reports; what it found wrong with itself is on the health issue the same way,
+and the daily run says so when the weekly one has not completed for ten days.
 
 The run also writes the public pages, from `state.json` and nothing else
 (`scripts/compat/render.py`), under `site/` on the `compat-results` branch:
@@ -187,8 +209,9 @@ run's `compat-site-preview` artifact.
 The run is red in two cases only: a release inside the tested range does not
 pass, or a planned point left no result, and in both only for a point of a
 red-capable kind. Everything else that needs a person
-arrives as an issue labelled `compat`: one per adapter, one for problems with
-the run itself, and one opened by a run that ended without a verdict. Each is
+arrives as an issue labelled `compat`: one per subject (an adapter, a set of
+frameworks run together, a program with no tested range), one for problems
+with the run itself, and one opened by a run that ended without a verdict. Each is
 found by a marker in its body, rewritten by every run and closed by the run
 when nothing is left to do; on a day a release could not be checked at all,
 nothing is closed. Records accumulate on the `compat-results` branch, one JSON

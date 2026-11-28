@@ -41,6 +41,7 @@ def _no_published_release(monkeypatch):
     """No test here reaches PyPI or a tag unless it says so."""
     nothing = {"problems": [], "points": [], "adapters": {}}
     monkeypatch.setattr(planner, "fetch_published", lambda cutoff, only=None: nothing)
+    monkeypatch.setattr(planner, "fetch_facts", lambda cadence: None)
 
 
 _RUN = {
@@ -1928,7 +1929,9 @@ def test_every_declared_kind_has_words_and_a_way_to_close(monkeypatch):
     for name, kind in kinds.KINDS.items():
         assert kind.label and kind.cadences and kind.fresh_days > 0, name
         assert name in kinds.RED_CAPABLE or kind.closes, name
-    assert kinds.due("daily") == ("framework", "published")
+    assert kinds.due("daily")[:2] == ("framework", "published")
+    assert kinds.due("weekly") == ("devbranch",)
+    assert set(kinds.due("daily")) | set(kinds.due("weekly")) == set(kinds.KINDS)
     assert kinds.RED_CAPABLE == {"framework"}, "a new kind starts by being watched"
 
 

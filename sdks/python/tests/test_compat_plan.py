@@ -38,6 +38,9 @@ _NOTHING_PUBLISHED = {"problems": [], "points": [], "adapters": {}}
 def _no_published_release(monkeypatch):
     """No test here reaches PyPI or a tag unless it says so."""
     monkeypatch.setattr(plan, "fetch_published", lambda cutoff, only=None: _NOTHING_PUBLISHED)
+    # Nor npm, the GitHub API or another repository. With no outside facts a plan holds
+    # the tested ranges alone, which is what the tests of those rules are about.
+    monkeypatch.setattr(plan, "fetch_facts", lambda cadence: None)
 
 
 def _release(version: str, day: str, *, python: str = ">=3.10", yanked: bool = False) -> dict:

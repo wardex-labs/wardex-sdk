@@ -7,6 +7,12 @@ to probe, which files to run, how long it may take. This module follows that
 recipe and never asks what kind of point it is running, so a new kind of point
 is new values in the same fields and never a branch here. A test holds that.
 
+A recipe may also say: install a target from a source commit instead of the
+index (`install.sources`), put an npm package's program on the path
+(`install.npm`), let the check install what it needs itself (`install.how ==
+"self"`), or run a script that writes its own verdict instead of a test suite
+(`check.how == "driver"`).
+
 The steps run in a fixed order and each failure has one name, so the report can
 tell "the new release changed what wardex records" from "PyPI was down":
 
@@ -51,6 +57,10 @@ PROBE = Path(__file__).with_name("attach_probe.py")
 #: Session plugins a point's check may name; loaded with `-p`, from here and nowhere else.
 PYTEST_PLUGINS = Path(__file__).with_name("pytest_plugins")
 _NO_SOLUTION = ("No solution found", "not satisfiable", "requirements are unsatisfiable")
+#: What npm says when the package or the version asked for does not exist.
+_NO_PACKAGE = ("E404", "ETARGET", "No matching version", "notarget")
+#: A driver's exit code for "what I was to run could not be fetched or built".
+DRIVER_NOT_PREPARED = 3
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, env: dict | None = None, timeout: int = 900):
@@ -170,6 +180,9 @@ class Point:
         self.run_cutoff = plan["cutoff"]
         self.recipe = self.point["install"]
         self.probe, self.check = self.point["probe"], self.point["check"]
+        self.sources = self.recipe.get("sources") or {}
+        self.npm = self.recipe.get("npm") or {}
+        self.path: list[str] = []
         self.work = Path(args.work).resolve()
         self.work.mkdir(parents=True, exist_ok=True)
         self.out = Path(args.out).resolve()
@@ -226,7 +239,13 @@ class Point:
     def _requirements(self, optional: tuple[int, ...], *, minimal: bool = False) -> str:
         lines = [self.wardex]
         for dist, version in self.point["targets"].items():
-            lines.append(f"{dist}{self.recipe['extras'].get(dist, '')}=={version}")
+            extras = self.recipe["extras"].get(dist, "")
+            if dist in self.npm:
+                continue  # not a Python distribution: installed by `install_npm`
+            if dist in self.sources:
+                lines.append(f"{dist}{extras} @ {self.sources[dist]}")
+            else:
+                lines.append(f"{dist}{extras}=={version}")
         if not minimal:
             lines += [
                 f"{dist}{self.recipe['extras'].get(dist, '')}" for dist in self.point["floats"]
@@ -295,10 +314,7 @@ class Point:
             self.result["install"] = {"outcome": outcome, "detail": (detail or err)[-600:]}
             lock.unlink(missing_ok=True)
             return False
-        code, _, err = run(
-            ["uv", "pip", "sync", lock, "--python", python_of(venv), "--require-hashes", "--quiet"],
-            cwd=self.work,
-        )
+        code, err = self._sync(venv, lock)
         if code != 0:
             self.result["install"] = {"outcome": "install_network", "detail": err[-600:]}
             return False
@@ -312,6 +328,59 @@ class Point:
         self.result["lock_sha256"] = sha256(lock)
         return self._verify(venv)
 
+    def _sync(self, venv: Path, lock: Path) -> tuple[int, str]:
+        """Install exactly what the lock holds, every index file checked against its hash.
+
+        A requirement installed from a source commit has no file hash to check, and the
+        installer refuses a lock that mixes the two. Its commit id pins it instead: the
+        index part is installed with hashes required, the source lines after it without
+        their dependencies (the lock already holds those), and the whole is then checked
+        for consistency."""
+        entries = lock_entries(lock.read_text(encoding="utf-8"))
+        direct = [entry for entry in entries if " @ " in entry.split("\n")[0]]
+        python = python_of(venv)
+        if not direct:
+            code, _, err = run(
+                ["uv", "pip", "sync", lock, "--python", python, "--require-hashes", "--quiet"],
+                cwd=self.work,
+            )
+            return code, err
+        index, sources = self.work / "lock-index.txt", self.work / "lock-sources.txt"
+        index.write_text(
+            "\n".join(entry for entry in entries if entry not in direct) + "\n", encoding="utf-8"
+        )
+        sources.write_text("\n".join(direct) + "\n", encoding="utf-8")
+        steps = (
+            ["uv", "pip", "sync", index, "--python", python, "--require-hashes", "--quiet"],
+            ["uv", "pip", "install", "-r", sources, "--python", python, "--no-deps", "--quiet"],
+            ["uv", "pip", "check", "--python", python],
+        )
+        for step in steps:
+            code, out, err = run(step, cwd=self.work)
+            if code != 0:
+                return code, err or out
+        return 0, ""
+
+    def install_npm(self) -> bool:
+        """Put each npm package of the recipe into the work directory and its programs on
+        the path of the check. False when one cannot be installed."""
+        for package, version in self.npm.items():
+            prefix = self.work / "npm"
+            cmd = ["npm", "install", "--prefix", prefix, "--no-audit", "--no-fund"]
+            code, out, err = run([*cmd, f"{package}@{version}"], cwd=self.work, timeout=600)
+            if code != 0:
+                missing = any(marker in err + out for marker in _NO_PACKAGE)
+                outcome = "not_installable" if missing else "install_network"
+                self.result["install"] = {"outcome": outcome, "detail": (err or out)[-600:]}
+                return False
+            manifest = prefix / "node_modules" / package / "package.json"
+            installed = json.loads(manifest.read_text(encoding="utf-8")).get("version")
+            print(f"installed {package} {installed} (target {version})", flush=True)
+            assert installed == version, f"{package}: installed {installed}, the point is {version}"
+            self.result["resolved"][f"npm:{package}"] = installed
+            self.path.append(str(prefix / "node_modules" / ".bin"))
+        return True
+
     def _verify(self, venv: Path) -> bool:
         """The interpreter, the exact target versions, and the wheel as the thing imported."""
         probe = (
@@ -319,7 +388,9 @@ class Point:
             "print(json.dumps({'python': sys.version.split()[0], 'sdk': wardex_sdk.__version__,"
             "'file': wardex_sdk.__file__,"
             "'dists': {d.metadata['Name'].lower().replace('_','-'): d.version"
-            " for d in m.distributions()}}))"
+            " for d in m.distributions()},"
+            "'direct': {d.metadata['Name'].lower().replace('_','-'): d.read_text('direct_url.json')"
+            " for d in m.distributions() if d.read_text('direct_url.json')}}))"
         )
         # From the repository root, as pytest runs: a source tree on the path would
         # shadow the wheel.
@@ -335,7 +406,17 @@ class Point:
         uv_version = run(["uv", "--version"])[1].split()
         self.result["uv_version"] = uv_version[1] if len(uv_version) > 1 else ""
         for dist, version in self.point["targets"].items():
+            if dist in self.npm:
+                continue
             installed = seen["dists"].get(dist)
+            if dist in self.sources:
+                # Installed from a commit: the commit is what the point is, and the version
+                # the package gives itself there is recorded beside it.
+                wanted = self.sources[dist].split("@")[-1].split("#")[0]
+                where = json.loads(seen["direct"].get(dist) or "{}").get("vcs_info") or {}
+                print(f"installed {dist} {installed} at {where.get('commit_id')}", flush=True)
+                assert where.get("commit_id") == wanted, f"{dist}: not installed from {wanted}"
+                continue
             print(f"installed {dist} {installed} (target {version})", flush=True)
             assert installed == version, f"{dist}: installed {installed}, the point is {version}"
         inside = Path(seen["file"]).resolve().is_relative_to(venv.resolve())
@@ -355,17 +436,24 @@ class Point:
         return code == 0
 
     def attach(self, venv: Path) -> bool:
-        code, out, err = run(
-            [python_of(venv), PROBE, self.probe["adapter"], ",".join(self.probe["imports"])],
-            cwd=self.work,
-            timeout=120,
-        )
-        if code != 0:
-            self.result["attach"] = {"verdict": "probe_failed", "detail": err[-600:]}
-            return False
-        seen = json.loads(out.strip().splitlines()[-1])
-        self.result["attach"] = {**seen, "verdict": attach_verdict(seen)}
-        return self.result["attach"]["verdict"] == "ok"
+        """The attach probe for every adapter of the point. The first reading that is not
+        as it should be is the point's; otherwise the first adapter's."""
+        asked = self.probe.get("adapters") or [self.probe]
+        readings = []
+        for one in asked:
+            code, out, err = run(
+                [python_of(venv), PROBE, one["adapter"], ",".join(one["imports"])],
+                cwd=self.work,
+                timeout=120,
+            )
+            if code != 0:
+                readings.append({"verdict": "probe_failed", "detail": err[-600:]})
+                continue
+            seen = json.loads(out.strip().splitlines()[-1])
+            readings.append({**seen, "verdict": attach_verdict(seen)})
+        wrong = [reading for reading in readings if reading["verdict"] != "ok"]
+        self.result["attach"] = (wrong or readings)[0]
+        return not wrong
 
     def files(self) -> list[str]:
         root = self.tree / model.TESTS_DIR
@@ -438,6 +526,98 @@ class Point:
             "skipped_ids": sorted(set(skipped)),
         }
 
+    def drive(self, venv: Path, tag: str) -> dict:
+        """Run the check's driver: a script of the tests tree that does the checking itself
+        and writes its verdict as JSON. The same shape comes back as from `pytest`.
+
+        Exit 0 is a pass and 1 a failure the driver explains. `DRIVER_NOT_PREPARED` says
+        what it was to run could not be fetched or built, which is nobody's failure here.
+        Anything else, or no readable verdict, is the harness's own failure."""
+        script = self.tree / model.TESTS_DIR / self.check["driver"]
+        verdict = self.out / "driver.json"
+        verdict.unlink(missing_ok=True)
+        fill = {
+            "work": str(self.work),
+            "out": str(self.out),
+            "wheel": self.wardex,
+            "target": next(iter(self.point["targets"].values()), ""),
+        }
+        lock = self.recipe.get("how", "lock") == "lock"
+        cmd = [python_of(venv) if lock else sys.executable, script]
+        cmd += [str(arg).format(**fill) for arg in self.check["args"]]
+        env = {**os.environ, **self.check.get("env", {})}
+        env.pop("PYTHONPATH", None)
+        if self.path:
+            env["PATH"] = os.pathsep.join([*self.path, env.get("PATH", "")])
+        started = time.monotonic()
+        limit = int(max(60, min(self.check["suite_timeout_s"], self._left() - 60)))
+        code, out, err = run(cmd, cwd=self.work, env=env, timeout=limit)
+        print(out[-6000:], flush=True)
+        if code not in (0, 1):
+            print(err[-3000:], flush=True)
+        said: dict = {}
+        if verdict.is_file() and code != 124:
+            try:
+                said = json.loads(verdict.read_text(encoding="utf-8"))
+            except ValueError:
+                said = {}
+        said = said if isinstance(said, dict) else {}
+        failed = [str(name)[:300] for name in said.get("failed") or [] if isinstance(name, str)]
+        held = (said.get("checks") or {}).get("held") if isinstance(said.get("checks"), dict) else 0
+        held = held if isinstance(held, int) and not isinstance(held, bool) and held > 0 else 0
+        ok = code == 0 and said.get("ok") is True and not failed
+        if code == 1 and not failed:
+            failed = [f"{self.check['driver']}: it ended with a failure it did not name"]
+        tag_note = f"driver-{tag}"
+        print(f"{tag_note}: exit {code}, ok {ok}", flush=True)
+        return {
+            "passed": max(held, 1) if ok else held,
+            "failed": len(failed),
+            "errors": 0,
+            "skipped": 0,
+            "exit_code": code,
+            "ok": ok,
+            "timed_out": code == 124,
+            "seconds": round(time.monotonic() - started, 1),
+            "failed_ids": sorted(set(failed))[:50],
+            "skipped_ids": [],
+            "said": bool(said),
+            "detail": (err or out)[-600:] if code not in (0, 1) else "",
+        }
+
+    def _driven(self, venv: Path) -> None:
+        """The check when it is a driver and not a suite."""
+        result = self.result
+        script = self.tree / model.TESTS_DIR / self.check["driver"]
+        first = self.drive(venv, "first")
+        detail = first.pop("detail")
+        result["tests"] = {
+            **first,
+            "files": [self.check["driver"]],
+            "excluded_files": [],
+            "selection_sha256": sha256(script) if script.is_file() else "",
+            "plugins": [],
+        }
+        result["tests"].pop("said")
+        if first["ok"]:
+            result["outcome"] = "pass"
+            return
+        if first["exit_code"] == DRIVER_NOT_PREPARED:
+            result["install"] = {"outcome": "install_network", "detail": detail}
+            result["outcome"] = "install_network"
+            return
+        if first["exit_code"] not in (1, 124) or (first["exit_code"] == 1 and not first["said"]):
+            raise RuntimeError(f"the driver ended with exit {first['exit_code']}: {detail[-300:]}")
+        if first["exit_code"] == 1 and self._left() > first["seconds"] * 1.5 + 120:
+            second = self.drive(venv, "rerun")
+            result["rerun"] = {"passed": second["ok"]}
+            if second["ok"]:
+                result["outcome"] = "flaky"
+                return
+        result["outcome"] = "fail"
+        # No replay on the packages of a last pass here: what a driver runs is not a lock.
+        result["cause"] = "not_determined" if self.point["in_claim"] else "new_version"
+
     def counterfactual(self, files: list[str], failed_ids: list[str]) -> None:
         """Today's wheel and tests on the packages of this point's last pass."""
         then = self.last_green.read_text(encoding="utf-8")
@@ -509,15 +689,27 @@ class Point:
 
     def _steps(self, venv: Path) -> None:
         result = self.result
-        if not self.install(venv):
-            result["outcome"] = result["outcome"] or result["install"]["outcome"]
+        if self.recipe.get("how", "lock") == "lock":
+            if not self.install(venv):
+                result["outcome"] = result["outcome"] or result["install"]["outcome"]
+                return
+        else:
+            # The check installs what it needs itself, from what the recipe hands it.
+            result["install"] = {"outcome": "ok", "detail": "", "dropped_optional": []}
+        if not self.install_npm():
+            result["outcome"] = result["install"]["outcome"]
             return
-        if not self.control_import(venv):
-            result["outcome"] = "framework_import_error"
-            return
-        if not self.attach(venv):
-            result["outcome"] = "attach_failed"
-            result["cause"] = "new_version" if not self.point["in_claim"] else None
+        probed = self.probe.get("adapters") or ([self.probe] if self.probe.get("adapter") else [])
+        if probed:
+            if not self.control_import(venv):
+                result["outcome"] = "framework_import_error"
+                return
+            if not self.attach(venv):
+                result["outcome"] = "attach_failed"
+                result["cause"] = "new_version" if not self.point["in_claim"] else None
+                return
+        if self.check.get("how", "suite") == "driver":
+            self._driven(venv)
             return
         files = self.files()
         first = self.pytest(venv, files, "first")

@@ -58,13 +58,70 @@ KINDS: dict[str, Kind] = {
         min_points=1,
         closes="when it passes, or when a newer wardex release takes its place",
     ),
+    # Two or more frameworks in one environment, each at its newest tested release, with
+    # every member's tests: what a process that uses them together installs.
+    "combination": Kind(
+        label="frameworks together",
+        cadences=frozenset({"daily"}),
+        fresh_days=3,
+        min_points=1,
+        closes="when the frameworks install together and their tests pass",
+    ),
+    # The adapter's conformance workload, alone and beside another instrumentation library
+    # turned on in the same process: the two trees have to be the same.
+    "neighbour": Kind(
+        label="beside another instrumentation",
+        cadences=frozenset({"daily"}),
+        fresh_days=3,
+        min_points=1,
+        closes="when the tree is the same again with the other library on",
+    ),
+    # The newest pre-release ahead of the newest final, when there is one.
+    "prerelease": Kind(
+        label="framework pre-release",
+        cadences=frozenset({"daily"}),
+        fresh_days=3,
+        min_points=0,
+        closes="when it passes, or when the final release takes its place",
+    ),
+    # The program an adapter records, run for real against a stand-in for the model API on
+    # a loopback port. The adapter's own tests replay output recorded from one release of it.
+    "cli": Kind(
+        label="live program",
+        cadences=frozenset({"daily"}),
+        fresh_days=3,
+        min_points=1,
+        closes="when the program's run is recorded as the README says again",
+    ),
+    # The Hermes smoke against a release tag of Hermes Agent, built from nothing.
+    "hermes": Kind(
+        label="Hermes release",
+        cadences=frozenset({"daily"}),
+        fresh_days=3,
+        min_points=1,
+        closes="when the smoke passes on that release again",
+    ),
+    # A framework's default branch at its head commit: what its next release will be.
+    "devbranch": Kind(
+        label="development branch",
+        cadences=frozenset({"weekly"}),
+        fresh_days=10,
+        min_points=1,
+        closes="when it passes at the branch's head, or when the release it became is tested",
+    ),
 }
 
 #: The cron lines of `compat.yml` and the cadence each one starts. A test holds the
 #: workflow's `schedule:` to this table.
 CRONS: dict[str, str] = {
     "23 19 * * *": "daily",
+    # Mondays, off the hour and away from the daily run's start.
+    "47 5 * * 1": "weekly",
 }
+#: The run that writes issues. A run of another cadence writes records and state; what it
+#: found reaches an issue, dated, when this one next runs. Two cadences rewriting one issue
+#: would each word the other's rows as remembered and comment on every alternation.
+ISSUE_WRITER = "daily"
 
 
 def is_red_capable(kind: str) -> bool:
