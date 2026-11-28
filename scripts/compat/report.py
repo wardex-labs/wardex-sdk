@@ -456,10 +456,12 @@ def standing(entry: dict, result: dict) -> dict:
 
 
 def outranked(result: dict, word: dict) -> bool:
-    """Whether today's refusal to install gives way to a failure that stands: a release that
-    failed and now will not install is still a release that failed. Several frameworks that
-    no longer install together are news about the set, and stand on their own."""
-    return result["outcome"] in NOT_OURS and not together(result) and word.get("outcome") in FAILED
+    """Whether what a point found today gives way to a failure that stands. A release that
+    failed and now will not install, or whose test dependencies will not install beside
+    it, was not run today: it is still a release that failed. Several frameworks that no
+    longer install together are news about the set, and stand on their own."""
+    ran = result["outcome"] in GREEN | FAILED
+    return not ran and not together(result) and word.get("outcome") in FAILED
 
 
 def next_failing(state: dict, results: dict[str, dict], run: dict) -> dict[str, str]:
@@ -1066,7 +1068,9 @@ def _remembered_rows(state: dict | None, subject: str, results: dict[str, dict])
             # A wardex release a newer one replaced. Its points are history, shown on its
             # own page; nobody is asked to do anything about them.
             continue
-        said, checked = last, entry.get("last_checked") or {}
+        # A watched point remembers what it last found, a refusal to install included; a point
+        # that is not watched, the last day it was run.
+        said, checked = last, entry.get("last_said") or entry.get("last_checked") or {}
         if last.get("outcome") not in GREEN | FAILED and checked.get("targets") == identity.get(
             "targets"
         ):
