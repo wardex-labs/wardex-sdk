@@ -336,22 +336,8 @@ def page(state: dict, version: str, today: str, *, standing_in_for: str = "") ->
     will be released as: the same rows, and a first paragraph that says whose they are."""
     about = (state.get("versions") or {}).get(version) or {}
     grouped = rows(state, version)
-    if version == MAIN and standing_in_for:
-        title = f"Compatibility of wardex {clean(standing_in_for, 40)}, before its release is run"
-        what = (
-            f"The daily run has not yet run `wardex-sdk=={clean(standing_in_for, 40)}` as PyPI "
-            "serves it: it is not published, or no run since has planned it. As long as none "
-            "has, this page shows what the run found for wardex built from `main`, whose version "
-            f"string that is (commit {code(str(about.get('commit', ''))[:10])}). No row here is "
-            "a result of the published wheel."
-        )
-    elif version == MAIN:
-        title = "Compatibility of the default branch"
-        what = (
-            f"What the daily run found for wardex built from `main` "
-            f"(version string {code(about.get('version', ''))}, commit "
-            f"{code(str(about.get('commit', ''))[:10])})."
-        )
+    elsewhere = ""
+    if version == MAIN:
         # A run of one adapter, and the weekly run, leave rows of another commit.
         other = sorted(
             (item["key"], str((item.get("last") or {}).get("commit"))[:10])
@@ -362,10 +348,26 @@ def page(state: dict, version: str, today: str, *, standing_in_for: str = "") ->
         if other:
             named = ", ".join(f"{code(key, 120)} at {code(commit)}" for key, commit in other[:12])
             more = f", and {len(other) - 12} more" if len(other) > 12 else ""
-            what += (
+            elsewhere = (
                 f" {len(other)} of the rows below were last run by another run, at another "
                 f"commit of `main`: {named}{more}."
             )
+    if version == MAIN and standing_in_for:
+        title = f"Compatibility of wardex {clean(standing_in_for, 40)}, before its release is run"
+        what = (
+            f"The daily run has not yet run `wardex-sdk=={clean(standing_in_for, 40)}` as PyPI "
+            "serves it: it is not published, or no run since has planned it. As long as none "
+            "has, this page shows what the run found for wardex built from `main`, whose version "
+            f"string that is (commit {code(str(about.get('commit', ''))[:10])}). No row here is "
+            f"a result of the published wheel.{elsewhere}"
+        )
+    elif version == MAIN:
+        title = "Compatibility of the default branch"
+        what = (
+            f"What the daily run found for wardex built from `main` "
+            f"(version string {code(about.get('version', ''))}, commit "
+            f"{code(str(about.get('commit', ''))[:10])}).{elsewhere}"
+        )
     else:
         title = f"Compatibility of wardex {clean(version, 40)}"
         what = (

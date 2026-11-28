@@ -203,16 +203,20 @@ public page says its rows are of; the page names the rows another run left at
 another commit. A subject taken out of `manifest.py` (an adapter, a set, a
 program, a branch) and a kind taken out of `kinds.py` are forgotten by the
 next whole daily run, which closes the issue in the same run and says the
-check went away, not that it passed.
+check went away, not that it passed; where the issue stays open for something
+else, a comment says which check left. What an older wardex release found is
+that release's history and stays.
 
-A run that is behind is history. That is a run planned before a run that has
-already reported (its failed jobs were run again later), and a run started
-again at a commit that is no longer the tip of its branch (GitHub re-runs a
-run with the code of its own commit, which does not know what was declared
-since). Its lines are kept and the list of runs learns of it; it changes no
-issue, nothing `state.json` remembers and nothing the pages show, and its
-summary says so. To say how things stand now, start a new run:
-`gh workflow run compat.yml`.
+A run can be behind: planned before a run that has already reported (its
+failed jobs were run again later), or started again at a commit that is no
+longer the tip of its branch (GitHub re-runs a run with the code of its own
+commit, which does not know what was declared since). Such a run adds what
+only it knows and takes nothing away. It forgets nothing, writes nothing over
+a point a later run has spoken for, has no say about the run's own health, and
+rewrites the issue of a subject only when it is the newest word on all of it.
+A release inside the tested range that only it saw failing is remembered and
+run again by the next plan. Its summary says it is behind; to say how things
+stand now, start a new run: `gh workflow run compat.yml`.
 
 The run also writes the public pages, from `state.json` and nothing else
 (`scripts/compat/render.py`), under `site/` on the `compat-results` branch:

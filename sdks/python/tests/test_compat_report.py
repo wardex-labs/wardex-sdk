@@ -3309,12 +3309,8 @@ def test_which_run_is_behind(listed, attempt, tip, said):
         assert weekly, "and a weekly run is behind a newer weekly run"
 
 
-def test_a_run_that_is_behind_writes_its_lines_and_changes_nothing_else(
-    tmp_path, monkeypatch, capsys
-):
-    """Yesterday's run failed and opened an issue; today's passed and closed it. Then the
-    failed jobs of yesterday's run are run again. Its plan is yesterday's: acting on it
-    would put yesterday's results over today's and reopen what today closed."""
+def _behind_world(tmp_path, monkeypatch, now: str = "2026-11-27"):
+    """One records folder, runs through `report.main`, and what was done to issues."""
     done: list[str] = []
     monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
     monkeypatch.setattr(report.GitHub, "do", lambda self, what, *rest: done.append(what))
@@ -3325,17 +3321,32 @@ def test_a_run_that_is_behind_writes_its_lines_and_changes_nothing_else(
     monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
     monkeypatch.setenv("GITHUB_SHA", commit)
     monkeypatch.setenv("COMPAT_TIP", commit)
+
+    class Now(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001, ANN206
+            return datetime.fromisoformat(f"{now}T09:00:00").replace(tzinfo=tz)
+
+    monkeypatch.setattr(report, "datetime", Now)
     records = tmp_path / "records"
     records.mkdir()
 
-    def run(day: str, run_id: str, attempt: str, outcome: str) -> int:
+    def run(day: str, run_id: str, attempt: str, *results: dict, **more: object) -> int:
         monkeypatch.setenv("GITHUB_RUN_ID", run_id)
         monkeypatch.setenv("GITHUB_RUN_ATTEMPT", attempt)
-        plan = {**_plan(_FLOOR, _TOP), "partial": False, "cutoff": f"{day}T19:40:00Z"}
+        points = [{k: v for k, v in r.items() if k in {*_FLOOR, "python"}} for r in results]
+        plan = {**_plan(*points), "partial": False, "cutoff": f"{day}T19:40:00Z", **more}
+        plan["scope"] = {
+            "cadence": "daily",
+            "partial": False,
+            "covers": {"framework": ["openai_agents"]},
+            "builds": {},
+            "declared": {"framework": ["openai_agents"]},
+        }
         work = tmp_path / f"work-{len(list(tmp_path.iterdir()))}"
         (work / "results").mkdir(parents=True)
         (work / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
-        for result in (_result(_FLOOR, outcome), _result(_TOP)):
+        for result in results:
             _write(work / "results", result)
         argv = ["--plan", str(work / "plan.json"), "--results", str(work / "results")]
         return report.main([*argv, "--state-dir", str(records), "--write"])
@@ -3343,42 +3354,194 @@ def test_a_run_that_is_behind_writes_its_lines_and_changes_nothing_else(
     def state() -> dict:
         return json.loads((records / "state.json").read_text(encoding="utf-8"))
 
-    def lines(day: str) -> int:
-        path = records / "records" / day[:4] / day[5:7] / f"{day[8:]}.jsonl"
-        return len(path.read_text(encoding="utf-8").splitlines())
+    return run, state, done, records
 
-    assert run("2026-11-26", "1", "1", "fail") == report.RED_EXIT
+
+def test_a_run_behind_a_later_one_writes_nothing_over_it_and_forgets_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """Yesterday's run failed and opened an issue; today's passed. Then the failed jobs of
+    yesterday's run are run again. Its plan is yesterday's: as the newest word it would put
+    yesterday's results over today's, reopen what today settled, and forget what today's
+    plan added."""
+    run, state, done, records = _behind_world(tmp_path, monkeypatch)
+    minor = _point("minor_newest", "0.22.3", line="0.22")
+    assert run("2026-11-26", "1", "1", _result(_FLOOR), _result(_TOP, "fail")) == report.RED_EXIT
     assert [what.split()[0] for what in done] == ["open"]
-    assert run("2026-11-27", "2", "1", "pass") == 0
+    assert run("2026-11-27", "2", "1", _result(_FLOOR), _result(_TOP), _result(minor)) == 0
     today = state()
     page = (records / "site" / "main" / "README.md").read_text(encoding="utf-8")
-    assert today["points"]["openai_agents--floor"]["last"]["outcome"] == "pass"
+    assert today["points"]["openai_agents--claim_top"]["last"]["outcome"] == "pass"
+    assert "openai_agents--minor_newest--0.22" in today["points"]
     done.clear()
     capsys.readouterr()
 
-    assert run("2026-11-26", "1", "2", "fail") == report.RED_EXIT, "its own verdict is its own"
-    assert done == [], "no issue is opened, rewritten or closed"
+    # Its plan could not plan something, too: a problem with the run itself, which is not
+    # this run's to put on the health issue any more.
+    again = (_result(_FLOOR, "fail"), _result(_TOP, "fail"))
+    problem = {"unplanned": ["cli: the npm registry could not be read"]}
+    assert run("2026-11-26", "1", "2", *again, **problem) == report.RED_EXIT, "its own verdict"
     after = state()
     assert [(e["id"], e["attempt"]) for e in after["runs"]] == [("1", "1"), ("2", "1"), ("1", "2")]
     assert {k: v for k, v in after.items() if k != "runs"} == {
         k: v for k, v in today.items() if k != "runs"
-    }
-    assert lines("2026-11-26") == 4, "the lines of both attempts are kept"
+    }, "the point today's plan added is still there, and no row went back a day"
+    assert not [what for what in done if what.split()[0] in ("open", "close", "reopen", "comment")]
     assert (records / "site" / "main" / "README.md").read_text(encoding="utf-8") == page
+    path = records / "records" / "2026" / "11" / "26.jsonl"
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 4, "both attempts are on record"
     said = capsys.readouterr().out
-    assert "### This run is history" in said
+    assert "### This run is behind" in said
     assert "a run planned after this one has already reported" in said
+    assert "(2 of its 2 results are on its lines only)" in said
 
-    # Today's run started again after the branch moved on: the code that runs is not the
-    # code at the tip, so it is history too. At the tip it is the newest word, and acts.
+    # The same plan as the newest word: what it could not plan is on the health issue, and
+    # what it no longer makes a point of is forgotten.
+    assert run("2026-11-28", "3", "1", _result(_FLOOR), _result(_TOP), **problem) == 0
+    assert done == ["open Compatibility: daily run health"]
+    assert "openai_agents--minor_newest--0.22" not in state()["points"]
+
+
+def test_a_run_started_again_off_the_tip_says_what_only_it_knows(tmp_path, monkeypatch, capsys):
+    """The run left no result for a point; the branch moved on; its failed jobs are run
+    again and the release fails. No later run has spoken: this is the newest knowledge
+    there is, and dropping it would let the release leave every later run untested."""
+    run, state, done, _ = _behind_world(tmp_path, monkeypatch, now="2026-11-26")
+    minor = _point("minor_newest", "0.22.3", line="0.22")
+    first = (_result(_FLOOR), _result(_TOP, "harness_error"), _result(minor))
+    assert run("2026-11-26", "1", "1", *first) == report.RED_EXIT
+    done.clear()
     monkeypatch.setenv("COMPAT_TIP", "f" * 40)
-    assert run("2026-11-27", "2", "2", "fail") == report.RED_EXIT
-    assert done == [] and state()["points"] == today["points"]
-    assert "no longer the tip of its branch" in capsys.readouterr().out
-    monkeypatch.setenv("COMPAT_TIP", commit)
-    assert run("2026-11-27", "2", "3", "fail") == report.RED_EXIT
-    assert state()["points"]["openai_agents--floor"]["last"]["outcome"] == "fail"
-    assert done and "This run is history" not in capsys.readouterr().out
+    # Its plan, made again by the old code, no longer makes the minor point.
+    assert run("2026-11-26", "1", "2", _result(_FLOOR), _result(_TOP, "fail")) == report.RED_EXIT
+    now = state()
+    assert now["points"]["openai_agents--claim_top"]["last"]["outcome"] == "fail"
+    assert now["points"]["openai_agents--claim_top"]["last_checked"]["outcome"] == "fail"
+    assert "openai_agents--minor_newest--0.22" in now["points"], "and nothing is forgotten"
+    assert [key.split("|")[0] for key in now["failing"]] == ["openai_agents"]
+    assert [what.split()[0] for what in done] == ["open"], "the adapter's issue, and no other"
+    said = capsys.readouterr().out
+    assert "no longer the tip of its branch" in said and "(0 of its 2 results" in said
+    # At the tip it is a run like any other, and forgets what its plan no longer makes.
+    monkeypatch.setenv("COMPAT_TIP", "0123456789abcdef0123456789abcdef01234567")
+    assert run("2026-11-26", "1", "3", _result(_FLOOR), _result(_TOP, "fail")) == report.RED_EXIT
+    assert "openai_agents--minor_newest--0.22" not in state()["points"]
+    assert "This run is behind" not in capsys.readouterr().out
+
+
+def test_a_release_only_a_run_that_is_behind_saw_failing_is_run_again(tmp_path, monkeypatch):
+    """Yesterday's run left no result for the newest tested release. Today a newer patch
+    took the point over and passes. Yesterday's failed jobs are then run again, and the
+    older patch fails: no point runs it any more, and only this run knows."""
+    run, state, done, _ = _behind_world(tmp_path, monkeypatch)
+    patch = _point("claim_top", "0.23.2")
+    assert run("2026-11-26", "1", "1", _result(_FLOOR), _result(_TOP, "harness_error")) == (
+        report.RED_EXIT
+    )
+    assert run("2026-11-27", "2", "1", _result(_FLOOR), _result(patch)) == 0
+    before = state()
+    assert before.get("displaced") in (None, {}) and before.get("failing") in (None, {})
+    old = _result({**_TOP, "python": "3.14"}, "fail")
+    assert run("2026-11-26", "1", "2", _result(_FLOOR), old) == report.RED_EXIT
+    after = state()
+    assert after["points"]["openai_agents--claim_top"]["last"]["targets"] == patch["targets"]
+    assert after["displaced"] == {
+        "openai_agents": [
+            {
+                "key": "openai_agents--displaced--0.23.1-py3.14",
+                "targets": {"openai-agents": "0.23.1"},
+                "python": "3.14",
+                "failed_on": "2026-11-26",
+            }
+        ]
+    }
+    assert list(after["failing"].values()) == ["2026-11-26"]
+    # A release it saw passing, or failing where the point still runs that release, or one
+    # above the range, is nothing only it knows.
+    assert run("2026-11-27", "2", "1", _result(_FLOOR), _result(patch)) == 0
+    settled = state()
+    for outcome, which in (("pass", _TOP), ("fail", patch), ("fail", _ABOVE)):
+        stale = _result({**which, "python": "3.14"}, outcome)
+        run("2026-11-26", "1", "3", _result(_FLOOR), stale)
+        assert state()["displaced"] == settled["displaced"], (outcome, which["key"])
+    # Nor is the floor, which fails with the packages of its own time: another finding,
+    # with a count of its own.
+    older = _result({**_point("floor", "0.21.0"), "python": "3.10"}, "fail")
+    run("2026-11-26", "1", "4", older, _result(_TOP))
+    assert state()["displaced"] == settled["displaced"]
+    assert state()["points"]["openai_agents--floor"]["last"]["targets"] == _FLOOR["targets"]
+
+
+def test_what_a_run_that_is_behind_leaves_alone(tmp_path):
+    """The facts of how things stand now: which kinds last completed, which build the
+    pages are of, the last scheduled start, the published release, and what is remembered
+    of releases its plan made no point of."""
+    plan = {**_plan(_FLOOR, _TOP), "partial": False}
+    plan["scope"] = {
+        "cadence": "daily",
+        "partial": False,
+        "covers": {"framework": ["openai_agents"]},
+    }
+    plan["published"] = {"version": "9.9.9", "ref": "v9.9.9", "commit": "c", "adapters": {}}
+    remembered = {
+        "key": "openai_agents--displaced--0.22.9-py3.14",
+        "targets": {"openai-agents": "0.22.9"},
+        "python": "3.14",
+        "failed_on": "2026-11-20",
+    }
+    state = {
+        "points": {},
+        "kinds": {"framework": {"last_complete": "2026-11-27", "points": 9}},
+        "versions": {"main": {"version": "0.7.0b2", "commit": "n" * 40, "date": "2026-11-27"}},
+        "last_scheduled": "2026-11-27T19:40:00Z",
+        "release": "0.7.0b1",
+        "displaced": {"openai_agents": [remembered]},
+        "failing": {"openai_agents|3.14|{}": "2026-11-20", "langgraph|3.14|{}": "2026-11-21"},
+    }
+    run = {**_RUN, "event": "schedule", "cadence": "daily", "sdk_commit": "o" * 40}
+    results = _results(_result(_FLOOR), _result(_TOP))
+    late = report.next_state(state, results, run, tmp_path, plan, late=True)
+    for name in ("kinds", "versions", "last_scheduled", "release", "displaced", "failing"):
+        assert late[name] == state[name], name
+    assert late["retired"] == [] and late["_forget"] == [] and late["_older"] == []
+    acting = report.next_state(state, results, run, tmp_path, plan)
+    assert acting["kinds"]["framework"]["last_complete"] == run["date"]
+    assert acting["versions"]["main"]["commit"] == "o" * 40
+    assert acting["last_scheduled"] == run["started_at"] and acting["release"] == "9.9.9"
+    assert acting["displaced"] == {} and list(acting["failing"]) == ["langgraph|3.14|{}"]
+    # With no page yet, it says its own build: there is nothing later to keep.
+    first = report.next_state({}, results, run, tmp_path, plan, late=True)
+    assert first["versions"]["main"]["commit"] == "o" * 40
+
+
+def test_a_run_that_is_behind_has_no_say_about_the_run_itself():
+    plan = {**_plan(_FLOOR, _TOP), "partial": False}
+    results = _results(_result(_FLOOR), _result(_TOP))
+    keys = [issue["key"] for issue in report.wanted_issues(plan, results, {}, _RUN)]
+    assert keys == ["openai_agents", "health", "run-died"]
+    late = [issue["key"] for issue in report.wanted_issues(plan, results, {}, _RUN, late=True)]
+    assert late == ["openai_agents"]
+
+
+def test_a_run_that_is_behind_speaks_only_for_a_subject_it_is_the_newest_word_on():
+    """An issue is rewritten whole from what the run found. Where a later run has spoken
+    for one of the subject's points, this run's rewrite would drop what that run found."""
+    plan = {**_plan(_FLOOR, _TOP), "partial": False}
+    other = {**_TOP, "key": "langgraph--claim_top", "adapter": "langgraph", "subject": "langgraph"}
+    remembered = {"point": {**_TOP, "kind": "framework", "subject": "pydantic_ai"}, "last": {}}
+    state = {"points": {"pydantic_ai--claim_top": remembered}}
+    results = _results(_result(_FLOOR), _result(_TOP), _result(other))
+
+    def keys(**how: object) -> list[str]:
+        return [i["key"] for i in report.wanted_issues(plan, results, state, _RUN, **how)]
+
+    assert keys() == ["langgraph", "openai_agents", "pydantic_ai", "health", "run-died"]
+    # Behind: what it ran, and not a subject it only remembers.
+    assert keys(late=True) == ["langgraph", "openai_agents"]
+    # A later run has spoken for one of the adapter's two points: not that subject either.
+    said = _results(_result(_FLOOR), _result(other))
+    late = report.wanted_issues(plan, said, state, _RUN, late=True, quiet={"openai_agents"})
+    assert [issue["key"] for issue in late] == ["langgraph"]
 
 
 def test_the_workflow_tells_the_report_what_its_branch_points_at_now():
@@ -3386,3 +3549,68 @@ def test_the_workflow_tells_the_report_what_its_branch_points_at_now():
         encoding="utf-8"
     )
     assert 'export COMPAT_TIP="$(git ls-remote origin "$GITHUB_REF"' in text
+    # The whole ref and no other: `ls-remote` also lists a branch whose name ends in it.
+    assert """awk -v ref="$GITHUB_REF" '$2 == ref { print $1; exit }')\"""" in text
+
+
+def test_what_the_weekly_run_found_wrong_with_itself_is_kept_for_the_daily_run(
+    tmp_path, monkeypatch
+):
+    """Through `main`: the weekly run writes no issue, so what it could not plan has to be
+    in the state for the daily run to say."""
+    posted: list[dict] = []
+    monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
+    monkeypatch.setattr(
+        report.GitHub, "do", lambda self, what, method, path, payload: posted.append(payload)
+    )
+    for name in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    records = tmp_path / "records"
+    records.mkdir()
+
+    def run(run_id: str, plan: dict, *results: dict) -> int:
+        monkeypatch.setenv("GITHUB_RUN_ID", run_id)
+        work = tmp_path / f"work-{run_id}"
+        (work / "results").mkdir(parents=True)
+        (work / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        for result in results:
+            _write(work / "results", result)
+        argv = ["--plan", str(work / "plan.json"), "--results", str(work / "results")]
+        return report.main([*argv, "--state-dir", str(records), "--write"])
+
+    weekly = {**_plan(), "partial": False, "cadence": "weekly", "adapters": {}}
+    weekly["unplanned"] = ["devbranch: the head of langgraph could not be read"]
+    weekly["scope"] = {"cadence": "weekly", "partial": False, "covers": {"devbranch": []}}
+    assert run("1", weekly) == 0
+    state = json.loads((records / "state.json").read_text(encoding="utf-8"))
+    assert state["health"] == {
+        "weekly": {
+            "date": "2026-11-26",
+            "marks": [["unplanned", "devbranch: the head of langgraph could not be read"]],
+        }
+    }
+    assert posted == [], "and it writes no issue itself"
+    daily = {**_plan(_FLOOR, _TOP), "partial": False, "cutoff": "2026-11-27T19:40:00Z"}
+    assert run("2", daily, _result(_FLOOR), _result(_TOP)) == 0
+    assert (
+        json.loads((records / "state.json").read_text(encoding="utf-8"))["health"]
+        == (state["health"])
+    ), "kept until the weekly run says otherwise"
+    # The weekly run of the week before, started again: what it could not plan then is not
+    # what the weekly run last found.
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    stale = {**weekly, "cutoff": "2026-11-19T19:40:00Z", "unplanned": ["devbranch: old news"]}
+    monkeypatch.setenv("COMPAT_TIP", "")
+    assert run("0", stale) == 0
+    assert (
+        json.loads((records / "state.json").read_text(encoding="utf-8"))["health"]
+        == (state["health"])
+    )
+    (opened,) = [payload for payload in posted if "compat-key: health" in payload.get("body", "")]
+    assert (
+        "From the weekly run of `2026-11-26`: `unplanned`: `devbranch: the head of langgraph "
+        "could not be read`" in opened["body"]
+    )

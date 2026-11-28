@@ -82,6 +82,9 @@ def _facts(**change: object) -> dict:
                     "published": "2026-11-25T16:00:00Z",
                     "prerelease": False,
                 },
+                {"tag": "v\u0669.0.0", "published": "2026-11-25T17:00:00Z", "prerelease": False},
+                {"tag": "v9.\u0669.0", "published": "2026-11-25T18:00:00Z", "prerelease": False},
+                {"tag": "v9.0.\u0669", "published": "2026-11-25T19:00:00Z", "prerelease": False},
             ]
         },
         "heads": {declared["repository"]: _HEAD for declared in manifest.DEV_BRANCHES.values()},
@@ -1336,3 +1339,113 @@ def test_a_set_that_has_not_installed_for_days_is_said_in_its_own_words_on_the_h
         "on 2 days running." in body
     )
     assert "on this Python" not in body
+
+
+# --- what the third reader found -----------------------------------------------------
+
+
+def test_a_check_that_leaves_while_its_issue_stays_open_is_said_on_it_that_day(tmp_path):
+    """Something else keeps the issue open, and the trace is of one run: said in the body
+    that day and in a comment of its own, or the later closing would never say it."""
+    daily = _plan()
+    results = {p["key"]: _result(p) for p in daily["points"]}
+    key = "pydantic_ai--claim_top"
+    results[key] = _result(results[key], "fail", tests={"failed_ids": ["t.py::test_x"]})
+    assert "pydantic_ai" not in manifest.DEV_BRANCHES
+    left = {**_GONE, "kind": "devbranch", "subject": "pydantic_ai", "adapter": "pydantic_ai"}
+    state = {
+        "points": {
+            "devbranch--pydantic_ai": {
+                "point": left,
+                "last": {"date": "2026-11-25", "outcome": "not_installable", "targets": {}},
+            }
+        }
+    }
+    after = report.next_state(state, results, _RUN, tmp_path, daily)
+    assert [(item["key"], item["failing"]) for item in after["retired"]] == [
+        ("devbranch--pydantic_ai", True)
+    ], "a check that could not be installed was not passing either"
+    issue = report.adapter_issue("pydantic_ai", daily, results, _RUN, after)
+    sentence = (
+        "The check `devbranch--pydantic_ai` was not passing when it was last "
+        "run (`2026-11-25`) and is no longer run: nothing declares it any more. That is not a "
+        "pass."
+    )
+    assert issue["open"] is True and issue["left"] == [sentence]
+    assert f"### No longer run\n\n- {sentence}" in issue["body"]
+    done: list[tuple] = []
+    gh = report.GitHub("o/r", write=False)
+    gh.do = lambda what, method, path, payload: done.append((what, payload))  # type: ignore[method-assign]
+    existing = [{"number": 7, "state": "open", "body": issue["body"]}]
+    report.sync_issue(gh, issue, existing)
+    assert [what for what, _ in done] == ["rewrite #7", "comment on #7"]
+    assert done[-1][1]["body"] == f"No longer run:\n\n- {sentence}"
+    # The day after, the trace is gone and nothing is said twice.
+    later = report.next_state(after, results, {**_RUN, "id": "2"}, tmp_path, daily)
+    again = report.adapter_issue("pydantic_ai", daily, results, _RUN, later)
+    assert again["left"] == [] and "No longer run" not in again["body"]
+    # An issue that closes says it in its closing words, and has no second comment.
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    closed = report.adapter_issue("pydantic_ai", daily, passing, _RUN, after)
+    assert closed["open"] is False and sentence in closed["closing"]
+    assert "No longer run" not in closed["body"]
+
+
+def test_what_an_older_release_found_stays_on_a_day_the_newest_cannot_be_read(tmp_path):
+    """An adapter has left the manifest. With no release planned today the run cannot tell
+    which release is the current one, and every remembered one is history to it."""
+    daily = _plan()
+    assert daily["scope"]["builds"] == {}, "no published release was planned"
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    was = {**_GONE, "kind": "published", "subject": "an_adapter_that_left", "adapter": "x"}
+    last = {"date": "2026-11-25", "outcome": "pass", "targets": {"x": "1"}}
+    key = "published--0.6.0--an_adapter_that_left--claim_top"
+    state = {
+        "release": "0.7.0b1",
+        "points": {
+            key: {"point": {**was, "sdk": {"origin": "pypi", "version": "0.6.0"}}, "last": last}
+        },
+    }
+    after = report.next_state(state, passing, _RUN, tmp_path, daily)
+    assert key in after["points"] and after["retired"] == []
+    # A point of the build itself has no release to be the history of, and goes.
+    own = {
+        "points": {
+            "an_adapter_that_left--floor": {"point": {**was, "kind": "framework"}, "last": last}
+        }
+    }
+    assert (
+        "an_adapter_that_left--floor"
+        not in report.next_state(own, passing, _RUN, tmp_path, daily)["points"]
+    )
+
+
+def test_the_page_that_stands_in_for_an_unreleased_version_names_other_commits_too(tmp_path):
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    state = report.next_state({}, passing, {**_RUN, "sdk_commit": "a" * 40}, tmp_path, daily)
+    weekly = _plan("weekly")
+    week = {p["key"]: _result(p) for p in weekly["points"]}
+    later = {**_RUN, "cadence": "weekly", "sdk_commit": "b" * 40, "date": "2026-11-30"}
+    state = report.next_state(state, week, later, tmp_path, weekly)
+    page = render.page(state, render.MAIN, "2026-11-30", standing_in_for="0.7.0b2")
+    assert (
+        "No row here is a result of the published wheel. 2 of the rows below were last run" in page
+    )
+    assert "`devbranch--langgraph` at `bbbbbbbbbb`" in page
+    # More than a dozen are counted, and the first dozen named.
+    for index in range(11):
+        entry = json.loads(json.dumps(state["points"]["devbranch--langgraph"]))
+        state["points"][f"devbranch--z{index:02}"] = entry
+    page = render.page(state, render.MAIN, "2026-11-30")
+    assert (
+        "13 of the rows below" in page and "`devbranch--z09` at `bbbbbbbbbb`, and 1 more." in page
+    )
+    assert "devbranch--z10` at" not in page.split("\n")[2]
+    del state["points"]["devbranch--z10"]
+    page = render.page(state, render.MAIN, "2026-11-30")
+    assert "12 of the rows below" in page and "`devbranch--z09` at `bbbbbbbbbb`." in page
+    # The page of a published release is of that release, and says nothing of the sort.
+    shipped = {**_GONE, "sdk": {"origin": "pypi", "version": "0.7.0b1"}}
+    state["points"]["published--0.7.0b1--x"] = {"point": shipped, "last": {"commit": "c" * 40}}
+    assert "another commit" not in render.page(state, "0.7.0b1", "2026-11-30")

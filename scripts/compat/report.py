@@ -597,9 +597,10 @@ def behind(state: dict, run: dict, tip: str | None) -> str:
     run planned before a run that has already reported: its failed jobs were run again
     after a later run wrote. And a run started again at a commit that is no longer the tip
     of its branch: GitHub re-runs a run with the code of its own commit, which does not
-    know what was declared since. Either would undo what the newer run wrote, forget
-    points its plan has not heard of and close their issues. Such a run is history: its
-    lines are kept, and it changes nothing else.
+    know what was declared since. Either, acting as the newest word, would undo what the
+    newer run wrote, forget points its plan has not heard of and close their issues. Such
+    a run adds what only it knows and takes nothing away: it forgets nothing, writes
+    nothing over what a later run found, and has no say about how the run itself stands.
 
     `tip` is the commit the run's branch points at now, or empty when that is not known."""
     mine = gate.run_of({"run": run})
@@ -645,12 +646,31 @@ def list_was_kept(state_dir: Path, days: list[str]) -> bool:
 
 
 def next_state(
-    state: dict, results: dict[str, dict], run: dict, results_dir: Path, plan: dict | None = None
+    state: dict,
+    results: dict[str, dict],
+    run: dict,
+    results_dir: Path,
+    plan: dict | None = None,
+    *,
+    late: bool = False,
 ) -> dict:
     """The small file the next run reads: each point's last record, last check and last pass,
-    and the failed releases a newer one has replaced."""
+    and the failed releases a newer one has replaced.
+
+    `late` is a run that is behind (`behind`). It adds what only it knows: a point no
+    later run has spoken for takes its result, and a release it saw failing that no point
+    runs any more is remembered. It takes nothing away: nothing is forgotten, and a point
+    a later run has spoken for keeps what that run said."""
     points = dict(state.get("points", {}))
     locks: dict[str, Path] = {}
+    found = results
+    if late:
+        # Dated by its plan: a point that holds a later day was spoken for after it.
+        results = {
+            key: result
+            for key, result in found.items()
+            if str(((points.get(key) or {}).get("last") or {}).get("date") or "") <= run["date"]
+        }
     failing = next_failing(state, results, run)
     for key, result in results.items():
         entry = dict(points.get(key, {}))
@@ -730,7 +750,7 @@ def next_state(
     scope = (plan or {}).get("scope") or {}
     forgotten: list[str] = []
     gone: list[dict] = []
-    for key in [key for key in points if key not in results]:
+    for key in [] if late else [key for key in points if key not in results]:
         # A point this run was in a position to plan and did not: the question is no longer
         # asked (the release left the range, a newer line replaced it). Anything outside
         # what the run covers is left exactly as the run that does cover it wrote it.
@@ -753,7 +773,9 @@ def next_state(
         # release's history, kept for its page.
         build = (identity.get("sdk") or {}).get("version")
         builds = scope.get("builds", {}).get(kind)
-        if not retired and build is not None and builds is not None and build not in builds:
+        if not retired and build is not None and (builds is None or build not in builds):
+            # Also on a day the newest release could not be read: with no release planned,
+            # every remembered one is another release than the one this run planned.
             continue
         if retired or undeclared or subject in scope.get("covers", {}).get(kind, ()):
             last = points[key].get("last") or {}
@@ -775,7 +797,7 @@ def next_state(
             del points[key]
             forgotten.append(key)
     seen = dict(state.get("kinds") or {})
-    if not scope.get("partial", True):
+    if not scope.get("partial", True) and not late:
         for kind in scope.get("covers", {}):
             mine = [r for r in results.values() if r.get("kind", "framework") == kind]
             seen[kind] = {"last_complete": run["date"], "points": len(mine)}
@@ -785,17 +807,53 @@ def next_state(
         "kinds": seen,
         "last_scheduled": state.get("last_scheduled"),
         "release": state.get("release"),
-        "versions": _versions(state, plan, run),
+        # Which build the pages are of is the later run's to say.
+        "versions": state["versions"]
+        if late and state.get("versions")
+        else _versions(state, plan, run),
         "runs": run_list(state.get("runs"), run),
         # Of this run only: the next run has nothing left to retire.
         "retired": gone,
     }
-    if (plan or {}).get("published"):
+    if (plan or {}).get("published") and not late:
         out["release"] = plan["published"]["version"]
     out["displaced"] = (
         next_displaced(state, plan, results) if plan else state.get("displaced") or {}
     )
-    out["failing"] = _still_asked(failing, plan, results, out["displaced"])
+    if late:
+        # A release its plan made no point of is not one nobody asks about any more.
+        for adapter, items in (state.get("displaced") or {}).items():
+            kept = out["displaced"].setdefault(adapter, [])
+            for item in items:
+                spoke = results.get(item["key"]) or _picked_again(item, results)
+                if spoke is None and all(other["key"] != item["key"] for other in kept):
+                    kept.append(item)
+        # And a release it saw failing, under a point a later run has moved to another
+        # release: no point runs it any more, and this run is the only one that knows.
+        for key in sorted(set(found) - set(results)):
+            result, now = found[key], (points[key].get("last") or {}).get("targets")
+            if not (_counted(result) and result["outcome"] in FAILED):
+                continue
+            if now == result["targets"] or result["role"] == "displaced":
+                continue
+            python = result.get("planned_python") or ""
+            item = {
+                "key": f"{result['adapter']}--displaced--"
+                f"{displaced_line(result['targets'], python)}",
+                "targets": result["targets"],
+                "python": python,
+                "failed_on": run["date"],
+            }
+            kept = out["displaced"].setdefault(result["adapter"], [])
+            if all(other["key"] != item["key"] for other in kept):
+                kept.append(item)
+            failing.setdefault(
+                release_id(result["adapter"], result["targets"], python), run["date"]
+            )
+        out["displaced"] = {
+            name: items for name, items in sorted(out["displaced"].items()) if items
+        }
+    out["failing"] = failing if late else _still_asked(failing, plan, results, out["displaced"])
 
     def keys(remembered: dict) -> set[str]:
         return {item["key"] for items in remembered.values() for item in items}
@@ -805,8 +863,12 @@ def next_state(
         # that must not outrank the newer failure.
         if key in points:
             points[key] = {k: v for k, v in points[key].items() if k != "last_checked"}
-    if run["event"] == "schedule" and run.get("cadence", kinds.ISSUE_WRITER) == kinds.ISSUE_WRITER:
+    writer = run.get("cadence", kinds.ISSUE_WRITER) == kinds.ISSUE_WRITER
+    if run["event"] == "schedule" and writer and not late:
         out["last_scheduled"] = run["started_at"]
+    # What a run that is behind found for points a later run has spoken for: on its lines,
+    # and on no issue as today's word.
+    out["_older"] = sorted(set(found) - set(results))
     out["_locks"] = locks
     # A forgotten point's lock goes with it. A key that is planned again later starts with
     # no last pass at all, instead of with a lock the state knows nothing about.
@@ -1252,6 +1314,7 @@ def adapter_issue(
     if not mine and traces:
         # Nothing was checked, so nothing passed: the question itself went away.
         closing = f"Nothing here is asked any more: no run plans a check of {code(name)} again."
+    left = []
     for item in traces:
         if not item.get("failing", True):
             continue
@@ -1261,10 +1324,15 @@ def adapter_issue(
             if item.get("undeclared")
             else f"its kind ({code(item.get('kind', ''))}) was retired"
         )
-        closing += (
-            f" The check {code(item.get('key', ''))} was not passing when it was last run "
+        left.append(
+            f"The check {code(item.get('key', ''))} was not passing when it was last run "
             f"({code(item.get('date', ''))}) and is no longer run: {why}. That is not a pass."
         )
+    closing += "".join(f" {sentence}" for sentence in left)
+    if left and (todo or watched):
+        # The issue stays open for something else, and the trace is of this run alone:
+        # said here and in a comment of its own, or it would never be said.
+        body += ["", "### No longer run", "", *[f"- {sentence}" for sentence in left]]
     if closing.startswith("Nothing here is asked"):
         closing += " Closing."
     else:
@@ -1280,6 +1348,7 @@ def adapter_issue(
         "open": bool(todo or watched),
         "changes": [*todo, *watched],
         "closing": closing,
+        "left": left,
     }
 
 
@@ -1404,11 +1473,23 @@ def died_issue(url: str = "") -> dict:
     }
 
 
-def wanted_issues(plan: dict, results: dict[str, dict], state: dict, run: dict) -> list[dict]:
+def wanted_issues(
+    plan: dict,
+    results: dict[str, dict],
+    state: dict,
+    run: dict,
+    *,
+    late: bool = False,
+    quiet: frozenset[str] | set[str] = frozenset(),
+) -> list[dict]:
     """Every issue this run has a say about.
 
     A run of one adapter knows nothing about the others, so it has no say
     about the two issues that speak for the whole run and must not close them.
+
+    A run that is behind (`late`) has a say about a subject only when it is the newest
+    word on all of it: it ran it, and no later run has spoken for any point of it that
+    this run ran (`quiet` holds the subjects for which one has).
     """
     if plan.get("cadence", kinds.ISSUE_WRITER) != kinds.ISSUE_WRITER:
         # One run writes issues. What this one found is in the state, and is on the issue,
@@ -1429,8 +1510,14 @@ def wanted_issues(plan: dict, results: dict[str, dict], state: dict, run: dict) 
         for item in state.get("retired") or []:
             if isinstance(item, dict) and item.get("subject"):
                 subjects.add(str(item["subject"]))
+    if late:
+        # Rewritten from this run's results, an issue a later run wrote would lose what
+        # that run found and this one did not run, and close.
+        subjects = {r.get("subject", r["adapter"]) for r in results.values()} - set(quiet)
     wanted = [adapter_issue(name, plan, results, run, state) for name in sorted(subjects)]
-    if not plan.get("partial"):
+    if not plan.get("partial") and not late:
+        # How the run itself stands is the newest run's to say: a run that is behind would
+        # put an old plan's problems back, and close what a later run that died opened.
         wanted += [health_issue(plan, results, state, run), died_issue()]
     return wanted
 
@@ -1528,6 +1615,10 @@ def sync_issue(gh: GitHub, wanted: dict, existing: list[dict], assignee: str = "
             gh.do(f"reopen #{mine['number']}", "PATCH", path, {"state": "open"})
         if changed:
             text = "What needs doing changed:\n\n" + "\n".join(f"- {c}" for c in wanted["changes"])
+            gh.do(f"comment on #{mine['number']}", "POST", f"{path}/comments", {"body": text})
+        if wanted.get("left"):
+            # A check that left while it was not passing. The body says so today only.
+            text = "No longer run:\n\n" + "\n".join(f"- {c}" for c in wanted["left"])
             gh.do(f"comment on #{mine['number']}", "POST", f"{path}/comments", {"body": text})
     else:
         text = wanted.get("closing") or "Nothing here needs doing any more. Closing."
@@ -1652,26 +1743,23 @@ def main(argv: list[str] | None = None) -> int:
     # And how many lines the run writes, so a reader can tell that one is missing.
     run["points"] = len(results)
     late = behind(state, run, os.environ.get("COMPAT_TIP"))
-    if late:
-        # History only: the list of runs learns of it, and nothing else is touched.
-        new_state = {**state, "runs": run_list(state.get("runs"), run)}
-        locks, forgotten = {}, []
-    else:
-        new_state = next_state(state, results, run, results_dir, plan)
-        locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
-        # What each cadence other than the one that writes issues last found wrong with
-        # itself.
-        health = {k: v for k, v in (state.get("health") or {}).items() if isinstance(v, dict)}
-        cadence = plan.get("cadence", kinds.ISSUE_WRITER)
-        if not plan.get("partial"):
-            health.pop(cadence, None)
-            if cadence != kinds.ISSUE_WRITER:
-                own = health_issue(plan, results, new_state, run)["marks"]
-                health[cadence] = {"date": run["date"], "marks": own}
-        new_state["health"] = health
+    new_state = next_state(state, results, run, results_dir, plan, late=bool(late))
+    locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
+    # What the run found that a later run has already spoken for.
+    older = set(new_state.pop("_older"))
+    # What each cadence other than the one that writes issues last found wrong with itself.
+    health = {k: v for k, v in (state.get("health") or {}).items() if isinstance(v, dict)}
+    cadence = plan.get("cadence", kinds.ISSUE_WRITER)
+    if not plan.get("partial") and not late:
+        health.pop(cadence, None)
+        if cadence != kinds.ISSUE_WRITER:
+            own = health_issue(plan, results, new_state, run)["marks"]
+            health[cadence] = {"date": run["date"], "marks": own}
+    new_state["health"] = health
 
     gh = GitHub(os.environ.get("GITHUB_REPOSITORY", ""), write=args.write)
-    wanted = [] if late else wanted_issues(plan, results, new_state, run)
+    quiet = {results[key].get("subject", results[key]["adapter"]) for key in older}
+    wanted = wanted_issues(plan, results, new_state, run, late=bool(late), quiet=quiet)
     existing = gh.issues() if os.environ.get("GITHUB_REPOSITORY") else []
     gh.ensure_label()
     for issue in wanted:
@@ -1694,21 +1782,25 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(files), encoding="utf-8"
             )
         state_file.write_text(json.dumps(new_state, indent=1, sort_keys=True), encoding="utf-8")
-        if not late:
-            # The pages are of the day they were written, which is the newer run's.
-            render.write_site(state_dir, new_state, run["date"])
+        # The pages are of the day they are written, which for a run that is behind is not
+        # the day of its plan.
+        render.write_site(state_dir, new_state, max(run["date"], today) if late else run["date"])
     if args.preview:
         # What the pages would say after this run, for a run that writes nothing.
-        render.write_site(Path(args.preview), new_state, run["date"])
+        render.write_site(
+            Path(args.preview), new_state, max(run["date"], today) if late else run["date"]
+        )
 
     text = summary(
         plan, results, reasons, gh.log if args.write else [f"(dry run) {a}" for a in gh.log]
     )
     if late:
         text += (
-            f"\n### This run is history\n\nIt changes no issue, nothing the records remember "
-            f"and nothing the pages show: {late}. Its lines are kept. Start a new run to say "
-            "how things stand now (`gh workflow run compat.yml`).\n"
+            f"\n### This run is behind\n\nIt adds what only it knows and takes nothing away: "
+            f"{late}. It forgets nothing, writes nothing over what a later run found "
+            f"({len(older)} of its {len(results)} results are on its lines only), and has no "
+            "say about the run's own health. Start a new run to say how things stand now "
+            "(`gh workflow run compat.yml`).\n"
         )
     text += gate_rehearsal(plan, results, run)
     print(text)
