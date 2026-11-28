@@ -550,7 +550,9 @@ def run_list(before: object, run: dict) -> list[dict]:
     held = [] if before is None else before if isinstance(before, list) else [before]
     kept = []
     for old in held:
-        if gate.entry_ok(old) and _DAY.fullmatch(old["date"]) and old["date"] <= today:
+        # Dated by its plan, and so possibly after this run: failed jobs of yesterday's run,
+        # run again today, write with yesterday's plan after today's run has written.
+        if gate.entry_ok(old) and _DAY.fullmatch(old["date"]):
             mine = (old["id"], old["attempt"]) == (entry["id"], entry["attempt"])
             if old["date"] >= oldest and not mine:
                 kept.append(old)

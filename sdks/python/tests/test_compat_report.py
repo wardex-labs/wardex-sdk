@@ -2987,6 +2987,24 @@ def test_the_gate_reads_what_the_report_wrote_and_a_run_with_no_point_is_still_a
     )
     assert tomorrow["pass"] is True, tomorrow["reasons"]
 
+    # The failed jobs of yesterday evening's run, run again now: written with yesterday's
+    # plan, after today's entry. Nothing already listed is damage for being dated later.
+    assert run(evening, "2") == report.RED_EXIT
+    assert [(e["id"], e["attempt"], e["date"]) for e in gate.read_runs(records)] == [
+        ("1", "1", "2026-11-26"),
+        ("2", "1", "2026-11-26"),
+        ("1", "2", "2026-11-27"),
+        ("2", "2", "2026-11-26"),
+    ]
+    still = gate.decide(
+        gate.read_lines(records, "2026-11-27"),
+        commit=commit,
+        today="2026-11-27",
+        claims={"openai_agents": 2},
+        runs=gate.read_runs(records),
+    )
+    assert still["pass"] is True, still["reasons"]
+
 
 def _entry(day: str, run_id: str = "1", **more) -> dict:
     listed = {**_RUN, "id": run_id, "date": day, "scope": "all", "red": False, "points": 2}
@@ -3003,6 +3021,10 @@ def test_the_list_of_runs_keeps_a_week_and_is_not_capped():
     many = [_entry("2026-12-03", f"r{n}") for n in range(300)]
     assert len(report.run_list(many, _NOW)) == 301, "as many as there were, however many"
     assert [e["id"] for e in report.run_list(None, _NOW)] == ["9"], "no list yet is no damage"
+    # Failed jobs of an older run, run again after a newer run has written: the newer
+    # run's entry is dated after this one, and is as good an entry as it was.
+    newer = _entry("2026-12-05", "n")
+    assert report.run_list([newer], _NOW) == [newer, report.run_list([], _NOW)[0]]
 
 
 @pytest.mark.parametrize(
@@ -3012,13 +3034,12 @@ def test_the_list_of_runs_keeps_a_week_and_is_not_capped():
         [3],
         [{"id": "7"}],
         [_entry("2026-12-03", red="no")],
-        [_entry("9999-12-31")],
         [_entry("")],
         [_entry("soon")],
         [{"unreadable_since": "9999-12-31"}],
         [{"unreadable_since": 5}],
     ],
-    ids=["text", "number", "half", "red", "future", "undated", "words", "mark-future", "mark-type"],
+    ids=["text", "number", "half", "red", "undated", "words", "mark-future", "mark-type"],
 )
 def test_a_damaged_entry_is_not_dropped_by_the_next_run_and_ages_out_like_any_other(damaged):
     """It may have been the run that said a commit is not fit to release. The run that
