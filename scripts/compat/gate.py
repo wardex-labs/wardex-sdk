@@ -75,8 +75,25 @@ def claimed(root: Path) -> dict[str, int]:
     return {name: need for name, rows in table.items() if rows and name in manifest.ADAPTERS}
 
 
+def _attempt(line: dict) -> int:
+    try:
+        return int(line["run"].get("attempt") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
 def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]) -> dict:
-    """`{"pass", "reasons", "run"}` for releasing `commit` on `today`."""
+    """`{"pass", "reasons", "run"}` for releasing `commit` on `today`.
+
+    The newest whole run on the default branch at exactly `commit` decides, and of that
+    run its last attempt: a run whose failed jobs were run again writes its lines a second
+    time, and what it said the first time is no longer what it says. A point recorded
+    twice is one point, and passes only if every line of it does."""
+    stop = {"pass": False, "run": None}
+    if not claims:
+        # A tree that gives no adapter a tested range has nothing a pass could prove,
+        # which is more likely a table that could not be read than a release with no claims.
+        return {**stop, "reasons": ["this tree gives no adapter a tested range"]}
     oldest = (date.fromisoformat(today) - timedelta(days=MAX_AGE_DAYS)).isoformat()
     runs: dict[tuple, list[dict]] = {}
     for line in lines:
@@ -87,27 +104,31 @@ def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]
                 line
             )
     if not runs:
+        short = "" if len(commit) >= 40 else " (the whole commit id is needed, not a prefix)"
         return {
-            "pass": False,
-            "run": None,
+            **stop,
             "reasons": [
                 f"no whole compatibility run on the default branch at {commit[:10]} in the "
-                f"last {MAX_AGE_DAYS} days"
+                f"last {MAX_AGE_DAYS} days{short}"
             ],
         }
     newest = runs[max(runs)]
+    last = max(_attempt(line) for line in newest)
+    points: dict[str, list[dict]] = {}
+    for line in newest:
+        if _attempt(line) == last and not is_watching(line):
+            points.setdefault(str(line.get("key", "")), []).append(line)
     reasons = []
     proving: dict[str, int] = {}
-    for line in sorted(newest, key=lambda entry: str(entry.get("key", ""))):
-        if is_watching(line):
-            continue
-        outcome, key = line.get("outcome"), clean(line.get("key", ""), 120)
+    for key, said in sorted(points.items()):
+        line = next((entry for entry in said if entry.get("outcome") not in GREEN), said[0])
+        outcome, key = line.get("outcome"), clean(key, 120)
         targets = ", ".join(f"{d} {v}" for d, v in (line.get("targets") or {}).items())
         if outcome in ("no_result", "harness_error"):
             reasons.append(f"{key}: {OUTCOME_WORDS[outcome]}")
         elif line.get("in_claim") and outcome not in GREEN:
-            said = OUTCOME_WORDS.get(outcome, "an unknown result")
-            reasons.append(f"{key}: {clean(targets)} is inside the tested range and: {said}")
+            words = OUTCOME_WORDS.get(outcome, "an unknown result")
+            reasons.append(f"{key}: {clean(targets)} is inside the tested range and: {words}")
         elif line.get("in_claim") and line.get("kind") == "framework":
             proving[line.get("subject", "")] = proving.get(line.get("subject", ""), 0) + 1
     for name, need in sorted(claims.items()):
