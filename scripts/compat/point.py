@@ -562,7 +562,12 @@ class Point:
             except ValueError:
                 said = {}
         said = said if isinstance(said, dict) else {}
-        failed = [str(name)[:300] for name in said.get("failed") or [] if isinstance(name, str)]
+        named = said.get("failed") or []
+        if isinstance(named, list) and all(isinstance(name, str) for name in named):
+            failed = [name[:300] for name in named]
+        else:
+            # Not a list of names: something failed, and the driver did not say what.
+            failed = [f"{self.check['driver']}: its list of failures is not a list of names"]
         held = (said.get("checks") or {}).get("held") if isinstance(said.get("checks"), dict) else 0
         held = held if isinstance(held, int) and not isinstance(held, bool) and held > 0 else 0
         ok = code == 0 and said.get("ok") is True and not failed

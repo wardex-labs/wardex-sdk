@@ -197,6 +197,11 @@ Only the daily run writes issues. What a weekly run found is kept in
 `state.json` and is on the issue, with its date, the next time the daily run
 reports; what it found wrong with itself is on the health issue the same way,
 and the daily run says so when the weekly one has not completed for ten days.
+The weekly run asks nothing about the tested ranges, so the release gate never
+takes it as the run that decides, and it does not change which commit the
+public page says its rows are of. A subject taken out of `manifest.py` is
+forgotten by the next whole daily run, which closes its issue and says the
+check went away, not that it passed.
 
 The run also writes the public pages, from `state.json` and nothing else
 (`scripts/compat/render.py`), under `site/` on the `compat-results` branch:

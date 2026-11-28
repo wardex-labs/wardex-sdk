@@ -889,6 +889,7 @@ def test_a_plan_says_what_it_speaks_for(tmp_path, monkeypatch):
         "covers": {"framework": ["openai_agents"]},
         "partial": False,
         "builds": {},
+        "declared": plan.declared(),
     }
     assert whole["schema"] == model.SCHEMA == 2
     assert whole["published"] is None and whole["unplanned"] == []

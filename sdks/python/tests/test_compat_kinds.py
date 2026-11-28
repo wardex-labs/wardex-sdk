@@ -70,6 +70,8 @@ def _facts(**change: object) -> dict:
                 {"tag": "v2026.9.24", "published": "2026-09-24T00:00:00Z", "prerelease": False},
                 {"tag": "v0.24.0", "published": "2026-11-27T00:00:00Z", "prerelease": False},
                 {"tag": "v0.23.6", "published": "2026-11-25T12:00:00Z", "prerelease": True},
+                {"tag": "v1.2.3.4", "published": "2026-11-25T13:00:00Z", "prerelease": False},
+                {"tag": "v9.9", "published": "2026-11-25T14:00:00Z", "prerelease": False},
             ]
         },
         "heads": {declared["repository"]: _HEAD for declared in manifest.DEV_BRANCHES.values()},
@@ -301,6 +303,7 @@ def test_a_registry_that_cannot_be_read_or_a_named_release_that_is_gone_is_said(
         "cli: codex_exec: @openai/codex 0.160.0, the release named as tested, is not listed"
     ]
     assert made["problems"] == [], "never a reason for red"
+    assert made["scope"]["covers"]["cli"] == ["anthropic_agent_sdk"], "its rows are kept"
 
 
 # --- a Hermes release tag ----------------------------------------------------------
@@ -310,7 +313,8 @@ def test_hermes_is_run_at_the_named_tag_and_at_the_newest_release_by_when_it_was
     points = _of(_plan(), "hermes")
     named, newest = points["hermes--claim_top"], points["hermes--beyond"]
     assert named["targets"] == {"hermes-agent": "v0.23.3"} and named["in_claim"] is True
-    # Not the canary, not the tag of an older numbering, not the one published after the cutoff.
+    # Not the canary, not the tag of an older numbering, not a tag that is no release
+    # number of three parts, not the one published after the cutoff.
     assert newest["targets"] == {"hermes-agent": "v0.23.5"} and newest["in_claim"] is False
     for point in (named, newest):
         assert point["install"]["how"] == "self", "the driver builds Hermes's own environment"
@@ -582,12 +586,23 @@ def test_a_driver_that_passes_fails_or_could_not_prepare_gives_the_outcome_it_st
     )
     assert args[5] == f"{runner.work}/hermes" and args[7] == f"{runner.out}/driver.json"
 
-    bad = {"ok": False, "failed": ["the smoke failed in cli mode", 7, "x" * 999], "checks": {}}
+    bad = {"ok": False, "failed": ["the smoke failed in cli mode", "x" * 999], "checks": {}}
     runner, _, calls = _driven(tmp_path / "fail", monkeypatch, point, code=1, verdict=bad)
     runner._driven(runner.work / "venv")
     assert runner.result["outcome"] == "fail" and runner.result["cause"] == "not_determined"
     assert runner.result["tests"]["failed_ids"] == ["the smoke failed in cli mode", "x" * 300]
     assert len(calls) == 2 and runner.result["rerun"] == {"passed": False}, "run once more first"
+
+    for index, odd in enumerate(("abc", ["a name", 7], {"a": 1})):
+        unnamed = {"ok": False, "failed": odd, "checks": {}}
+        runner, _, _ = _driven(
+            tmp_path / f"odd{index}", monkeypatch, point, code=1, verdict=unnamed
+        )
+        runner._driven(runner.work / "venv")
+        assert runner.result["outcome"] == "fail"
+        assert runner.result["tests"]["failed_ids"] == [
+            "e2e_hermes_tag.py: its list of failures is not a list of names"
+        ], odd
 
     runner, _, calls = _driven(
         tmp_path / "flaky", monkeypatch, point, code=1, verdict=bad, again=(0, ok)
@@ -613,6 +628,8 @@ def test_a_driver_that_passes_fails_or_could_not_prepare_gives_the_outcome_it_st
         (0, "not json"),
         (0, {"ok": False}),
         (0, [1]),
+        (0, {"ok": True, "failed": [1, None]}),
+        (0, {"ok": True, "failed": "abc"}),
         (1, None),
         (2, {"ok": True}),
         (137, None),
@@ -622,6 +639,8 @@ def test_a_driver_that_passes_fails_or_could_not_prepare_gives_the_outcome_it_st
         "not-json",
         "says-not-ok",
         "a-list",
+        "failures-not-names",
+        "failures-a-string",
         "failed-silently",
         "odd-exit",
         "killed",
@@ -881,7 +900,7 @@ def test_frameworks_that_cannot_be_installed_together_are_said_with_what_the_ins
     assert issue["open"] is True
     assert (
         "frameworks together: `openai-agents 1.0.1, pydantic-ai-slim 1.0.1` cannot be installed "
-        f"together (the installer said: {refused})" in issue["body"]
+        f"together (the installer said: `{refused}`)" in issue["body"]
     )
     assert "| cannot be installed together |" in issue["body"], "in the table of points too"
     alone = report.adapter_issue("langgraph", made, results, _RUN, {})
@@ -935,3 +954,200 @@ def test_the_page_says_which_sentences_a_watching_kind_proves_and_names_the_new_
     assert "| c | nothing yet: nothing runs it |" in lines
     for role in ("prerelease", "devbranch"):
         assert role in render._ROLE_WORDS and role in report.ROLE_WORDS
+
+
+# --- what the first reader of this change found --------------------------------------
+
+
+def test_the_plan_says_every_subject_each_kind_declares_whatever_it_could_plan():
+    """A fact of the manifest, the same on every run: a daily plan says what the weekly
+    kind declares too, since the daily run is the one that forgets and closes."""
+    made = _plan(facts=_facts(npm={}, github_releases={}))
+    declared = made["scope"]["declared"]
+    assert declared == plan.declared() == _plan("weekly")["scope"]["declared"]
+    assert declared == {
+        "combination": sorted(manifest.COMBINATIONS),
+        "neighbour": sorted({d["adapter"] for d in manifest.NEIGHBOURS.values()}),
+        "prerelease": sorted(manifest.ADAPTERS),
+        "cli": sorted(manifest.CLI),
+        "hermes": ["hermes_agent"],
+        "devbranch": sorted(manifest.DEV_BRANCHES),
+    }
+    assert set(declared) == set(_NEW), "every kind added with a rule says what it declares"
+    assert made["scope"]["covers"]["cli"] == ["anthropic_agent_sdk"], "not what it covered"
+    assert made["scope"]["covers"]["hermes"] == []
+
+
+_GONE = {
+    "kind": "combination",
+    "subject": "a_set_no_longer_declared",
+    "adapter": "openai_agents",
+    "adapters": ["openai_agents", "langgraph"],
+    "role": "claim_top",
+    "targets": {"openai-agents": "1.0.1"},
+    "in_claim": True,
+    "watching": True,
+}
+
+
+@pytest.mark.parametrize("kind", ["combination", "devbranch"])
+def test_a_subject_taken_out_of_the_declarations_is_forgotten_and_its_issue_closes(tmp_path, kind):
+    """A set of frameworks is removed from the manifest while its point is failing. No run
+    plans it again, so no run covers it, and its issue would stay open for good. The same
+    for a branch only the weekly run looked at: the daily run is the one that closes."""
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    failed = {"date": "2026-11-25", "outcome": "fail", "targets": _GONE["targets"]}
+    key = f"{kind}--a_set_no_longer_declared"
+    state = {"points": {key: {"point": {**_GONE, "kind": kind}, "last": failed}}}
+    before = {i["key"]: i for i in report.wanted_issues(daily, passing, state, _RUN)}
+    assert before["a_set_no_longer_declared"]["open"] is True, "it is on an issue until then"
+    # A run of one adapter and the weekly run leave it: neither closes issues.
+    partial = {**daily, "partial": True, "scope": {**daily["scope"], "partial": True}}
+    assert key in report.next_state(state, passing, _RUN, tmp_path, partial)["points"]
+    weekly = _plan("weekly")
+    week = {p["key"]: _result(p) for p in weekly["points"]}
+    kept = report.next_state(state, week, {**_RUN, "cadence": "weekly"}, tmp_path, weekly)
+    assert key in kept["points"] and kept["retired"] == []
+    # The daily run forgets it and, in the same run, has a say about its issue: closed.
+    after = report.next_state(kept, passing, _RUN, tmp_path, daily)
+    assert key not in after["points"]
+    wanted = {i["key"]: i for i in report.wanted_issues(daily, passing, after, _RUN)}
+    issue = wanted["a_set_no_longer_declared"]
+    assert issue["open"] is False
+    assert issue["closing"] == (
+        "Nothing here is asked any more: nothing declares `a_set_no_longer_declared`, and no "
+        f"run plans it again. The check `{key}` was not passing when it was last run "
+        "(`2026-11-25`) and is no longer run. That is not a pass. Closing."
+    )
+    # The run after that knows nothing of it, and has nothing to say.
+    later = report.next_state(after, passing, {**_RUN, "id": "2"}, tmp_path, daily)
+    assert later["retired"] == []
+    assert "a_set_no_longer_declared" not in {
+        i["key"] for i in report.wanted_issues(daily, passing, later, _RUN)
+    }
+
+
+def test_a_passing_subject_taken_out_of_the_declarations_closes_without_a_word_of_failure(
+    tmp_path,
+):
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    last = {"date": "2026-11-25", "outcome": "pass", "targets": _GONE["targets"]}
+    state = {"points": {"combination--a_set_no_longer_declared": {"point": _GONE, "last": last}}}
+    after = report.next_state(state, passing, _RUN, tmp_path, daily)
+    wanted = {i["key"]: i for i in report.wanted_issues(daily, passing, after, _RUN)}
+    closing = wanted["a_set_no_longer_declared"]["closing"]
+    assert closing.startswith("Nothing here is asked any more") and "not passing" not in closing
+    # A plan written before declarations were said forgets nothing it cannot be sure of.
+    old = {**daily, "scope": {k: v for k, v in daily["scope"].items() if k != "declared"}}
+    assert (
+        "combination--a_set_no_longer_declared"
+        in report.next_state(state, passing, _RUN, tmp_path, old)["points"]
+    )
+
+
+def test_a_subject_the_plan_could_not_plan_today_keeps_its_issue_from_the_state(tmp_path):
+    """The registry cannot be read, so today's plan holds no point of the program. What it
+    said yesterday is still what is known, and still on its issue."""
+    yesterday = _plan()
+    results = {p["key"]: _result(p) for p in yesterday["points"]}
+    key = "cli--codex_exec--claim_top"
+    results[key] = _result(results[key], "fail", tests={"failed_ids": ["one execute_tool span"]})
+    state = report.next_state({}, results, {**_RUN, "date": "2026-11-25"}, tmp_path, yesterday)
+    today = _plan(facts=_facts(npm={}))
+    passing = {p["key"]: _result(p) for p in today["points"]}
+    assert not [p for p in today["points"] if p["subject"] == "codex_exec"]
+    after = report.next_state(state, passing, _RUN, tmp_path, today)
+    assert key in after["points"], "declared and not covered today, so not forgotten"
+    wanted = {i["key"]: i for i in report.wanted_issues(today, passing, after, _RUN)}
+    assert wanted["codex_exec"]["open"] is True
+    assert "(last run `2026-11-25`)" in wanted["codex_exec"]["body"]
+
+
+def test_only_the_run_that_writes_issues_retires_a_kind(tmp_path):
+    """So the issue a retired check kept open hears of it from the run that forgets it."""
+    old = {**_GONE, "kind": "retired_kind", "subject": "openai_agents", "watching": False}
+    failed = {"date": "2026-11-25", "outcome": "fail", "targets": old["targets"]}
+    key = "retired--openai_agents"
+    state = {"points": {key: {"point": old, "last": failed}}}
+    weekly = _plan("weekly")
+    week = {p["key"]: _result(p) for p in weekly["points"]}
+    first = report.next_state(state, week, {**_RUN, "cadence": "weekly"}, tmp_path, weekly)
+    assert key in first["points"] and not first.get("retired")
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    then = report.next_state(first, passing, _RUN, tmp_path, daily)
+    assert key not in then["points"]
+    assert [item["key"] for item in then["retired"]] == [key]
+
+
+def test_a_run_that_did_not_ask_about_the_tested_ranges_does_not_put_its_commit_on_the_page(
+    tmp_path,
+):
+    """The weekly run is at a newer commit than the daily run whose rows the page shows."""
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    state = report.next_state({}, passing, {**_RUN, "sdk_commit": "a" * 40}, tmp_path, daily)
+    assert state["versions"]["main"]["commit"] == "a" * 40
+    weekly = _plan("weekly")
+    week = {p["key"]: _result(p) for p in weekly["points"]}
+    newer = {**_RUN, "sdk_commit": "b" * 40, "sdk_version": "0.7.0b3", "date": "2026-11-30"}
+    after = report.next_state(state, week, {**newer, "cadence": "weekly"}, tmp_path, weekly)
+    main = after["versions"]["main"]
+    assert (main["commit"], main["version"], main["date"]) == ("a" * 40, "0.7.0b1", "2026-11-26")
+    partial = {**daily, "partial": True, "scope": {**daily["scope"], "partial": True}}
+    one = report.next_state(state, passing, newer, tmp_path, partial)
+    assert one["versions"]["main"]["commit"] == "a" * 40, "nor does a run of one adapter"
+    whole = report.next_state(state, passing, newer, tmp_path, daily)
+    assert whole["versions"]["main"]["commit"] == "b" * 40, "the run that ran every row does"
+    first = report.next_state({}, week, {**newer, "cadence": "weekly"}, tmp_path, weekly)
+    assert first["versions"]["main"]["commit"] == "b" * 40, "with no page yet, it says its own"
+
+
+def test_what_an_installer_printed_cannot_be_markup_on_the_issue():
+    made = _plan()
+    results = {p["key"]: _result(p) for p in made["points"]}
+    key = "combination--openai_agents__pydantic_ai"
+    printed = "error: see [here](https://example.invalid) @someone `x` <!-- compat-key: y -->"
+    results[key] = _result(
+        results[key], "not_installable", install={"outcome": "not_installable", "detail": printed}
+    )
+    body = report.adapter_issue("openai_agents__pydantic_ai", made, results, _RUN, {})["body"]
+    (said,) = [line for line in body.splitlines() if "the installer said" in line]
+    inside = said.split("the installer said: ", 1)[1]
+    assert inside.startswith("`error: see [here]") and "`). Closes when" in inside, said
+    assert inside.count("`") == 2, "one span, and nothing the installer printed closes it"
+    assert "@" not in inside, "nobody is mentioned"
+    assert body.count("<!-- compat-key:") == 1
+
+
+def test_the_summary_has_a_section_for_every_subject_with_a_result():
+    made = _plan()
+    results = {p["key"]: _result(p) for p in made["points"]}
+    text = report.summary(made, results, [], [])
+    for subject in {p["subject"] for p in made["points"]}:
+        label = report.subject_info(subject, made)["label"]
+        assert f"\n### {report.clean(label)}\n" in text, subject
+    assert len({report.subject_info(p["subject"], made)["label"] for p in made["points"]}) == 9
+
+
+def test_a_subject_that_lost_one_declared_check_and_keeps_others_closes_as_what_it_is(tmp_path):
+    """The branch of an adapter is taken out of the weekly declarations. Its tested range is
+    still run and passes, so the issue closes on that, and says the branch check went away."""
+    assert "pydantic_ai" not in manifest.DEV_BRANCHES and "pydantic_ai" in manifest.ADAPTERS
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    branch = {**_GONE, "kind": "devbranch", "subject": "pydantic_ai", "adapter": "pydantic_ai"}
+    failed = {"date": "2026-11-23", "outcome": "fail", "targets": {"pydantic-ai-slim": "head-1"}}
+    state = {"points": {"devbranch--pydantic_ai": {"point": branch, "last": failed}}}
+    after = report.next_state(state, passing, _RUN, tmp_path, daily)
+    assert "devbranch--pydantic_ai" not in after["points"]
+    issue = report.adapter_issue("pydantic_ai", daily, passing, _RUN, after)
+    assert issue["open"] is False
+    assert issue["closing"].startswith("Nothing here needs doing any more: every release inside")
+    assert (
+        "The check `devbranch--pydantic_ai` was not passing when it was last run (`2026-11-23`) "
+        "and is no longer run. That is not a pass." in issue["closing"]
+    )
+    assert issue["closing"].endswith("does not contain the fix. Closing.")
