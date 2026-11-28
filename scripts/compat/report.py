@@ -590,6 +590,34 @@ def run_list(before: object, run: dict, *, now: str | None = None) -> list[dict]
 LIST_GONE = "gone"
 
 
+def behind(state: dict, run: dict, tip: str | None) -> str:
+    """Why this run is not the one to say how things stand now, or "".
+
+    The state is what the newest run of the newest code knows. Two runs are not that. A
+    run planned before a run that has already reported: its failed jobs were run again
+    after a later run wrote. And a run started again at a commit that is no longer the tip
+    of its branch: GitHub re-runs a run with the code of its own commit, which does not
+    know what was declared since. Either would undo what the newer run wrote, forget
+    points its plan has not heard of and close their issues. Such a run is history: its
+    lines are kept, and it changes nothing else.
+
+    `tip` is the commit the run's branch points at now, or empty when that is not known."""
+    mine = gate.run_of({"run": run})
+    for entry in state.get("runs") or [] if isinstance(state.get("runs"), list) else []:
+        if not gate.entry_ok(entry) or entry["ref"] != run["ref"]:
+            continue
+        same = (entry.get("cadence") or kinds.ISSUE_WRITER) == run["cadence"]
+        if same and mine is not None and gate.run_of({"run": entry}) > mine:
+            return "a run planned after this one has already reported"
+    if str(run.get("attempt") or "1") != "1" and tip != run["sdk_commit"]:
+        return (
+            "this is a run started again at a commit that is no longer the tip of its branch"
+            if tip
+            else "this is a run started again, and what its branch points at now is not known"
+        )
+    return ""
+
+
 def list_was_kept(state_dir: Path, days: list[str]) -> bool:
     """Whether a record line of the last week was written by a report that kept the list.
 
@@ -640,6 +668,9 @@ def next_state(
             "cause": result["cause"],
             "targets": result["targets"],
             "url": run["url"],
+            # Which commit of this repository ran it: a run of one adapter, and the weekly
+            # run, leave rows of another commit than the one the page is headed with.
+            "commit": run["sdk_commit"],
             "failed_ids": [clean(node, 300) for node in tests.get("failed_ids", [])[:200]],
             "excluded_files": [clean(name) for name in tests.get("excluded_files", [])[:200]],
         }
@@ -698,7 +729,7 @@ def next_state(
         points[key] = entry
     scope = (plan or {}).get("scope") or {}
     forgotten: list[str] = []
-    retired_failing: list[dict] = []
+    gone: list[dict] = []
     for key in [key for key in points if key not in results]:
         # A point this run was in a position to plan and did not: the question is no longer
         # asked (the release left the range, a newer line replaced it). Anything outside
@@ -726,22 +757,21 @@ def next_state(
             continue
         if retired or undeclared or subject in scope.get("covers", {}).get(kind, ()):
             last = points[key].get("last") or {}
-            if (
-                retired
-                and identity.get("in_claim")
-                and not identity.get("watching")
-                and last.get("outcome") in RED
-            ):
-                # A check that could turn the run red, failing inside a claim, is going away
-                # with its kind. The issue it kept open says so when it closes.
-                retired_failing.append(
-                    {"subject": subject, "key": key, "kind": kind, "date": last.get("date")}
+            if retired or undeclared:
+                # The question itself went away: no later run knows of this point, so this
+                # run leaves a trace for the issue it may have kept open. The issue is
+                # closed by the same run, and says a check that was not passing is gone,
+                # not fixed.
+                gone.append(
+                    {
+                        "subject": subject,
+                        "key": key,
+                        "kind": kind,
+                        "date": last.get("date"),
+                        "undeclared": not retired,
+                        "failing": last.get("outcome") not in GREEN,
+                    }
                 )
-            elif undeclared and not retired:
-                gone = {"subject": subject, "key": key, "kind": kind, "date": last.get("date")}
-                gone["undeclared"] = True
-                gone["failing"] = last.get("outcome") not in GREEN
-                retired_failing.append(gone)
             del points[key]
             forgotten.append(key)
     seen = dict(state.get("kinds") or {})
@@ -758,7 +788,7 @@ def next_state(
         "versions": _versions(state, plan, run),
         "runs": run_list(state.get("runs"), run),
         # Of this run only: the next run has nothing left to retire.
-        "retired": retired_failing,
+        "retired": gone,
     }
     if (plan or {}).get("published"):
         out["release"] = plan["published"]["version"]
@@ -788,7 +818,11 @@ def next_state(
 
 
 def _version(result: dict) -> str:
-    return ", ".join(f"{dist} {version}" for dist, version in result["targets"].items())
+    # A scoped npm package is named with an at-sign, and no at-sign is ever written to an
+    # issue: the scope and the name say which package it is.
+    return ", ".join(
+        f"{dist.removeprefix('@')} {version}" for dist, version in result["targets"].items()
+    )
 
 
 def _planned_sdk(result: dict) -> dict:
@@ -1215,26 +1249,22 @@ def adapter_issue(
         for item in (state or {}).get("retired") or []
         if isinstance(item, dict) and item.get("subject") == name
     ]
-    if not mine and any(item.get("undeclared") for item in traces):
+    if not mine and traces:
         # Nothing was checked, so nothing passed: the question itself went away.
-        closing = (
-            f"Nothing here is asked any more: nothing declares {code(name)}, and no run "
-            "plans it again."
-        )
+        closing = f"Nothing here is asked any more: no run plans a check of {code(name)} again."
     for item in traces:
-        if item.get("undeclared"):
-            if item.get("failing"):
-                closing += (
-                    f" The check {code(item.get('key', ''))} was not passing when it was last "
-                    f"run ({code(item.get('date', ''))}) and is no longer run. That is not a pass."
-                )
-        else:
-            # Not fixed: no longer asked. Said, so a closed issue is not read as a pass.
-            closing += (
-                f" The check {code(item.get('key', ''))} was failing when it was last run "
-                f"({code(item.get('date', ''))}) and is no longer run: its kind "
-                f"({code(item.get('kind', ''))}) was retired. That is not a pass."
-            )
+        if not item.get("failing", True):
+            continue
+        # Not fixed: no longer asked. Said, so a closed issue is not read as a pass.
+        why = (
+            "nothing declares it any more"
+            if item.get("undeclared")
+            else f"its kind ({code(item.get('kind', ''))}) was retired"
+        )
+        closing += (
+            f" The check {code(item.get('key', ''))} was not passing when it was last run "
+            f"({code(item.get('date', ''))}) and is no longer run: {why}. That is not a pass."
+        )
     if closing.startswith("Nothing here is asked"):
         closing += " Closing."
     else:
@@ -1281,7 +1311,7 @@ def health_issue(plan: dict, results: dict[str, dict], state: dict, run: dict) -
             )
         elif outcome in NOT_OURS and streak >= 2:
             todo.append(
-                f"{code(key)}: {code(_version(result))} {OUTCOME_WORDS[outcome]}, "
+                f"{code(key)}: {code(_version(result))} {_outcome_words(result)}, "
                 f"on {streak} days running."
             )
         else:
@@ -1393,10 +1423,11 @@ def wanted_issues(plan: dict, results: dict[str, dict], state: dict, run: dict) 
             identity = entry.get("point") or {}
             if identity.get("kind", "framework") in kinds.KINDS and identity.get("subject"):
                 subjects.add(identity["subject"])
-        # And a subject this run has just forgotten because nothing declares it any more:
-        # no later run will know of it, so this one closes what it left open.
+        # And a subject this run has just forgotten a point of, because its kind was
+        # retired or nothing declares it any more. No later run will know of it, so this
+        # one has the say about what it left open.
         for item in state.get("retired") or []:
-            if isinstance(item, dict) and item.get("undeclared") and item.get("subject"):
+            if isinstance(item, dict) and item.get("subject"):
                 subjects.add(str(item["subject"]))
     wanted = [adapter_issue(name, plan, results, run, state) for name in sorted(subjects)]
     if not plan.get("partial"):
@@ -1620,20 +1651,27 @@ def main(argv: list[str] | None = None) -> int:
     run["red"] = bool(reasons)
     # And how many lines the run writes, so a reader can tell that one is missing.
     run["points"] = len(results)
-    new_state = next_state(state, results, run, results_dir, plan)
-    locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
-    # What each cadence other than the one that writes issues last found wrong with itself.
-    health = {k: v for k, v in (state.get("health") or {}).items() if isinstance(v, dict)}
-    cadence = plan.get("cadence", kinds.ISSUE_WRITER)
-    if not plan.get("partial"):
-        health.pop(cadence, None)
-        if cadence != kinds.ISSUE_WRITER:
-            own = health_issue(plan, results, new_state, run)["marks"]
-            health[cadence] = {"date": run["date"], "marks": own}
-    new_state["health"] = health
+    late = behind(state, run, os.environ.get("COMPAT_TIP"))
+    if late:
+        # History only: the list of runs learns of it, and nothing else is touched.
+        new_state = {**state, "runs": run_list(state.get("runs"), run)}
+        locks, forgotten = {}, []
+    else:
+        new_state = next_state(state, results, run, results_dir, plan)
+        locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
+        # What each cadence other than the one that writes issues last found wrong with
+        # itself.
+        health = {k: v for k, v in (state.get("health") or {}).items() if isinstance(v, dict)}
+        cadence = plan.get("cadence", kinds.ISSUE_WRITER)
+        if not plan.get("partial"):
+            health.pop(cadence, None)
+            if cadence != kinds.ISSUE_WRITER:
+                own = health_issue(plan, results, new_state, run)["marks"]
+                health[cadence] = {"date": run["date"], "marks": own}
+        new_state["health"] = health
 
     gh = GitHub(os.environ.get("GITHUB_REPOSITORY", ""), write=args.write)
-    wanted = wanted_issues(plan, results, new_state, run)
+    wanted = [] if late else wanted_issues(plan, results, new_state, run)
     existing = gh.issues() if os.environ.get("GITHUB_REPOSITORY") else []
     gh.ensure_label()
     for issue in wanted:
@@ -1656,7 +1694,9 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(files), encoding="utf-8"
             )
         state_file.write_text(json.dumps(new_state, indent=1, sort_keys=True), encoding="utf-8")
-        render.write_site(state_dir, new_state, run["date"])
+        if not late:
+            # The pages are of the day they were written, which is the newer run's.
+            render.write_site(state_dir, new_state, run["date"])
     if args.preview:
         # What the pages would say after this run, for a run that writes nothing.
         render.write_site(Path(args.preview), new_state, run["date"])
@@ -1664,6 +1704,12 @@ def main(argv: list[str] | None = None) -> int:
     text = summary(
         plan, results, reasons, gh.log if args.write else [f"(dry run) {a}" for a in gh.log]
     )
+    if late:
+        text += (
+            f"\n### This run is history\n\nIt changes no issue, nothing the records remember "
+            f"and nothing the pages show: {late}. Its lines are kept. Start a new run to say "
+            "how things stand now (`gh workflow run compat.yml`).\n"
+        )
     text += gate_rehearsal(plan, results, run)
     print(text)
     target = os.environ.get("GITHUB_STEP_SUMMARY")

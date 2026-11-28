@@ -2918,6 +2918,7 @@ def test_the_gate_reads_what_the_report_wrote_and_a_run_with_no_point_is_still_a
     commit = "0123456789abcdef0123456789abcdef01234567"
     monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
     monkeypatch.setenv("GITHUB_SHA", commit)
+    monkeypatch.setenv("COMPAT_TIP", commit)
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
     records = tmp_path / "records"
     records.mkdir()
@@ -3228,3 +3229,160 @@ def test_a_weekly_run_is_told_it_cannot_rehearse_the_gate():
     run = {**_RUN, "scope": "all", "ref": gate.MAIN_REF, "cadence": "weekly"}
     said = report.gate_rehearsal({"points": []}, {}, run)
     assert "This run cannot say" in said and "ask about the tested ranges" in said
+
+
+# --- a run that is behind is history -------------------------------------------------
+
+_LISTED_RUN = {
+    "id": "5",
+    "attempt": "1",
+    "started_at": "2026-11-27T19:40:00Z",
+    "date": "2026-11-27",
+    "scope": "all",
+    "cadence": "daily",
+    "ref": "refs/heads/main",
+    "sdk_commit": "c" * 40,
+    "url": "https://example.invalid/runs/5",
+    "red": False,
+    "points": 2,
+}
+_MINE = {**_RUN, "scope": "all", "cadence": "daily", "sdk_commit": "c" * 40}
+
+
+@pytest.mark.parametrize(
+    ("listed", "attempt", "tip", "said"),
+    [
+        ([_LISTED_RUN], "1", "c" * 40, "a run planned after this one has already reported"),
+        ([{**_LISTED_RUN, "scope": "partial"}], "1", "c" * 40, "a run planned after this one"),
+        ([{**_LISTED_RUN, "cadence": "weekly"}], "1", "c" * 40, ""),
+        (
+            [{k: v for k, v in _LISTED_RUN.items() if k != "cadence"}],
+            "1",
+            "c" * 40,
+            "a run planned",
+        ),
+        ([{**_LISTED_RUN, "ref": "refs/heads/other"}], "1", "c" * 40, ""),
+        (
+            [{**_LISTED_RUN, "started_at": "2026-11-25T19:40:00Z", "date": "2026-11-25"}],
+            "1",
+            "",
+            "",
+        ),
+        (
+            [{**_LISTED_RUN, "started_at": _RUN["started_at"], "id": "1", "attempt": "2"}],
+            "1",
+            "",
+            "",
+        ),
+        ([{**_LISTED_RUN, "red": "no"}, {"unreadable_since": "2026-11-27"}, "x"], "1", "", ""),
+        ("gone", "1", "", ""),
+        (None, "1", "d" * 40, ""),
+        (None, "", "d" * 40, ""),
+        (None, "2", "c" * 40, ""),
+        (None, "2", "d" * 40, "no longer the tip of its branch"),
+        (None, "3", "", "what its branch points at now is not known"),
+        (None, "2", None, "what its branch points at now is not known"),
+    ],
+    ids=[
+        "a-newer-run",
+        "a-newer-run-of-one-adapter",
+        "a-newer-weekly-run",
+        "a-newer-run-from-before-cadences",
+        "a-newer-run-of-another-branch",
+        "an-older-run",
+        "another-attempt-of-this-run",
+        "entries-that-cannot-be-read",
+        "a-list-that-is-gone",
+        "first-attempt-off-the-tip",
+        "no-attempt-said",
+        "again-at-the-tip",
+        "again-off-the-tip",
+        "again-tip-unknown",
+        "again-tip-not-given",
+    ],
+)
+def test_which_run_is_behind(listed, attempt, tip, said):
+    reason = report.behind({"runs": listed}, {**_MINE, "attempt": attempt}, tip)
+    assert (said in reason) if said else reason == "", reason
+    weekly = report.behind({"runs": listed}, {**_MINE, "attempt": "1", "cadence": "weekly"}, "c")
+    if listed == [{**_LISTED_RUN, "cadence": "weekly"}]:
+        assert weekly, "and a weekly run is behind a newer weekly run"
+
+
+def test_a_run_that_is_behind_writes_its_lines_and_changes_nothing_else(
+    tmp_path, monkeypatch, capsys
+):
+    """Yesterday's run failed and opened an issue; today's passed and closed it. Then the
+    failed jobs of yesterday's run are run again. Its plan is yesterday's: acting on it
+    would put yesterday's results over today's and reopen what today closed."""
+    done: list[str] = []
+    monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
+    monkeypatch.setattr(report.GitHub, "do", lambda self, what, *rest: done.append(what))
+    for name in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"):
+        monkeypatch.delenv(name, raising=False)
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    monkeypatch.setenv("GITHUB_SHA", commit)
+    monkeypatch.setenv("COMPAT_TIP", commit)
+    records = tmp_path / "records"
+    records.mkdir()
+
+    def run(day: str, run_id: str, attempt: str, outcome: str) -> int:
+        monkeypatch.setenv("GITHUB_RUN_ID", run_id)
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", attempt)
+        plan = {**_plan(_FLOOR, _TOP), "partial": False, "cutoff": f"{day}T19:40:00Z"}
+        work = tmp_path / f"work-{len(list(tmp_path.iterdir()))}"
+        (work / "results").mkdir(parents=True)
+        (work / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        for result in (_result(_FLOOR, outcome), _result(_TOP)):
+            _write(work / "results", result)
+        argv = ["--plan", str(work / "plan.json"), "--results", str(work / "results")]
+        return report.main([*argv, "--state-dir", str(records), "--write"])
+
+    def state() -> dict:
+        return json.loads((records / "state.json").read_text(encoding="utf-8"))
+
+    def lines(day: str) -> int:
+        path = records / "records" / day[:4] / day[5:7] / f"{day[8:]}.jsonl"
+        return len(path.read_text(encoding="utf-8").splitlines())
+
+    assert run("2026-11-26", "1", "1", "fail") == report.RED_EXIT
+    assert [what.split()[0] for what in done] == ["open"]
+    assert run("2026-11-27", "2", "1", "pass") == 0
+    today = state()
+    page = (records / "site" / "main" / "README.md").read_text(encoding="utf-8")
+    assert today["points"]["openai_agents--floor"]["last"]["outcome"] == "pass"
+    done.clear()
+    capsys.readouterr()
+
+    assert run("2026-11-26", "1", "2", "fail") == report.RED_EXIT, "its own verdict is its own"
+    assert done == [], "no issue is opened, rewritten or closed"
+    after = state()
+    assert [(e["id"], e["attempt"]) for e in after["runs"]] == [("1", "1"), ("2", "1"), ("1", "2")]
+    assert {k: v for k, v in after.items() if k != "runs"} == {
+        k: v for k, v in today.items() if k != "runs"
+    }
+    assert lines("2026-11-26") == 4, "the lines of both attempts are kept"
+    assert (records / "site" / "main" / "README.md").read_text(encoding="utf-8") == page
+    said = capsys.readouterr().out
+    assert "### This run is history" in said
+    assert "a run planned after this one has already reported" in said
+
+    # Today's run started again after the branch moved on: the code that runs is not the
+    # code at the tip, so it is history too. At the tip it is the newest word, and acts.
+    monkeypatch.setenv("COMPAT_TIP", "f" * 40)
+    assert run("2026-11-27", "2", "2", "fail") == report.RED_EXIT
+    assert done == [] and state()["points"] == today["points"]
+    assert "no longer the tip of its branch" in capsys.readouterr().out
+    monkeypatch.setenv("COMPAT_TIP", commit)
+    assert run("2026-11-27", "2", "3", "fail") == report.RED_EXIT
+    assert state()["points"]["openai_agents--floor"]["last"]["outcome"] == "fail"
+    assert done and "This run is history" not in capsys.readouterr().out
+
+
+def test_the_workflow_tells_the_report_what_its_branch_points_at_now():
+    text = (Path(__file__).resolve().parents[3] / ".github/workflows/compat.yml").read_text(
+        encoding="utf-8"
+    )
+    assert 'export COMPAT_TIP="$(git ls-remote origin "$GITHUB_REF"' in text

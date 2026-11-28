@@ -595,7 +595,7 @@ def fetch_published(cutoff: str, only: str | None = None) -> dict:
 
 _BASE = "key adapter role targets floats python in_claim cutoff assume_measured uploaded".split()
 _SHA = re.compile(r"[0-9a-f]{40}")
-_TAG = re.compile(r"v\d+\.\d+\.\d+")
+_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 _NO_SPEC = {
     "extras": {},
     "requires": (),
@@ -883,6 +883,8 @@ def declared() -> dict[str, list[str]]:
     planned by no run again, and this is how the report can tell that from a subject a
     run could not plan today."""
     return {
+        "framework": sorted(manifest.ADAPTERS),
+        "published": sorted(manifest.ADAPTERS),
         "combination": sorted(manifest.COMBINATIONS),
         "neighbour": sorted({spec["adapter"] for spec in manifest.NEIGHBOURS.values()}),
         "prerelease": sorted(manifest.ADAPTERS),
