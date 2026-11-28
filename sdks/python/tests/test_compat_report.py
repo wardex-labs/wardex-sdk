@@ -643,25 +643,47 @@ def test_what_a_point_last_said_is_carried_only_for_the_same_release():
     carried = report.adapter_issue(
         "openai_agents", plan, above, _RUN, _failed_yesterday(_ABOVE, nodes)
     )
-    assert carried["open"] and carried["hold"] is False
+    assert carried["open"]
     assert (
         "`openai-agents 0.26.0` is newer than the tested range. It did not pass when it was "
         "last checked, on `2026-11-25`, and could not be checked today" in carried["body"]
     )
     assert carried["fingerprint"] == yesterday["fingerprint"], "no news, so no comment"
-    # One that is not known to have failed asks nothing: no issue is opened for it, and one
-    # that is open is not closed by it.
+    # One that is not known to have failed asks nothing: no issue is opened for it. It is
+    # named, on the issue and in the words an issue closes with: not checked is not passed.
     unknown = report.adapter_issue("openai_agents", plan, above, _RUN, {})
-    assert (unknown["open"], unknown["hold"]) == (False, True)
-    assert "### Not checked today" in unknown["body"]
-    assert "could not be checked today" not in "".join(unknown["changes"])
+    assert unknown["open"] is False and unknown["changes"] == []
+    assert (
+        "### Not checked today\n\n- `openai-agents 0.26.0` is newer than the tested range and "
+        "could not be checked today (could not be installed (index or network)), so nothing "
+        "is known of it." in unknown["body"]
+    )
+    assert unknown["closing"] == (
+        "Nothing here is known to need doing, and nothing of it could be checked today: "
+        "`openai-agents 0.26.0` (could not be installed (index or network)). It opens again "
+        "if what is checked next does not pass. Closing."
+    )
+    # With something that was checked and passed, the closing says both.
+    both = _results(_result(_TOP), _result(_ABOVE, "install_network"))
+    closing = report.adapter_issue("openai_agents", plan, both, _RUN, {})["closing"]
+    assert closing.startswith("Nothing here needs doing any more: every release inside")
+    assert "Not checked today: `openai-agents 0.26.0` (could not be installed" in closing
     # Nor is what it said of another release, or a pass, a failure of this one.
     other = _failed_yesterday(_ABOVE, nodes)
     other["points"][_ABOVE["key"]]["last_checked"]["targets"] = {"openai-agents": "0.25.0"}
-    assert report.adapter_issue("openai_agents", plan, above, _RUN, other)["hold"] is True
+    assert report.adapter_issue("openai_agents", plan, above, _RUN, other)["open"] is False
     passed = _failed_yesterday(_ABOVE, nodes)
     passed["points"][_ABOVE["key"]]["last_checked"]["outcome"] = "pass"
-    assert report.adapter_issue("openai_agents", plan, above, _RUN, passed)["hold"] is True
+    assert report.adapter_issue("openai_agents", plan, above, _RUN, passed)["open"] is False
+    # A failure of another sort above the range is remembered as what it was.
+    gone = _failed_yesterday(_ABOVE, nodes)
+    gone["points"][_ABOVE["key"]]["last_checked"]["outcome"] = "attach_failed"
+    before = report.adapter_issue(
+        "openai_agents", plan, _results(_result(_ABOVE, "attach_failed", cause="upstream")), _RUN
+    )
+    gone["points"][_ABOVE["key"]]["last_checked"]["failed_ids"] = []
+    after = report.adapter_issue("openai_agents", plan, above, _RUN, gone)
+    assert after["open"] and after["fingerprint"] == before["fingerprint"]
     # A different release now sits at this point: yesterday's failure was another version's.
     moved = _failed_yesterday(_TOP, nodes)
     moved["points"][_TOP["key"]]["last_checked"]["targets"] = {"openai-agents": "0.23.0"}

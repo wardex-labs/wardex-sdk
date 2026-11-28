@@ -1157,9 +1157,9 @@ def adapter_issue(
     results = {**old, **results}
     mine = [r for r in results.values() if r.get("subject", r["adapter"]) == name]
     watched = []
-    # Lines of watching points that left no result. They keep an open issue open and open
-    # none: what a point could not say is no news about its subject.
-    held: list[str] = []
+    # Lines of points that could not be checked and are not known to have failed. They are
+    # shown and count for nothing: what a point could not say is no news about its subject.
+    unknown: list[str] = []
     todo, marks, failing, unchecked = [], [], [], []
     spoken: set[str] = set()
     for result in mine:
@@ -1204,15 +1204,16 @@ def adapter_issue(
                     )
                     continue
                 if unseen or not result["in_claim"]:
-                    # It says nothing of the subject, in either direction: a wheel that did
-                    # not build must not open an issue for everything that is watched, and
-                    # a release above the range that will not install asks nothing of
-                    # anyone. Neither is a reason to close what is open.
-                    held.append(
+                    # Nothing is known of it, and so nothing is asked: a wheel that did not
+                    # build must not open an issue for everything that is watched, and a
+                    # release above the range that will not install asks nothing of anyone.
+                    # It is named, on the issue and in the words an issue closes with, so
+                    # that not checked is never read as passed.
+                    unknown.append(
                         f"{_kind_label(result)}: {version} could not be checked{when} "
-                        f"({what}), so nothing is known of it. This neither opens nor closes "
-                        "the issue."
+                        f"({what}), so nothing is known of it."
                     )
+                    unchecked.append(f"{version} ({what})")
                     continue
             watched.append(
                 f"{_kind_label(result)}: {version} {what}{when}. Closes {_kind_closes(result)}."
@@ -1308,13 +1309,13 @@ def adapter_issue(
             # last checked still stands: a day the index was down is no day it passed.
             before = known.get(result["key"], {}).get("last_checked") or {}
             if before.get("outcome") not in FAILED or before.get("targets") != result["targets"]:
-                # Nothing is known of it, and nothing is asked: it opens no issue, and is
-                # no reason to close one.
-                held.append(
+                # Nothing is known of it, and nothing is asked. Named, like the rest that
+                # could not be checked.
+                unknown.append(
                     f"{version} is newer than the tested range and could not be checked today "
-                    f"({OUTCOME_WORDS[outcome]}), so nothing is known of it. This neither opens "
-                    "nor closes the issue."
+                    f"({OUTCOME_WORDS[outcome]}), so nothing is known of it."
                 )
+                unchecked.append(f"{version} ({OUTCOME_WORDS[outcome]})")
                 continue
             todo.append(
                 f"{version} is newer than the tested range. It did not pass when it was last "
@@ -1415,9 +1416,9 @@ def adapter_issue(
     if watched:
         body += ["", "### Watching (never turns the run red)", ""]
         body += [f"- {line}" for line in watched]
-    if held:
+    if unknown:
         body += ["", "### Not checked today", ""]
-        body += [f"- {line}" for line in held]
+        body += [f"- {line}" for line in unknown]
     body += ["", "### Points", "", *_table(mine)]
     if _left_out(mine):
         body += ["", *_left_out(mine)]
@@ -1436,6 +1437,14 @@ def adapter_issue(
     )
     if unchecked:
         closing += " Not checked today: " + "; ".join(unchecked) + "."
+    seen = [r for r in mine if r["key"] not in old and r["outcome"] in GREEN | FAILED]
+    if unchecked and not seen:
+        # Nothing passed, because nothing was looked at: not the words of a fix.
+        closing = (
+            "Nothing here is known to need doing, and nothing of it could be checked today: "
+            + "; ".join(unchecked)
+            + ". It opens again if what is checked next does not pass."
+        )
     traces = [
         item
         for item in (state or {}).get("retired") or []
@@ -1459,11 +1468,11 @@ def adapter_issue(
             f"({code(item.get('date', ''))}) and is no longer run: {why}. That is not a pass."
         )
     closing += "".join(f" {sentence}" for sentence in left)
-    if left and (todo or watched or held):
+    if left and (todo or watched):
         # The issue stays open for something else, and the trace is of this run alone:
         # said here and in a comment of its own, or it would never be said.
         body += ["", "### No longer run", "", *[f"- {sentence}" for sentence in left]]
-    if closing.startswith("Nothing here is asked"):
+    if closing.startswith(("Nothing here is asked", "Nothing here is known")):
         closing += " Closing."
     else:
         closing += (
@@ -1476,9 +1485,6 @@ def adapter_issue(
         "body": "\n".join(body) + "\n",
         "fingerprint": fingerprint,
         "open": bool(todo or watched),
-        # Nothing to do, and something that could not be looked at: the issue stays as it
-        # is, open or not.
-        "hold": bool(held) and not (todo or watched),
         "changes": [*todo, *watched],
         "closing": closing,
         "left": left,
@@ -1725,24 +1731,6 @@ def sync_issue(gh: GitHub, wanted: dict, existing: list[dict], assignee: str = "
         found = re.search(r"<!-- compat-fingerprint: (\w+) -->", mine["body"] or "")
         was = found.group(1) if found else None
     changed = was != wanted["fingerprint"]
-    if wanted.get("hold"):
-        # An open issue says today's lines and stays open, with no comment: nothing
-        # changed that anyone can act on. One that is closed, or not there, is left alone.
-        if mine and mine["state"] == "open":
-            body = wanted["body"]
-            if was:
-                # What it last had to say is still what it has to say.
-                body = body.replace(
-                    f"<!-- compat-fingerprint: {wanted['fingerprint']} -->",
-                    f"<!-- compat-fingerprint: {was} -->",
-                )
-            path = f"issues/{mine['number']}"
-            gh.do(f"rewrite #{mine['number']}", "PATCH", path, {"body": body})
-            if wanted.get("left"):
-                # A check that left while it was not passing: of this run alone, so now.
-                text = "No longer run:\n\n" + "\n".join(f"- {c}" for c in wanted["left"])
-                gh.do(f"comment on #{mine['number']}", "POST", f"{path}/comments", {"body": text})
-        return
     if mine is None:
         if wanted["open"]:
             payload = {"title": wanted["title"], "body": wanted["body"], "labels": [LABEL]}
