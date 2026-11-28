@@ -1165,6 +1165,8 @@ def _a_tag_in_git(
         if args[0] == "show" and args[1].endswith("release-override.json"):
             if override is None:
                 raise plan.subprocess.CalledProcessError(128, "git")
+            if override == "not text":
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
             return override
         if args[0] == "show":
             return measured if args[1].endswith("_measured.py") else enums
@@ -1399,3 +1401,7 @@ def test_a_release_that_overrode_its_gate_carries_that_into_the_plan(monkeypatch
     stale = json.dumps({"version": "0.6.0", "reason": "an earlier release"})
     _a_tag_in_git(monkeypatch, held=True, shallow=False, override=stale)
     assert plan.read_tag("0.7.0b1")["override"] is None
+    # A file that is not text is no override, and does not cost the release its points.
+    _a_tag_in_git(monkeypatch, held=True, shallow=False, override="not text")
+    unreadable = plan.read_tag("0.7.0b1")
+    assert unreadable["override"] is None and unreadable["tests"]

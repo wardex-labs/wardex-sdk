@@ -80,6 +80,20 @@ def upgrade_state(state: dict) -> dict:
 OVERRIDE = "scripts/compat/release-override.json"
 
 
+def prose(text: object, limit: int = 200) -> str:
+    """One line of someone's own words, in any language, with nothing that is markup.
+
+    What is left holds no backtick, so it can be printed inside a code span, where no
+    other character means anything either: a link, a mention and emphasis stay text."""
+    kept = "".join(ch if ch.isprintable() and ch not in "`|<>[]" else " " for ch in str(text))
+    return " ".join(kept.split())[:limit]
+
+
+def quoted(text: object, limit: int = 200) -> str:
+    """`text` as a code span that cannot be broken out of."""
+    return f"`{prose(text, limit)}`"
+
+
 def parse_override(text: str, version: str) -> dict | None:
     """The override `text` holds for `version`, or None.
 
@@ -94,10 +108,9 @@ def parse_override(text: str, version: str) -> dict | None:
     reason = data.get("reason")
     if not isinstance(reason, str):
         return None
-    # The reason is printed on a public page: one line, in any language, with nothing that
-    # is markup. And it has to say something: a few letters at the least.
-    kept = "".join(ch if ch.isprintable() and ch not in "`|<>[]" else " " for ch in reason)
-    kept = " ".join(kept.split())[:200]
+    # The reason is printed on a public page. It has to say something: a few letters at
+    # the least.
+    kept = prose(reason)
     if sum(ch.isalpha() for ch in kept) < 3:
         return None
     return {"version": version, "reason": kept}

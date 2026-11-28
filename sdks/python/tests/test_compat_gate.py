@@ -33,6 +33,7 @@ def _run(day: str = _TODAY, *, commit: str = _COMMIT, run_id: str = "7", **more)
         "date": day,
         "started_at": f"{day}T19:40:00Z",
         "sdk_commit": commit,
+        "red": False,
         **more,
     }
 
@@ -94,7 +95,7 @@ def test_a_release_inside_the_range_that_did_not_pass_stops_the_release(outcome)
     decision = _decide(_line("floor"), _line("claim_top"), _line("minor_newest", outcome))
     assert decision["pass"] is False and len(decision["reasons"]) == 1
     assert decision["reasons"][0].startswith(
-        "openai_agents--minor_newest: openai-agents 0.23.1 is inside the tested range and: "
+        "`openai_agents--minor_newest`: `openai-agents 0.23.1` is inside the tested range and: "
     )
 
 
@@ -256,7 +257,7 @@ def test_the_gate_passes_stops_and_is_overridden_out_loud(tmp_path, monkeypatch,
     red = _records(tmp_path / "red", _TODAY, _line("floor", "fail"), _line("claim_top"))
     code, said = _main(monkeypatch, tmp_path / "2", red)
     assert code == gate.STOP_EXIT == 20 and "**STOP.**" in said and "OVERRIDDEN" not in said
-    assert "- openai_agents--floor: openai-agents 0.23.1 is inside the tested range and: " in said
+    assert "- `openai_agents--floor`: `openai-agents 0.23.1` is inside the tested range " in said
 
     reason = "the floor fails on a dependency release; tracked upstream"
     code, said = _main(
@@ -264,8 +265,8 @@ def test_the_gate_passes_stops_and_is_overridden_out_loud(tmp_path, monkeypatch,
     )
     assert code == 0 and "**STOP.**" in said, "the reasons are still printed"
     assert (
-        f"**OVERRIDDEN** for 0.7.0b2 by `{gate.OVERRIDE}` in this tree. Reason given: {reason}."
-        in said
+        f"**OVERRIDDEN** for `0.7.0b2` by `{gate.OVERRIDE}` in this tree. Reason given: "
+        f"`{reason}`. The release goes on" in said
     )
 
     code, said = _main(
@@ -276,7 +277,10 @@ def test_the_gate_passes_stops_and_is_overridden_out_loud(tmp_path, monkeypatch,
     code, said = _main(
         monkeypatch, tmp_path / "5", green, override={"version": "0.7.0b2", "reason": reason}
     )
-    assert code == 0 and "OVERRIDDEN" not in said, "an override nobody needed is not mentioned"
+    assert code == 0 and "OVERRIDDEN" not in said and "**PASS.**" in said
+    # The plan reads the file from the release's tag whatever the gate said, so a file
+    # nobody needed would still put the sentence on the release's page.
+    assert f"`{gate.OVERRIDE}` in this tree names this version and was not needed." in said
 
 
 def test_a_run_two_days_old_still_proves_and_one_three_days_old_does_not():
@@ -399,3 +403,106 @@ def test_an_override_file_that_does_not_apply_is_said_not_ignored(tmp_path, monk
     applies = _tree(tmp_path / "3", "0.7.0b2", good)
     assert gate.rejected_override(applies, "0.7.0b2") == "", "a file that applies is not rejected"
     assert gate.rejected_override(applies, "0.7.0b3") != "", "left behind by an earlier release"
+
+
+# --- what a third reader found ---------------------------------------------------
+
+
+def test_lines_that_do_not_say_how_their_run_ended_prove_nothing():
+    """Lines written before a run recorded its colour. Passing lines alone are not proof
+    that the run was green, so the gate does not take them for it."""
+    silent = {k: v for k, v in _run().items() if k != "red"}
+    decision = _decide(_line("floor", run=silent), _line("claim_top", run=silent))
+    assert decision["reasons"] == [
+        "the run's lines do not say how it ended; run it again at this commit"
+    ]
+    half = _decide(_line("floor"), _line("claim_top", run=silent))
+    assert half["pass"] is False
+
+
+def test_nothing_a_record_line_holds_is_markup_in_what_the_gate_prints():
+    nasty = "k](https://e.invalid)|x`y`<b>**z**"
+    line = _line("floor", "fail", targets={"d|e [1](https://e.invalid)": "`1`"})
+    line["key"] = nasty
+    line["run"] = _run(url="https://e.invalid/x)[y](https://f.invalid")
+    decision = _decide(line, _line("claim_top"))
+    said = gate.words(decision, None, _COMMIT)
+    first = decision["reasons"][0]
+    assert first.startswith(
+        "`k](https://e.invalid)|x?y?<b>**z**`: `d|e [1](https://e.invalid) ?1?`"
+    )
+    assert all(reason.count("`") % 2 == 0 for reason in decision["reasons"])
+    assert decision["run"] == "" and "f.invalid" not in said, (
+        "an address that is not one is dropped"
+    )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        {"targets": ["openai-agents"]},
+        {"outcome": ["pass"]},
+        {"outcome": "passed"},
+        {"subject": ["x"]},
+    ],
+)
+def test_a_damaged_line_of_the_deciding_run_stops_the_release_and_is_not_a_crash(damage):
+    decision = _decide(_line("floor"), _line("claim_top"), _line("minor_newest", **damage))
+    if "targets" in damage or "subject" in damage:
+        assert decision["pass"] is True, "nothing the verdict reads was damaged"
+    else:
+        assert decision["reasons"] == [
+            "`openai_agents--minor_newest`: a result this gate cannot read"
+        ]
+    beyond = _decide(_line("floor"), _line("claim_top"), _line("beyond", outcome="?"))
+    assert beyond["pass"] is False, "a result nobody can read is not a failure above the range"
+
+
+def test_a_records_file_with_bytes_that_are_not_text_keeps_its_good_lines(tmp_path):
+    _records(tmp_path, _TODAY, _line("floor"), _line("claim_top"))
+    day = tmp_path / "records/2026/12/03.jsonl"
+    day.write_bytes(day.read_bytes() + b"\xff\xfe not text\n" + b'{"run": {}, "targets": 3}\n')
+    lines = gate.read_lines(tmp_path, _TODAY)
+    assert [line.get("key") for line in lines][:2] == [
+        "openai_agents--floor",
+        "openai_agents--claim_top",
+    ]
+    decision = gate.decide(lines, commit=_COMMIT, today=_TODAY, claims=_CLAIMS)
+    assert decision["pass"] is True
+
+
+def test_an_override_that_cannot_be_read_stops_the_release_and_says_the_file_is_there(
+    tmp_path, monkeypatch
+):
+    red = _records(tmp_path / "red", _TODAY, _line("floor", "fail"), _line("claim_top"))
+    tree = _tree(tmp_path / "bytes" / "tree", "0.7.0b2", "{}")
+    (tree / gate.OVERRIDE).write_bytes(b"\xff\xfe")
+    assert gate.read_override(tree, "0.7.0b2") is None
+    assert "does not apply" in gate.rejected_override(tree, "0.7.0b2")
+    folder = _tree(tmp_path / "folder" / "tree", "0.7.0b2", None)
+    (folder / gate.OVERRIDE).mkdir(parents=True)
+    assert gate.read_override(folder, "0.7.0b2") is None
+    assert "does not apply" in gate.rejected_override(folder, "0.7.0b2")
+    link = _tree(tmp_path / "link" / "tree", "0.7.0b2", None)
+    (link / gate.OVERRIDE).parent.mkdir(parents=True)
+    (link / gate.OVERRIDE).symlink_to(tmp_path / "nowhere")
+    assert "does not apply" in gate.rejected_override(link, "0.7.0b2")
+    monkeypatch.setattr(gate, "REPO", tree)
+    monkeypatch.setattr(gate, "claimed", lambda root=None: dict(_CLAIMS))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    code = gate.main(["--commit", _COMMIT, "--records", str(red), "--today", _TODAY])
+    assert code == gate.STOP_EXIT
+
+
+def test_a_reason_is_printed_as_written_in_any_language_and_never_as_markup(tmp_path, monkeypatch):
+    red = _records(tmp_path / "red", _TODAY, _line("floor", "fail"), _line("claim_top"))
+    korean = "상위 프레임워크 버그로 측정 불가"
+    code, said = _main(
+        monkeypatch, tmp_path / "1", red, override={"version": "0.7.0b2", "reason": korean}
+    )
+    assert code == 0 and f"Reason given: `{korean}`." in said
+    loud = "ok** **PASS** see https://e.invalid/x _x_ ~~y~~ @someone"
+    code, said = _main(
+        monkeypatch, tmp_path / "2", red, override={"version": "0.7.0b2", "reason": loud}
+    )
+    assert code == 0 and f"Reason given: `{loud}`." in said, "inside a code span nothing is markup"

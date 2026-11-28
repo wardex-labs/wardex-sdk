@@ -1316,7 +1316,8 @@ def gate_rehearsal(plan: dict, results: dict[str, dict], run: dict) -> str:
         )
     else:
         said.append("The release gate would stop:")
-        said += ["", *[f"- {clean(reason, 300)}" for reason in decision["reasons"]]]
+        # The gate's own sentences, made of fixed words and code spans it cleaned itself.
+        said += ["", *[f"- {reason}" for reason in decision["reasons"]]]
     return "\n".join(said) + "\n"
 
 

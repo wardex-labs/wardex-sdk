@@ -42,27 +42,37 @@ REPO = Path(__file__).resolve().parents[2]
 _VERSION_LINE = re.compile(r'^version\s*=\s*"([^"]+)"', re.M)
 
 
-def clean(text: object, limit: int = 200) -> str:
-    return "".join(ch if " " <= ch <= "~" else "?" for ch in str(text))[:limit]
+_RUN_URL = re.compile(r"https://[A-Za-z0-9./_-]{1,200}")
+
+
+def code(text: object, limit: int = 200) -> str:
+    """What a record line holds, as a code span: printable ASCII and never markup."""
+    kept = "".join(ch if " " <= ch <= "~" and ch != "`" else "?" for ch in str(text))
+    return f"`{kept[:limit]}`"
+
+
+def _url(text: object) -> str:
+    """A run's address as a record line gives it, or "" when it is anything but one."""
+    return text if isinstance(text, str) and _RUN_URL.fullmatch(text) else ""
 
 
 def read_lines(records: Path, today: str) -> list[dict]:
     """Every record line of the last `MAX_AGE_DAYS` days, as schema-2 lines.
 
-    A line that is not JSON is skipped: one bad line must not hide the good ones."""
+    A line that cannot be read is skipped: one bad line must not hide the good ones."""
     lines = []
     for back in range(MAX_AGE_DAYS + 1):
         day = date.fromisoformat(today) - timedelta(days=back)
         path = records / "records" / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}.jsonl"
         if not path.is_file():
             continue
-        for text in path.read_text(encoding="utf-8").splitlines():
+        for raw in path.read_bytes().splitlines():
             try:
-                line = json.loads(text)
-            except ValueError:
+                line = json.loads(raw.decode("utf-8"))
+                if isinstance(line, dict) and isinstance(line.get("run"), dict):
+                    lines.append(model.read_record(line))
+            except (ValueError, TypeError, KeyError, AttributeError):
                 continue
-            if isinstance(line, dict) and isinstance(line.get("run"), dict):
-                lines.append(model.read_record(line))
     return lines
 
 
@@ -80,6 +90,12 @@ def _attempt(line: dict) -> int:
         return int(line["run"].get("attempt") or 1)
     except (TypeError, ValueError):
         return 1
+
+
+def _outcome(line: dict) -> str:
+    """The line's outcome, or "" when it holds anything but a word."""
+    outcome = line.get("outcome")
+    return outcome if isinstance(outcome, str) else ""
 
 
 def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]) -> dict:
@@ -121,24 +137,30 @@ def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]
     reasons = []
     proving: dict[str, int] = {}
     for key, said in sorted(points.items()):
-        line = next((entry for entry in said if entry.get("outcome") not in GREEN), said[0])
-        outcome, key = line.get("outcome"), clean(key, 120)
-        targets = ", ".join(f"{d} {v}" for d, v in (line.get("targets") or {}).items())
+        line = next((entry for entry in said if _outcome(entry) not in GREEN), said[0])
+        outcome, key = _outcome(line), code(key, 120)
+        held = line.get("targets")
+        targets = ", ".join(f"{d} {v}" for d, v in (held if isinstance(held, dict) else {}).items())
         if outcome in ("no_result", "harness_error"):
             reasons.append(f"{key}: {OUTCOME_WORDS[outcome]}")
+        elif outcome not in OUTCOME_WORDS:
+            # Not a word any run writes: the line is damaged, wherever its point sits.
+            reasons.append(f"{key}: a result this gate cannot read")
         elif line.get("in_claim") and outcome not in GREEN:
-            words = OUTCOME_WORDS.get(outcome, "an unknown result")
-            reasons.append(f"{key}: {clean(targets)} is inside the tested range and: {words}")
+            reasons.append(
+                f"{key}: {code(targets)} is inside the tested range and: {OUTCOME_WORDS[outcome]}"
+            )
         elif line.get("in_claim") and line.get("kind") == "framework":
-            proving[line.get("subject", "")] = proving.get(line.get("subject", ""), 0) + 1
+            subject = str(line.get("subject", ""))
+            proving[subject] = proving.get(subject, 0) + 1
     for name, need in sorted(claims.items()):
         if proving.get(name, 0) < need:
             reasons.append(
                 f"{name}: {proving.get(name, 0)} passing points inside its tested range, "
                 f"{need} are needed"
             )
-    red = any(_attempt(line) == last and line["run"].get("red") is True for line in newest)
-    if red and not reasons:
+    ended = {line["run"].get("red") for line in newest if _attempt(line) == last}
+    if True in ended and not reasons:
         # A run is also red for what its plan could not make a point of: a tested release
         # that admits no supported interpreter, an adapter the index would not list. No
         # line holds that, and a release needs the run to have been green.
@@ -146,7 +168,11 @@ def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]
             "the run ended red for a reason no point holds (its plan could not cover "
             "something the tree says is tested); see the run"
         )
-    return {"pass": not reasons, "reasons": reasons, "run": clean(newest[0]["run"].get("url", ""))}
+    elif ended != {False} and not reasons:
+        # Lines written before a run recorded how it ended. Passing lines alone are not
+        # proof that it ended green, so they are not taken for it.
+        reasons.append("the run's lines do not say how it ended; run it again at this commit")
+    return {"pass": not reasons, "reasons": reasons, "run": _url(newest[0]["run"].get("url"))}
 
 
 def read_override(root: Path, version: str) -> dict | None:
@@ -155,7 +181,7 @@ def read_override(root: Path, version: str) -> dict | None:
     One left behind by an earlier release names that release and excuses nothing."""
     try:
         return model.parse_override((root / OVERRIDE).read_text(encoding="utf-8"), version)
-    except OSError:
+    except (OSError, ValueError):  # missing, a directory, or not text
         return None
 
 
@@ -164,7 +190,9 @@ def rejected_override(root: Path, version: str) -> str:
 
     A gate that fails closed in silence leaves the person who wrote the file guessing."""
     path = root / OVERRIDE
-    if not path.is_file() or read_override(root, version) is not None:
+    # Anything at that path counts, a directory or a dangling link too: whoever put it
+    # there meant something by it.
+    if not (path.exists() or path.is_symlink()) or read_override(root, version) is not None:
         return ""
     return (
         f"`{OVERRIDE}` is in this tree and does not apply. It has to be a JSON object with "
@@ -186,6 +214,13 @@ def words(decision: dict, override: dict | None, commit: str, rejected: str = ""
             f"**PASS.** Every point that speaks for a tested range passed at {commit[:10]}: "
             f"{decision['run']}"
         )
+        if override:
+            lines += [
+                "",
+                f"`{OVERRIDE}` in this tree names this version and was not needed. Remove it "
+                "before releasing: the plan reads it from the release's tag, and the page of "
+                "this release would say it carried an override.",
+            ]
     else:
         lines.append(
             f"**STOP.** {commit[:10]} has no recent pass for what it says it is tested on:"
@@ -205,8 +240,9 @@ def words(decision: dict, override: dict | None, commit: str, rejected: str = ""
         if override:
             lines += [
                 "",
-                f"**OVERRIDDEN** for {override['version']} by `{OVERRIDE}` in this tree. Reason "
-                f"given: {override['reason']}. The release goes on, and its page will say so.",
+                f"**OVERRIDDEN** for {code(override['version'], 40)} by `{OVERRIDE}` in this "
+                f"tree. Reason given: {model.quoted(override['reason'])}. The release goes on, "
+                "and its page will say so.",
             ]
         elif rejected:
             lines += ["", rejected]
@@ -223,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     decision = decide(
         read_lines(Path(args.records), today), commit=args.commit, today=today, claims=claimed(REPO)
     )
-    override = None if decision["pass"] else read_override(REPO, tree_version(REPO))
+    override = read_override(REPO, tree_version(REPO))
     rejected = "" if decision["pass"] else rejected_override(REPO, tree_version(REPO))
     text = words(decision, override, args.commit, rejected)
     print(text)
@@ -231,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
             handle.write(text)
-    return 0 if decision["pass"] or override else STOP_EXIT
+    return 0 if decision["pass"] or override else STOP_EXIT  # an override only matters on a stop
 
 
 if __name__ == "__main__":
