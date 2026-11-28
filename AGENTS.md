@@ -240,9 +240,11 @@ red-capable kind. Everything else that needs a person
 arrives as an issue labelled `compat`: one per subject (an adapter, a set of
 frameworks run together, a program with no tested range), one for problems
 with the run itself, and one opened by a run that ended without a verdict. A
-day a point says nothing about its release (it left no result, the run broke,
-the index could not be reached, or the run did not plan it) changes nothing on
-any issue. What the point
+day a watching point says nothing about its release (it left no result, the
+run broke, the index could not be reached, or the run did not plan it) posts
+nothing on its issue, and neither does a day a point above the range is run and
+cannot be checked; a red-capable point inside the range that left no result
+turns the run red and says so. What the point
 last found stands, in the same words and with no comment: a failure, inside the
 range or above it, watched or not; a pass above the range, which says the range
 can be widened; and, for a watching point, a release inside the range that will

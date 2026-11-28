@@ -685,6 +685,10 @@ def test_what_a_point_last_said_is_carried_only_for_the_same_release():
         "checked, on `2026-11-25`; it could not be checked today (could not be installed "
         "(index or network)). The range can be widened" in kept["body"]
     )
+    # Where a pass proves less than a live run, it never said the range can be widened.
+    replayed = {**plan, "adapters": {"openai_agents": {**plan["adapters"]["openai_agents"]}}}
+    replayed["adapters"]["openai_agents"]["evidence"] = "replay"
+    assert report.adapter_issue("openai_agents", replayed, above, _RUN, passed)["open"] is False
     passed["points"][_ABOVE["key"]]["last_checked"]["targets"] = {"openai-agents": "0.25.0"}
     assert report.adapter_issue("openai_agents", plan, above, _RUN, passed)["open"] is False
     # A failure of another sort above the range is remembered as what it was.

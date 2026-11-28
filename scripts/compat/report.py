@@ -820,8 +820,13 @@ def next_state(
                 "python": result.get("planned_python"),
                 "failed_ids": [clean(node, 300) for node in tests.get("failed_ids", [])[:200]],
             }
-        if (entry.get("last_said") or {}).get("targets") not in (None, result["targets"]):
-            del entry["last_said"]
+        if not is_watching(result) or (entry.get("last_said") or {}).get("targets") not in (
+            None,
+            result["targets"],
+        ):
+            # About another release, or about a point that is no longer only watched: a
+            # point that can turn the run red says what it found on its own lines.
+            entry.pop("last_said", None)
         if is_watching(result) and says(result) and not outranked(result, standing(entry, result)):
             # What a watched point last found, a refusal to install included. A day it says
             # nothing, its issue says this again, in the same words and with the same mark.

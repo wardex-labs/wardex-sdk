@@ -1783,9 +1783,13 @@ def test_what_a_watching_point_found_stands_on_a_day_it_says_nothing(
     after = report.next_state(state, silent, _RUN, tmp_path, made)
     issue = report.adapter_issue(subject, made, silent, _RUN, after)
     assert issue["open"] is True
+    words = {
+        "combination--openai_agents__pydantic_ai": "cannot be installed together",
+        "hermes--claim_top": report.OUTCOME_WORDS[found],
+    }[key]
     assert (
-        "when it was last checked, on `2026-11-25`, and could not be checked since"
-        in (issue["body"])
+        f"{words} when it was last checked, on `2026-11-25`, and could not be checked since"
+        in issue["body"]
     )
     assert issue["fingerprint"] == yesterday["fingerprint"]
     assert [what for what, _ in _synced(issue, opened)] == ["rewrite #7"]
@@ -1913,3 +1917,17 @@ def test_what_the_weekly_run_found_short_of_a_failure_is_on_the_daily_issue(tmp_
         "the test dependencies cannot be installed beside it (last run `2026-11-23`)"
         in (issue["body"])
     )
+
+
+def test_a_point_that_can_turn_the_run_red_keeps_no_watched_word(tmp_path):
+    """A watched point failed, then its kind was promoted. What it found while it was only
+    watched is not what it says now: a red-capable point speaks on its own lines."""
+    made = _plan()
+    key = "hermes--claim_top"
+    passing = {p["key"]: _result(p) for p in made["points"]}
+    failed = {**passing, key: _result(passing[key], "fail", tests={"failed_ids": ["t.py::a"]})}
+    state = report.next_state({}, failed, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    assert state["points"][key]["last_said"]["outcome"] == "fail"
+    promoted = {**passing, key: {**passing[key], "watching": False}}
+    after = report.next_state(state, promoted, _RUN, tmp_path, made)
+    assert "last_said" not in after["points"][key]
