@@ -2921,7 +2921,7 @@ def test_the_gate_reads_what_the_report_wrote_and_a_run_with_no_point_is_still_a
 
     def run(plan: dict, run_id: str, *results: dict) -> int:
         monkeypatch.setenv("GITHUB_RUN_ID", run_id)
-        work = tmp_path / run_id
+        work = tmp_path / f"{run_id}-{len(list(tmp_path.iterdir()))}"
         (work / "results").mkdir(parents=True, exist_ok=True)
         (work / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
         for result in results:
@@ -2938,11 +2938,14 @@ def test_the_gate_reads_what_the_report_wrote_and_a_run_with_no_point_is_still_a
             runs=gate.read_runs(records),
         )
 
-    morning = {**_plan(_FLOOR, _TOP), "partial": False}
-    assert run(morning, "1", _result(_FLOOR), _result(_TOP)) == 0
+    # A watching point that fails is one of the run's lines, and stops nothing.
+    watched = _published(_TOP)
+    morning = {**_release_plan(watched), "partial": False}
+    results = (_result(_FLOOR), _result(_TOP), _result(watched, "fail"))
+    assert run(morning, "1", *results) == 0
     listed = gate.read_runs(records)
     assert [(e["id"], e["attempt"], e["red"], e["points"]) for e in listed] == [
-        ("1", "1", False, 2)
+        ("1", "1", False, 3)
     ]
     assert listed[0]["scope"] == "all" and listed[0]["ref"] == "refs/heads/main"
     assert decided()["pass"] is True
@@ -2953,16 +2956,77 @@ def test_the_gate_reads_what_the_report_wrote_and_a_run_with_no_point_is_still_a
     evening["adapters"]["openai_agents"]["problems"] = ["no release could be listed"]
     assert run(evening, "2") == report.RED_EXIT
     assert [(e["id"], e["red"], e["points"]) for e in gate.read_runs(records)] == [
-        ("1", False, 2),
+        ("1", False, 3),
         ("2", True, 0),
     ]
-    assert len(gate.read_lines(records, "2026-11-26")) == 2, "the second run wrote no line"
+    assert len(gate.read_lines(records, "2026-11-26")) == 3, "the second run wrote no line"
     stopped = decided()
     assert stopped["pass"] is False and "ended red" in stopped["reasons"][0]
 
-    # The same run again is one entry, and a run a week old leaves the list.
+    # The same run and attempt again is one entry.
     assert run(evening, "2") == report.RED_EXIT
     assert len(gate.read_runs(records)) == 2
-    later = report.run_list(gate.read_runs(records), {**_RUN, "date": "2026-12-04", "id": "9"})
-    assert [entry["id"] for entry in later] == ["9"]
-    assert report.run_list("not a list", {**_RUN, "id": "9"})[-1]["id"] == "9"
+
+    # Every job of the first run run again the next day: a second attempt with a start of
+    # its own. Both attempts stay listed, the first one's lines are still lines of a run
+    # the list knows, and the newest thing the commit said is green again.
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    again = {**morning, "cutoff": "2026-11-27T08:00:00Z"}
+    assert run(again, "1", *results) == 0
+    assert [(e["id"], e["attempt"], e["date"]) for e in gate.read_runs(records)] == [
+        ("1", "1", "2026-11-26"),
+        ("2", "1", "2026-11-26"),
+        ("1", "2", "2026-11-27"),
+    ]
+    tomorrow = gate.decide(
+        gate.read_lines(records, "2026-11-27"),
+        commit=commit,
+        today="2026-11-27",
+        claims={"openai_agents": 2},
+        runs=gate.read_runs(records),
+    )
+    assert tomorrow["pass"] is True, tomorrow["reasons"]
+
+
+def _entry(day: str, run_id: str = "1", **more) -> dict:
+    listed = {**_RUN, "id": run_id, "date": day, "scope": "all", "red": False, "points": 2}
+    kept = (*report._RUN_KEPT, "red", "points")
+    return {k: v for k, v in {**listed, **more}.items() if k in kept}
+
+
+_NOW = {**_RUN, "id": "9", "date": "2026-12-04", "scope": "all", "red": False, "points": 2}
+
+
+def test_the_list_of_runs_keeps_a_week_and_is_not_capped():
+    before = [_entry("2026-11-26"), _entry("2026-11-27", "2"), _entry("2026-12-04", "3")]
+    assert [e["id"] for e in report.run_list(before, _NOW)] == ["2", "3", "9"], "seven days"
+    many = [_entry("2026-12-03", f"r{n}") for n in range(300)]
+    assert len(report.run_list(many, _NOW)) == 301, "as many as there were, however many"
+    assert [e["id"] for e in report.run_list(None, _NOW)] == ["9"], "no list yet is no damage"
+
+
+@pytest.mark.parametrize(
+    "damaged",
+    [
+        "not a list",
+        [3],
+        [{"id": "7"}],
+        [_entry("2026-12-03", red="no")],
+        [_entry("9999-12-31")],
+        [_entry("")],
+        [_entry("soon")],
+        [{"unreadable_since": "9999-12-31"}],
+        [{"unreadable_since": 5}],
+    ],
+    ids=["text", "number", "half", "red", "future", "undated", "words", "mark-future", "mark-type"],
+)
+def test_a_damaged_entry_is_not_dropped_by_the_next_run_and_ages_out_like_any_other(damaged):
+    """It may have been the run that said a commit is not fit to release. The run that
+    comes along next must not be what makes the gate forget it."""
+    kept = report.run_list(damaged, _NOW)
+    assert kept == [{"unreadable_since": "2026-12-04"}, kept[-1]] and kept[-1]["id"] == "9"
+    assert not gate.entry_ok(kept[0]) and gate.entry_ok(kept[-1])
+    week = report.run_list(kept, {**_NOW, "id": "10", "date": "2026-12-11"})
+    assert week[0] == {"unreadable_since": "2026-12-04"}, "still there a week later"
+    gone = report.run_list(week, {**_NOW, "id": "11", "date": "2026-12-12"})
+    assert [e.get("id") for e in gone] == ["10", "11"]

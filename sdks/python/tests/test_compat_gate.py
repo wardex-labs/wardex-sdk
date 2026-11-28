@@ -336,6 +336,14 @@ def test_lines_of_a_run_the_list_does_not_hold_matter_only_at_this_commit():
     assert _judge([*green, *old, *branch], _listed(green))["pass"] is True
     here = _stamped((_line("floor", "fail", run=_run(run_id="5")),))
     assert "does not know (`5`)" in _judge([*green, *here], _listed(green))["reasons"][0]
+    # And lines that put themselves at this commit, of a run the list puts elsewhere.
+    for field, value in [("sdk_commit", "f" * 40), ("ref", "refs/heads/x"), ("scope", "partial")]:
+        moved = [{**entry, field: value} for entry in _listed(here)]
+        decision = _judge([*green, *here], [*_listed(green), *moved])
+        assert decision["reasons"] == [
+            "the records hold lines that do not agree with the list of runs about which run "
+            "they are of (`5`)"
+        ], field
 
 
 def test_a_run_that_wrote_no_line_is_still_the_newest_run():
