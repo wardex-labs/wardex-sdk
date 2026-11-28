@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import os
 import socket
 import ssl
 import threading
@@ -156,6 +157,13 @@ def _shield_tests_from_ambient_env(monkeypatch):
         "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The compatibility scripts take the run they are in from the Actions
+    # environment. On a job started again, `GITHUB_RUN_ATTEMPT` is 2, and a
+    # test that drives a report through several days would read every day as
+    # a run started again at an unknown commit, one that takes nothing away.
+    for name in list(os.environ):
+        if name.startswith(("GITHUB_", "COMPAT_")) or name == "GH_TOKEN":
+            monkeypatch.delenv(name)
 
 
 def pytest_configure(config):
