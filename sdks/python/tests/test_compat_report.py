@@ -2805,6 +2805,7 @@ def test_a_schedule_that_never_fired_is_dated_from_the_day_its_file_reached_the_
 
 def _rehearsed(*results: dict, ref: str = "refs/heads/main", scope: str = "all") -> str:
     run = {**_RUN, "ref": ref, "scope": scope, "cadence": "daily", "red": False}
+    run["points"] = len(results)
     plan = _plan(*[{k: v for k, v in r.items() if k in _FLOOR} for r in results])
     return report.gate_rehearsal(plan, _results(*results), run)
 
@@ -2892,6 +2893,7 @@ def test_a_run_writes_its_colour_on_every_line_it_records(tmp_path, monkeypatch,
 
     code, green = lines_of(_plan(_FLOOR, _TOP), "green")
     assert code == 0 and [line["run"]["red"] for line in green] == [False, False]
+    assert [line["run"]["points"] for line in green] == [2, 2], "and how many lines it wrote"
     assert "### If this commit were released now" in capsys.readouterr().out, "in every summary"
     problem = _plan(_FLOOR, _TOP)
     problem["adapters"]["openai_agents"]["problems"] = ["0.22.0 admits no supported interpreter"]

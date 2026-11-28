@@ -1347,6 +1347,8 @@ def main(argv: list[str] | None = None) -> int:
     # On every record line of the run, so a reader of the lines alone (the release gate)
     # knows the run's colour, also when the reason is one no point holds.
     run["red"] = bool(reasons)
+    # And how many lines the run writes, so a reader can tell that one is missing.
+    run["points"] = len(results)
     new_state = next_state(state, results, run, results_dir, plan)
     locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
 
