@@ -369,25 +369,27 @@ def test_a_failure_waiting_for_its_own_point_is_on_the_default_branchs_page():
     state["displaced"] = {"openai_agents": [item]}
     page = render.page(state, render.MAIN, _TODAY)
     assert (
-        "- `openai-agents 0.23.1` did not pass when it was last run, on 27 Nov 2026. A newer "
-        "release took its place; it is run on its own from the next run on." in page
+        "- `openai-agents 0.23.1` did not pass when it was last run, on 27 Nov 2026. No rule "
+        "picks it any more; it is run on its own from the next run on." in page
     )
     own = _identity("openai_agents", "displaced", "0.23.1")
     state["points"][item["key"]] = _entry(own, "fail")
-    assert "took its place" not in render.page(state, render.MAIN, _TODAY), "its row says it now"
+    assert "No rule picks it" not in render.page(state, render.MAIN, _TODAY), "its row says it now"
 
     del state["points"][item["key"]]
     again = _identity("openai_agents", "claim_top", "0.23.1")
     state["points"]["openai_agents--claim_top"] = _entry(again, "install_network")
-    assert "took its place" not in render.page(state, render.MAIN, _TODAY), "a rule picked it again"
+    assert "No rule picks it" not in render.page(state, render.MAIN, _TODAY), (
+        "a rule picked it again"
+    )
 
     state["displaced"]["openai_agents"] = [{**item, "python": "3.10"}]
     page = render.page(state, render.MAIN, _TODAY)
-    assert "took its place" in page, "the same release on another interpreter is another failure"
+    assert "No rule picks it" in page, "the same release on another interpreter is another failure"
     floor = _identity("openai_agents", "floor", "0.23.1")
     state["points"] = {"openai_agents--floor": _entry(floor)}
     state["displaced"]["openai_agents"] = [item]
-    assert "took its place" in render.page(state, render.MAIN, _TODAY), "the floor is not it"
+    assert "No rule picks it" in render.page(state, render.MAIN, _TODAY), "the floor is not it"
     state["points"] = {"openai_agents--claim_top": _entry(again, "install_network")}
 
     odd = ["not an item", {"targets": "nor this"}, {"targets": {"x": None}}]
@@ -395,4 +397,4 @@ def test_a_failure_waiting_for_its_own_point_is_on_the_default_branchs_page():
     page = render.page(state, render.MAIN, _TODAY)
     assert "- `x None` did not pass when it was last run, on an unknown day." in page
     state["displaced"]["openai_agents"] = "not a list"
-    assert "took its place" not in render.page(state, render.MAIN, _TODAY)
+    assert "No rule picks it" not in render.page(state, render.MAIN, _TODAY)

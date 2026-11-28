@@ -359,8 +359,8 @@ def _replaced(points: list[dict], items: list[dict]) -> list[str]:
         version = ", ".join(f"{dist} {v}" for dist, v in item["targets"].items())
         lines.append(
             f"- {code(version)} did not pass when it was last run, on "
-            f"{day_words(item.get('failed_on', '')) or 'an unknown day'}. A newer release took "
-            "its place; it is run on its own from the next run on."
+            f"{day_words(item.get('failed_on', '')) or 'an unknown day'}. No rule picks it "
+            "any more; it is run on its own from the next run on."
         )
     return [*lines, ""] if lines else []
 
