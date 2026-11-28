@@ -3051,3 +3051,37 @@ def test_a_damaged_entry_is_not_dropped_by_the_next_run_and_ages_out_like_any_ot
     assert week[0] == {"unreadable_since": "2026-12-04"}, "still there a week later"
     gone = report.run_list(week, {**_NOW, "id": "11", "date": "2026-12-12"})
     assert [e.get("id") for e in gone] == ["10", "11"]
+
+
+def test_a_mark_is_dated_by_the_newest_day_the_list_knows_and_the_gate_stops_on_it():
+    """A green run, then a red run that planned nothing, both at one commit. The red run's
+    entry is damaged. Failed jobs of a run two weeks old are then run again: that run is
+    dated by its old plan, and a mark dated by it would be dropped by the next ordinary
+    run, leaving the green run to speak for the commit."""
+    green = _entry("2026-12-03", "g", started_at="2026-12-03T10:00:00Z")
+    red = _entry("2026-12-03", "r", started_at="2026-12-03T20:00:00Z", red="true", points=0)
+    old_run = {**_NOW, "id": "o", "attempt": "2", "date": "2026-11-19"}
+    after_old = report.run_list([green, red], old_run)
+    assert after_old[:2] == [green, {"unreadable_since": "2026-12-03"}], "not 19 Nov"
+    after_next = report.run_list(after_old, {**_NOW, "id": "n", "scope": "partial"})
+    assert {"unreadable_since": "2026-12-03"} in after_next and green in after_next
+    decision = gate.decide(
+        [],
+        commit=green["sdk_commit"],
+        today="2026-12-04",
+        claims={"openai_agents": 2},
+        runs=after_next,
+    )
+    assert decision == {
+        "pass": False,
+        "run": None,
+        "reasons": ["the list of runs in `state.json` of the records cannot be read"],
+    }
+    # A mark already there keeps its day, and one dated after everything known is reset.
+    kept = report.run_list([{"unreadable_since": "2026-12-01"}, green], old_run)
+    assert kept[0] == {"unreadable_since": "2026-12-01"}
+    reset = report.run_list([{"unreadable_since": "2026-12-09"}, green], old_run)
+    assert reset[0] == {"unreadable_since": "2026-12-03"}
+    # And a run newer than everything listed dates the mark itself.
+    newest = report.run_list([{"id": "half"}, _entry("2026-12-01", "e")], _NOW)
+    assert newest[0] == {"unreadable_since": "2026-12-04"}
