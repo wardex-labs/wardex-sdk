@@ -261,11 +261,18 @@ class Point:
         source.write_text(requirements, encoding="utf-8")
         cmd = ["uv", "pip", "compile", source, "-o", lock, "--python", python_of(venv)]
         cmd += ["--generate-hashes", "--no-header", "--no-annotate", "--quiet"]
-        cmd += ["--exclude-newer", self.point["cutoff"]]
-        if self.point["cutoff"] != self.run_cutoff:
-            # The test tools are today's, whatever the era of the framework under them.
-            for tool in self.recipe["tools"]:
-                cmd += ["--exclude-newer-package", f"{tool.split('==')[0]}={self.run_cutoff}"]
+        era = self.recipe.get("era")
+        if era:
+            # Sketch: only a named family is held to the floor's time; the rest is today's.
+            cmd += ["--exclude-newer", self.run_cutoff]
+            for name in era:
+                cmd += ["--exclude-newer-package", f"{name}={self.point['cutoff']}"]
+        else:
+            cmd += ["--exclude-newer", self.point["cutoff"]]
+            if self.point["cutoff"] != self.run_cutoff:
+                # The test tools are today's, whatever the era of the framework under them.
+                for tool in self.recipe["tools"]:
+                    cmd += ["--exclude-newer-package", f"{tool.split('==')[0]}={self.run_cutoff}"]
         if refresh:
             for dist in self.point["targets"]:
                 cmd += ["--refresh-package", dist]
