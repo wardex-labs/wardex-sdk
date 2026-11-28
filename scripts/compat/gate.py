@@ -14,6 +14,13 @@ the command that produces it. A release that has to go out anyway carries
 `scripts/compat/release-override.json` in its own tree, naming its version and
 the reason; the gate then lets it through and says so, and the page of that
 release says so for as long as the page exists.
+
+What the gate trusts, and what it does not. Only the report job of a run on the
+default branch writes the records branch, and whoever else can push there can
+write a passing run, so the gate does not try to tell a forged line from a real
+one. What it does guard against is damage: a line whose fields are not what the
+report writes is never read loosely into a pass. The run it belongs to decides
+nothing, and the release stops.
 """
 
 from __future__ import annotations
@@ -39,7 +46,7 @@ MAX_AGE_DAYS = 2
 MAIN_REF = "refs/heads/main"
 OVERRIDE = model.OVERRIDE
 REPO = Path(__file__).resolve().parents[2]
-_VERSION_LINE = re.compile(r'^version\s*=\s*"([^"]+)"', re.M)
+_VERSION_LINE = re.compile(r"""^version\s*=\s*(?:"([^"]+)"|'([^']+)')""", re.M)
 
 
 _RUN_URL = re.compile(r"https://[A-Za-z0-9./_-]{1,200}")
@@ -89,13 +96,14 @@ def _attempt(line: dict) -> int | None:
     """The attempt a line was written by (1 when it does not say), or None when what it
     holds is not a count."""
     said = line["run"].get("attempt")
-    if said is None:
+    if said is None or said == "":  # a run outside Actions has no attempt number to give
         return 1
     if isinstance(said, bool):
         return None
     if isinstance(said, int):
         return said if said > 0 else None
-    return int(said) if isinstance(said, str) and said.isdecimal() and int(said) > 0 else None
+    counted = isinstance(said, str) and said.isdecimal() and len(said) < 7
+    return int(said) if counted and int(said) > 0 else None
 
 
 def damage(line: dict) -> str:
@@ -175,17 +183,27 @@ def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]
     reasons = []
     proving: dict[str, int] = {}
     for key, said in sorted(points.items()):
-        line = next((entry for entry in said if entry["outcome"] not in GREEN), said[0])
-        outcome, key = line["outcome"], code(key, 120)
-        targets = ", ".join(f"{d} {v}" for d, v in line["targets"].items())
-        if outcome in ("no_result", "harness_error"):
-            reasons.append(f"{key}: {OUTCOME_WORDS[outcome]}")
-        elif line["in_claim"] and outcome not in GREEN:
-            reasons.append(
-                f"{key}: {code(targets)} is inside the tested range and: {OUTCOME_WORDS[outcome]}"
-            )
-        elif line["in_claim"] and line["kind"] == "framework":
-            proving[line["subject"]] = proving.get(line["subject"], 0) + 1
+        # Every line of the point is judged, and the point proves something only when
+        # every one of them does: two lines under one key that disagree are not a pass.
+        stopped = []
+        for line in said:
+            outcome = line["outcome"]
+            targets = ", ".join(f"{d} {v}" for d, v in line["targets"].items())
+            if outcome in ("no_result", "harness_error"):
+                stopped.append(f"{code(key, 120)}: {OUTCOME_WORDS[outcome]}")
+            elif line["in_claim"] and outcome not in GREEN:
+                stopped.append(
+                    f"{code(key, 120)}: {code(targets)} is inside the tested range and: "
+                    f"{OUTCOME_WORDS[outcome]}"
+                )
+        reasons += sorted(set(stopped))
+        subjects = {line["subject"] for line in said}
+        proves = all(
+            line["in_claim"] and line["kind"] == "framework" and line["outcome"] in GREEN
+            for line in said
+        )
+        if proves and len(subjects) == 1:
+            proving[said[0]["subject"]] = proving.get(said[0]["subject"], 0) + 1
     for name, need in sorted(claims.items()):
         if proving.get(name, 0) < need:
             reasons.append(
@@ -211,6 +229,8 @@ def read_override(root: Path, version: str) -> dict | None:
     """The override this tree carries for its own version, or None.
 
     One left behind by an earlier release names that release and excuses nothing."""
+    if not version:
+        return None  # a tree whose version cannot be read has no version to be excused
     try:
         return model.parse_override((root / OVERRIDE).read_text(encoding="utf-8"), version)
     except (OSError, ValueError):  # missing, a directory, or not text
@@ -226,6 +246,11 @@ def rejected_override(root: Path, version: str) -> str:
     # there meant something by it.
     if not (path.exists() or path.is_symlink()) or read_override(root, version) is not None:
         return ""
+    if not version:
+        return (
+            f"`{OVERRIDE}` is in this tree and does not apply: the version of this tree could "
+            "not be read from `sdks/python/pyproject.toml`, so there is no release to excuse."
+        )
     return (
         f"`{OVERRIDE}` is in this tree and does not apply. It has to be a JSON object with "
         f'"version": "{version}" (the version of this tree) and a "reason" that says in '
@@ -234,8 +259,15 @@ def rejected_override(root: Path, version: str) -> str:
 
 
 def tree_version(root: Path) -> str:
-    match = _VERSION_LINE.search((root / "sdks/python/pyproject.toml").read_text(encoding="utf-8"))
-    return match[1] if match else ""
+    """The version this tree would be released as, or "" when it cannot be read."""
+    try:
+        text = (root / "sdks/python/pyproject.toml").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
+    match = _VERSION_LINE.search(text)
+    version = (match[1] or match[2]) if match else ""
+    # Printed inside quotes in what the gate says, so only what a version is made of.
+    return version if re.fullmatch(r"[0-9A-Za-z.+!_-]{1,60}", version) else ""
 
 
 def words(decision: dict, override: dict | None, commit: str, rejected: str = "") -> str:
@@ -301,14 +333,18 @@ def main(argv: list[str] | None = None) -> int:
             "run": None,
             "reasons": [f"the gate could not read what it decides from ({type(broken).__name__})"],
         }
-    override = read_override(REPO, tree_version(REPO))
-    rejected = "" if decision["pass"] else rejected_override(REPO, tree_version(REPO))
+    version = tree_version(REPO)
+    override = read_override(REPO, version)
+    rejected = "" if decision["pass"] else rejected_override(REPO, version)
     text = words(decision, override, args.commit, rejected)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
-        with open(summary, "a", encoding="utf-8") as handle:
-            handle.write(text)
+        try:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError:
+            pass  # printed above; a summary that cannot be written changes no verdict
     return 0 if decision["pass"] or override else STOP_EXIT  # an override only matters on a stop
 
 

@@ -108,9 +108,10 @@ def parse_override(text: str, version: str) -> dict | None:
     reason = data.get("reason")
     if not isinstance(reason, str):
         return None
-    # The reason is printed on a public page. It has to say something: a few letters at
-    # the least.
     kept = prose(reason)
-    if sum(ch.isalpha() for ch in kept) < 3:
-        return None
-    return {"version": version, "reason": kept}
+    return {"version": version, "reason": kept} if says_something(kept) else None
+
+
+def says_something(reason: object) -> bool:
+    """Whether a reason holds words: a few letters at the least, in any language."""
+    return isinstance(reason, str) and sum(ch.isalpha() for ch in prose(reason)) >= 3
