@@ -2780,6 +2780,7 @@ def test_a_schedule_that_never_fired_is_dated_from_the_day_its_file_reached_the_
         if path.startswith("actions/workflows/compat.yml/runs"):
             return answers["runs"]
         if path.startswith("commits?path=.github/workflows/compat.yml"):
+            assert path.endswith("&per_page=100"), "a short page would end at a newer commit"
             return answers["commits"]
         assert path == "actions/workflows/compat.yml"
         return {"created_at": answers["registered"]}
