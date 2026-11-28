@@ -215,9 +215,34 @@ jobs:
       - name: pytest
         run: uv run pytest sdks/python/tests -q
 
+  # What this release says it is tested on, proven on the day it goes out. `gate`
+  # above shows the code is right; this shows that the framework releases the
+  # README calls tested still pass on it. It reads the records the compatibility
+  # run wrote for exactly this commit and needs no permission beyond reading.
+  #
+  # It stops the publish when no whole run on the default branch looked at this
+  # commit in the last two days, or when one did and a release inside a tested
+  # range did not pass. The job's summary says which, and the command that
+  # produces the missing proof. A dispatch runs it too, on any ref, so the
+  # verdict for a commit can be read before its tag exists.
+  compat-gate:
+    name: gate (compatibility records for this commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: read the compatibility records
+        run: |
+          git fetch --depth 1 origin compat-results
+          git worktree add --detach "$RUNNER_TEMP/records" FETCH_HEAD
+      - name: every tested range of this commit has a recent pass
+        run: python3 scripts/compat/gate.py --commit "$GITHUB_SHA" --records "$RUNNER_TEMP/records"
+
   publish:
     name: publish to PyPI
-    needs: [build, smoke, gate]
+    needs: [build, smoke, gate, compat-gate]
     # Only a *pushed* `python-v*` tag publishes. The trigger is half the guard
     # because workflow_dispatch takes a tag ref too — the ref picker has a Tag
     # tab, and `gh workflow run --ref python-v1.2.3` is the obvious way to
