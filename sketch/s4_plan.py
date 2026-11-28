@@ -17,8 +17,12 @@ from compat import manifest, plan  # noqa: E402
 
 LIBS = {"httpx": "0.28.1", "aiohttp": "3.9.0", "requests": "2.31.0", "h2": "4.0.0"}
 EXTRAS = {"httpx": "[http2]"}
-FAMILY = ["httpx", "httpcore", "h11", "h2", "hpack", "hyperframe", "aiohttp", "aiosignal", "frozenlist",
-          "multidict", "yarl", "requests", "urllib3", "charset-normalizer", "idna", "certifi", "anyio", "sniffio"]
+FAMILY = {
+    "httpx": ["httpx", "httpcore", "h11", "anyio", "sniffio", "certifi", "idna"],
+    "aiohttp": ["aiohttp", "aiosignal", "frozenlist", "multidict", "yarl", "aiohappyeyeballs", "propcache", "attrs"],
+    "requests": ["requests", "urllib3", "charset-normalizer", "idna", "certifi"],
+    "h2": ["h2", "hpack", "hyperframe"],
+}
 OTHERS = ["anyio", "hpack", "opentelemetry-api", "opentelemetry-sdk", "syrupy", "uvloop"]
 FRAMEWORKS = {"agents", "langgraph", "langchain", "langchain_core", "claude_agent_sdk", "pydantic_ai",
               "fastmcp", "mcp", "boto3", "openai", "logfire"}
@@ -61,7 +65,7 @@ def main() -> int:
             point = plan.compile_point(base, kind="published", subject=lib, spec=spec)
             point["probe"] = {"imports": [], "adapter": None}
             if role == "floor":
-                point["install"]["era"] = FAMILY
+                point["install"]["era"] = FAMILY[lib]
             points.append(point)
             print(point["key"], python, version, point_cutoff, len(spec["tests"]))
     Path(sys.argv[1]).write_text(json.dumps({"cutoff": cutoff, "points": points}, indent=1), encoding="utf-8")

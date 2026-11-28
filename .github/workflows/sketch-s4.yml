@@ -96,6 +96,26 @@ jobs:
           for d in ("httpx", "httpcore", "h11", "h2", "aiohttp", "requests", "urllib3", "anyio", "uvloop"):
               if d in r["resolved"]: print("WITH", d, r["resolved"][d])
           PY
+      - name: which anyio the three TLS tests fail on
+        if: matrix.key == 'transport--httpx--floor'
+        run: |
+          V="$RUNNER_TEMP/point/venv/bin/python"
+          T="sdks/python/tests/test_ssl_interceptor.py"
+          K="anyio_tls_reads_the_peer or async_capture_populates_handshake or async_https_call_is_captured"
+          echo "::group::the three alone, as installed"
+          "$V" -m pytest "$T" -q -k "$K" --tb=short -p no:cacheprovider || true
+          echo "::endgroup::"
+          for A in 4.6.2 4.7.0 4.8.0 4.9.0; do
+            uv pip install --python "$V" --quiet "anyio==$A"
+            echo "ANYIO $A: three alone"
+            "$V" -m pytest "$T" -q -k "$K" --tb=line -p no:cacheprovider 2>&1 | tail -6 || true
+            echo "ANYIO $A: the whole file"
+            "$V" -m pytest "$T" -q --tb=line -p no:cacheprovider 2>&1 | tail -6 || true
+          done
+          uv pip install --python "$V" --quiet "anyio==4.7.0"
+          echo "::group::first failure in full, anyio 4.7.0"
+          "$V" -m pytest "$T" -q -k "async_https_call_is_captured" --tb=long -p no:cacheprovider 2>&1 | head -150 || true
+          echo "::endgroup::"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
