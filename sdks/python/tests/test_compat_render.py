@@ -476,6 +476,8 @@ def test_a_version_with_its_own_page_is_never_drawn_from_the_default_branch():
         "0.7.0-b1",
         "0.7.0beta1",
         "0.7.0b01",
+        "1.0c1",
+        "1.0post1",
         "00.7.0b1",
         "0.7.0b2+local",
         "1!2.0",
