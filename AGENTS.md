@@ -214,11 +214,12 @@ commit, which does not know what was declared since). Such a run adds what
 only it knows and takes nothing away. It forgets nothing, writes nothing over
 a point a later run has spoken for, has no say about the run's own health, and
 rewrites the issue of a subject only when it is the newest word on all of it.
-Which run spoke last for a point is told by the run that wrote it (each point
-keeps the run and the commit of its last result), not by the day: two runs
-planned on one day are told apart, and every job of an old run run again does
-not speak over what a run created after it found at a newer commit. Where only
-older runs have spoken, what it found is the newest word and is written.
+Which of two words on a point is the newer is told by the runs that said
+them, not by the day (each point keeps the run and the commit of its last
+result). At another commit it is the word of the run created later, which
+built the newer commit whenever either was planned: every job of an old run,
+run again, makes a plan today and still builds its old commit. At the same
+commit it is the word planned later.
 A release inside the tested range that only it saw failing is remembered and
 run again by the next plan. Its summary says it is behind; to say how things
 stand now, start a new run: `gh workflow run compat.yml`.

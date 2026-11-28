@@ -3621,72 +3621,81 @@ def test_what_the_weekly_run_found_wrong_with_itself_is_kept_for_the_daily_run(
 
 # --- what a later run has spoken for is told by the run, not by the day ---------------
 
-_LAST = {"date": "2026-11-26", "run": ["2026-11-26T19:40:00Z", "5"], "commit": "c" * 40}
+_C, _OTHER = "c" * 40, "a" * 40
+_AT = "2026-11-26T19:40:00Z"
+_LAST = {"date": "2026-11-26", "run": [_AT, "5"], "commit": _C}
 
 
 @pytest.mark.parametrize(
-    ("last", "started", "run_id", "commit", "old", "spoken"),
+    ("last", "started", "run_id", "commit", "spoken"),
     [
-        ({}, "2026-11-26T19:40:00Z", "5", "c", False, False),
-        (_LAST, "2026-11-26T19:40:00Z", "5", "c" * 40, False, False),
-        (_LAST, "2026-11-26T19:30:00Z", "9", "c" * 40, False, True),
-        (_LAST, "2026-11-26T19:40:00Z", "4", "c" * 40, False, True),
-        (_LAST, "2026-11-26T19:50:00Z", "1", "c" * 40, False, False),
-        (_LAST, "2026-11-27T08:00:00Z", "1", "a" * 40, False, False),
-        (_LAST, "2026-11-27T08:00:00Z", "1", "a" * 40, True, True),
-        (_LAST, "2026-11-27T08:00:00Z", "1", "c" * 40, True, False),
-        ({**_LAST, "commit": None}, "2026-11-27T08:00:00Z", "1", "c" * 40, True, True),
-        (_LAST, "2026-11-27T08:00:00Z", "6", "a" * 40, True, False),
-        (_LAST, "2026-11-27T08:00:00Z", "10", "a" * 40, True, False),
-        ({**_LAST, "run": [_LAST["run"][0], "10"]}, "2026-11-27T08:00:00Z", "9", "a", True, True),
-        (_LAST, "2026-11-26T19:40:00Z", "5", "a" * 40, True, False),
-        ({"date": "2026-11-26"}, "2026-11-25T19:40:00Z", "1", "c", False, True),
-        ({"date": "2026-11-26"}, "2026-11-26T19:40:00Z", "1", "c", False, True),
-        ({"date": "2026-11-26"}, "2026-11-27T19:40:00Z", "1", "c", False, False),
-        ({"date": "2026-11-26"}, "2026-11-27T19:40:00Z", "1", "c", True, False),
-        ({**_LAST, "run": ["x"]}, "2026-11-27T19:40:00Z", "1", "c" * 40, False, False),
-        ({**_LAST, "run": "2026-11-28"}, "2026-11-26T19:40:00Z", "1", "c" * 40, False, True),
-        ({**_LAST, "run": [5, 6]}, "2026-11-27T19:40:00Z", "1", "c" * 40, False, False),
-        ({**_LAST, "run": ["2026-11-28", 6]}, "2026-11-26T19:40:00Z", "1", "c" * 40, False, True),
-        ({**_LAST, "run": [_LAST["run"][0], 6]}, "2026-11-26T19:40:00Z", "1", "c" * 40, True, True),
-        (
-            {**_LAST, "run": [_LAST["run"][0], 6]},
-            "2026-11-27T19:40:00Z",
-            "1",
-            "c" * 40,
-            True,
-            False,
-        ),
+        # The same build: the word planned later is the later one.
+        (_LAST, _AT, "5", _C, False),
+        (_LAST, "2026-11-26T19:30:00Z", "9", _C, True),
+        (_LAST, "2026-11-26T19:40:00Z", "4", _C, True),
+        (_LAST, "2026-11-26T19:50:00Z", "1", _C, False),
+        (_LAST, "2026-11-27T08:00:00Z", "5", _C, False),
+        (_LAST, "2026-11-25T08:00:00Z", "5", _C, True),
+        # Another build: the run created later built the newer commit, whenever either
+        # was planned.
+        (_LAST, "2026-11-27T08:00:00Z", "1", _OTHER, True),
+        (_LAST, "2026-11-25T08:00:00Z", "1", _OTHER, True),
+        (_LAST, "2026-11-27T08:00:00Z", "6", _OTHER, False),
+        (_LAST, "2026-11-25T08:00:00Z", "6", _OTHER, False),
+        (_LAST, "2026-11-25T08:00:00Z", "10", _OTHER, False),
+        ({**_LAST, "run": [_AT, "10"]}, "2026-11-27T08:00:00Z", "9", _OTHER, True),
+        ({**_LAST, "commit": None}, "2026-11-27T08:00:00Z", "1", _C, True),
+        ({**_LAST, "commit": None}, "2026-11-27T08:00:00Z", "6", _C, False),
+        # Its own earlier attempt is the same build, whatever the point kept of the commit.
+        ({**_LAST, "commit": None}, "2026-11-27T08:00:00Z", "5", _C, False),
+        ({**_LAST, "commit": None}, "2026-11-25T08:00:00Z", "5", _C, True),
+        # Written before the run was kept on a point: by the day.
+        ({}, _AT, "5", _C, False),
+        ({"date": "2026-11-26"}, "2026-11-25T19:40:00Z", "1", _C, True),
+        ({"date": "2026-11-26"}, "2026-11-26T19:40:00Z", "1", _C, True),
+        ({"date": "2026-11-26"}, "2026-11-27T19:40:00Z", "1", _C, False),
+        ({"date": "2026-11-26", "commit": _OTHER}, "2026-11-27T19:40:00Z", "1", _C, False),
+        # A name that is not a pair of texts is no name.
+        ({**_LAST, "run": ["x"]}, "2026-11-27T19:40:00Z", "1", _C, False),
+        ({**_LAST, "run": "2026-11-28"}, "2026-11-26T19:40:00Z", "1", _C, True),
+        ({**_LAST, "run": [5, 6]}, "2026-11-27T19:40:00Z", "1", _OTHER, False),
+        ({**_LAST, "run": [_AT, 6]}, "2026-11-26T19:40:00Z", "1", _C, True),
+        ({**_LAST, "run": [_AT, 6]}, "2026-11-27T19:40:00Z", "1", _OTHER, False),
+        ({**_LAST, "run": [6, "5"]}, "2026-11-27T19:40:00Z", "5", _C, False),
     ],
     ids=[
+        "same-build-its-own-attempt",
+        "same-build-planned-later-the-same-day",
+        "same-build-planned-at-the-same-instant-with-a-later-id",
+        "same-build-planned-earlier-the-same-day",
+        "same-build-its-own-attempt-planned-earlier",
+        "same-build-its-own-attempt-planned-later",
+        "another-build-created-later-planned-earlier",
+        "another-build-created-later-planned-later",
+        "another-build-created-earlier-planned-earlier",
+        "another-build-created-earlier-planned-later",
+        "another-build-created-earlier-with-a-shorter-id",
+        "another-build-created-later-with-a-longer-id",
+        "no-commit-kept-created-later",
+        "no-commit-kept-created-earlier",
+        "no-commit-kept-its-own-attempt-planned-earlier",
+        "no-commit-kept-its-own-attempt-planned-later",
         "never-run",
-        "its-own-earlier-attempt",
-        "a-run-planned-later-the-same-day",
-        "a-run-planned-at-the-same-instant-with-a-later-id",
-        "a-run-planned-earlier-the-same-day",
-        "an-earlier-run-at-another-commit",
-        "a-run-created-later-and-this-run-is-of-an-old-commit",
-        "a-run-created-later-at-this-runs-own-commit",
-        "a-run-created-later-that-kept-no-commit",
-        "a-run-created-earlier-and-this-run-is-of-an-old-commit",
-        "a-run-created-earlier-with-a-shorter-id",
-        "a-run-created-later-with-a-longer-id",
-        "its-own-earlier-attempt-and-this-run-is-of-an-old-commit",
         "unnamed-and-a-later-day",
         "unnamed-and-the-same-day",
         "unnamed-and-an-earlier-day",
-        "unnamed-an-earlier-day-and-this-run-is-of-an-old-commit",
-        "a-name-that-is-not-one-and-an-earlier-day",
-        "a-name-that-is-not-one-and-the-same-day",
-        "a-name-of-numbers-and-an-earlier-day",
-        "a-name-half-of-numbers-and-the-same-day",
-        "a-name-with-the-same-instant-and-a-number-the-same-day",
-        "a-name-with-a-number-and-an-earlier-day",
+        "unnamed-another-commit-and-an-earlier-day",
+        "a-name-of-one-part",
+        "a-name-that-is-text-the-same-day",
+        "a-name-of-numbers-an-earlier-day",
+        "a-name-with-a-number-the-same-day",
+        "a-name-with-a-number-another-build-an-earlier-day",
+        "a-name-with-a-number-first-its-own-id",
     ],
 )
-def test_what_a_later_run_has_spoken_for(last, started, run_id, commit, old, spoken):
+def test_what_a_run_that_is_behind_leaves_standing(last, started, run_id, commit, spoken):
     run = {"started_at": started, "date": started[:10], "id": run_id, "sdk_commit": commit}
-    assert report.spoken_for(last, run, old_commit=old) is spoken
+    assert report.spoken_for(last, run) is spoken
 
 
 def test_of_two_runs_planned_on_one_day_the_one_planned_first_writes_nothing_over_the_other(
@@ -3838,3 +3847,48 @@ def test_a_run_started_again_off_the_tip_is_the_newest_word_where_only_older_run
         assert (last["outcome"], last["commit"]) == ("fail", "b" * 40), replanned
         assert [what.split()[0] for what in done] == ["open"], replanned
         assert list(state()["failing"].values()) == [day]
+
+
+def test_an_old_run_run_again_whole_does_not_outrank_a_newer_build_by_its_new_plan(
+    tmp_path, monkeypatch, capsys
+):
+    """A run at a newer commit found a regression, and its report never wrote. Every job
+    of the run before it is then run again: a plan made now, the old commit, a pass. When
+    the newer run's failed jobs are run again its plan is the older one, and its build the
+    newer: what it found stands over the old build's pass."""
+    run, state, done, _ = _behind_world(tmp_path, monkeypatch, now="2026-11-28")
+    old, new = "a" * 40, "b" * 40
+    monkeypatch.setenv("GITHUB_SHA", old)
+    monkeypatch.setenv("COMPAT_TIP", old)
+    assert run("2026-11-26", "100", "1", _result(_FLOOR), _result(_TOP)) == 0
+    # Run 200, at the newer commit, planned on the 27th, wrote nothing.
+    monkeypatch.setenv("COMPAT_TIP", new)
+    assert run("2026-11-28", "100", "2", _result(_FLOOR), _result(_TOP)) == 0
+    assert state()["points"]["openai_agents--claim_top"]["last"]["run"] == [
+        "2026-11-28T19:40:00Z",
+        "100",
+    ]
+    done.clear()
+    capsys.readouterr()
+    monkeypatch.setenv("GITHUB_SHA", new)
+    assert run("2026-11-27", "200", "2", _result(_FLOOR), _result(_TOP, "fail")) == report.RED_EXIT
+    assert "a run planned after this one has already reported" in capsys.readouterr().out
+    last = state()["points"]["openai_agents--claim_top"]["last"]
+    assert (last["outcome"], last["commit"]) == ("fail", new)
+    assert [what.split()[0] for what in done] == ["open"]
+    # And the old run, run again once more, does not put its pass back over it.
+    done.clear()
+    monkeypatch.setenv("GITHUB_SHA", old)
+    assert (
+        run(
+            "2026-11-28",
+            "100",
+            "3",
+            _result(_FLOOR),
+            _result(_TOP),
+            **{"cutoff": "2026-11-28T21:00:00Z"},
+        )
+        == 0
+    )
+    assert state()["points"]["openai_agents--claim_top"]["last"]["outcome"] == "fail"
+    assert done == []
