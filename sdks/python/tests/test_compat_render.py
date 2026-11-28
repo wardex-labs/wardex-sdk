@@ -425,12 +425,14 @@ def test_a_version_not_published_yet_gets_cells_drawn_from_the_default_branch():
     assert "0.7.0b2/README.md" in files and "0.7.0b2/langgraph.svg" in files
     cell = ET.fromstring(files["0.7.0b2/openai_agents.svg"])  # noqa: S314 - made just above
     said = cell.find("{http://www.w3.org/2000/svg}title").text
-    assert said == "unpublished · 0.23.1 passes · 28 Nov", "the build's row, not the release's"
+    assert said == "from main · 0.23.1 passes · 28 Nov", "the build's row, not the release's"
     assert cell.find("{http://www.w3.org/2000/svg}circle").get("fill") == "#2da44e"
     assert "0.23.1 fails" in files[f"{_RELEASE}/openai_agents.svg"], "the release keeps its own"
     page = files["0.7.0b2/README.md"]
-    assert page.startswith("# Compatibility of wardex 0.7.0b2, not published yet\n")
-    assert "PyPI did not serve `wardex-sdk==0.7.0b2`" in page and "`fedcba9876`" in page
+    assert page.startswith("# Compatibility of wardex 0.7.0b2, before its release is run\n")
+    assert "has not yet run `wardex-sdk==0.7.0b2` as PyPI serves it" in page
+    assert "did not serve" not in page, "a run that could not read PyPI does not know that"
+    assert "`fedcba9876`" in page
     assert "No row here is a result of the published wheel." in page
     assert "\n## openai-agents\n" in page, "the heading the README's link lands on"
     assert (
@@ -438,29 +440,57 @@ def test_a_version_not_published_yet_gets_cells_drawn_from_the_default_branch():
         in page
     )
     index = files["README.md"].splitlines()
-    assert "- [wardex 0.7.0b2, not published yet](0.7.0b2/README.md)" in index
+    assert "- [wardex 0.7.0b2, before its release is run](0.7.0b2/README.md)" in index
     assert "0.8.0.dev0/README.md" in render.site(_bumped("0.8.0.dev0"), _TODAY), "any number"
-    assert index.index("- [wardex 0.7.0b2, not published yet](0.7.0b2/README.md)") < index.index(
-        f"- [wardex {_RELEASE}]({_RELEASE}/README.md)"
-    )
+    assert index.index(
+        "- [wardex 0.7.0b2, before its release is run](0.7.0b2/README.md)"
+    ) < index.index(f"- [wardex {_RELEASE}]({_RELEASE}/README.md)")
 
 
 def test_a_version_with_its_own_page_is_never_drawn_from_the_default_branch():
     state = _bumped(_RELEASE)
     files = render.site(state, _TODAY)
-    assert render.unpublished(state) == ""
+    assert render.unreleased(state) == ""
     assert "0.23.1 fails" in files[f"{_RELEASE}/openai_agents.svg"]
-    assert "not published yet" not in files[f"{_RELEASE}/README.md"] + files["README.md"]
+    assert "before its release" not in files[f"{_RELEASE}/README.md"] + files["README.md"]
     assert sorted(name.split("/")[0] for name in files) == sorted(
         [_RELEASE, _RELEASE, "README.md", "main"]
     )
 
 
-@pytest.mark.parametrize("version", ["../../outside", "main", "", None, 7, ["0.7.0b2"], "x" * 99])
+@pytest.mark.parametrize(
+    "version",
+    [
+        "../../outside",
+        "0/../../outside",
+        "0.7.0B1",
+        "main",
+        "",
+        None,
+        7,
+        ["0.7.0b2"],
+        "x" * 99,
+        "1" * 41,
+    ],
+)
 def test_a_version_string_that_is_not_a_release_number_names_no_folder(version, tmp_path):
     state = _bumped(version)
-    assert render.unpublished(state) == ""
+    assert render.unreleased(state) == ""
     before = sorted(render.site(_bumped(_RELEASE), _TODAY))
     assert sorted(render.site(state, _TODAY)) == before
+    render.write_site(tmp_path / "records", state, _TODAY)
+    assert not (tmp_path / "outside").exists()
+
+
+def test_an_adapter_whose_name_is_not_a_name_gets_no_cell_under_the_coming_version(tmp_path):
+    state = _bumped()
+    state["versions"]["main"]["adapters"]["../../outside"] = {"label": "x"}
+    state["versions"]["main"]["adapters"]["BAD NAME"] = {"label": "x"}
+    files = render.site(state, _TODAY)
+    assert sorted(name for name in files if name.startswith("0.7.0b2/")) == [
+        "0.7.0b2/README.md",
+        "0.7.0b2/langgraph.svg",
+        "0.7.0b2/openai_agents.svg",
+    ]
     render.write_site(tmp_path / "records", state, _TODAY)
     assert not (tmp_path / "outside").exists()
