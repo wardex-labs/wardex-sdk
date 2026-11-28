@@ -1449,3 +1449,44 @@ def test_the_page_that_stands_in_for_an_unreleased_version_names_other_commits_t
     shipped = {**_GONE, "sdk": {"origin": "pypi", "version": "0.7.0b1"}}
     state["points"]["published--0.7.0b1--x"] = {"point": shipped, "last": {"commit": "c" * 40}}
     assert "another commit" not in render.page(state, "0.7.0b1", "2026-11-30")
+
+
+def test_a_wheel_that_did_not_build_opens_no_issue_for_what_is_watched(tmp_path):
+    """Every point left no result: the run's own failure, on the health issue. A watching
+    point that left none says nothing about its subject, so nothing is opened for a set of
+    frameworks, a program or a release tag; a line that was there stays, as what it last said."""
+    made = _plan()
+    nothing = {p["key"]: _result(p, "no_result") for p in made["points"]}
+    wanted = {i["key"]: i for i in report.wanted_issues(made, nothing, {}, _RUN)}
+    for subject in ("openai_agents__pydantic_ai", "all_frameworks", "codex_exec", "hermes_agent"):
+        assert wanted[subject]["open"] is False, subject
+    assert wanted["openai_agents"]["open"] is True, "a tested range with no proof is said"
+    assert "### Watching" not in wanted["openai_agents"]["body"]
+    assert "cli--codex_exec--claim_top` left no usable result" in wanted["health"]["body"]
+    # Yesterday the program failed. Today it left no result: the line stays, as yesterday's.
+    key = "cli--codex_exec--claim_top"
+    failed = {p["key"]: _result(p) for p in made["points"]}
+    failed[key] = _result(failed[key], "fail", tests={"failed_ids": ["one execute_tool span"]})
+    state = report.next_state({}, failed, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    after = report.next_state(state, nothing, _RUN, tmp_path, made)
+    issue = report.adapter_issue("codex_exec", made, nothing, _RUN, after)
+    assert issue["open"] is True
+    assert (
+        "live program: `openai/codex 0.160.0` did not pass when it was last checked, on "
+        "`2026-11-25`, and left no result today." in issue["body"]
+    )
+    # A harness error is the same, and a result is a result again.
+    broke = {**nothing, key: _result(nothing[key], "harness_error")}
+    assert report.adapter_issue("codex_exec", made, broke, _RUN, after)["open"] is True
+    assert report.adapter_issue("codex_exec", made, broke, _RUN, {})["open"] is False
+    # What it last said was about another release: nothing is known of this one.
+    moved = {**nothing, key: {**nothing[key], "targets": {"@openai/codex": "0.161.0"}}}
+    assert report.adapter_issue("codex_exec", made, moved, _RUN, after)["open"] is False
+    # And a pass when it was last checked is no line.
+    green = report.next_state(
+        {}, {p["key"]: _result(p) for p in made["points"]}, _RUN, tmp_path, made
+    )
+    assert report.adapter_issue("codex_exec", made, nothing, _RUN, green)["open"] is False
+    passing = {p["key"]: _result(p) for p in made["points"]}
+    later = report.next_state(after, passing, {**_RUN, "id": "3"}, tmp_path, made)
+    assert report.adapter_issue("codex_exec", made, passing, _RUN, later)["open"] is False

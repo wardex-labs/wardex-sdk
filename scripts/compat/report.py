@@ -1163,6 +1163,24 @@ def adapter_issue(
             # watching failure as a broken promise or a promise as merely watched.
             if outcome in GREEN or (outcome in NOT_OURS and not result["in_claim"]):
                 continue
+            if outcome in ("no_result", "harness_error") and result["key"] not in old:
+                # The run's own failure, and on the health issue as that. It says nothing
+                # of the subject: a wheel that did not build must not open an issue for
+                # everything that is watched. What the point said when it last was
+                # checked still stands, and keeps its line.
+                before = known.get(result["key"], {}).get("last_checked") or {}
+                if (
+                    before.get("outcome") not in FAILED
+                    or before.get("targets") != result["targets"]
+                ):
+                    continue
+                watched.append(
+                    f"{_kind_label(result)}: {version} did not pass when it was last checked, "
+                    f"on {code(before.get('date', ''))}, and left no result today. "
+                    f"Closes {_kind_closes(result)}."
+                )
+                marks.append([result["key"], "watching", before["outcome"], []])
+                continue
             watched.append(
                 f"{_kind_label(result)}: {version} {what}{when}. Closes {_kind_closes(result)}."
             )
