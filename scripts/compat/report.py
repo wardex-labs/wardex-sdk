@@ -548,6 +548,11 @@ def run_list(before: object, run: dict) -> list[dict]:
     # A state from before the list existed has none, and that is a list of nothing. Anything
     # else that is not a list is damage, and is kept as that.
     held = [] if before is None else before if isinstance(before, list) else [before]
+    # The newest day the list knows. A run is dated by its plan, and failed jobs run again
+    # weeks later still carry the old plan's day: a mark dated by such a run would be old
+    # the day it was made, and the next ordinary run would drop it.
+    days = [old["date"] for old in held if gate.entry_ok(old) and _DAY.fullmatch(old["date"])]
+    latest = max([today, *days])
     kept = []
     for old in held:
         # Dated by its plan, and so possibly after this run: failed jobs of yesterday's run,
@@ -561,8 +566,8 @@ def run_list(before: object, run: dict) -> list[dict]:
         # is not fit to release, so it is not dropped by the next run that comes along: it
         # stays, as something the gate cannot read, for as long as an entry would.
         seen = old.get("unreadable_since") if isinstance(old, dict) else None
-        if not (isinstance(seen, str) and _DAY.fullmatch(seen) and seen <= today):
-            seen = today
+        if not (isinstance(seen, str) and _DAY.fullmatch(seen) and seen <= latest):
+            seen = latest
         if seen >= oldest:
             kept.append({"unreadable_since": seen})
     return [*kept, entry]
