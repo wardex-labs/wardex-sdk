@@ -137,6 +137,15 @@ def decide(lines: list[dict], *, commit: str, today: str, claims: dict[str, int]
                 f"{name}: {proving.get(name, 0)} passing points inside its tested range, "
                 f"{need} are needed"
             )
+    red = any(_attempt(line) == last and line["run"].get("red") is True for line in newest)
+    if red and not reasons:
+        # A run is also red for what its plan could not make a point of: a tested release
+        # that admits no supported interpreter, an adapter the index would not list. No
+        # line holds that, and a release needs the run to have been green.
+        reasons.append(
+            "the run ended red for a reason no point holds (its plan could not cover "
+            "something the tree says is tested); see the run"
+        )
     return {"pass": not reasons, "reasons": reasons, "run": clean(newest[0]["run"].get("url", ""))}
 
 
@@ -150,12 +159,26 @@ def read_override(root: Path, version: str) -> dict | None:
         return None
 
 
+def rejected_override(root: Path, version: str) -> str:
+    """What to say when the tree carries an override file that does not apply, or "".
+
+    A gate that fails closed in silence leaves the person who wrote the file guessing."""
+    path = root / OVERRIDE
+    if not path.is_file() or read_override(root, version) is not None:
+        return ""
+    return (
+        f"`{OVERRIDE}` is in this tree and does not apply. It has to be a JSON object with "
+        f'"version": "{version}" (the version of this tree) and a "reason" that says in '
+        "words why the release goes out without the proof."
+    )
+
+
 def tree_version(root: Path) -> str:
     match = _VERSION_LINE.search((root / "sdks/python/pyproject.toml").read_text(encoding="utf-8"))
     return match[1] if match else ""
 
 
-def words(decision: dict, override: dict | None, commit: str) -> str:
+def words(decision: dict, override: dict | None, commit: str, rejected: str = "") -> str:
     """What the gate prints: the decision, why, and what to do about it."""
     lines = ["## Release gate: compatibility", ""]
     if decision["pass"]:
@@ -185,6 +208,8 @@ def words(decision: dict, override: dict | None, commit: str) -> str:
                 f"**OVERRIDDEN** for {override['version']} by `{OVERRIDE}` in this tree. Reason "
                 f"given: {override['reason']}. The release goes on, and its page will say so.",
             ]
+        elif rejected:
+            lines += ["", rejected]
     return "\n".join(lines) + "\n"
 
 
@@ -199,7 +224,8 @@ def main(argv: list[str] | None = None) -> int:
         read_lines(Path(args.records), today), commit=args.commit, today=today, claims=claimed(REPO)
     )
     override = None if decision["pass"] else read_override(REPO, tree_version(REPO))
-    text = words(decision, override, args.commit)
+    rejected = "" if decision["pass"] else rejected_override(REPO, tree_version(REPO))
+    text = words(decision, override, args.commit, rejected)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

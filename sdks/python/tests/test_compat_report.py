@@ -2817,11 +2817,11 @@ def test_every_run_says_what_the_release_gate_would_say_of_its_commit(monkeypatc
     assert (
         "- openai_agents--floor: openai-agents 0.22.0 is inside the tested range and: " in stopped
     )
-    branch = _rehearsed(_result(_FLOOR), _result(_TOP), ref="refs/heads/some-branch")
-    assert "no whole compatibility run on the default branch" in branch
-    assert "no whole compatibility run" in _rehearsed(
-        _result(_FLOOR), _result(_TOP), scope="partial"
-    )
+    for elsewhere in (
+        _rehearsed(_result(_FLOOR), _result(_TOP), ref="refs/heads/some-branch"),
+        _rehearsed(_result(_FLOOR), _result(_TOP), scope="partial"),
+    ):
+        assert "This run cannot say" in elsewhere and "would" not in elsewhere
 
 
 def test_a_rehearsal_that_breaks_costs_the_run_nothing(monkeypatch):
@@ -2847,3 +2847,31 @@ def test_the_page_of_a_release_that_overrode_its_gate_says_so(tmp_path):
     plan["published"]["override"] = None
     state = report.next_state(state, {}, _RUN, tmp_path, plan)
     assert "without a passing" not in render.page(state, "0.7.0b1", "2026-11-26")
+
+
+def test_a_run_writes_its_colour_on_every_line_it_records(tmp_path, monkeypatch):
+    """The release gate reads lines and nothing else. A run that was red because its plan
+    could not cover a tested release has no line that says so, unless every line does."""
+    monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
+    monkeypatch.setattr(report.GitHub, "do", lambda self, what, *rest: None)
+    for name in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "GITHUB_REPOSITORY"):
+        monkeypatch.delenv(name, raising=False)
+
+    def lines_of(plan: dict, where: str) -> tuple[int, list[dict]]:
+        records, results_dir = tmp_path / where / "records", tmp_path / where / "results"
+        records.mkdir(parents=True)
+        (tmp_path / where / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        _write(results_dir, _result(_FLOOR))
+        _write(results_dir, _result(_TOP))
+        argv = ["--plan", str(tmp_path / where / "plan.json"), "--results", str(results_dir)]
+        code = report.main([*argv, "--state-dir", str(records), "--write"])
+        (day,) = (records / "records").rglob("*.jsonl")
+        return code, [json.loads(line) for line in day.read_text(encoding="utf-8").splitlines()]
+
+    code, green = lines_of(_plan(_FLOOR, _TOP), "green")
+    assert code == 0 and [line["run"]["red"] for line in green] == [False, False]
+    problem = _plan(_FLOOR, _TOP)
+    problem["adapters"]["openai_agents"]["problems"] = ["0.22.0 admits no supported interpreter"]
+    code, red = lines_of(problem, "red")
+    assert code == report.RED_EXIT and [line["run"]["red"] for line in red] == [True, True]
+    assert all(line["outcome"] == "pass" for line in red), "no line of its own says why"

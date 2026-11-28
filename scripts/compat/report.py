@@ -1288,6 +1288,17 @@ def gate_rehearsal(plan: dict, results: dict[str, dict], run: dict) -> str:
     Printed by every run, so the gate's verdict is seen daily and not for the first time
     on the day of a release. It decides nothing here."""
     said = ["", "### If this commit were released now", ""]
+    if run.get("scope") != "all" or run.get("ref") != gate.MAIN_REF:
+        # A run of one adapter, or a run on a branch, proves nothing to the gate whatever
+        # it found, and saying "no run" from inside a run would be a strange thing to read.
+        return "\n".join(
+            [
+                *said,
+                "This run cannot say: the release gate reads only whole runs on the default "
+                "branch, and this is not one.",
+                "",
+            ]
+        )
     try:
         decision = gate.decide(
             records(plan, results, run),
@@ -1332,6 +1343,9 @@ def main(argv: list[str] | None = None) -> int:
     results = load_results(plan, results_dir)
     apply_skip_rule(results, state)
     reasons = judge(plan, results)
+    # On every record line of the run, so a reader of the lines alone (the release gate)
+    # knows the run's colour, also when the reason is one no point holds.
+    run["red"] = bool(reasons)
     new_state = next_state(state, results, run, results_dir, plan)
     locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
 
