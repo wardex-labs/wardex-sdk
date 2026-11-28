@@ -240,11 +240,16 @@ red-capable kind. Everything else that needs a person
 arrives as an issue labelled `compat`: one per subject (an adapter, a set of
 frameworks run together, a program with no tested range), one for problems
 with the run itself, and one opened by a run that ended without a verdict. A
-watching point that left no result is a problem with the run and is said
-there. Of its subject it says nothing, in either direction: it opens no issue
-and closes none. An open issue shows the line and stays open, with no comment;
-where the point failed on that same release when it was last checked, that is
-still what the issue says. Each is
+point that could not be checked today says nothing of its subject, in either
+direction. A release that failed when it was last checked, inside the range
+or above it, watched or not, is still failing as far as anyone knows: its
+line stays, with no comment, on a day the index was down, it would not
+install, or the run left no result for it. A watching point that left no
+result (the run's own failure, said on the health issue), and a release above
+the range that could not be installed, with no failure known of them, are
+listed under "Not checked today" and count for nothing: they open no issue
+and close none. A watching release inside the range that will not install is
+said, as is a set of frameworks that will not install together. Each is
 found by a marker in its body, rewritten by every run and closed by the run
 when nothing is left to do; on a day a release could not be checked at all,
 nothing is closed. Records accumulate on the `compat-results` branch, one JSON

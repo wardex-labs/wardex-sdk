@@ -1181,35 +1181,46 @@ def adapter_issue(
         if is_watching(result):
             # Reported, and never an argument for red. Said apart, so nobody reads a
             # watching failure as a broken promise or a promise as merely watched.
-            if outcome in GREEN or (outcome in NOT_OURS and not result["in_claim"]):
+            if outcome in GREEN:
                 continue
-            if outcome in ("no_result", "harness_error"):
-                # The run's own failure, and on the health issue as that. It says nothing
-                # of the subject, in either direction: a wheel that did not build must not
-                # open an issue for everything that is watched, and a day nothing could
-                # be checked must not close one.
+            # Not checked today: it left no result (the run's own failure, on the health
+            # issue as that), or it could not be installed. Several frameworks that will
+            # not install together are not that: it is what a point of that kind finds.
+            found = outcome == "not_installable" and len(result.get("adapters") or []) > 1
+            unseen = outcome in ("no_result", "harness_error")
+            if unseen or (outcome in NOT_OURS and not found):
                 before = known.get(result["key"], {}).get("last_checked") or {}
                 if before.get("outcome") in FAILED and before.get("targets") == result["targets"]:
                     # What the point said when this release was last checked still stands,
-                    # and is the same thing to say as on the day it said it.
+                    # and is the same thing to say as on the day it said it: a day nothing
+                    # could be checked must not close an issue.
                     watched.append(
                         f"{_kind_label(result)}: {version} did not pass when it was last "
-                        f"checked, on {code(before.get('date', ''))}, and has left no result "
-                        f"since. Closes {_kind_closes(result)}."
+                        f"checked, on {code(before.get('date', ''))}, and could not be checked "
+                        f"since ({what}). Closes {_kind_closes(result)}."
                     )
                     marks.append(
                         [result["key"], "watching", before["outcome"], before.get("failed_ids", [])]
                     )
                     continue
-                held.append(
-                    f"{_kind_label(result)}: {version} left no result{when}, so nothing is "
-                    "known of it. This neither opens nor closes the issue."
-                )
-                continue
+                if unseen or not result["in_claim"]:
+                    # It says nothing of the subject, in either direction: a wheel that did
+                    # not build must not open an issue for everything that is watched, and
+                    # a release above the range that will not install asks nothing of
+                    # anyone. Neither is a reason to close what is open.
+                    held.append(
+                        f"{_kind_label(result)}: {version} could not be checked{when} "
+                        f"({what}), so nothing is known of it. This neither opens nor closes "
+                        "the issue."
+                    )
+                    continue
             watched.append(
                 f"{_kind_label(result)}: {version} {what}{when}. Closes {_kind_closes(result)}."
             )
-            marks.append([result["key"], "watching", outcome, nodes])
+            # As the state keeps them, so that the day after says the same thing.
+            marks.append(
+                [result["key"], "watching", outcome, [clean(node, 300) for node in nodes[:200]]]
+            )
             if nodes:
                 failing.append((result, nodes))
             continue
@@ -1292,6 +1303,34 @@ def adapter_issue(
                 "once that it is untested. This closes when the adapter supports it and the "
                 "range includes it."
             )
+        elif not result["in_claim"] and outcome not in GREEN:
+            # Above the range and not checked today. What it said when this release was
+            # last checked still stands: a day the index was down is no day it passed.
+            before = known.get(result["key"], {}).get("last_checked") or {}
+            if before.get("outcome") not in FAILED or before.get("targets") != result["targets"]:
+                # Nothing is known of it, and nothing is asked: it opens no issue, and is
+                # no reason to close one.
+                held.append(
+                    f"{version} is newer than the tested range and could not be checked today "
+                    f"({OUTCOME_WORDS[outcome]}), so nothing is known of it. This neither opens "
+                    "nor closes the issue."
+                )
+                continue
+            todo.append(
+                f"{version} is newer than the tested range. It did not pass when it was last "
+                f"checked, on {code(before.get('date', ''))}, and could not be checked today: "
+                f"{OUTCOME_WORDS[outcome]}. This closes when the adapter supports it and the "
+                "range includes it."
+            )
+            marks.append(
+                [
+                    result["key"],
+                    before["outcome"],
+                    before.get("cause"),
+                    before.get("failed_ids", []),
+                ]
+            )
+            continue
         elif not result["in_claim"] and outcome in GREEN and info["evidence"] == "live":
             todo.append(
                 f"{version} is newer than the tested range and passes. The range can be widened "
@@ -1299,7 +1338,11 @@ def adapter_issue(
             )
         else:
             continue
-        marks.append([result["key"], outcome, result["cause"], nodes])
+        # The names as the state keeps them, so that a day the release cannot be checked
+        # says the same thing as the day it failed, whatever the names hold.
+        marks.append(
+            [result["key"], outcome, result["cause"], [clean(n, 300) for n in nodes[:200]]]
+        )
         if nodes:
             failing.append((result, nodes))
 
@@ -1369,9 +1412,12 @@ def adapter_issue(
     body += [f"- Note: {clean(note)}" for note in info.get("notes", [])]
     body += ["", "### What needs doing", ""]
     body += [f"- {line}" for line in todo] or ["Nothing."]
-    if watched or held:
+    if watched:
         body += ["", "### Watching (never turns the run red)", ""]
-        body += [f"- {line}" for line in [*watched, *held]]
+        body += [f"- {line}" for line in watched]
+    if held:
+        body += ["", "### Not checked today", ""]
+        body += [f"- {line}" for line in held]
     body += ["", "### Points", "", *_table(mine)]
     if _left_out(mine):
         body += ["", *_left_out(mine)]
@@ -1413,7 +1459,7 @@ def adapter_issue(
             f"({code(item.get('date', ''))}) and is no longer run: {why}. That is not a pass."
         )
     closing += "".join(f" {sentence}" for sentence in left)
-    if left and (todo or watched):
+    if left and (todo or watched or held):
         # The issue stays open for something else, and the trace is of this run alone:
         # said here and in a comment of its own, or it would never be said.
         body += ["", "### No longer run", "", *[f"- {sentence}" for sentence in left]]
@@ -1690,7 +1736,12 @@ def sync_issue(gh: GitHub, wanted: dict, existing: list[dict], assignee: str = "
                     f"<!-- compat-fingerprint: {wanted['fingerprint']} -->",
                     f"<!-- compat-fingerprint: {was} -->",
                 )
-            gh.do(f"rewrite #{mine['number']}", "PATCH", f"issues/{mine['number']}", {"body": body})
+            path = f"issues/{mine['number']}"
+            gh.do(f"rewrite #{mine['number']}", "PATCH", path, {"body": body})
+            if wanted.get("left"):
+                # A check that left while it was not passing: of this run alone, so now.
+                text = "No longer run:\n\n" + "\n".join(f"- {c}" for c in wanted["left"])
+                gh.do(f"comment on #{mine['number']}", "POST", f"{path}/comments", {"body": text})
         return
     if mine is None:
         if wanted["open"]:

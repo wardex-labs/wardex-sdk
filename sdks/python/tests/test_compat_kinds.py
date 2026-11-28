@@ -1476,10 +1476,11 @@ def test_a_wheel_that_did_not_build_opens_no_issue_for_what_is_watched(tmp_path)
     assert (adapter["open"], adapter["hold"]) == (True, False), "a tested range with no proof"
     assert "cli--codex_exec--claim_top` left no usable result" in wanted["health"]["body"]
     line = (
-        "- live program: `openai/codex 0.160.0` left no result, so nothing is known of it. "
-        "This neither opens nor closes the issue."
+        "- live program: `openai/codex 0.160.0` could not be checked (no result), so nothing "
+        "is known of it. This neither opens nor closes the issue."
     )
-    assert line in wanted["codex_exec"]["body"]
+    assert f"### Not checked today\n\n{line}" in wanted["codex_exec"]["body"]
+    assert "### Watching" not in wanted["codex_exec"]["body"]
     broke = {
         **nothing,
         "cli--codex_exec--claim_top": _result(
@@ -1510,7 +1511,7 @@ def test_a_day_nothing_could_be_checked_closes_nothing(tmp_path):
     assert (same["open"], same["hold"]) == (True, False)
     assert (
         "live program: `openai/codex 0.160.0` did not pass when it was last checked, on "
-        "`2026-11-25`, and has left no result since." in same["body"]
+        "`2026-11-25`, and could not be checked since (no result)." in same["body"]
     )
     assert same["fingerprint"] == yesterday["fingerprint"]
     said = [line for line in same["body"].splitlines() if line.startswith("- live program: ")]
@@ -1532,7 +1533,9 @@ def test_a_day_nothing_could_be_checked_closes_nothing(tmp_path):
     assert (other["open"], other["hold"]) == (False, True)
     done = _synced(other, opened)
     assert [what for what, _ in done] == ["rewrite #7"], "no comment, and no close"
-    assert "`openai/codex 0.161.0` left no result, so nothing is known of it." in done[0][1]["body"]
+    assert (
+        "`openai/codex 0.161.0` could not be checked (no result), so nothing" in done[0][1]["body"]
+    )
     assert f"<!-- compat-fingerprint: {yesterday['fingerprint']} -->" in done[0][1]["body"]
     assert other["fingerprint"] != yesterday["fingerprint"]
 
@@ -1561,7 +1564,8 @@ def test_what_the_weekly_run_could_not_check_opens_no_issue_either(tmp_path):
     assert (issue["open"], issue["hold"]) == (False, True)
     assert (
         "- development branch: `langgraph head-0123456789, langgraph-prebuilt head-0123456789` "
-        "left no result (last run `2026-11-26`), so nothing is known of it." in issue["body"]
+        "could not be checked (last run `2026-11-26`) (no result), so nothing is known of it."
+        in issue["body"]
     )
     assert _synced(issue, []) == []
     # With something else to do, it is an issue like any other, and the line is on it.
@@ -1573,5 +1577,105 @@ def test_what_the_weekly_run_could_not_check_opens_no_issue_either(tmp_path):
     }
     busy = report.adapter_issue("langgraph", daily, failing, _RUN, state)
     assert (busy["open"], busy["hold"]) == (True, False)
-    assert "left no result (last run `2026-11-26`)" in busy["body"]
-    assert "left no result" not in "".join(busy["changes"]), "and it is no change to act on"
+    assert "could not be checked (last run `2026-11-26`) (no result)" in busy["body"]
+    assert "could not be checked" not in "".join(busy["changes"]), "and no change to act on"
+
+
+# --- what the ninth reader found ------------------------------------------------------
+
+
+@pytest.mark.parametrize("today", ["install_network", "not_installable", "no_result"])
+@pytest.mark.parametrize("key", ["hermes--beyond", "hermes--claim_top"])
+def test_a_watching_release_that_failed_keeps_its_line_on_a_day_it_cannot_be_checked(
+    tmp_path, key, today
+):
+    """Above the range or inside it. Yesterday it failed; today the index was down, or it
+    would not install, or the run left nothing. The issue neither closes nor comments: what
+    is known is what was known."""
+    made = _plan()
+    nodes = ["smoke: cli mode {'a': 1} `x`", "y" * 320]
+    failed = {p["key"]: _result(p) for p in made["points"]}
+    failed[key] = _result(failed[key], "fail", tests={"failed_ids": nodes})
+    state = report.next_state({}, failed, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    yesterday = report.adapter_issue("hermes_agent", made, failed, _RUN, state)
+    opened = [{"number": 7, "state": "open", "body": yesterday["body"]}]
+    results = {**{p["key"]: _result(p) for p in made["points"]}, key: _result(failed[key], today)}
+    after = report.next_state(state, results, _RUN, tmp_path, made)
+    issue = report.adapter_issue("hermes_agent", made, results, _RUN, after)
+    assert (issue["open"], issue["hold"]) == (True, False)
+    assert (
+        "did not pass when it was last checked, on `2026-11-25`, and could not be" in issue["body"]
+    )
+    assert issue["fingerprint"] == yesterday["fingerprint"], "the same thing to say"
+    assert [what for what, _ in _synced(issue, opened)] == ["rewrite #7"]
+
+
+def test_a_watching_failure_of_another_sort_is_remembered_as_what_it_was(tmp_path):
+    made = _plan()
+    key = "hermes--beyond"
+    failed = {p["key"]: _result(p) for p in made["points"]}
+    failed[key] = _result(failed[key], "attach_failed")
+    state = report.next_state({}, failed, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    yesterday = report.adapter_issue("hermes_agent", made, failed, _RUN, state)
+    nothing = {**failed, key: _result(failed[key], "no_result")}
+    after = report.next_state(state, nothing, _RUN, tmp_path, made)
+    issue = report.adapter_issue("hermes_agent", made, nothing, _RUN, after)
+    assert issue["open"] is True and issue["fingerprint"] == yesterday["fingerprint"]
+
+
+def test_a_watching_release_above_the_range_that_will_not_install_asks_nothing(tmp_path):
+    """With no failure known of it: no issue is opened for it, and one that is open for
+    what the point said of another release is not closed by it."""
+    made = _plan()
+    key = "hermes--beyond"
+    results = {p["key"]: _result(p) for p in made["points"]}
+    results[key] = _result(results[key], "not_installable")
+    issue = report.adapter_issue("hermes_agent", made, results, _RUN, {})
+    assert (issue["open"], issue["hold"]) == (False, True)
+    assert "### Not checked today" in issue["body"] and "### Watching" not in issue["body"]
+    assert _synced(issue, []) == []
+    # Inside the range it is said, as it was: the release the README names does not install.
+    inside = {
+        **results,
+        key: _result(results[key]),
+        "hermes--claim_top": _result(results["hermes--claim_top"], "not_installable"),
+    }
+    said = report.adapter_issue("hermes_agent", made, inside, _RUN, {})
+    assert (said["open"], said["hold"]) == (True, False)
+    # And a set of frameworks that will not install together is what its point finds.
+    sets = {**results, key: _result(results[key])}
+    conflict = "combination--openai_agents__pydantic_ai"
+    sets[conflict] = _result(sets[conflict], "not_installable", install={"detail": "x"})
+    assert report.adapter_issue("openai_agents__pydantic_ai", made, sets, _RUN, {})["open"] is True
+    # Also the day after its tests failed: that they no longer install together is news,
+    # and not a day the set could not be checked.
+    failed = {**results, key: _result(results[key])}
+    failed[conflict] = _result(failed[conflict], "fail", tests={"failed_ids": ["t.py::test_x"]})
+    state = report.next_state({}, failed, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    after = report.next_state(state, sets, _RUN, tmp_path, made)
+    body = report.adapter_issue("openai_agents__pydantic_ai", made, sets, _RUN, after)["body"]
+    assert "cannot be installed together (the installer said: `x`)" in body
+    assert "did not pass when it was last checked" not in body
+
+
+def test_a_check_that_left_is_said_on_an_issue_that_is_held_too(tmp_path):
+    """A check leaves while it was not passing, on a day the subject's other point left no
+    result. The issue is held, and the trace is of this run alone: said now, or never."""
+    made = _plan()
+    results = {p["key"]: _result(p) for p in made["points"]}
+    results["hermes--beyond"] = _result(results["hermes--beyond"], "no_result")
+    left = {**_GONE, "kind": "devbranch", "subject": "hermes_agent", "adapter": "hermes_agent"}
+    last = {"date": "2026-11-25", "outcome": "fail", "targets": {}}
+    state = {"points": {"devbranch--hermes_agent": {"point": left, "last": last}}}
+    after = report.next_state(state, results, _RUN, tmp_path, made)
+    issue = report.adapter_issue("hermes_agent", made, results, _RUN, after)
+    assert (issue["open"], issue["hold"]) == (False, True) and len(issue["left"]) == 1
+    assert (
+        "### No longer run\n\n- The check `devbranch--hermes_agent` was not passing"
+        in issue["body"]
+    )
+    opened = [{"number": 7, "state": "open", "body": "<!-- compat-key: hermes_agent -->"}]
+    done = _synced(issue, opened)
+    assert [what for what, _ in done] == ["rewrite #7", "comment on #7"]
+    assert done[1][1]["body"].startswith("No longer run:\n\n- The check `devbranch--hermes_agent`")
+    assert _synced(issue, []) == [], "and no issue is opened to say it"
