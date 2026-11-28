@@ -94,7 +94,10 @@ def parse_override(text: str, version: str) -> dict | None:
     reason = data.get("reason")
     if not isinstance(reason, str):
         return None
-    # Words only: the reason is printed on a public page.
-    reason = "".join(ch if " " <= ch <= "~" and ch not in "`|<>[]" else "?" for ch in reason)
-    reason = reason.strip()[:200]
-    return {"version": version, "reason": reason} if reason.strip("? ") else None
+    # The reason is printed on a public page: one line, in any language, with nothing that
+    # is markup. And it has to say something: a few letters at the least.
+    kept = "".join(ch if ch.isprintable() and ch not in "`|<>[]" else " " for ch in reason)
+    kept = " ".join(kept.split())[:200]
+    if sum(ch.isalpha() for ch in kept) < 3:
+        return None
+    return {"version": version, "reason": kept}

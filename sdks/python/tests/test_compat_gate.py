@@ -224,7 +224,17 @@ def test_an_override_is_for_one_version_and_has_to_say_why(tmp_path):
         assert gate.read_override(tree, "0.7.0b2") is None, nothing
     marked = {"version": "0.7.0b2", "reason": "see [the issue](https://e.invalid) `now`\n## x"}
     kept = gate.read_override(_tree(tmp_path / "m", "0.7.0b2", marked), "0.7.0b2")
-    assert kept == {"version": "0.7.0b2", "reason": "see ?the issue?(https://e.invalid) ?now??## x"}
+    assert kept == {"version": "0.7.0b2", "reason": "see the issue (https://e.invalid) now ## x"}
+    for n, wordless in enumerate(["...", "---", "!!!", "123", "*", "? ?", "ab"]):
+        tree = _tree(tmp_path / f"w{n}", "0.7.0b2", {"version": "0.7.0b2", "reason": wordless})
+        assert gate.read_override(tree, "0.7.0b2") is None, wordless
+    korean = {"version": "0.7.0b2", "reason": "하한 버전이 업스트림에서 깨져 먼저 내보냄"}
+    said = gate.read_override(_tree(tmp_path / "k", "0.7.0b2", korean), "0.7.0b2")
+    assert said == korean, "a reason is words in any language"
+    long = {"version": "0.7.0b2", "reason": "because " * 100}
+    assert (
+        len(gate.read_override(_tree(tmp_path / "l", "0.7.0b2", long), "0.7.0b2")["reason"]) == 200
+    )
 
 
 def _main(monkeypatch, tmp_path, records: Path, *, override: object = None) -> tuple[int, str]:
@@ -330,3 +340,62 @@ def test_an_adapter_with_no_row_in_the_table_is_not_a_claim(monkeypatch):
     table = {"openai_agents": [], "langgraph": [{"distribution": "langgraph"}], "not_run": [{}]}
     monkeypatch.setattr(gate.plan, "read_measured", lambda *paths: table)
     assert gate.claimed(_REPO) == {"langgraph": 2}
+
+
+def test_a_missing_or_unreadable_attempt_is_the_first(tmp_path):
+    """Lines written before attempts were recorded, beside a later attempt of the same
+    run: the later attempt is still what the run says."""
+    old, garbled, second = _run(attempt=None), _run(attempt="x"), _run(attempt="2")
+    for first in (old, garbled):
+        red = [_line("floor", "fail", run=first), _line("claim_top", run=first)]
+        green = [_line("floor", run=second), _line("claim_top", run=second)]
+        assert _decide(*red, *green)["pass"] is True
+        assert _decide(*green, *red)["pass"] is True
+
+
+def test_a_point_that_says_both_did_not_pass_whichever_line_comes_last():
+    lines = [_line("floor"), _line("claim_top", "fail"), _line("claim_top")]
+    assert _decide(*lines)["pass"] is False
+    assert _decide(lines[0], lines[2], lines[1])["pass"] is False
+
+
+def test_a_run_that_ended_red_proves_nothing_even_when_every_line_passes():
+    """A run is also red for what its plan could not make a point of: a tested release
+    that admits no supported interpreter, an adapter the index would not list. No line
+    holds that. The lines carry the run's colour so the gate does not have to guess."""
+    red = _run(red=True)
+    decision = _decide(_line("floor", run=red), _line("claim_top", run=red))
+    assert (
+        decision["pass"] is False
+        and "ended red for a reason no point holds" in (decision["reasons"][0])
+    )
+    with_reason = _decide(_line("floor", "fail", run=red), _line("claim_top", run=red))
+    assert "floor" in with_reason["reasons"][0], "a point that says why is reason enough"
+    assert not any("no point holds" in reason for reason in with_reason["reasons"])
+    green = _run(red=False)
+    assert _decide(_line("floor", run=green), _line("claim_top", run=green))["pass"] is True
+    retried = [
+        _line("floor", run=_run(red=True, attempt="1")),
+        _line("claim_top", run=_run(red=True, attempt="1")),
+    ]
+    retried += [
+        _line("floor", run=_run(red=False, attempt="2")),
+        _line("claim_top", run=_run(red=False, attempt="2")),
+    ]
+    assert _decide(*retried)["pass"] is True, "the last attempt's colour"
+
+
+def test_an_override_file_that_does_not_apply_is_said_not_ignored(tmp_path, monkeypatch, capsys):
+    red = _records(tmp_path / "red", _TODAY, _line("floor", "fail"), _line("claim_top"))
+    code, said = _main(
+        monkeypatch, tmp_path / "1", red, override={"version": "0.7.0b2", "reason": "..."}
+    )
+    assert code == gate.STOP_EXIT and "OVERRIDDEN" not in said
+    assert f"`{gate.OVERRIDE}` is in this tree and does not apply." in said
+    assert '"version": "0.7.0b2"' in said
+    code, said = _main(monkeypatch, tmp_path / "2", red)
+    assert code == gate.STOP_EXIT and "does not apply" not in said, "no file, nothing to say"
+    good = {"version": "0.7.0b2", "reason": "the floor fails upstream; tracked there"}
+    applies = _tree(tmp_path / "3", "0.7.0b2", good)
+    assert gate.rejected_override(applies, "0.7.0b2") == "", "a file that applies is not rejected"
+    assert gate.rejected_override(applies, "0.7.0b3") != "", "left behind by an earlier release"
