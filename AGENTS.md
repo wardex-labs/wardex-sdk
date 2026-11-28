@@ -240,18 +240,19 @@ red-capable kind. Everything else that needs a person
 arrives as an issue labelled `compat`: one per subject (an adapter, a set of
 frameworks run together, a program with no tested range), one for problems
 with the run itself, and one opened by a run that ended without a verdict. A
-release that failed when it was last checked is still failing as far as anyone
-knows, inside the range or above it, watched or not: its line stays, with no
-comment, on a day the index was down, it would not install, or the run left no
-result for it. A point that could not be checked and is not known to have
-failed on the release it runs asks nothing: a watching point that left no
-result (the run's own failure, said on the health issue) and a release above
-the range that could not be installed open no issue. They are listed under
-"Not checked today", and when an issue closes its closing words name them, so
-that not checked is never read as passed; when nothing of a subject could be
-checked at all, the closing words say that and not that anything passes. A
-watching release inside the range that will not install is said, as is a set
-of frameworks that will not install together. Each issue is found by a marker
+day a point says nothing about its release (it left no result, the run broke,
+the index could not be reached) changes nothing on any issue. What the point
+last found stands, in the same words and with no comment: a failure, inside the
+range or above it, watched or not; a pass above the range, which says the range
+can be widened; and, for a watching point, a release inside the range that will
+not install as asked or a set of frameworks that will not install together. A
+refusal to install does not replace a failure of the same release. A point that
+could not be checked and is not known to have found anything asks nothing and
+opens no issue, and neither does a release above the range that will not
+install. They are listed under "Not checked today", and when an issue closes
+its closing words name them, so that not checked is never read as passed; when
+nothing of a subject could be checked at all, the closing words say that and
+not that anything passes. Each issue is found by a marker
 in its body, rewritten by every run and closed by the run when nothing is left
 to do. Records accumulate on the `compat-results` branch, one JSON
 line per point per run under `records/`, with the hash-locked package list of

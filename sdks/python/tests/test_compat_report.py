@@ -668,12 +668,24 @@ def test_what_a_point_last_said_is_carried_only_for_the_same_release():
     closing = report.adapter_issue("openai_agents", plan, both, _RUN, {})["closing"]
     assert closing.startswith("Nothing here needs doing any more: every release inside")
     assert "Not checked today: `openai-agents 0.26.0` (could not be installed" in closing
-    # Nor is what it said of another release, or a pass, a failure of this one.
+    # Nor is what it said of another release a failure of this one.
     other = _failed_yesterday(_ABOVE, nodes)
     other["points"][_ABOVE["key"]]["last_checked"]["targets"] = {"openai-agents": "0.25.0"}
     assert report.adapter_issue("openai_agents", plan, above, _RUN, other)["open"] is False
-    passed = _failed_yesterday(_ABOVE, nodes)
-    passed["points"][_ABOVE["key"]]["last_checked"]["outcome"] = "pass"
+    # A pass is the last word too: the issue that says the range can be widened stays open
+    # over a day the index was down, with no comment, and does not close and open again.
+    passing = report.adapter_issue("openai_agents", plan, _results(_result(_ABOVE)), _RUN)
+    assert passing["open"] and "The range can be widened" in passing["body"]
+    passed = _failed_yesterday(_ABOVE, [])
+    passed["points"][_ABOVE["key"]]["last_checked"].update(outcome="pass", cause=None)
+    kept = report.adapter_issue("openai_agents", plan, above, _RUN, passed)
+    assert kept["open"] and kept["fingerprint"] == passing["fingerprint"]
+    assert (
+        "`openai-agents 0.26.0` is newer than the tested range and passed when it was last "
+        "checked, on `2026-11-25`; it could not be checked today (could not be installed "
+        "(index or network)). The range can be widened" in kept["body"]
+    )
+    passed["points"][_ABOVE["key"]]["last_checked"]["targets"] = {"openai-agents": "0.25.0"}
     assert report.adapter_issue("openai_agents", plan, above, _RUN, passed)["open"] is False
     # A failure of another sort above the range is remembered as what it was.
     gone = _failed_yesterday(_ABOVE, nodes)

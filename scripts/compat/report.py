@@ -419,6 +419,49 @@ def _counted(result: dict) -> bool:
     return _own(result) and result["in_claim"] and result["role"] != "floor"
 
 
+#: What a point can leave and have said nothing of its release: no result, a run that
+#: broke, an index or network that could not be reached.
+SILENT = frozenset({"no_result", "harness_error", "install_network"})
+
+
+def says(result: dict) -> bool:
+    """Whether what a watching point left is news about its subject.
+
+    A pass and a failure are. So is a set of frameworks that will not install together, a
+    release inside the range that will not install as asked, and test dependencies that
+    will not install beside it: each is what the point found. A day it left nothing, broke
+    or could not reach the index says nothing; neither does a release above the range that
+    will not install, which asks nothing of anyone."""
+    outcome = result["outcome"]
+    if outcome in SILENT:
+        return False
+    if outcome in NOT_OURS:
+        return together(result) or bool(result["in_claim"])
+    return True
+
+
+def together(result: dict) -> bool:
+    """Whether a refusal to install is of several frameworks at once: what a point that
+    installs them together finds, and not a matter of the index or the interpreter."""
+    return result["outcome"] == "not_installable" and len(result.get("adapters") or []) > 1
+
+
+def standing(entry: dict, result: dict) -> dict:
+    """What stands as a watched point's last word on the release it runs today, or {}.
+
+    What it last found (`last_said`), or, in a state written before that was kept, the last
+    day it was run."""
+    word = entry.get("last_said") or entry.get("last_checked") or {}
+    return word if word.get("targets") == result["targets"] else {}
+
+
+def outranked(result: dict, word: dict) -> bool:
+    """Whether today's refusal to install gives way to a failure that stands: a release that
+    failed and now will not install is still a release that failed. Several frameworks that
+    no longer install together are news about the set, and stand on their own."""
+    return result["outcome"] in NOT_OURS and not together(result) and word.get("outcome") in FAILED
+
+
 def next_failing(state: dict, results: dict[str, dict], run: dict) -> dict[str, str]:
     """For each release and interpreter failing on this build, the first day of the failure
     it is in now.
@@ -775,6 +818,18 @@ def next_state(
                 "python": result.get("planned_python"),
                 "failed_ids": [clean(node, 300) for node in tests.get("failed_ids", [])[:200]],
             }
+        if (entry.get("last_said") or {}).get("targets") not in (None, result["targets"]):
+            del entry["last_said"]
+        if is_watching(result) and says(result) and not outranked(result, standing(entry, result)):
+            # What a watched point last found, a refusal to install included. A day it says
+            # nothing, its issue says this again, in the same words and with the same mark.
+            entry["last_said"] = {
+                "date": run["date"],
+                "outcome": result["outcome"],
+                "cause": result["cause"],
+                "targets": result["targets"],
+                "failed_ids": [clean(node, 300) for node in tests.get("failed_ids", [])[:200]],
+            }
         # The first day of the failure this release is in now. A day it could not be checked
         # neither starts nor ends one; a pass, or another release under this key, ends it.
         since = entry.get("failing_since") or {}
@@ -1110,7 +1165,7 @@ def subject_info(name: str, plan: dict) -> dict:
 def _outcome_words(result: dict) -> str:
     """What a row's outcome is called. Several frameworks that will not install are not a
     matter of the interpreter: they cannot be installed together."""
-    if result["outcome"] == "not_installable" and len(result.get("adapters") or []) > 1:
+    if together(result):
         return "cannot be installed together"
     return OUTCOME_WORDS[result["outcome"]]
 
@@ -1182,39 +1237,38 @@ def adapter_issue(
             # Reported, and never an argument for red. Said apart, so nobody reads a
             # watching failure as a broken promise or a promise as merely watched.
             if outcome in GREEN:
+                if result["key"] in old:
+                    unchecked.append(f"{version} (not run by this run)")
                 continue
-            # Not checked today: it left no result (the run's own failure, on the health
-            # issue as that), or it could not be installed. Several frameworks that will
-            # not install together are not that: it is what a point of that kind finds.
-            found = outcome == "not_installable" and len(result.get("adapters") or []) > 1
-            unseen = outcome in ("no_result", "harness_error")
-            if unseen or (outcome in NOT_OURS and not found):
-                before = known.get(result["key"], {}).get("last_checked") or {}
-                if before.get("outcome") in FAILED and before.get("targets") == result["targets"]:
-                    # What the point said when this release was last checked still stands,
-                    # and is the same thing to say as on the day it said it: a day nothing
-                    # could be checked must not close an issue.
+            before = standing(known.get(result["key"], {}), result)
+            if not says(result) or outranked(result, before):
+                if before.get("outcome") not in (None, *GREEN):
+                    # What the point found when this release was last checked still stands,
+                    # and is the same thing to say as on the day it found it: a day it says
+                    # nothing must neither close an issue nor post a comment.
+                    then = before["outcome"]
+                    found = (
+                        "did not pass"
+                        if then in FAILED
+                        else _outcome_words({**result, "outcome": then})
+                    )
                     watched.append(
-                        f"{_kind_label(result)}: {version} did not pass when it was last "
-                        f"checked, on {code(before.get('date', ''))}, and could not be checked "
-                        f"since ({what}). Closes {_kind_closes(result)}."
+                        f"{_kind_label(result)}: {version} {found} when it was last checked, "
+                        f"on {code(before.get('date', ''))}, and could not be checked since "
+                        f"({what}). Closes {_kind_closes(result)}."
                     )
-                    marks.append(
-                        [result["key"], "watching", before["outcome"], before.get("failed_ids", [])]
-                    )
+                    marks.append([result["key"], "watching", then, before.get("failed_ids", [])])
                     continue
-                if unseen or not result["in_claim"]:
-                    # Nothing is known of it, and so nothing is asked: a wheel that did not
-                    # build must not open an issue for everything that is watched, and a
-                    # release above the range that will not install asks nothing of anyone.
-                    # It is named, on the issue and in the words an issue closes with, so
-                    # that not checked is never read as passed.
-                    unknown.append(
-                        f"{_kind_label(result)}: {version} could not be checked{when} "
-                        f"({what}), so nothing is known of it."
-                    )
-                    unchecked.append(f"{version} ({what})")
-                    continue
+                # Nothing is known of it, and so nothing is asked: a wheel that did not
+                # build or an index that was down must not open an issue for everything that
+                # is watched. It is named, on the issue and in the words an issue closes
+                # with, so that not checked is never read as passed.
+                unknown.append(
+                    f"{_kind_label(result)}: {version} could not be checked{when} "
+                    f"({what}), so nothing is known of it."
+                )
+                unchecked.append(f"{version} ({what})")
+                continue
             watched.append(
                 f"{_kind_label(result)}: {version} {what}{when}. Closes {_kind_closes(result)}."
             )
@@ -1308,6 +1362,26 @@ def adapter_issue(
             # Above the range and not checked today. What it said when this release was
             # last checked still stands: a day the index was down is no day it passed.
             before = known.get(result["key"], {}).get("last_checked") or {}
+            widen = before.get("outcome") in GREEN and info["evidence"] == "live"
+            if widen and before.get("targets") == result["targets"]:
+                # The pass that showed the range can be widened is still the last word on
+                # this release, in the same words as on the day it passed.
+                todo.append(
+                    f"{version} is newer than the tested range and passed when it was last "
+                    f"checked, on {code(before.get('date', ''))}; it could not be checked "
+                    f"today ({OUTCOME_WORDS[outcome]}). The range can be widened to include "
+                    "it: the table of tested versions, the test pin and the README."
+                )
+                unchecked.append(f"{version} ({OUTCOME_WORDS[outcome]})")
+                marks.append(
+                    [
+                        result["key"],
+                        before["outcome"],
+                        before.get("cause"),
+                        before.get("failed_ids", []),
+                    ]
+                )
+                continue
             if before.get("outcome") not in FAILED or before.get("targets") != result["targets"]:
                 # Nothing is known of it, and nothing is asked. Named, like the rest that
                 # could not be checked.
