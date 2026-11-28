@@ -112,6 +112,11 @@ jobs:
             echo "ANYIO $A: the whole file"
             "$V" -m pytest "$T" -q --tb=line -p no:cacheprovider 2>&1 | tail -6 || true
           done
+          for A in 4.6.2 4.7.0 4.8.0; do
+            uv pip install --python "$V" --quiet "anyio==$A"
+            echo "DIAG anyio $A"
+            "$V" -m pytest sdks/python/tests/test_diag_anyio47.py -q -s --tb=line -p no:cacheprovider 2>&1 | grep -E "TASK|passed|failed|^FAILED|Error" || true
+          done
           uv pip install --python "$V" --quiet "anyio==4.7.0"
           echo "::group::first failure in full, anyio 4.7.0"
           "$V" -m pytest "$T" -q -k "async_https_call_is_captured" --tb=long -p no:cacheprovider 2>&1 | head -150 || true

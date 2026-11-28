@@ -46,7 +46,7 @@ def files_for(lib: str) -> list[str]:
 def main() -> int:
     cutoff = plan.iso(datetime.now(timezone.utc))
     points = []
-    for lib, floor in LIBS.items():
+    for lib, floor in {"httpx": LIBS["httpx"]}.items():
         releases = plan.fetch_releases(lib)
         finals = plan._finals(releases, cutoff)
         newest = max(finals, key=plan.vkey)
