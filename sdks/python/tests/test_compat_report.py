@@ -604,16 +604,19 @@ def test_a_release_that_failed_and_cannot_be_checked_today_is_still_on_the_list(
     """Yesterday a tested release failed; today it could not even be installed. The run
     is not red, and the issue must neither close nor forget what it knew."""
     plan = _plan(_FLOOR, _TOP)
-    nodes = ["t.py::test_tree"]
+    # Names as tests have them: a parametrized one with what a code span cannot hold, and
+    # one longer than the state keeps.
+    nodes = ["t.py::test_tree", "t.py::test_x[{'a': 1}-`y`]", "t.py::test_" + "z" * 400]
     yesterday = report.adapter_issue(
         "openai_agents",
         plan,
         _results(_result(_FLOOR), _result(_TOP, "fail", cause="upstream", failed_ids=nodes)),
         _RUN,
     )
+    kept = [report.clean(node, 300) for node in nodes]
     results = _results(_result(_FLOOR), _result(_TOP, today))
     issue = report.adapter_issue(
-        "openai_agents", plan, results, _RUN, _failed_yesterday(_TOP, nodes)
+        "openai_agents", plan, results, _RUN, _failed_yesterday(_TOP, kept)
     )
     assert issue["open"]
     assert "did not pass when last checked, on `2026-11-25`" in issue["body"]
@@ -624,14 +627,41 @@ def test_a_release_that_failed_and_cannot_be_checked_today_is_still_on_the_list(
     assert tracker.log == ["rewrite #7"]
 
 
-def test_what_a_point_last_said_is_carried_only_for_the_same_release_inside_the_range():
+def test_what_a_point_last_said_is_carried_only_for_the_same_release():
     plan = _plan(_FLOOR, _TOP, _ABOVE)
     nodes = ["t.py::test_tree"]
-    # A release above the range that cannot be installed today needs nothing doing.
+    # A release above the range that failed and cannot be installed today is still failing
+    # as far as anyone knows: a day the index was down is no day it passed, and its issue
+    # is not closed and opened again around it.
+    yesterday = report.adapter_issue(
+        "openai_agents",
+        plan,
+        _results(_result(_ABOVE, "fail", cause="upstream", failed_ids=nodes)),
+        _RUN,
+    )
     above = _results(_result(_ABOVE, "install_network"))
-    assert not report.adapter_issue(
+    carried = report.adapter_issue(
         "openai_agents", plan, above, _RUN, _failed_yesterday(_ABOVE, nodes)
-    )["open"]
+    )
+    assert carried["open"] and carried["hold"] is False
+    assert (
+        "`openai-agents 0.26.0` is newer than the tested range. It did not pass when it was "
+        "last checked, on `2026-11-25`, and could not be checked today" in carried["body"]
+    )
+    assert carried["fingerprint"] == yesterday["fingerprint"], "no news, so no comment"
+    # One that is not known to have failed asks nothing: no issue is opened for it, and one
+    # that is open is not closed by it.
+    unknown = report.adapter_issue("openai_agents", plan, above, _RUN, {})
+    assert (unknown["open"], unknown["hold"]) == (False, True)
+    assert "### Not checked today" in unknown["body"]
+    assert "could not be checked today" not in "".join(unknown["changes"])
+    # Nor is what it said of another release, or a pass, a failure of this one.
+    other = _failed_yesterday(_ABOVE, nodes)
+    other["points"][_ABOVE["key"]]["last_checked"]["targets"] = {"openai-agents": "0.25.0"}
+    assert report.adapter_issue("openai_agents", plan, above, _RUN, other)["hold"] is True
+    passed = _failed_yesterday(_ABOVE, nodes)
+    passed["points"][_ABOVE["key"]]["last_checked"]["outcome"] = "pass"
+    assert report.adapter_issue("openai_agents", plan, above, _RUN, passed)["hold"] is True
     # A different release now sits at this point: yesterday's failure was another version's.
     moved = _failed_yesterday(_TOP, nodes)
     moved["points"][_TOP["key"]]["last_checked"]["targets"] = {"openai-agents": "0.23.0"}
