@@ -3181,6 +3181,23 @@ def test_a_removed_list_is_not_started_again_from_nothing(tmp_path, monkeypatch,
     if damage == "no file":
         state_file.unlink()
 
+    # The first run to write after that is the second attempt of a run three weeks old,
+    # dated by its old plan. The lines that show there was a list are a week and more
+    # after that date; they are found from the day it is, not from the day of the plan.
+    class TheDayAfter(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001, ANN206
+            return datetime(2026, 11, 27, 9, 0, tzinfo=tz)
+
+    monkeypatch.setattr(report, "datetime", TheDayAfter)
+    old = {**_plan(), "partial": False, "cutoff": "2026-11-05T07:00:00Z"}
+    old["adapters"]["openai_agents"]["problems"] = ["no release could be listed"]
+    assert run(old, "0", "2") == report.RED_EXIT
+    assert [(e.get("unreadable_since"), e.get("id")) for e in gate.read_runs(records)] == [
+        ("2026-11-27", None),
+        (None, "0"),
+    ]
+
     assert run(first, "1", "2", _result(_FLOOR), _result(_TOP)) == 0
     listed = gate.read_runs(records)
     assert "unreadable_since" in listed[0] and [e.get("id") for e in listed[1:]] == ["1"]
