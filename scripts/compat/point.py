@@ -562,7 +562,8 @@ class Point:
             except ValueError:
                 said = {}
         said = said if isinstance(said, dict) else {}
-        named = said.get("failed") or []
+        named = said.get("failed", [])
+        named = [] if named is None else named
         if isinstance(named, list) and all(isinstance(name, str) for name in named):
             failed = [name[:300] for name in named]
         else:

@@ -216,6 +216,9 @@ jobs:
         run: |
           mkdir -p results
           export COMPAT_SDK_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' sdks/python/pyproject.toml | head -1)"
+          # What this run's branch points at now. A run started again at a commit that is
+          # no longer that one is history: it writes its lines and changes nothing else.
+          export COMPAT_TIP="$(git ls-remote origin "$GITHUB_REF" 2>/dev/null | cut -f1 | head -1)"
           status=0
           python3 scripts/compat/report.py --plan plan/plan.json --results results \
             --state-dir "$RUNNER_TEMP/records" --preview "$RUNNER_TEMP/preview" \

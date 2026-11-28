@@ -352,6 +352,20 @@ def page(state: dict, version: str, today: str, *, standing_in_for: str = "") ->
             f"(version string {code(about.get('version', ''))}, commit "
             f"{code(str(about.get('commit', ''))[:10])})."
         )
+        # A run of one adapter, and the weekly run, leave rows of another commit.
+        other = sorted(
+            (item["key"], str((item.get("last") or {}).get("commit"))[:10])
+            for found in grouped.values()
+            for item in found
+            if (item.get("last") or {}).get("commit") not in (None, "", about.get("commit"))
+        )
+        if other:
+            named = ", ".join(f"{code(key, 120)} at {code(commit)}" for key, commit in other[:12])
+            more = f", and {len(other) - 12} more" if len(other) > 12 else ""
+            what += (
+                f" {len(other)} of the rows below were last run by another run, at another "
+                f"commit of `main`: {named}{more}."
+            )
     else:
         title = f"Compatibility of wardex {clean(version, 40)}"
         what = (

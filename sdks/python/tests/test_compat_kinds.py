@@ -18,7 +18,7 @@ import pytest
 _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from compat import kinds, manifest, plan, report, verdict  # noqa: E402
+from compat import kinds, manifest, plan, render, report, verdict  # noqa: E402
 from compat import point as point_runner  # noqa: E402
 
 _TESTS = Path(__file__).parent
@@ -72,6 +72,16 @@ def _facts(**change: object) -> dict:
                 {"tag": "v0.23.6", "published": "2026-11-25T12:00:00Z", "prerelease": True},
                 {"tag": "v1.2.3.4", "published": "2026-11-25T13:00:00Z", "prerelease": False},
                 {"tag": "v9.9", "published": "2026-11-25T14:00:00Z", "prerelease": False},
+                {
+                    "tag": "v\u0661.\u0660.\u0660",
+                    "published": "2026-11-25T15:00:00Z",
+                    "prerelease": False,
+                },
+                {
+                    "tag": "v\uff11.\uff12.\uff13",
+                    "published": "2026-11-25T16:00:00Z",
+                    "prerelease": False,
+                },
             ]
         },
         "heads": {declared["repository"]: _HEAD for declared in manifest.DEV_BRANCHES.values()},
@@ -593,7 +603,7 @@ def test_a_driver_that_passes_fails_or_could_not_prepare_gives_the_outcome_it_st
     assert runner.result["tests"]["failed_ids"] == ["the smoke failed in cli mode", "x" * 300]
     assert len(calls) == 2 and runner.result["rerun"] == {"passed": False}, "run once more first"
 
-    for index, odd in enumerate(("abc", ["a name", 7], {"a": 1})):
+    for index, odd in enumerate(("abc", ["a name", 7], {"a": 1}, False, 0, "", {})):
         unnamed = {"ok": False, "failed": odd, "checks": {}}
         runner, _, _ = _driven(
             tmp_path / f"odd{index}", monkeypatch, point, code=1, verdict=unnamed
@@ -630,6 +640,10 @@ def test_a_driver_that_passes_fails_or_could_not_prepare_gives_the_outcome_it_st
         (0, [1]),
         (0, {"ok": True, "failed": [1, None]}),
         (0, {"ok": True, "failed": "abc"}),
+        (0, {"ok": True, "failed": False}),
+        (0, {"ok": True, "failed": 0}),
+        (0, {"ok": True, "failed": ""}),
+        (0, {"ok": True, "failed": {}}),
         (1, None),
         (2, {"ok": True}),
         (137, None),
@@ -641,6 +655,10 @@ def test_a_driver_that_passes_fails_or_could_not_prepare_gives_the_outcome_it_st
         "a-list",
         "failures-not-names",
         "failures-a-string",
+        "failures-false",
+        "failures-zero",
+        "failures-empty-text",
+        "failures-empty-object",
         "failed-silently",
         "odd-exit",
         "killed",
@@ -819,21 +837,32 @@ def test_a_failing_check_retired_with_its_kind_is_named_when_its_issue_closes(tm
     after = report.next_state(state, passing, _RUN, tmp_path, daily)
     assert not [key for key in after["points"] if key.startswith("retired--")]
     assert "openai_agents--minor_newest--0.9" not in after["points"]
-    assert after["retired"] == [
-        {
-            "subject": "openai_agents",
-            "key": "retired--openai_agents",
-            "kind": "retired_kind",
-            "date": "2026-11-25",
-        }
-    ]
+    # Every point that went away with the kind leaves a trace, and the ones that were not
+    # passing are named: a watched one and one above the range were on the issue too.
+    assert {item["key"]: item["failing"] for item in after["retired"]} == {
+        "retired--openai_agents": True,
+        "retired--watched": True,
+        "retired--passing": False,
+        "retired--above": True,
+    }
+    assert after["retired"][0] == {
+        "subject": "openai_agents",
+        "key": "retired--openai_agents",
+        "kind": "retired_kind",
+        "date": "2026-11-25",
+        "undeclared": False,
+        "failing": True,
+    }
     issue = report.adapter_issue("openai_agents", daily, passing, _RUN, after)
     assert issue["open"] is False
-    assert (
-        "The check `retired--openai_agents` was failing when it was last run (`2026-11-25`) and "
-        "is no longer run: its kind (`retired_kind`) was retired. That is not a pass."
-        in issue["closing"]
-    )
+    assert issue["closing"].startswith("Nothing here needs doing any more: every release inside")
+    for key in ("retired--openai_agents", "retired--watched", "retired--above"):
+        assert (
+            f"The check `{key}` was not passing when it was last run (`2026-11-25`) and "
+            "is no longer run: its kind (`retired_kind`) was retired. That is not a pass."
+            in issue["closing"]
+        ), key
+    assert "retired--passing" not in issue["closing"]
     assert (
         "retired" not in report.adapter_issue("langgraph", daily, passing, _RUN, after)["closing"]
     )
@@ -966,6 +995,8 @@ def test_the_plan_says_every_subject_each_kind_declares_whatever_it_could_plan()
     declared = made["scope"]["declared"]
     assert declared == plan.declared() == _plan("weekly")["scope"]["declared"]
     assert declared == {
+        "framework": sorted(manifest.ADAPTERS),
+        "published": sorted(manifest.ADAPTERS),
         "combination": sorted(manifest.COMBINATIONS),
         "neighbour": sorted({d["adapter"] for d in manifest.NEIGHBOURS.values()}),
         "prerelease": sorted(manifest.ADAPTERS),
@@ -973,7 +1004,7 @@ def test_the_plan_says_every_subject_each_kind_declares_whatever_it_could_plan()
         "hermes": ["hermes_agent"],
         "devbranch": sorted(manifest.DEV_BRANCHES),
     }
-    assert set(declared) == set(_NEW), "every kind added with a rule says what it declares"
+    assert set(declared) == set(kinds.KINDS), "every kind says what it declares"
     assert made["scope"]["covers"]["cli"] == ["anthropic_agent_sdk"], "not what it covered"
     assert made["scope"]["covers"]["hermes"] == []
 
@@ -1016,9 +1047,9 @@ def test_a_subject_taken_out_of_the_declarations_is_forgotten_and_its_issue_clos
     issue = wanted["a_set_no_longer_declared"]
     assert issue["open"] is False
     assert issue["closing"] == (
-        "Nothing here is asked any more: nothing declares `a_set_no_longer_declared`, and no "
-        f"run plans it again. The check `{key}` was not passing when it was last run "
-        "(`2026-11-25`) and is no longer run. That is not a pass. Closing."
+        "Nothing here is asked any more: no run plans a check of `a_set_no_longer_declared` "
+        f"again. The check `{key}` was not passing when it was last run (`2026-11-25`) and is "
+        "no longer run: nothing declares it any more. That is not a pass. Closing."
     )
     # The run after that knows nothing of it, and has nothing to say.
     later = report.next_state(after, passing, {**_RUN, "id": "2"}, tmp_path, daily)
@@ -1148,6 +1179,160 @@ def test_a_subject_that_lost_one_declared_check_and_keeps_others_closes_as_what_
     assert issue["closing"].startswith("Nothing here needs doing any more: every release inside")
     assert (
         "The check `devbranch--pydantic_ai` was not passing when it was last run (`2026-11-23`) "
-        "and is no longer run. That is not a pass." in issue["closing"]
+        "and is no longer run: nothing declares it any more. That is not a pass."
+        in issue["closing"]
     )
     assert issue["closing"].endswith("does not contain the fix. Closing.")
+
+
+def test_a_scoped_npm_package_is_named_by_scope_and_name_with_no_at_sign_on_an_issue():
+    made = _plan()
+    results = {p["key"]: _result(p) for p in made["points"]}
+    text = report.summary(made, results, [], [])
+    assert "| `openai/codex 0.160.0` |" in text and "?openai" not in text
+    key = "cli--codex_exec--claim_top"
+    results[key] = _result(results[key], "fail", tests={"failed_ids": ["one execute_tool span"]})
+    body = report.adapter_issue("codex_exec", made, results, _RUN, {})["body"]
+    assert "`openai/codex 0.160.0`" in body and "@" not in body and "?openai" not in body
+
+
+# --- what the second reader found ----------------------------------------------------
+
+
+def test_a_verdict_that_names_no_failure_or_leaves_the_list_out_is_a_pass(tmp_path, monkeypatch):
+    point = _of(_plan(), "hermes")["hermes--claim_top"]
+    for index, said in enumerate(({"ok": True}, {"ok": True, "failed": None})):
+        verdict = {**said, "checks": {"held": 3}}
+        runner, _, _ = _driven(tmp_path / str(index), monkeypatch, point, code=0, verdict=verdict)
+        runner._driven(runner.work / "venv")
+        assert runner.result["outcome"] == "pass", said
+
+
+def test_an_adapter_taken_out_of_the_manifest_is_forgotten_and_its_issue_closes(tmp_path):
+    """Its points of every kind, the first two included; what an older wardex release
+    found stays, as that release's history."""
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    was = {
+        "kind": "framework",
+        "subject": "an_adapter_that_left",
+        "adapter": "an_adapter_that_left",
+        "role": "claim_top",
+        "targets": {"left": "1.0.1"},
+        "in_claim": True,
+        "watching": False,
+    }
+    failed = {"date": "2026-11-25", "outcome": "fail", "targets": was["targets"]}
+    shipped = {**was, "kind": "published", "watching": True}
+    state = {
+        "release": "0.7.0b1",
+        "points": {
+            "an_adapter_that_left--claim_top": {"point": was, "last": failed},
+            "published--0.7.0b1--an_adapter_that_left--claim_top": {
+                "point": {**shipped, "sdk": {"origin": "pypi", "version": "0.7.0b1"}},
+                "last": failed,
+            },
+            "published--0.6.0--an_adapter_that_left--claim_top": {
+                "point": {**shipped, "sdk": {"origin": "pypi", "version": "0.6.0"}},
+                "last": failed,
+            },
+        },
+    }
+    daily["scope"]["builds"] = {"published": ["0.7.0b1"]}
+    before = {i["key"]: i for i in report.wanted_issues(daily, passing, state, _RUN)}
+    assert before["an_adapter_that_left"]["open"] is True
+    after = report.next_state(state, passing, _RUN, tmp_path, daily)
+    assert [key for key in after["points"] if "that_left" in key] == [
+        "published--0.6.0--an_adapter_that_left--claim_top"
+    ]
+    wanted = {i["key"]: i for i in report.wanted_issues(daily, passing, after, _RUN)}
+    issue = wanted["an_adapter_that_left"]
+    assert issue["open"] is False
+    assert issue["closing"].startswith(
+        "Nothing here is asked any more: no run plans a check of `an_adapter_that_left` again."
+    )
+    assert issue["closing"].count("nothing declares it any more. That is not a pass.") == 2
+    # An adapter the index would not list today is still declared, and nothing is forgotten.
+    assert "openai_agents" in daily["scope"]["declared"]["framework"]
+
+
+def test_a_subject_whose_only_checks_went_with_their_kind_has_its_issue_closed(tmp_path):
+    """A watching kind is retired while its point fails, and its subject has no point of
+    any other kind. Nothing would ever touch its issue again."""
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    only = {
+        "kind": "a_kind_that_was_retired",
+        "subject": "a_program",
+        "adapter": "a_program",
+        "role": "claim_top",
+        "targets": {"a-program": "v1.0.0"},
+        "in_claim": True,
+        "watching": True,
+    }
+    failed = {"date": "2026-11-25", "outcome": "fail", "targets": only["targets"]}
+    state = {"points": {"gone--a_program": {"point": only, "last": failed}}}
+    after = report.next_state(state, passing, _RUN, tmp_path, daily)
+    assert after["points"].get("gone--a_program") is None
+    wanted = {i["key"]: i for i in report.wanted_issues(daily, passing, after, _RUN)}
+    issue = wanted["a_program"]
+    assert issue["open"] is False
+    assert issue["closing"] == (
+        "Nothing here is asked any more: no run plans a check of `a_program` again. The check "
+        "`gone--a_program` was not passing when it was last run (`2026-11-25`) and is no longer "
+        "run: its kind (`a_kind_that_was_retired`) was retired. That is not a pass. Closing."
+    )
+    # With a trace of each sort and no row left, both are said.
+    both = {
+        "points": {
+            "gone--a_program": {"point": only, "last": failed},
+            "combination--a_program": {"point": {**only, "kind": "combination"}, "last": failed},
+        }
+    }
+    after = report.next_state(both, passing, _RUN, tmp_path, daily)
+    closing = report.adapter_issue("a_program", daily, passing, _RUN, after)["closing"]
+    assert closing.startswith("Nothing here is asked any more")
+    assert "was retired. That is not a pass." in closing
+    assert "nothing declares it any more. That is not a pass." in closing
+    # A run of one adapter has no say about it.
+    partial = {**daily, "partial": True, "scope": {**daily["scope"], "partial": True}}
+    assert "a_program" not in {
+        i["key"] for i in report.wanted_issues(partial, passing, after, _RUN)
+    }
+
+
+def test_the_page_says_which_rows_another_run_left_at_another_commit(tmp_path):
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    state = report.next_state({}, passing, {**_RUN, "sdk_commit": "a" * 40}, tmp_path, daily)
+    assert state["points"]["openai_agents--floor"]["last"]["commit"] == "a" * 40
+    page = render.page(state, render.MAIN, "2026-11-26")
+    assert "another commit" not in page
+    weekly = _plan("weekly")
+    week = {p["key"]: _result(p) for p in weekly["points"]}
+    later = {**_RUN, "cadence": "weekly", "sdk_commit": "b" * 40, "date": "2026-11-30"}
+    state = report.next_state(state, week, later, tmp_path, weekly)
+    page = render.page(state, render.MAIN, "2026-11-30")
+    assert "commit `aaaaaaaaaa`)." in page
+    assert (
+        "2 of the rows below were last run by another run, at another commit of `main`: "
+        "`devbranch--langgraph` at `bbbbbbbbbb`, `devbranch--openai_agents` at `bbbbbbbbbb`."
+    ) in page
+    # Rows from before the commit was kept say nothing, and are not counted.
+    for entry in state["points"].values():
+        entry["last"].pop("commit", None)
+    assert "another commit" not in render.page(state, render.MAIN, "2026-11-30")
+
+
+def test_a_set_that_has_not_installed_for_days_is_said_in_its_own_words_on_the_health_issue():
+    made = _plan()
+    results = {p["key"]: _result(p) for p in made["points"]}
+    key = "combination--openai_agents__pydantic_ai"
+    results[key] = _result(results[key], "not_installable", install={"detail": "no solution"})
+    state = {"points": {key: {"not_ours_days": 2}}}
+    body = report.health_issue(made, results, state, _RUN)["body"]
+    assert (
+        f"`{key}`: `openai-agents 1.0.1, pydantic-ai-slim 1.0.1` cannot be installed together, "
+        "on 2 days running." in body
+    )
+    assert "on this Python" not in body

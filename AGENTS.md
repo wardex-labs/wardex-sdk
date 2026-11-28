@@ -199,9 +199,20 @@ reports; what it found wrong with itself is on the health issue the same way,
 and the daily run says so when the weekly one has not completed for ten days.
 The weekly run asks nothing about the tested ranges, so the release gate never
 takes it as the run that decides, and it does not change which commit the
-public page says its rows are of. A subject taken out of `manifest.py` is
-forgotten by the next whole daily run, which closes its issue and says the
+public page says its rows are of; the page names the rows another run left at
+another commit. A subject taken out of `manifest.py` (an adapter, a set, a
+program, a branch) and a kind taken out of `kinds.py` are forgotten by the
+next whole daily run, which closes the issue in the same run and says the
 check went away, not that it passed.
+
+A run that is behind is history. That is a run planned before a run that has
+already reported (its failed jobs were run again later), and a run started
+again at a commit that is no longer the tip of its branch (GitHub re-runs a
+run with the code of its own commit, which does not know what was declared
+since). Its lines are kept and the list of runs learns of it; it changes no
+issue, nothing `state.json` remembers and nothing the pages show, and its
+summary says so. To say how things stand now, start a new run:
+`gh workflow run compat.yml`.
 
 The run also writes the public pages, from `state.json` and nothing else
 (`scripts/compat/render.py`), under `site/` on the `compat-results` branch:

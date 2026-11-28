@@ -31,7 +31,7 @@ REPO = "https://github.com/NousResearch/hermes-agent"
 SMOKE = Path(__file__).with_name("e2e_hermes_smoke.py")
 #: The interpreter Hermes's core dependencies ask for at the tags this was measured on.
 PYTHON = "3.14"
-_TAG = re.compile(r"v\d+(?:\.\d+){1,3}")
+_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 _PLUGIN = """\
 from wardex_sdk.hermes_agent import HOOKS, MIDDLEWARE
 lines = ["name: wardex", 'version: "0.1.0"', "description: wardex, for the smoke.",
