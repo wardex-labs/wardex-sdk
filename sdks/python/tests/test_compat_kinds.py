@@ -1853,3 +1853,63 @@ def test_a_pass_the_weekly_run_saw_is_named_as_not_run_by_the_daily_run(tmp_path
         "langgraph head-0123456789, langgraph-prebuilt head-0123456789` (not run by this run)"
         in (closing)
     )
+
+
+def test_what_a_watching_point_found_stands_on_a_day_it_is_not_planned(tmp_path):
+    """Yesterday the release the README names would not install. Today no point of it was
+    planned (the release list could not be read, or the run was for one adapter). What it
+    found stands: the issue stays open with the same mark, and posts no comment."""
+    made = _plan()
+    key = "hermes--claim_top"
+    passing = {p["key"]: _result(p) for p in made["points"]}
+    refused = {**passing, key: _result(passing[key], "not_installable")}
+    old = report.next_state({}, passing, {**_RUN, "date": "2026-11-24"}, tmp_path, made)
+    state = report.next_state(old, refused, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    yesterday = report.adapter_issue("hermes_agent", made, refused, _RUN, state)
+    assert yesterday["open"] is True
+    unplanned = {k: r for k, r in passing.items() if r.get("subject") != "hermes_agent"}
+    issue = report.adapter_issue("hermes_agent", made, unplanned, _RUN, state)
+    assert issue["open"] is True and issue["fingerprint"] == yesterday["fingerprint"]
+    assert "cannot be installed on this Python (last run `2026-11-25`)" in issue["body"]
+
+
+def test_a_failure_stands_over_a_day_the_test_dependencies_will_not_install(tmp_path):
+    """The release failed, and today its test dependencies would not install beside it, so
+    it was not run. It is still a release that failed: no comment, and the failing names
+    stay on the issue."""
+    made = _plan()
+    key = "hermes--claim_top"
+    passing = {p["key"]: _result(p) for p in made["points"]}
+    failed = {**passing, key: _result(passing[key], "fail", tests={"failed_ids": ["t.py::a"]})}
+    state = report.next_state({}, failed, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    yesterday = report.adapter_issue("hermes_agent", made, failed, _RUN, state)
+    blocked = {**passing, key: _result(passing[key], "test_deps_unresolvable")}
+    after = report.next_state(state, blocked, _RUN, tmp_path, made)
+    assert after["points"][key]["last_said"]["outcome"] == "fail"
+    issue = report.adapter_issue("hermes_agent", made, blocked, _RUN, after)
+    assert issue["fingerprint"] == yesterday["fingerprint"]
+    assert "did not pass when it was last checked, on `2026-11-25`" in issue["body"]
+
+
+def test_what_the_weekly_run_found_short_of_a_failure_is_on_the_daily_issue(tmp_path):
+    """The development branch passed one week, and the next its test dependencies would not
+    install. The daily run, which does not run the branch, says what the weekly run found."""
+    weekly = _plan("weekly")
+    key = "devbranch--langgraph"
+    passed = {p["key"]: _result(p) for p in weekly["points"]}
+    first = report.next_state(
+        {}, passed, {**_RUN, "cadence": "weekly", "date": "2026-11-16"}, tmp_path, weekly
+    )
+    blocked = {**passed, key: _result(passed[key], "test_deps_unresolvable")}
+    state = report.next_state(
+        first, blocked, {**_RUN, "cadence": "weekly", "date": "2026-11-23"}, tmp_path, weekly
+    )
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    after = report.next_state(state, passing, _RUN, tmp_path, daily)
+    issue = report.adapter_issue("langgraph", daily, passing, _RUN, after)
+    assert issue["open"] is True
+    assert (
+        "the test dependencies cannot be installed beside it (last run `2026-11-23`)"
+        in (issue["body"])
+    )

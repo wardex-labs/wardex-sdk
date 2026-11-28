@@ -241,12 +241,14 @@ arrives as an issue labelled `compat`: one per subject (an adapter, a set of
 frameworks run together, a program with no tested range), one for problems
 with the run itself, and one opened by a run that ended without a verdict. A
 day a point says nothing about its release (it left no result, the run broke,
-the index could not be reached) changes nothing on any issue. What the point
+the index could not be reached, or the run did not plan it) changes nothing on
+any issue. What the point
 last found stands, in the same words and with no comment: a failure, inside the
 range or above it, watched or not; a pass above the range, which says the range
 can be widened; and, for a watching point, a release inside the range that will
 not install as asked or a set of frameworks that will not install together. A
-refusal to install does not replace a failure of the same release. A point that
+release that failed and was not run since, because it or its test dependencies
+would not install, is still a release that failed. A point that
 could not be checked and is not known to have found anything asks nothing and
 opens no issue, and neither does a release above the range that will not
 install. They are listed under "Not checked today", and when an issue closes
