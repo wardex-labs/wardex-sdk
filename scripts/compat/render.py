@@ -43,7 +43,14 @@ FROM_MAIN = "from main"
 REPO_URL = "https://github.com/wardex-labs/wardex-sdk"
 RECORDS_BRANCH = "compat-results"
 
-_VERSION = re.compile(r"[0-9][0-9A-Za-z.+!-]{0,40}")
+# Forty characters at most: what a title and a link print of a version.
+_VERSION = re.compile(r"[0-9][0-9A-Za-z.+!-]{0,39}")
+_NUMBER = r"(?:0|[1-9][0-9]*)"
+#: A version spelled the one way PyPI spells it, development releases included. Another
+#: spelling of a release that has a page would not be found to have one.
+_CANONICAL = re.compile(
+    rf"{_NUMBER}(?:\.{_NUMBER})*(?:(?:a|b|rc){_NUMBER})?(?:\.post{_NUMBER})?(?:\.dev{_NUMBER})?"
+)
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,40}")
 _MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 
@@ -114,10 +121,12 @@ def unreleased(state: dict) -> str:
     so. Compared without case, as a folder on some file systems is."""
     held = state.get("versions") or {}
     version = (held.get(MAIN) or {}).get("version")
-    if not isinstance(version, str) or version.lower() in {str(key).lower() for key in held}:
+    if not isinstance(version, str) or not _CANONICAL.fullmatch(version):
         return ""
-    # No longer than what a title and a link print of it.
-    return version if _VERSION.fullmatch(version) and len(version) <= 40 else ""
+    # A canonical spelling is lower case, so this finds a page under any case of it.
+    if version in {str(key).lower() for key in held}:
+        return ""
+    return version if _VERSION.fullmatch(version) else ""
 
 
 def status_of(entry: dict, today: str) -> dict:
@@ -329,8 +338,8 @@ def page(state: dict, version: str, today: str, *, standing_in_for: str = "") ->
         title = f"Compatibility of wardex {clean(standing_in_for, 40)}, before its release is run"
         what = (
             f"The daily run has not yet run `wardex-sdk=={clean(standing_in_for, 40)}` as PyPI "
-            "serves it: it is not published, or no run since has planned it. Until one has, "
-            "this page shows what the run found for wardex built from `main`, whose version "
+            "serves it: it is not published, or no run since has planned it. As long as none "
+            "has, this page shows what the run found for wardex built from `main`, whose version "
             f"string that is (commit {code(str(about.get('commit', ''))[:10])}). No row here is "
             "a result of the published wheel."
         )

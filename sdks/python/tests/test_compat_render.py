@@ -431,6 +431,7 @@ def test_a_version_not_published_yet_gets_cells_drawn_from_the_default_branch():
     page = files["0.7.0b2/README.md"]
     assert page.startswith("# Compatibility of wardex 0.7.0b2, before its release is run\n")
     assert "has not yet run `wardex-sdk==0.7.0b2` as PyPI serves it" in page
+    assert "it is not published, or no run since has planned it." in page
     assert "did not serve" not in page, "a run that could not read PyPI does not know that"
     assert "`fedcba9876`" in page
     assert "No row here is a result of the published wheel." in page
@@ -471,6 +472,14 @@ def test_a_version_with_its_own_page_is_never_drawn_from_the_default_branch():
         ["0.7.0b2"],
         "x" * 99,
         "1" * 41,
+        "0.7.0.b1",
+        "0.7.0-b1",
+        "0.7.0beta1",
+        "0.7.0b01",
+        "00.7.0b1",
+        "0.7.0b2+local",
+        "1!2.0",
+        "0..",
     ],
 )
 def test_a_version_string_that_is_not_a_release_number_names_no_folder(version, tmp_path):
@@ -494,3 +503,19 @@ def test_an_adapter_whose_name_is_not_a_name_gets_no_cell_under_the_coming_versi
     ]
     render.write_site(tmp_path / "records", state, _TODAY)
     assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.parametrize(
+    "version", ["0.8.0.dev0", "1.0.0rc1", "1.0.0.post1", "2", "1." + "1" * 38, "10.0.1a0"]
+)
+def test_a_version_spelled_as_the_index_spells_it_gets_its_folder(version):
+    assert len("1." + "1" * 38) == 40, "the longest a title and a link print whole"
+    files = render.site(_bumped(version), _TODAY)
+    assert f"{version}/README.md" in files and f"{version}/openai_agents.svg" in files
+    assert f"({version}/README.md)" in files["README.md"]
+
+
+def test_a_page_that_exists_under_another_case_is_the_page():
+    state = _bumped("0.7.0rc1")
+    state["versions"]["0.7.0RC1"] = state["versions"].pop(_RELEASE)
+    assert render.unreleased(state) == ""
