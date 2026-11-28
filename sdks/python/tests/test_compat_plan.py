@@ -1353,3 +1353,22 @@ def test_a_published_point_that_fails_is_replayed_with_the_release_and_never_bla
     assert runner.result["cause"] == "not_determined"
     runner.counterfactual(["test_a.py"], ["test_a.py::test_x"])
     assert runner.result["cause"] == "upstream"
+
+
+def test_the_plan_says_which_releases_of_each_pinned_distribution_the_index_serves():
+    """The report asks this before it remembers a failed release: one the index withdrew,
+    of the framework or of a companion it is pinned with, cannot be run again."""
+    history = {
+        "langgraph": [_release("1.2.0", "2026-08-01"), _release("1.2.1", "2026-09-01")],
+        "langgraph-prebuilt": [
+            _release("1.1.0", "2026-08-01"),
+            _release("1.1.1", "2026-09-01", yanked=True),
+            _release("1.2.0", "2026-10-01"),
+        ],
+    }
+    rows = [
+        {"distribution": "langgraph", "minors": ("1.2",), "known_bad": (), "since": ""},
+        {"distribution": "langgraph-prebuilt", "minors": ("1.1",), "known_bad": (), "since": ""},
+    ]
+    info = plan.plan_adapter("langgraph", rows, history, _CUTOFF)["info"]
+    assert info["served"] == {"langgraph": ["1.2.0", "1.2.1"], "langgraph-prebuilt": ["1.1.0"]}

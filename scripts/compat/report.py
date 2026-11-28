@@ -293,6 +293,12 @@ def _recipe(point: dict | None) -> dict | None:
     return {name: point[name] for name in (*kept, "budget_s", "fresh_days") if name in point}
 
 
+#: Points whose release nobody is owed a run of when the point leaves the plan: the floor
+#: runs a release with another time's packages, and a replaced release's own point leaves
+#: the plan only when the plan no longer claims the release.
+_NOT_OWED = ("floor", "displaced")
+
+
 def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
     """Releases inside the tested range that failed and that no rule picks any more.
 
@@ -320,19 +326,36 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
             if result["role"] != "displaced" and result["outcome"] in FAILED:
                 continue
             kept.setdefault(adapter, []).append(item)
-    for key, result in sorted(results.items()):
-        before = state.get("points", {}).get(key, {}).get("last_checked") or {}
-        entries = plan["adapters"].get(result["adapter"], {}).get("entries") or []
-        if (
-            not _own(result)
-            or not result["in_claim"]
-            or result["role"] == "displaced"
-            or before.get("outcome") not in FAILED
-            or before.get("targets") == result["targets"]
-            or not entries
-        ):
+    for key, entry in sorted((state.get("points") or {}).items()):
+        before = entry.get("last_checked") or {}
+        if before.get("outcome") not in FAILED or not isinstance(before.get("targets"), dict):
             continue
-        rows = {entry["distribution"]: entry for entry in entries}
+        result = results.get(key)
+        if result is not None:
+            # Its point is still planned, on another release now.
+            moved = _own(result) and result["in_claim"] and result["role"] != "displaced"
+            if not moved or before["targets"] == result["targets"]:
+                continue
+            adapter = result["adapter"]
+            python = before.get("python") or result.get("planned_python") or ""
+        else:
+            # Its point is no longer planned at all: the rules moved (the floor now sits on
+            # its line, the line it was the newest patch of became the top one). The
+            # release is as untested as one a newer patch replaced.
+            identity = entry.get("point") or {}
+            mine = (
+                not identity.get("watching")
+                and (identity.get("sdk") or {}).get("origin", "build") == "build"
+            )
+            if not mine or not identity.get("in_claim") or identity.get("role") in _NOT_OWED:
+                continue
+            adapter = identity.get("adapter", "")
+            python = before.get("python") or identity.get("python") or ""
+        info = plan["adapters"].get(adapter) or {}
+        entries = info.get("entries") or []
+        if not entries or info.get("problems"):
+            continue
+        rows = {row["distribution"]: row for row in entries}
         # A range narrowed past the release, or a release now listed as bad, is settled.
         # Every pinned distribution is asked of its own row.
         if not all(
@@ -340,16 +363,27 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
             for dist, v in before["targets"].items()
         ):
             continue
-        python = before.get("python") or result.get("planned_python") or ""
+        # So is one the index no longer serves, for any distribution the point pinned: no
+        # point can be made for it.
+        served = info.get("served")
+        if isinstance(served, dict) and not all(
+            v in served.get(dist, ()) for dist, v in before["targets"].items()
+        ):
+            continue
         item = {
-            "key": f"{result['adapter']}--displaced--{displaced_line(before['targets'], python)}",
+            "key": f"{adapter}--displaced--{displaced_line(before['targets'], python)}",
             "targets": before["targets"],
             "python": python,
             "failed_on": before["date"],
         }
-        mine = kept.setdefault(result["adapter"], [])
-        if all(other["key"] != item["key"] for other in mine):
-            mine.append(item)
+        # A rule's point that checked the same release on the same interpreter today
+        # speaks for it: its pass settles it, its failure is on that point's record.
+        spoke = _picked_again(item, results)
+        if spoke is not None and spoke["outcome"] in GREEN | FAILED:
+            continue
+        mine_ = kept.setdefault(adapter, [])
+        if all(other["key"] != item["key"] for other in mine_):
+            mine_.append(item)
     return {adapter: items for adapter, items in sorted(kept.items()) if items}
 
 
@@ -398,8 +432,13 @@ def _still_asked(failing: dict, plan: dict | None, results: dict, displaced: dic
     range, or was listed as bad, takes its count with it."""
     if not plan:
         return failing
+    # Asked by a point that counts, or by the list. A point above the range, the floor or
+    # another wardex build running the same release asks a different question, and must
+    # not keep this one's count alive after the release left the range.
     asked = {
-        release_id(r["adapter"], r["targets"], r.get("planned_python")) for r in results.values()
+        release_id(r["adapter"], r["targets"], r.get("planned_python"))
+        for r in results.values()
+        if _counted(r)
     }
     asked |= {
         release_id(adapter, item["targets"], item.get("python"))
@@ -846,7 +885,7 @@ def adapter_issue(
             )
             if result["role"] == "displaced":
                 closes = (
-                    "A newer release has taken its place, so no other point tests it. This "
+                    "No rule picks it any more, so no other point tests it. This "
                     "closes when it passes again, or when the table of tested versions lists "
                     "it under `known_bad`."
                 )
@@ -924,9 +963,10 @@ def adapter_issue(
         lapse = _lapse_since(counted.get(_item_id(name, item)), item["targets"], run)
         todo.append(
             f"{version} is inside the tested range and did not pass when it was last run, on "
-            f"{code(item['failed_on'])}. A newer release has taken its place, so it is run on "
-            "its own from the next run on. This closes when it passes, or when the table of "
-            f"tested versions lists it under `known_bad`.{lapse}"
+            f"{code(item['failed_on'])}. No rule picks it any more (a newer release took its "
+            "place, or the points moved), so it is run on its own from the next run on. This "
+            "closes when it passes, or when the table of tested versions lists it under "
+            f"`known_bad`.{lapse}"
         )
         marks.append([item["key"], "displaced", None, []])
         if lapse:

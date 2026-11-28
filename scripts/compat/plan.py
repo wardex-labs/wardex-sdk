@@ -320,6 +320,9 @@ def plan_adapter(
             for entry in entries
         ],
         "newest": max(finals, key=vkey) if finals else None,
+        # The releases inside the range the index serves now, for each distribution a point
+        # pins. One the index withdrew cannot be run, so nothing is owed for it.
+        "served": {primary["distribution"]: list(claimed)},
         "prerelease_ahead": _prerelease_ahead(releases[primary["distribution"]], finals, cutoff),
         # A problem means the adapter could not be planned and turns the run red. A note is
         # a fact about the plan worth reading (a point that cannot exist) and does not.
@@ -340,6 +343,9 @@ def plan_adapter(
         entry["distribution"]: _finals(releases[entry["distribution"]], cutoff)
         for entry in companions
     }
+    for entry in companions:
+        served = _claimed(companion_finals[entry["distribution"]], entry)
+        info["served"][entry["distribution"]] = served
 
     def companion_pins(pick: int) -> dict[str, str]:
         pins = {}

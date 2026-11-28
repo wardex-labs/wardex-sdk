@@ -912,7 +912,7 @@ def test_a_displaced_release_that_still_fails_is_red_and_says_how_it_closes(tmp_
     assert [item["key"] for item in state["displaced"]["openai_agents"]] == [old["key"]]
     issue = report.adapter_issue("openai_agents", plan, results, _RUN, state)
     (line,) = issue["changes"]
-    assert "A newer release has taken its place, so no other point tests it." in line
+    assert "No rule picks it any more, so no other point tests it." in line
     assert "lists it under `known_bad`" in line
     assert "failed as the newest tested release, since replaced" in issue["body"]
 
@@ -1636,9 +1636,9 @@ def test_a_replaced_failure_outlives_a_day_it_could_not_be_checked_and_a_day_not
     assert state["displaced"]["openai_agents"] == [item]
     assert silent["open"] and silent["changes"] == [
         "`openai-agents 0.23.1` is inside the tested range and did not pass when it was last "
-        "run, on `2026-11-21`. A newer release has taken its place, so it is run on its own "
-        "from the next run on. This closes when it passes, or when the table of tested "
-        "versions lists it under `known_bad`."
+        "run, on `2026-11-21`. No rule picks it any more (a newer release took its place, or "
+        "the points moved), so it is run on its own from the next run on. This closes when "
+        "it passes, or when the table of tested versions lists it under `known_bad`."
     ]
 
 
@@ -2463,7 +2463,7 @@ def test_the_way_out_stays_on_the_issue_while_a_release_changes_hands(tmp_path):
         days = day - 1
         assert f"It has failed since `2026-11-01`, {days} days." in line, day
         assert "claim.py bad openai-agents 0.23.1" in line, day
-    assert "taken its place" in said[20]["changes"][0], "the day it was replaced"
+    assert "No rule picks it any more" in said[20]["changes"][0], "the day it was replaced"
     assert "could not be checked today" in said[21]["changes"][0], "its own point's first day"
     assert said[20]["fingerprint"] == said[21]["fingerprint"]
 
@@ -2496,7 +2496,7 @@ def test_only_a_red_capable_point_of_this_build_makes_or_speaks_for_a_replaced_f
     state = {"displaced": {"openai_agents": [item]}}
     passed = _loaded(_result(_FLOOR), _result(new), _result(beside))
     issue = report.adapter_issue("openai_agents", plan, passed, _RUN, state)
-    assert issue["open"] and "taken its place" in issue["changes"][0]
+    assert issue["open"] and "No rule picks it any more" in issue["changes"][0]
 
 
 def _one_day(state: dict, date: str, tmp_path, *outcomes: tuple) -> dict:
@@ -2551,10 +2551,31 @@ def test_a_count_is_by_release_and_interpreter_and_ends_when_nobody_asks_any_mor
 
     newer = {**_point("claim_top", "0.23.2"), "python": "3.14"}
     state = _one_day(state, "2026-11-05", tmp_path, (newer, "pass"))
-    replaced = report.release_id("openai_agents", {"openai-agents": "0.23.1"}, "3.14")
-    assert state["failing"] == {replaced: "2026-11-03"}, (
-        "what was replaced on 3.14 is remembered; nobody asks about 3.10 any more"
+    on = {
+        py: report.release_id("openai_agents", {"openai-agents": "0.23.1"}, py)
+        for py in ("3.14", "3.10")
+    }
+    assert state["failing"] == {on["3.14"]: "2026-11-03", on["3.10"]: "2026-10-20"}, (
+        "replaced on 3.14, and its point on 3.10 no longer planned: both are still owed a run"
     )
+    assert sorted(item["python"] for item in state["displaced"]["openai_agents"]) == [
+        "3.10",
+        "3.14",
+    ]
+
+    listed = {**_ENTRY, "known_bad": ["0.23.1"]}
+    plan = _plan_with_table(newer, entry=listed)
+    plan["scope"] = {
+        "cadence": "daily",
+        "covers": {"framework": ["openai_agents"]},
+        "partial": False,
+    }
+    result = _result(newer)
+    result["planned_python"] = "3.14"
+    settled = report.next_state(
+        state, {newer["key"]: result}, {**_RUN, "date": "2026-11-06"}, tmp_path, plan
+    )
+    assert settled["failing"] == {} and settled["displaced"] == {}, "listed as bad: nobody asks"
 
     uncovered = _plan_with_table()
     uncovered["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
@@ -2613,3 +2634,129 @@ def test_only_a_release_inside_the_range_is_counted_and_an_uncovered_day_keeps_e
     uncovered["adapters"]["openai_agents"]["problems"] = ["the index did not answer"]
     kept = report.next_state(state, {}, {**_RUN, "date": "2026-11-02"}, tmp_path, uncovered)
     assert kept["failing"] == {counted: "2026-11-01"} and kept["displaced"] == {}
+
+
+def test_a_failing_release_whose_point_leaves_the_plan_is_still_owed_a_run(tmp_path):
+    """The rules moved: the floor now sits on the line this release was the newest patch
+    of, so no point runs it with today's packages any more. It failed when it was last
+    checked and the range still claims it, so it is remembered like a release a newer
+    patch replaced. Not when the index withdrew it, and not when a point checked it today."""
+    floor = {**_FLOOR, "python": "3.10"}
+    patch = {**_point("minor_newest", "0.22.3"), "python": "3.14"}
+    top = {**_TOP, "python": "3.14"}
+    state = _one_day({}, "2026-11-01", tmp_path, (floor, "pass"), (patch, "fail"), (top, "pass"))
+
+    def without_it(served: list[str], *more: tuple) -> dict:
+        plan = _plan_with_table(floor, top, *[planned for planned, _ in more])
+        plan["adapters"]["openai_agents"]["served"] = {"openai-agents": served}
+        plan["scope"] = {
+            "cadence": "daily",
+            "covers": {"framework": ["openai_agents"]},
+            "partial": False,
+        }
+        results = {}
+        for planned, outcome in ((floor, "pass"), (top, "pass"), *more):
+            result = _result(planned, outcome)
+            result["planned_python"] = planned["python"]
+            results[planned["key"]] = result
+        after = report.next_state(state, results, {**_RUN, "date": "2026-11-02"}, tmp_path, plan)
+        return {
+            "state": after,
+            "issue": report.adapter_issue(
+                "openai_agents", plan, results, {**_RUN, "date": "2026-11-02"}, after
+            ),
+        }
+
+    owed = without_it(["0.22.0", "0.22.3", "0.23.1"])
+    (item,) = owed["state"]["displaced"]["openai_agents"]
+    assert (item["targets"], item["python"], item["failed_on"]) == (
+        {"openai-agents": "0.22.3"},
+        "3.14",
+        "2026-11-01",
+    )
+    assert patch["key"] not in owed["state"]["points"]
+    assert owed["issue"]["open"] and "No rule picks it any more" in owed["issue"]["changes"][0]
+    assert list(owed["state"]["failing"].values()) == ["2026-11-01"]
+
+    withdrawn = without_it(["0.22.0", "0.23.1"])
+    assert withdrawn["state"]["displaced"] == {} and not withdrawn["issue"]["open"]
+    assert without_it([])["state"]["displaced"] == {}, "nothing of the distribution is served"
+
+    again = {**_point("claim_top_oldpy", "0.22.3"), "key": "openai_agents--other", "python": "3.14"}
+    for outcome, remembered in (("pass", False), ("fail", False), ("install_network", True)):
+        seen = without_it(["0.22.0", "0.22.3", "0.23.1"], (again, outcome))
+        assert bool(seen["state"]["displaced"]) is remembered, outcome
+        assert seen["issue"]["open"] is (outcome != "pass"), outcome
+
+
+def test_a_count_is_not_kept_alive_by_a_point_that_does_not_count(tmp_path):
+    """A release left the range and passes above it; later the range takes it back and it
+    fails. That is day one, not the day it first failed before it left."""
+    inside = {**_point("claim_top", "0.24.0"), "python": "3.14"}
+    state = _one_day({}, "2026-11-01", tmp_path, (inside, "fail"))
+    above = {**_point("beyond", "0.24.0", line="0.24"), "python": "3.14"}
+    top = {**_TOP, "python": "3.14"}
+    state = _one_day(state, "2026-11-11", tmp_path, (top, "pass"), (above, "pass"))
+    assert state["failing"] == {}
+    state = _one_day(state, "2026-11-21", tmp_path, (inside, "fail"))
+    assert list(state["failing"].values()) == ["2026-11-21"]
+
+
+def test_a_pair_whose_companion_release_was_withdrawn_is_owed_nothing(tmp_path):
+    """The framework is pinned with a companion. The companion's release is withdrawn, so
+    the pair that failed cannot be installed any more: no point can be made for it, and
+    remembering it would put a release nobody can run on the issue for a day."""
+    pair = {
+        **_TOP,
+        "python": "3.14",
+        "targets": {"langgraph": "1.2.1", "langgraph-prebuilt": "1.1.2"},
+    }
+    state = _one_day({}, "2026-11-01", tmp_path, (pair, "fail"))
+    moved = {**pair, "targets": {"langgraph": "1.2.1", "langgraph-prebuilt": "1.1.1"}}
+    rows = [
+        {"distribution": "langgraph", "minors": ["1.2"], "known_bad": [], "since": ""},
+        {"distribution": "langgraph-prebuilt", "minors": ["1.1"], "known_bad": [], "since": ""},
+    ]
+
+    def day(served: dict) -> dict:
+        plan = _plan(moved)
+        plan["adapters"]["openai_agents"].update(entries=rows, served=served)
+        plan["scope"] = {
+            "cadence": "daily",
+            "covers": {"framework": ["openai_agents"]},
+            "partial": False,
+        }
+        result = _result(moved, "fail")
+        result["planned_python"] = "3.14"
+        return report.next_state(
+            state, {moved["key"]: result}, {**_RUN, "date": "2026-11-02"}, tmp_path, plan
+        )
+
+    gone = day({"langgraph": ["1.2.1"], "langgraph-prebuilt": ["1.1.1"]})
+    assert gone["displaced"] == {} and len(gone["failing"]) == 1, "only the pair that runs today"
+    still = day({"langgraph": ["1.2.1"], "langgraph-prebuilt": ["1.1.1", "1.1.2"]})
+    assert [item["targets"] for item in still["displaced"]["openai_agents"]] == [pair["targets"]]
+
+
+@pytest.mark.parametrize(
+    "left",
+    [
+        {**_point("floor", "0.22.3"), "key": "left--floor"},
+        {**_point("displaced", "0.22.3"), "key": "left--displaced"},
+        {**_point("minor_newest", "0.22.3"), "key": "left--watched", "watching": True},
+        {**_point("minor_newest", "0.22.3"), "key": "left--pypi", "sdk": {"origin": "pypi"}},
+        {**_point("beyond", "0.22.3"), "key": "left--beyond"},
+    ],
+)
+def test_not_every_failing_point_that_leaves_the_plan_is_owed_a_run(tmp_path, left):
+    """The floor ran the release with another time's packages; a replaced release's own
+    point leaves the plan only when the plan stopped claiming it; a watched point, another
+    wardex build and a release above the range were never this build's promise."""
+    left = {**left, "python": "3.14"}
+    state = _one_day({}, "2026-11-01", tmp_path, (left, "fail"))
+    state["points"][left["key"]]["point"].update(
+        watching=left.get("watching", False), sdk=left.get("sdk", {"origin": "build"})
+    )
+    top = {**_TOP, "python": "3.14"}
+    after = _one_day(state, "2026-11-02", tmp_path, (top, "pass"))
+    assert after["displaced"] == {} and after["failing"] == {}
