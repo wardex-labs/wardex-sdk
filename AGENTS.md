@@ -248,7 +248,10 @@ every point that speaks for a tested range, with at least two such points for
 each adapter the tree gives a range. A watching kind is not asked. It reads
 the record lines and writes nothing. Which runs there were it reads from the
 list the report keeps in `state.json` beside the lines, so a run that could
-plan no point, and so wrote no line, is still the newest run at its commit. It never reads damage into a pass: a line
+plan no point, and so wrote no line, is still the newest run at its commit.
+The report keeps an entry of that list it cannot read as a mark for a week,
+and treats a list that is missing beside lines written with one as damaged, so
+the runs that follow do not wash damage out. It never reads damage into a pass: a line
 of the last three days that cannot be read, a line of the deciding run whose
 fields are not what the report writes, and a run that holds fewer lines than
 the points it planned each stop the release, and the line is named. It ends

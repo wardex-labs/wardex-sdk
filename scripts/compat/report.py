@@ -20,7 +20,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -534,25 +534,28 @@ _RUN_KEPT = ("id", "attempt", "started_at", "date", "scope", "ref", "sdk_commit"
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
-def run_list(before: object, run: dict) -> list[dict]:
+def run_list(before: object, run: dict, *, now: str | None = None) -> list[dict]:
     """The runs that wrote records, this one last: what the release gate takes as the
     list of runs there were. A run that planned no point writes no line, and is here.
 
     One entry per run and attempt. `red` and `points` are there once the run has a
     verdict; a state built before that (a preview) lists the run without them, and the
-    gate reads such an entry as one it cannot use."""
+    gate reads such an entry as one it cannot use. `now` is the day this is written
+    (UTC today when not given), which is not always the run's: a run is dated by its plan."""
     entry = {field: run.get(field) for field in _RUN_KEPT}
     entry.update({field: run[field] for field in ("red", "points") if field in run})
     today = run["date"]
+    now = now or datetime.now(timezone.utc).date().isoformat()
     oldest = (date.fromisoformat(today) - timedelta(days=RUN_LIST_DAYS)).isoformat()
     # A state from before the list existed has none, and that is a list of nothing. Anything
     # else that is not a list is damage, and is kept as that.
     held = [] if before is None else before if isinstance(before, list) else [before]
-    # The newest day the list knows. A run is dated by its plan, and failed jobs run again
-    # weeks later still carry the old plan's day: a mark dated by such a run would be old
-    # the day it was made, and the next ordinary run would drop it.
+    # The newest day there is: the day this is written, this run's, and those the list
+    # knows. A run is dated by its plan, and failed jobs run again weeks later still carry
+    # the old plan's day: a mark dated by such a run would be old the day it was made, and
+    # the next ordinary run would drop it.
     days = [old["date"] for old in held if gate.entry_ok(old) and _DAY.fullmatch(old["date"])]
-    latest = max([today, *days])
+    latest = max([today, now, *days])
     kept = []
     for old in held:
         # Dated by its plan, and so possibly after this run: failed jobs of yesterday's run,
@@ -571,6 +574,36 @@ def run_list(before: object, run: dict) -> list[dict]:
         if seen >= oldest:
             kept.append({"unreadable_since": seen})
     return [*kept, entry]
+
+
+#: What `runs` is set to when the state holds no list and the records show there was one.
+LIST_GONE = "gone"
+
+
+def list_was_kept(state_dir: Path, days: list[str]) -> bool:
+    """Whether a record line of the last week was written by a report that kept the list.
+
+    Such a line carries how many points its run wrote lines for, a stamp that came with the
+    list. A state with no list beside such lines did not start without one: the list was
+    removed, and the next run must not be what quietly starts it again from nothing."""
+    for day in days:
+        try:
+            start = date.fromisoformat(day)
+        except ValueError:
+            continue
+        for back in range(RUN_LIST_DAYS + 1):
+            at = start - timedelta(days=back)
+            path = state_dir / "records" / f"{at:%Y}" / f"{at:%m}" / f"{at:%d}.jsonl"
+            if not path.is_file():
+                continue
+            for raw in path.read_bytes().splitlines():
+                try:
+                    stamp = json.loads(raw.decode("utf-8"))["run"]["points"]
+                except Exception:  # noqa: BLE001, S112 - a line that is not one says nothing
+                    continue
+                if isinstance(stamp, int) and not isinstance(stamp, bool):
+                    return True
+    return False
 
 
 def next_state(
@@ -1387,6 +1420,9 @@ def main(argv: list[str] | None = None) -> int:
     state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.is_file() else {}
     state = model.upgrade_state(state)
     run = run_info(plan)
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("runs") is None and list_was_kept(state_dir, [run["date"], today]):
+        state = {**state, "runs": LIST_GONE}
 
     results = load_results(plan, results_dir)
     apply_skip_rule(results, state)
