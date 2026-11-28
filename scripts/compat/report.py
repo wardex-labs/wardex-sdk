@@ -638,27 +638,30 @@ def off_tip(run: dict, tip: str | None) -> bool:
     return str(run.get("attempt") or "1") != "1" and tip != run["sdk_commit"]
 
 
-def spoken_for(last: dict, run: dict, *, old_commit: bool) -> bool:
-    """Whether what a point last said is another run's word that a run that is behind
-    must leave standing.
+def spoken_for(last: dict, run: dict) -> bool:
+    """Whether what a point last said is the word of a newer build, or a later word of
+    the same build, which a run that is behind must leave standing.
 
-    Not by the day: two runs planned on one day are told apart by which was planned
-    later. And not by the plan alone: every job of an old run, run again, makes a plan
-    today, is the newest by its plan and still builds its old commit. So: the point was
-    last written by a run planned after this one; or this run is of an old commit and the
-    point was last written, at another commit, by a run created after this one. A branch
-    moves forward, and a run starts at its tip: that other commit is a newer one. A point
-    an older run wrote is not spoken for, whatever its commit, and neither is one a later
-    run wrote at this run's own commit: what this run found there is the newest there is
-    about that build. A point written before the run was kept on it is told by its day,
-    and on the same day is left standing."""
+    Not by the day: two runs planned on one day are told apart. And not by the plan
+    alone: every job of an old run, run again, makes a plan today, and still builds its
+    old commit. Two things are known of the run that wrote a point, its id and its
+    commit, and of them:
+
+    - Another commit is another build, and which is the newer cannot be read from the
+      commits. It can be read from the runs: a run keeps its id and its commit through
+      every attempt, ids rise with each new run, a branch moves forward and a run starts
+      at its tip. The run created later built the newer commit, whenever either was
+      planned.
+    - The same commit is the same build, and the word planned later is the later one.
+
+    A point written before the run was kept on it is told by its day, and on the same day
+    is left standing."""
     by = last.get("run")
     if isinstance(by, list) and len(by) == 2 and all(isinstance(part, str) for part in by):
-        if (by[0], by[1]) > (run["started_at"], run["id"]):
-            return True
-        # A run keeps its id through every attempt, and ids rise with each new run.
-        created_later = (len(by[1]), by[1]) > (len(run["id"]), run["id"])
-        return old_commit and created_later and last.get("commit") != run["sdk_commit"]
+        if by[1] != run["id"] and last.get("commit") != run["sdk_commit"]:
+            # Ids are numbers written as text: the longer is the greater.
+            return (len(by[1]), by[1]) > (len(run["id"]), run["id"])
+        return (by[0], by[1]) > (run["started_at"], run["id"])
     return str(last.get("date") or "") >= run["date"]
 
 
@@ -696,7 +699,6 @@ def next_state(
     plan: dict | None = None,
     *,
     late: bool = False,
-    old_commit: bool = False,
 ) -> dict:
     """The small file the next run reads: each point's last record, last check and last pass,
     and the failed releases a newer one has replaced.
@@ -704,8 +706,7 @@ def next_state(
     `late` is a run that is behind (`behind`). It adds what only it knows: a point no
     later run has spoken for takes its result, and a release it saw failing that no point
     runs any more is remembered. It takes nothing away: nothing is forgotten, and a point
-    a later run has spoken for keeps what that run said (`spoken_for`; `old_commit` says
-    the run was started again at a commit its branch no longer points at)."""
+    a newer build or a later run has spoken for keeps what it said (`spoken_for`)."""
     points = dict(state.get("points", {}))
     locks: dict[str, Path] = {}
     found = results
@@ -713,7 +714,7 @@ def next_state(
         results = {
             key: result
             for key, result in found.items()
-            if not spoken_for((points.get(key) or {}).get("last") or {}, run, old_commit=old_commit)
+            if not spoken_for((points.get(key) or {}).get("last") or {}, run)
         }
     failing = next_failing(state, results, run)
     for key, result in results.items():
@@ -1784,9 +1785,7 @@ def main(argv: list[str] | None = None) -> int:
     run["points"] = len(results)
     tip = os.environ.get("COMPAT_TIP")
     late = behind(state, run, tip)
-    new_state = next_state(
-        state, results, run, results_dir, plan, late=bool(late), old_commit=off_tip(run, tip)
-    )
+    new_state = next_state(state, results, run, results_dir, plan, late=bool(late))
     locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
     # What the run found that a later run has already spoken for.
     older = set(new_state.pop("_older"))
