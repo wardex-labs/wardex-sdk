@@ -1451,42 +1451,127 @@ def test_the_page_that_stands_in_for_an_unreleased_version_names_other_commits_t
     assert "another commit" not in render.page(state, "0.7.0b1", "2026-11-30")
 
 
+def _synced(issue: dict, existing: list[dict]) -> list[tuple]:
+    done: list[tuple] = []
+    gh = report.GitHub("o/r", write=False)
+    gh.do = lambda what, method, path, payload: done.append((what, payload))  # type: ignore[method-assign]
+    report.sync_issue(gh, issue, existing)
+    return done
+
+
 def test_a_wheel_that_did_not_build_opens_no_issue_for_what_is_watched(tmp_path):
     """Every point left no result: the run's own failure, on the health issue. A watching
     point that left none says nothing about its subject, so nothing is opened for a set of
-    frameworks, a program or a release tag; a line that was there stays, as what it last said."""
+    frameworks, a program or a release tag."""
     made = _plan()
     nothing = {p["key"]: _result(p, "no_result") for p in made["points"]}
     wanted = {i["key"]: i for i in report.wanted_issues(made, nothing, {}, _RUN)}
     for subject in ("openai_agents__pydantic_ai", "all_frameworks", "codex_exec", "hermes_agent"):
-        assert wanted[subject]["open"] is False, subject
-    assert wanted["openai_agents"]["open"] is True, "a tested range with no proof is said"
-    assert "### Watching" not in wanted["openai_agents"]["body"]
+        issue = wanted[subject]
+        assert (issue["open"], issue["hold"]) == (False, True), subject
+        assert _synced(issue, []) == [], "nothing is opened"
+        closed = [{"number": 4, "state": "closed", "body": issue["body"]}]
+        assert _synced(issue, closed) == [], "and a closed one is left closed"
+    adapter = wanted["openai_agents"]
+    assert (adapter["open"], adapter["hold"]) == (True, False), "a tested range with no proof"
     assert "cli--codex_exec--claim_top` left no usable result" in wanted["health"]["body"]
-    # Yesterday the program failed. Today it left no result: the line stays, as yesterday's.
+    line = (
+        "- live program: `openai/codex 0.160.0` left no result, so nothing is known of it. "
+        "This neither opens nor closes the issue."
+    )
+    assert line in wanted["codex_exec"]["body"]
+    broke = {
+        **nothing,
+        "cli--codex_exec--claim_top": _result(
+            nothing["cli--codex_exec--claim_top"], "harness_error"
+        ),
+    }
+    assert report.adapter_issue("codex_exec", made, broke, _RUN, {})["hold"] is True
+
+
+def test_a_day_nothing_could_be_checked_closes_nothing(tmp_path):
+    """Yesterday a watching point failed. Today it left no result. The issue stays open,
+    whether the point still runs that release or has moved to another, and nothing is
+    said on it that anyone could act on."""
+    made = _plan()
     key = "cli--codex_exec--claim_top"
     failed = {p["key"]: _result(p) for p in made["points"]}
     failed[key] = _result(failed[key], "fail", tests={"failed_ids": ["one execute_tool span"]})
     state = report.next_state({}, failed, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    yesterday = report.adapter_issue("codex_exec", made, failed, _RUN, state)
+    assert yesterday["open"] is True
+    opened = [{"number": 7, "state": "open", "body": yesterday["body"]}]
+    nothing = {p["key"]: _result(p, "no_result") for p in made["points"]}
+
+    # The same release: what it said when it was last checked still stands, and is the
+    # same thing to say, so no comment is made of it.
     after = report.next_state(state, nothing, _RUN, tmp_path, made)
-    issue = report.adapter_issue("codex_exec", made, nothing, _RUN, after)
-    assert issue["open"] is True
+    same = report.adapter_issue("codex_exec", made, nothing, _RUN, after)
+    assert (same["open"], same["hold"]) == (True, False)
     assert (
         "live program: `openai/codex 0.160.0` did not pass when it was last checked, on "
-        "`2026-11-25`, and left no result today." in issue["body"]
+        "`2026-11-25`, and has left no result since." in same["body"]
     )
-    # A harness error is the same, and a result is a result again.
-    broke = {**nothing, key: _result(nothing[key], "harness_error")}
-    assert report.adapter_issue("codex_exec", made, broke, _RUN, after)["open"] is True
-    assert report.adapter_issue("codex_exec", made, broke, _RUN, {})["open"] is False
-    # What it last said was about another release: nothing is known of this one.
+    assert same["fingerprint"] == yesterday["fingerprint"]
+    said = [line for line in same["body"].splitlines() if line.startswith("- live program: ")]
+    assert len([line for line in said if "`openai/codex 0.160.0`" in line]) == 1, said
+    assert len(said) == 2, "and the other point, which passed and left no result, has its own"
+    assert [what for what, _ in _synced(same, opened)] == ["rewrite #7"]
+    # What it last said of another release is not about this one, however the state came
+    # to hold it.
+    stale = json.loads(json.dumps(after))
+    stale["points"][key]["last_checked"]["targets"] = {"@openai/codex": "0.150.0"}
+    assert report.adapter_issue("codex_exec", made, nothing, _RUN, stale)["hold"] is True
+
+    # The point moved to another release and left no result: nothing is known of it. The
+    # issue is not closed as if that were a pass.
     moved = {**nothing, key: {**nothing[key], "targets": {"@openai/codex": "0.161.0"}}}
-    assert report.adapter_issue("codex_exec", made, moved, _RUN, after)["open"] is False
-    # And a pass when it was last checked is no line.
-    green = report.next_state(
-        {}, {p["key"]: _result(p) for p in made["points"]}, _RUN, tmp_path, made
-    )
-    assert report.adapter_issue("codex_exec", made, nothing, _RUN, green)["open"] is False
+    after = report.next_state(state, moved, _RUN, tmp_path, made)
+    assert "last_checked" not in after["points"][key]
+    other = report.adapter_issue("codex_exec", made, moved, _RUN, after)
+    assert (other["open"], other["hold"]) == (False, True)
+    done = _synced(other, opened)
+    assert [what for what, _ in done] == ["rewrite #7"], "no comment, and no close"
+    assert "`openai/codex 0.161.0` left no result, so nothing is known of it." in done[0][1]["body"]
+    assert f"<!-- compat-fingerprint: {yesterday['fingerprint']} -->" in done[0][1]["body"]
+    assert other["fingerprint"] != yesterday["fingerprint"]
+
+    # A result is a result again: a pass closes it, with the words of a pass.
     passing = {p["key"]: _result(p) for p in made["points"]}
     later = report.next_state(after, passing, {**_RUN, "id": "3"}, tmp_path, made)
-    assert report.adapter_issue("codex_exec", made, passing, _RUN, later)["open"] is False
+    closed = report.adapter_issue("codex_exec", made, passing, _RUN, later)
+    assert (closed["open"], closed["hold"]) == (False, False)
+    assert [what for what, _ in _synced(closed, opened)] == [
+        "rewrite #7",
+        "comment on #7",
+        "close #7",
+    ]
+
+
+def test_what_the_weekly_run_could_not_check_opens_no_issue_either(tmp_path):
+    """The weekly run's wheel did not build and the branch head had moved. Its rows are
+    remembered with no result: the daily run, which writes the issues, opens none for
+    them, and keeps open one that was."""
+    daily, weekly = _plan(), _plan("weekly")
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    week = {p["key"]: _result(p, "no_result") for p in weekly["points"]}
+    state = report.next_state({}, week, {**_RUN, "cadence": "weekly"}, tmp_path, weekly)
+    state = report.next_state(state, passing, {**_RUN, "id": "2"}, tmp_path, daily)
+    issue = report.adapter_issue("langgraph", daily, passing, _RUN, state)
+    assert (issue["open"], issue["hold"]) == (False, True)
+    assert (
+        "- development branch: `langgraph head-0123456789, langgraph-prebuilt head-0123456789` "
+        "left no result (last run `2026-11-26`), so nothing is known of it." in issue["body"]
+    )
+    assert _synced(issue, []) == []
+    # With something else to do, it is an issue like any other, and the line is on it.
+    failing = {
+        **passing,
+        "langgraph--claim_top": _result(
+            passing["langgraph--claim_top"], "fail", tests={"failed_ids": ["t.py::test_x"]}
+        ),
+    }
+    busy = report.adapter_issue("langgraph", daily, failing, _RUN, state)
+    assert (busy["open"], busy["hold"]) == (True, False)
+    assert "left no result (last run `2026-11-26`)" in busy["body"]
+    assert "left no result" not in "".join(busy["changes"]), "and it is no change to act on"

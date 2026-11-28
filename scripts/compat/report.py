@@ -1157,6 +1157,9 @@ def adapter_issue(
     results = {**old, **results}
     mine = [r for r in results.values() if r.get("subject", r["adapter"]) == name]
     watched = []
+    # Lines of watching points that left no result. They keep an open issue open and open
+    # none: what a point could not say is no news about its subject.
+    held: list[str] = []
     todo, marks, failing, unchecked = [], [], [], []
     spoken: set[str] = set()
     for result in mine:
@@ -1180,23 +1183,28 @@ def adapter_issue(
             # watching failure as a broken promise or a promise as merely watched.
             if outcome in GREEN or (outcome in NOT_OURS and not result["in_claim"]):
                 continue
-            if outcome in ("no_result", "harness_error") and result["key"] not in old:
+            if outcome in ("no_result", "harness_error"):
                 # The run's own failure, and on the health issue as that. It says nothing
-                # of the subject: a wheel that did not build must not open an issue for
-                # everything that is watched. What the point said when it last was
-                # checked still stands, and keeps its line.
+                # of the subject, in either direction: a wheel that did not build must not
+                # open an issue for everything that is watched, and a day nothing could
+                # be checked must not close one.
                 before = known.get(result["key"], {}).get("last_checked") or {}
-                if (
-                    before.get("outcome") not in FAILED
-                    or before.get("targets") != result["targets"]
-                ):
+                if before.get("outcome") in FAILED and before.get("targets") == result["targets"]:
+                    # What the point said when this release was last checked still stands,
+                    # and is the same thing to say as on the day it said it.
+                    watched.append(
+                        f"{_kind_label(result)}: {version} did not pass when it was last "
+                        f"checked, on {code(before.get('date', ''))}, and has left no result "
+                        f"since. Closes {_kind_closes(result)}."
+                    )
+                    marks.append(
+                        [result["key"], "watching", before["outcome"], before.get("failed_ids", [])]
+                    )
                     continue
-                watched.append(
-                    f"{_kind_label(result)}: {version} did not pass when it was last checked, "
-                    f"on {code(before.get('date', ''))}, and left no result today. "
-                    f"Closes {_kind_closes(result)}."
+                held.append(
+                    f"{_kind_label(result)}: {version} left no result{when}, so nothing is "
+                    "known of it. This neither opens nor closes the issue."
                 )
-                marks.append([result["key"], "watching", before["outcome"], []])
                 continue
             watched.append(
                 f"{_kind_label(result)}: {version} {what}{when}. Closes {_kind_closes(result)}."
@@ -1361,9 +1369,9 @@ def adapter_issue(
     body += [f"- Note: {clean(note)}" for note in info.get("notes", [])]
     body += ["", "### What needs doing", ""]
     body += [f"- {line}" for line in todo] or ["Nothing."]
-    if watched:
+    if watched or held:
         body += ["", "### Watching (never turns the run red)", ""]
-        body += [f"- {line}" for line in watched]
+        body += [f"- {line}" for line in [*watched, *held]]
     body += ["", "### Points", "", *_table(mine)]
     if _left_out(mine):
         body += ["", *_left_out(mine)]
@@ -1422,6 +1430,9 @@ def adapter_issue(
         "body": "\n".join(body) + "\n",
         "fingerprint": fingerprint,
         "open": bool(todo or watched),
+        # Nothing to do, and something that could not be looked at: the issue stays as it
+        # is, open or not.
+        "hold": bool(held) and not (todo or watched),
         "changes": [*todo, *watched],
         "closing": closing,
         "left": left,
@@ -1668,6 +1679,19 @@ def sync_issue(gh: GitHub, wanted: dict, existing: list[dict], assignee: str = "
         found = re.search(r"<!-- compat-fingerprint: (\w+) -->", mine["body"] or "")
         was = found.group(1) if found else None
     changed = was != wanted["fingerprint"]
+    if wanted.get("hold"):
+        # An open issue says today's lines and stays open, with no comment: nothing
+        # changed that anyone can act on. One that is closed, or not there, is left alone.
+        if mine and mine["state"] == "open":
+            body = wanted["body"]
+            if was:
+                # What it last had to say is still what it has to say.
+                body = body.replace(
+                    f"<!-- compat-fingerprint: {wanted['fingerprint']} -->",
+                    f"<!-- compat-fingerprint: {was} -->",
+                )
+            gh.do(f"rewrite #{mine['number']}", "PATCH", f"issues/{mine['number']}", {"body": body})
+        return
     if mine is None:
         if wanted["open"]:
             payload = {"title": wanted["title"], "body": wanted["body"], "labels": [LABEL]}
