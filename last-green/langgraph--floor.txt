@@ -759,7 +759,7 @@ uuid-utils==0.16.0 \
     --hash=sha256:f7ae4168e1ca0ae69d24207645a8b3cd2b641a0ad15058eda17d2c9898aa89d3 \
     --hash=sha256:fbcac6e6710aa2e4bfbb81762758e01470dc56d5048ba4253acc77c9833568ff
 /home/runner/work/wardex-sdk/wardex-sdk/dist/wardex_sdk-0.7.0b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
-    --hash=sha256:7e3bffdf70b7c00a493d359b620091c0939ad89e45cee58b7e415325f69d89dc
+    --hash=sha256:39ab1004ecfac7a89db7d69270c861fd214d4537ccb3f66de9abb453361bf7b9
 xxhash==3.7.0 \
     --hash=sha256:01cf5c5333aed26cc8d5eea33b8d6398e085e365a704b7372fabdf7ab06441a9 \
     --hash=sha256:030c0fd688fce3569fbb49a2feefd4110cbb0b650186fb4610759ecfac677548 \

@@ -1,8 +1,15 @@
 # Compatibility of the default branch
 
-What the daily run found for wardex built from `main` (version string `0.7.0b1`, commit `52b0f862ec`).
+What the daily run found for wardex built from `main` (version string `0.7.0b1`, commit `4d7ac91381`).
 
 Generated on 28 Nov 2026 from the run records on this branch; nothing here is written by hand. A row marked *watching* is run and reported and never turns the run red. A pass older than 3 days is shown as when it last passed, not as passing. How to reproduce a row: [AGENTS.md](https://github.com/wardex-labs/wardex-sdk/blob/main/AGENTS.md).
+
+## all_frameworks
+
+
+| Check | What | Version | Python | Result | Last run | Last pass |
+|---|---|---|---|---|---|---|
+| frameworks together (watching) | newest tested release | `claude-agent-sdk 0.2.189, langgraph 1.2.24, langgraph-prebuilt 1.1.3, openai-agents 0.23.1, pydantic-ai-slim 2.77.0` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
 
 ## claude-agent-sdk
 
@@ -15,6 +22,23 @@ Generated on 28 Nov 2026 from the run records on this branch; nothing here is wr
 | framework release | newest tested release | `claude-agent-sdk 0.2.189` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
 | framework release | newest tested release, oldest Python | `claude-agent-sdk 0.2.189` | `3.10` | pass | 28 Nov 2026 | 28 Nov 2026 |
 | framework release | oldest tested release | `claude-agent-sdk 0.2.82` | `3.10` | pass | 28 Nov 2026 | 28 Nov 2026 |
+| live program (watching) | newest tested release | `claude-agent-sdk 0.2.189` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
+
+## codex_exec
+
+
+| Check | What | Version | Python | Result | Last run | Last pass |
+|---|---|---|---|---|---|---|
+| live program (watching) | newer than the tested range | `@openai/codex 0.172.0` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
+| live program (watching) | newest tested release | `@openai/codex 0.160.0` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
+
+## hermes_agent
+
+
+| Check | What | Version | Python | Result | Last run | Last pass |
+|---|---|---|---|---|---|---|
+| Hermes release (watching) | newer than the tested range | `hermes-agent v0.23.5` | `3.14` | pass | 28 Nov 2026 | - |
+| Hermes release (watching) | newest tested release | `hermes-agent v0.23.3` | `3.14` | pass | 28 Nov 2026 | - |
 
 ## langgraph
 
@@ -27,6 +51,7 @@ Generated on 28 Nov 2026 from the run records on this branch; nothing here is wr
 | framework release | newest tested release | `langgraph 1.2.24, langgraph-prebuilt 1.1.3` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
 | framework release | newest tested release, oldest Python | `langgraph 1.2.24` | `3.10` | pass | 28 Nov 2026 | 28 Nov 2026 |
 | framework release | oldest tested release | `langgraph 1.2.0, langgraph-prebuilt 1.1.0` | `3.10` | pass | 28 Nov 2026 | 28 Nov 2026 |
+| beside another instrumentation (watching) | newest tested release | `langgraph 1.2.24, langgraph-prebuilt 1.1.3` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
 
 ## openai-agents
 
@@ -36,6 +61,7 @@ Generated on 28 Nov 2026 from the run records on this branch; nothing here is wr
 
 | Check | What | Version | Python | Result | Last run | Last pass |
 |---|---|---|---|---|---|---|
+| beside another instrumentation (watching) | newest tested release | `openai-agents 0.23.1` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
 | framework release | newer than the tested range | `openai-agents 0.24.0` | `3.14` | tests fail | 28 Nov 2026 | - |
 | framework release | newer than the tested range | `openai-agents 0.25.0` | `3.14` | tests fail | 28 Nov 2026 | - |
 | framework release | newer than the tested range | `openai-agents 0.26.0` | `3.14` | tests fail | 28 Nov 2026 | - |
@@ -64,6 +90,20 @@ Failing tests on `openai-agents 0.26.0`:
 - `test_openai_agents_silent_gaps.py::test_a_disabled_nested_run_inside_a_traced_one_loses_only_its_own_joins`
 - `test_openai_agents_silent_gaps.py::test_a_disabling_run_config_inside_an_open_trace_says_exactly_what_is_lost`
 
+## openai_agents__langgraph
+
+
+| Check | What | Version | Python | Result | Last run | Last pass |
+|---|---|---|---|---|---|---|
+| frameworks together (watching) | newest tested release | `langgraph 1.2.24, langgraph-prebuilt 1.1.3, openai-agents 0.23.1` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
+
+## openai_agents__pydantic_ai
+
+
+| Check | What | Version | Python | Result | Last run | Last pass |
+|---|---|---|---|---|---|---|
+| frameworks together (watching) | newest tested release | `openai-agents 0.23.1, pydantic-ai-slim 2.77.0` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
+
 ## pydantic-ai
 
 - Tested range, as this build states it: `pydantic-ai-slim` 2.x from 2.54
@@ -72,6 +112,7 @@ Failing tests on `openai-agents 0.26.0`:
 
 | Check | What | Version | Python | Result | Last run | Last pass |
 |---|---|---|---|---|---|---|
+| beside another instrumentation (watching) | newest tested release | `pydantic-ai-slim 2.77.0` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
 | framework release | newest tested release | `pydantic-ai-slim 2.77.0` | `3.14` | pass | 28 Nov 2026 | 28 Nov 2026 |
 | framework release | newest tested release, oldest Python | `pydantic-ai-slim 2.54.0` | `3.10` | pass | 28 Nov 2026 | 28 Nov 2026 |
 | framework release | oldest tested release | `pydantic-ai-slim 2.54.0` | `3.10` | pass | 28 Nov 2026 | 28 Nov 2026 |
@@ -84,7 +125,7 @@ Each sentence of the README that says wardex was tested, verified or measured ag
 |---|---|
 | Each adapter is tested against the framework releases in the table above. | framework release points, daily |
 | Langfuse and Phoenix are tested destinations | nothing yet: checked by hand against a live receiver; no scheduled run starts one |
-| Hermes Agent (through a Hermes plugin; measured on v0.23.3) | nothing yet: replayed on every pull request from payloads recorded on that release; no scheduled run installs Hermes |
-| Verified against codex-cli 0.160.0. | nothing yet: replayed on every pull request from output recorded on that release; no scheduled run installs the CLI |
+| Hermes Agent (through a Hermes plugin; measured on v0.23.3) | Hermes release points, daily (watching) |
+| Verified against codex-cli 0.160.0. | live program points, daily (watching) |
 | Prebuilt wheels cover Linux with glibc (x86_64, aarch64), macOS (x86_64, arm64) and Windows (x86_64) | nothing yet: each wheel is built and import-checked at release; the tests run on Linux x86_64 only |
 | Measured on one arm64 macOS machine at a load average of about 2, not a guarantee. | nothing yet: one measurement on one machine, stated as such; no scheduled run repeats it |

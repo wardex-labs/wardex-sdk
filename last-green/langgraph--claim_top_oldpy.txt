@@ -795,7 +795,7 @@ uuid-utils==0.20.0 \
     --hash=sha256:fe039dd1e46bc1d4767a973bb6330f5c8b671422664af01c39af90a3decfc253 \
     --hash=sha256:ffa0842a682f65b565befbfcf792b7b029edfb3cffaeb8dc382c458f49980591
 /home/runner/work/wardex-sdk/wardex-sdk/dist/wardex_sdk-0.7.0b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
-    --hash=sha256:7e3bffdf70b7c00a493d359b620091c0939ad89e45cee58b7e415325f69d89dc
+    --hash=sha256:39ab1004ecfac7a89db7d69270c861fd214d4537ccb3f66de9abb453361bf7b9
 websockets==16.1.1 \
     --hash=sha256:01fbdcbac298efe19360b94bc0039c8f746f0220ba570f327577bfee81059175 \
     --hash=sha256:024193f8551a2b0eafbdd160911012c4e6c228c28430c84433253299a9e42d6a \
