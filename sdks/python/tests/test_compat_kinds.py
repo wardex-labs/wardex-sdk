@@ -1514,8 +1514,13 @@ def test_a_day_a_failed_release_could_not_be_checked_keeps_its_line(tmp_path):
     # What it last said of another release is not about this one, however the state came
     # to hold it.
     stale = json.loads(json.dumps(after))
-    stale["points"][key]["last_checked"]["targets"] = {"@openai/codex": "0.150.0"}
+    for word in ("last_checked", "last_said"):
+        stale["points"][key][word]["targets"] = {"@openai/codex": "0.150.0"}
     assert report.adapter_issue("codex_exec", made, nothing, _RUN, stale)["open"] is False
+    # A state written before what a watched point found was kept still has the day it ran.
+    older = json.loads(json.dumps(after))
+    del older["points"][key]["last_said"]
+    assert report.adapter_issue("codex_exec", made, nothing, _RUN, older) == same
 
 
 def test_an_issue_that_closes_names_what_could_not_be_checked(tmp_path):
@@ -1533,7 +1538,7 @@ def test_an_issue_that_closes_names_what_could_not_be_checked(tmp_path):
     nothing = {p["key"]: _result(p, "no_result") for p in made["points"]}
     moved = {**nothing, key: {**nothing[key], "targets": {"@openai/codex": "0.161.0"}}}
     after = report.next_state(state, moved, _RUN, tmp_path, made)
-    assert "last_checked" not in after["points"][key]
+    assert "last_checked" not in after["points"][key] and "last_said" not in after["points"][key]
     other = report.adapter_issue("codex_exec", made, moved, _RUN, after)
     assert other["open"] is False
     assert other["closing"] == (
@@ -1745,4 +1750,106 @@ def test_a_check_that_left_is_said_on_an_issue_only_a_watching_failure_keeps_ope
     assert (
         "### No longer run\n\n- The check `devbranch--hermes_agent` was not passing"
         in issue["body"]
+    )
+
+
+@pytest.mark.parametrize("today", ["harness_error", "no_result", "install_network"])
+@pytest.mark.parametrize(
+    ("subject", "key", "found"),
+    [
+        (
+            "openai_agents__pydantic_ai",
+            "combination--openai_agents__pydantic_ai",
+            "not_installable",
+        ),
+        ("hermes_agent", "hermes--claim_top", "not_installable"),
+        ("hermes_agent", "hermes--claim_top", "test_deps_unresolvable"),
+    ],
+)
+def test_what_a_watching_point_found_stands_on_a_day_it_says_nothing(
+    tmp_path, subject, key, found, today
+):
+    """Yesterday a watching point found that its release will not install as asked. Today
+    the run broke, left nothing, or could not reach the index. Nothing contradicts what it
+    found: the issue stays open, says it again, and posts no comment."""
+    made = _plan()
+    passing = {p["key"]: _result(p) for p in made["points"]}
+    refused = {**passing, key: _result(passing[key], found, install={"detail": "no wheel"})}
+    state = report.next_state({}, refused, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    yesterday = report.adapter_issue(subject, made, refused, _RUN, state)
+    assert yesterday["open"] is True
+    opened = [{"number": 7, "state": "open", "body": yesterday["body"]}]
+    silent = {**passing, key: _result(passing[key], today)}
+    after = report.next_state(state, silent, _RUN, tmp_path, made)
+    issue = report.adapter_issue(subject, made, silent, _RUN, after)
+    assert issue["open"] is True
+    assert (
+        "when it was last checked, on `2026-11-25`, and could not be checked since"
+        in (issue["body"])
+    )
+    assert issue["fingerprint"] == yesterday["fingerprint"]
+    assert [what for what, _ in _synced(issue, opened)] == ["rewrite #7"]
+    # The day it is checked again and finds the same, nothing changed either.
+    again = report.next_state(after, refused, {**_RUN, "id": "2"}, tmp_path, made)
+    assert (
+        report.adapter_issue(subject, made, refused, _RUN, again)["fingerprint"]
+        == (yesterday["fingerprint"])
+    )
+
+
+def test_a_day_the_index_is_down_opens_no_issue_for_what_is_watched(tmp_path):
+    """Everything passed yesterday. Today no point could reach the index. That is the run's
+    trouble, said on the health issue when it lasts; it is no news about any subject."""
+    made = _plan()
+    passing = {p["key"]: _result(p) for p in made["points"]}
+    state = report.next_state({}, passing, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    down = {key: _result(result, "install_network") for key, result in passing.items()}
+    after = report.next_state(state, down, _RUN, tmp_path, made)
+    subjects = {p.get("subject", p["adapter"]) for p in made["points"]}
+    for subject in sorted(subjects):
+        issue = report.adapter_issue(subject, made, down, _RUN, after)
+        assert issue["open"] is False, subject
+        assert _synced(issue, []) == [], subject
+    # Inside the range a release that will not install as asked is still what it finds.
+    refused = {
+        **down,
+        "hermes--claim_top": _result(passing["hermes--claim_top"], "not_installable"),
+    }
+    assert report.adapter_issue("hermes_agent", made, refused, _RUN, after)["open"] is True
+
+
+def test_a_watching_failure_with_more_names_than_are_kept_is_the_same_news_the_next_day(
+    tmp_path,
+):
+    """A watching point fails with more test names than the state keeps, and the next day
+    it cannot be checked. What its issue marks is what the state can say again."""
+    made = _plan()
+    key = "hermes--beyond"
+    names = [f"t.py::test_{'x' * 320}{n}" for n in range(250)]
+    passing = {p["key"]: _result(p) for p in made["points"]}
+    failed = {**passing, key: _result(passing[key], "fail", tests={"failed_ids": names})}
+    state = report.next_state({}, failed, {**_RUN, "date": "2026-11-25"}, tmp_path, made)
+    yesterday = report.adapter_issue("hermes_agent", made, failed, _RUN, state)
+    down = {**passing, key: _result(passing[key], "install_network")}
+    after = report.next_state(state, down, _RUN, tmp_path, made)
+    assert (
+        report.adapter_issue("hermes_agent", made, down, _RUN, after)["fingerprint"]
+        == (yesterday["fingerprint"])
+    )
+
+
+def test_a_pass_the_weekly_run_saw_is_named_as_not_run_by_the_daily_run(tmp_path):
+    """The daily run does not run the development branch. When it writes the words an issue
+    closes with, the branch's pass is named as not run today, not counted as checked."""
+    weekly = _plan("weekly")
+    run = {**_RUN, "cadence": "weekly", "date": "2026-11-23"}
+    passed = {p["key"]: _result(p) for p in weekly["points"]}
+    state = report.next_state({}, passed, run, tmp_path, weekly)
+    daily = _plan()
+    passing = {p["key"]: _result(p) for p in daily["points"]}
+    after = report.next_state(state, passing, _RUN, tmp_path, daily)
+    closing = report.adapter_issue("langgraph", daily, passing, _RUN, after)["closing"]
+    assert (
+        "langgraph head-0123456789, langgraph-prebuilt head-0123456789` (not run by this run)"
+        in (closing)
     )
