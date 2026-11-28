@@ -3015,16 +3015,21 @@ def _entry(day: str, run_id: str = "1", **more) -> dict:
 _NOW = {**_RUN, "id": "9", "date": "2026-12-04", "scope": "all", "red": False, "points": 2}
 
 
+def _run_list(before: object, run: dict, now: str | None = None) -> list[dict]:
+    """`report.run_list` written on the run's own day, unless a test says another."""
+    return report.run_list(before, run, now=now or run["date"])
+
+
 def test_the_list_of_runs_keeps_a_week_and_is_not_capped():
     before = [_entry("2026-11-26"), _entry("2026-11-27", "2"), _entry("2026-12-04", "3")]
-    assert [e["id"] for e in report.run_list(before, _NOW)] == ["2", "3", "9"], "seven days"
+    assert [e["id"] for e in _run_list(before, _NOW)] == ["2", "3", "9"], "seven days"
     many = [_entry("2026-12-03", f"r{n}") for n in range(300)]
-    assert len(report.run_list(many, _NOW)) == 301, "as many as there were, however many"
-    assert [e["id"] for e in report.run_list(None, _NOW)] == ["9"], "no list yet is no damage"
+    assert len(_run_list(many, _NOW)) == 301, "as many as there were, however many"
+    assert [e["id"] for e in _run_list(None, _NOW)] == ["9"], "no list yet is no damage"
     # Failed jobs of an older run, run again after a newer run has written: the newer
     # run's entry is dated after this one, and is as good an entry as it was.
     newer = _entry("2026-12-05", "n")
-    assert report.run_list([newer], _NOW) == [newer, report.run_list([], _NOW)[0]]
+    assert _run_list([newer], _NOW) == [newer, _run_list([], _NOW)[0]]
 
 
 @pytest.mark.parametrize(
@@ -3044,12 +3049,12 @@ def test_the_list_of_runs_keeps_a_week_and_is_not_capped():
 def test_a_damaged_entry_is_not_dropped_by_the_next_run_and_ages_out_like_any_other(damaged):
     """It may have been the run that said a commit is not fit to release. The run that
     comes along next must not be what makes the gate forget it."""
-    kept = report.run_list(damaged, _NOW)
+    kept = _run_list(damaged, _NOW)
     assert kept == [{"unreadable_since": "2026-12-04"}, kept[-1]] and kept[-1]["id"] == "9"
     assert not gate.entry_ok(kept[0]) and gate.entry_ok(kept[-1])
-    week = report.run_list(kept, {**_NOW, "id": "10", "date": "2026-12-11"})
+    week = _run_list(kept, {**_NOW, "id": "10", "date": "2026-12-11"})
     assert week[0] == {"unreadable_since": "2026-12-04"}, "still there a week later"
-    gone = report.run_list(week, {**_NOW, "id": "11", "date": "2026-12-12"})
+    gone = _run_list(week, {**_NOW, "id": "11", "date": "2026-12-12"})
     assert [e.get("id") for e in gone] == ["10", "11"]
 
 
@@ -3061,9 +3066,9 @@ def test_a_mark_is_dated_by_the_newest_day_the_list_knows_and_the_gate_stops_on_
     green = _entry("2026-12-03", "g", started_at="2026-12-03T10:00:00Z")
     red = _entry("2026-12-03", "r", started_at="2026-12-03T20:00:00Z", red="true", points=0)
     old_run = {**_NOW, "id": "o", "attempt": "2", "date": "2026-11-19"}
-    after_old = report.run_list([green, red], old_run)
+    after_old = _run_list([green, red], old_run)
     assert after_old[:2] == [green, {"unreadable_since": "2026-12-03"}], "not 19 Nov"
-    after_next = report.run_list(after_old, {**_NOW, "id": "n", "scope": "partial"})
+    after_next = _run_list(after_old, {**_NOW, "id": "n", "scope": "partial"})
     assert {"unreadable_since": "2026-12-03"} in after_next and green in after_next
     decision = gate.decide(
         [],
@@ -3078,10 +3083,112 @@ def test_a_mark_is_dated_by_the_newest_day_the_list_knows_and_the_gate_stops_on_
         "reasons": ["the list of runs in `state.json` of the records cannot be read"],
     }
     # A mark already there keeps its day, and one dated after everything known is reset.
-    kept = report.run_list([{"unreadable_since": "2026-12-01"}, green], old_run)
+    kept = _run_list([{"unreadable_since": "2026-12-01"}, green], old_run)
     assert kept[0] == {"unreadable_since": "2026-12-01"}
-    reset = report.run_list([{"unreadable_since": "2026-12-09"}, green], old_run)
+    reset = _run_list([{"unreadable_since": "2026-12-09"}, green], old_run)
     assert reset[0] == {"unreadable_since": "2026-12-03"}
     # And a run newer than everything listed dates the mark itself.
-    newest = report.run_list([{"id": "half"}, _entry("2026-12-01", "e")], _NOW)
+    newest = _run_list([{"id": "half"}, _entry("2026-12-01", "e")], _NOW)
     assert newest[0] == {"unreadable_since": "2026-12-04"}
+
+
+def test_a_mark_is_dated_by_the_day_it_is_written_when_the_list_knows_no_newer_day():
+    """The only entry the list holds is the damaged one, and the next run to write is the
+    second attempt of a run two weeks old. Nothing in the list says what day it is. The
+    mark is dated by the day it is written, so it is still there when the next run of
+    today comes, and the red run it stands for is not forgotten."""
+    red = _entry("2026-12-03", "r", red="true", points=0)
+    old_run = {**_NOW, "id": "o", "attempt": "2", "date": "2026-11-19"}
+    after_old = _run_list([red], old_run, now="2026-12-03")
+    assert after_old[0] == {"unreadable_since": "2026-12-03"}, "not 19 Nov"
+    today = {**_NOW, "id": "g", "attempt": "2", "date": "2026-12-03"}
+    after_today = _run_list(after_old, today, now="2026-12-03")
+    assert after_today[0] == {"unreadable_since": "2026-12-03"}
+    assert [entry.get("id") for entry in after_today] == [None, "g"], "the old run aged out"
+    # A clock behind the run's own day does not date a mark before the run.
+    assert _run_list([{"id": "half"}], _NOW, now="2026-12-01")[0] == {
+        "unreadable_since": "2026-12-04"
+    }
+
+
+def _stamped_line(day: str, points: object) -> str:
+    return json.dumps({"schema": 2, "key": "k", "run": {"date": day, "points": points}})
+
+
+def test_a_list_missing_beside_lines_written_with_one_was_removed(tmp_path):
+    folder = tmp_path / "records/2026/12"
+    folder.mkdir(parents=True)
+    kept = lambda: report.list_was_kept(tmp_path, ["2026-12-04", "not a day"])  # noqa: E731
+    assert kept() is False, "no records at all"
+    before = json.dumps({"schema": 2, "key": "k", "run": {"date": "2026-12-03"}})
+    (folder / "03.jsonl").write_text(f"{before}\nnot json\n[1]\n", encoding="utf-8")
+    assert kept() is False, "lines from before the list existed say nothing"
+    (folder / "03.jsonl").write_text(_stamped_line("2026-12-03", True) + "\n", encoding="utf-8")
+    assert kept() is False, "a stamp that is not a count is not one"
+    (folder / "03.jsonl").write_text(_stamped_line("2026-12-03", 2) + "\n", encoding="utf-8")
+    assert kept() is True
+    (folder / "03.jsonl").rename(tmp_path / "records/2026/11.jsonl")
+    (tmp_path / "records/2026/11").mkdir()
+    (tmp_path / "records/2026/11.jsonl").rename(tmp_path / "records/2026/11/27.jsonl")
+    assert kept() is True, "a week back"
+    (tmp_path / "records/2026/11/27.jsonl").rename(tmp_path / "records/2026/11/26.jsonl")
+    assert kept() is False, "and no further"
+
+
+@pytest.mark.parametrize("damage", ["no key", "null", "empty state", "no file"])
+def test_a_removed_list_is_not_started_again_from_nothing(tmp_path, monkeypatch, damage):
+    """A red run, then a red run that planned nothing, at one commit. The list is taken
+    out of the state. The failed jobs of the first run are run again and pass. Read as
+    "no list yet", the state would list that second attempt alone, and the commit's
+    newest word would be green."""
+    monkeypatch.setattr(report.GitHub, "_api", lambda self, method, path, payload=None: [])
+    monkeypatch.setattr(report.GitHub, "do", lambda self, what, *rest: None)
+    for name in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "GITHUB_REPOSITORY"):
+        monkeypatch.delenv(name, raising=False)
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    monkeypatch.setenv("GITHUB_SHA", commit)
+    records = tmp_path / "records"
+    records.mkdir()
+
+    def run(plan: dict, run_id: str, attempt: str, *results: dict) -> int:
+        monkeypatch.setenv("GITHUB_RUN_ID", run_id)
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", attempt)
+        work = tmp_path / f"work-{len(list(tmp_path.iterdir()))}"
+        (work / "results").mkdir(parents=True)
+        (work / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        for result in results:
+            _write(work / "results", result)
+        argv = ["--plan", str(work / "plan.json"), "--results", str(work / "results")]
+        return report.main([*argv, "--state-dir", str(records), "--write"])
+
+    first = {**_plan(_FLOOR, _TOP), "partial": False}
+    assert run(first, "1", "1", _result(_FLOOR, "fail"), _result(_TOP)) == report.RED_EXIT
+    nothing = {**_plan(), "partial": False, "cutoff": "2026-11-26T21:00:00Z"}
+    nothing["adapters"]["openai_agents"]["problems"] = ["no release could be listed"]
+    assert run(nothing, "2", "1") == report.RED_EXIT
+    assert [entry["id"] for entry in gate.read_runs(records)] == ["1", "2"]
+
+    state_file = records / "state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    if damage == "no key":
+        state.pop("runs")
+    elif damage == "null":
+        state["runs"] = None
+    elif damage == "empty state":
+        state = {}
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    if damage == "no file":
+        state_file.unlink()
+
+    assert run(first, "1", "2", _result(_FLOOR), _result(_TOP)) == 0
+    listed = gate.read_runs(records)
+    assert "unreadable_since" in listed[0] and [e.get("id") for e in listed[1:]] == ["1"]
+    decision = gate.decide(
+        gate.read_lines(records, "2026-11-26"),
+        commit=commit,
+        today="2026-11-26",
+        claims={"openai_agents": 2},
+        runs=listed,
+    )
+    assert decision["reasons"] == ["the list of runs in `state.json` of the records cannot be read"]

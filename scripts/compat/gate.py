@@ -21,10 +21,18 @@ release says so for as long as the page exists.
 
 What the gate trusts, and what it does not. Only the report job of a run on the
 default branch writes the records branch, and whoever else can push there can
-write a passing run, so the gate does not try to tell a forged line from a real
-one. What it does guard against is damage: a line whose fields are not what the
-report writes is never read loosely into a pass. The run it belongs to decides
-nothing, and the release stops.
+write a passing run, so the gate does not try to tell a forged record from a
+real one. Taking well-formed content away cleanly (an entry of the list of
+runs, a whole run's lines together with its entry) is the same act as forging
+and is not detected either.
+
+What it does guard against is damage: content that is not what the report
+writes. A line or an entry of the wrong shape is never read loosely into a
+pass; the run it belongs to decides nothing, and the release stops. The report
+does its part: it keeps a damaged entry as a mark the gate cannot read for a
+week, dated the day it was found, and it treats a list that is missing beside
+lines that were written with one as damaged, so that the runs that follow do
+not wash the damage out.
 """
 
 from __future__ import annotations
