@@ -1,6 +1,6 @@
 # Compatibility of the default branch
 
-What the daily run found for wardex built from `main` (version string `0.7.0b1`, commit `5ee7a87720`).
+What the daily run found for wardex built from `main` (version string `0.7.0b1`, commit `52b0f862ec`).
 
 Generated on 28 Nov 2026 from the run records on this branch; nothing here is written by hand. A row marked *watching* is run and reported and never turns the run red. A pass older than 3 days is shown as when it last passed, not as passing. How to reproduce a row: [AGENTS.md](https://github.com/wardex-labs/wardex-sdk/blob/main/AGENTS.md).
 
