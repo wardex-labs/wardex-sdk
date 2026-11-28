@@ -241,8 +241,10 @@ arrives as an issue labelled `compat`: one per subject (an adapter, a set of
 frameworks run together, a program with no tested range), one for problems
 with the run itself, and one opened by a run that ended without a verdict. A
 watching point that left no result is a problem with the run and is said
-there: it opens no issue for its subject, and a line its subject already had
-stays as what the point said when it last was checked. Each is
+there. Of its subject it says nothing, in either direction: it opens no issue
+and closes none. An open issue shows the line and stays open, with no comment;
+where the point failed on that same release when it was last checked, that is
+still what the issue says. Each is
 found by a marker in its body, rewritten by every run and closed by the run
 when nothing is left to do; on a day a release could not be checked at all,
 nothing is closed. Records accumulate on the `compat-results` branch, one JSON
