@@ -2854,7 +2854,16 @@ def test_the_page_of_a_release_that_overrode_its_gate_says_so(tmp_path):
         state = report.next_state(state, {}, _RUN, tmp_path, plan)
         assert f"its own tree: {shown}\n" in render.page(state, "0.7.0b1", "2026-11-26")
     # A state file read back from the branch may hold anything where the override was.
-    for wrong in ("yes", ["r"], 7):
+    for wrong in (
+        "yes",
+        ["r"],
+        7,
+        {},
+        {"reason": ""},
+        {"reason": "  "},
+        {"reason": "``"},
+        {"reason": 3},
+    ):
         state["versions"]["0.7.0b1"]["override"] = wrong
         assert "override of the" not in render.page(state, "0.7.0b1", "2026-11-26")
     plan["published"]["override"] = None

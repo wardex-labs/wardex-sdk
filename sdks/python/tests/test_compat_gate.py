@@ -457,6 +457,7 @@ _DAMAGE = [
     ("run.attempt", True),
     ("run.attempt", 0),
     ("run.attempt", "0"),
+    ("run.attempt", "9" * 5000),
     ("run.attempt", [1]),
 ]
 
@@ -564,3 +565,81 @@ def test_a_reason_is_printed_as_written_in_any_language_and_never_as_markup(tmp_
         monkeypatch, tmp_path / "2", red, override={"version": "0.7.0b2", "reason": loud}
     )
     assert code == 0 and f"Reason given: `{loud}`." in said, "inside a code span nothing is markup"
+
+
+# --- what a fifth reader found ---------------------------------------------------
+
+
+def test_every_line_under_one_key_is_judged_and_a_key_that_disagrees_proves_nothing():
+    """The report writes one line per point per attempt. Two under one key is damage, and
+    it is never settled by looking at the first of them."""
+    above = _line("claim_top", "fail", in_claim=False)
+    for second in (_line("claim_top", "no_result"), _line("claim_top", "fail")):
+        for lines in ([above, second], [second, above]):
+            decision = _decide(_line("floor"), _line("minor_newest"), *lines)
+            assert (
+                decision["pass"] is False and "openai_agents--claim_top" in decision["reasons"][0]
+            )
+    mixed = [_line("claim_top"), _line("claim_top", in_claim=False)]
+    assert _decide(_line("floor"), *mixed)["reasons"] == [
+        "openai_agents: 1 passing points inside its tested range, 2 are needed"
+    ]
+    elsewhere = [_line("claim_top"), _line("claim_top", subject="langgraph")]
+    assert _decide(_line("floor"), *elsewhere)["pass"] is False
+    same = _line("claim_top", "fail")
+    assert len(_decide(_line("floor"), _line("minor_newest"), same, same)["reasons"]) == 1
+
+
+def test_a_damaged_line_stops_the_release_wherever_in_the_run_it_sits():
+    bad = _line("minor_newest", "fail", watching="false")
+    good = [_line("floor"), _line("claim_top")]
+    for lines in ([bad, *good], [good[0], bad, good[1]], [*good, bad]):
+        assert _decide(*lines)["pass"] is False
+    # In an attempt a later one replaced, too: what the run wrote is not all readable.
+    first, second = _run(attempt="1"), _run(attempt="2")
+    earlier = _line("minor_newest", "fail", run=first, watching="false")
+    later = [_line("floor", run=second), _line("claim_top", run=second)]
+    decision = _decide(earlier, *later)
+    assert decision["reasons"] == [
+        "`openai_agents--minor_newest`: a line of this run cannot be read (watching)"
+    ]
+    assert gate.damage({"run": 3}) == "run"
+
+
+def test_a_run_outside_actions_has_no_attempt_number_and_is_the_first():
+    local = _run(attempt="")
+    assert _decide(_line("floor", run=local), _line("claim_top", run=local))["pass"] is True
+
+
+def test_a_run_whose_date_is_not_a_date_is_not_a_candidate():
+    undated = _run(date=5)
+    decision = _decide(_line("floor", run=undated), _line("claim_top", run=undated))
+    assert decision["run"] is None and decision["reasons"][0].startswith(
+        "no whole compatibility run"
+    )
+
+
+def test_a_tree_whose_version_cannot_be_read_has_no_release_to_excuse(
+    tmp_path, monkeypatch, capsys
+):
+    red = _records(tmp_path / "red", _TODAY, _line("floor", "fail"), _line("claim_top"))
+    nameless = {"version": "", "reason": "the floor fails upstream"}
+    tree = _tree(tmp_path / "tree", "0.7.0b2", nameless)
+    pyproject = tree / "sdks/python/pyproject.toml"
+    for text in (None, b"\xff\xfe", b'[project]\nversion = "a b`c"\n', b"[project]\n"):
+        if text is None:
+            pyproject.unlink()
+        else:
+            pyproject.write_bytes(text)
+        assert gate.tree_version(tree) == ""
+        assert gate.read_override(tree, gate.tree_version(tree)) is None
+        monkeypatch.setattr(gate, "REPO", tree)
+        monkeypatch.setattr(gate, "claimed", lambda root=None: dict(_CLAIMS))
+        # A summary that cannot be written changes no verdict either.
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path))
+        code = gate.main(["--commit", _COMMIT, "--records", str(red), "--today", _TODAY])
+        said = capsys.readouterr().out
+        assert code == gate.STOP_EXIT and "OVERRIDDEN" not in said
+        assert "the version of this tree could not be read" in said
+    pyproject.write_text("[project]\nversion = '0.7.0b2'\n", encoding="utf-8")
+    assert gate.tree_version(tree) == "0.7.0b2", "either kind of quote is a version line"
