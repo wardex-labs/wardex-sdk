@@ -237,7 +237,10 @@ pass, or a planned point left no result, and in both only for a point of a
 red-capable kind. Everything else that needs a person
 arrives as an issue labelled `compat`: one per subject (an adapter, a set of
 frameworks run together, a program with no tested range), one for problems
-with the run itself, and one opened by a run that ended without a verdict. Each is
+with the run itself, and one opened by a run that ended without a verdict. A
+watching point that left no result is a problem with the run and is said
+there: it opens no issue for its subject, and a line its subject already had
+stays as what the point said when it last was checked. Each is
 found by a marker in its body, rewritten by every run and closed by the run
 when nothing is left to do; on a day a release could not be checked at all,
 nothing is closed. Records accumulate on the `compat-results` branch, one JSON
