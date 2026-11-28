@@ -3456,18 +3456,21 @@ def test_a_release_only_a_run_that_is_behind_saw_failing_is_run_again(tmp_path, 
         ]
     }
     assert list(after["failing"].values()) == ["2026-11-26"]
+    # Seen again by another attempt of the same run, it is remembered once.
+    assert run("2026-11-26", "1", "3", _result(_FLOOR), old) == report.RED_EXIT
+    assert state()["displaced"] == after["displaced"]
     # A release it saw passing, or failing where the point still runs that release, or one
     # above the range, is nothing only it knows.
     assert run("2026-11-27", "2", "1", _result(_FLOOR), _result(patch)) == 0
     settled = state()
     for outcome, which in (("pass", _TOP), ("fail", patch), ("fail", _ABOVE)):
         stale = _result({**which, "python": "3.14"}, outcome)
-        run("2026-11-26", "1", "3", _result(_FLOOR), stale)
+        run("2026-11-26", "1", "5", _result(_FLOOR), stale)
         assert state()["displaced"] == settled["displaced"], (outcome, which["key"])
     # Nor is the floor, which fails with the packages of its own time: another finding,
     # with a count of its own.
     older = _result({**_point("floor", "0.21.0"), "python": "3.10"}, "fail")
-    run("2026-11-26", "1", "4", older, _result(_TOP))
+    run("2026-11-26", "1", "6", older, _result(_TOP))
     assert state()["displaced"] == settled["displaced"]
     assert state()["points"]["openai_agents--floor"]["last"]["targets"] == _FLOOR["targets"]
 
@@ -3614,3 +3617,176 @@ def test_what_the_weekly_run_found_wrong_with_itself_is_kept_for_the_daily_run(
         "From the weekly run of `2026-11-26`: `unplanned`: `devbranch: the head of langgraph "
         "could not be read`" in opened["body"]
     )
+
+
+# --- what a later run has spoken for is told by the run, not by the day ---------------
+
+_LAST = {"date": "2026-11-26", "run": ["2026-11-26T19:40:00Z", "5"], "commit": "c" * 40}
+
+
+@pytest.mark.parametrize(
+    ("last", "started", "run_id", "commit", "old", "spoken"),
+    [
+        ({}, "2026-11-26T19:40:00Z", "5", "c", False, False),
+        (_LAST, "2026-11-26T19:40:00Z", "5", "c" * 40, False, False),
+        (_LAST, "2026-11-26T19:30:00Z", "9", "c" * 40, False, True),
+        (_LAST, "2026-11-26T19:40:00Z", "4", "c" * 40, False, True),
+        (_LAST, "2026-11-26T19:50:00Z", "1", "c" * 40, False, False),
+        (_LAST, "2026-11-27T08:00:00Z", "1", "a" * 40, False, False),
+        (_LAST, "2026-11-27T08:00:00Z", "1", "a" * 40, True, True),
+        (_LAST, "2026-11-27T08:00:00Z", "1", "c" * 40, True, False),
+        ({"date": "2026-11-26"}, "2026-11-25T19:40:00Z", "1", "c", False, True),
+        ({"date": "2026-11-26"}, "2026-11-26T19:40:00Z", "1", "c", False, True),
+        ({"date": "2026-11-26"}, "2026-11-27T19:40:00Z", "1", "c", False, False),
+        ({"date": "2026-11-26"}, "2026-11-27T19:40:00Z", "1", "c", True, True),
+        ({**_LAST, "run": ["x"]}, "2026-11-27T19:40:00Z", "1", "c" * 40, False, False),
+        ({**_LAST, "run": "2026-11-28"}, "2026-11-26T19:40:00Z", "1", "c" * 40, False, True),
+        ({**_LAST, "run": [5, 6]}, "2026-11-27T19:40:00Z", "1", "c" * 40, False, False),
+        ({**_LAST, "run": ["2026-11-28", 6]}, "2026-11-26T19:40:00Z", "1", "c" * 40, False, True),
+    ],
+    ids=[
+        "never-run",
+        "its-own-earlier-attempt",
+        "a-run-planned-later-the-same-day",
+        "a-run-planned-at-the-same-instant-with-a-later-id",
+        "a-run-planned-earlier-the-same-day",
+        "an-earlier-run-at-another-commit",
+        "another-commit-and-this-run-is-of-an-old-one",
+        "the-same-commit-and-this-run-is-of-an-old-one",
+        "unnamed-and-a-later-day",
+        "unnamed-and-the-same-day",
+        "unnamed-and-an-earlier-day",
+        "unnamed-no-commit-and-this-run-is-of-an-old-one",
+        "a-name-that-is-not-one-and-an-earlier-day",
+        "a-name-that-is-not-one-and-the-same-day",
+        "a-name-of-numbers-and-an-earlier-day",
+        "a-name-half-of-numbers-and-the-same-day",
+    ],
+)
+def test_what_a_later_run_has_spoken_for(last, started, run_id, commit, old, spoken):
+    run = {"started_at": started, "date": started[:10], "id": run_id, "sdk_commit": commit}
+    assert report.spoken_for(last, run, old_commit=old) is spoken
+
+
+def test_of_two_runs_planned_on_one_day_the_one_planned_first_writes_nothing_over_the_other(
+    tmp_path, monkeypatch, capsys
+):
+    """The scheduled run and a run started by hand a little later, the same day. The later
+    one reports first and finds a failure; the scheduled one, held up, reports after it and
+    passed. No job was run again, and the day is the same: only which was planned later
+    tells them apart."""
+    run, state, done, _ = _behind_world(tmp_path, monkeypatch, now="2026-11-26")
+    later = {"cutoff": "2026-11-26T19:50:00Z"}
+    assert run("2026-11-26", "2", "1", _result(_FLOOR), _result(_TOP, "fail"), **later) == (
+        report.RED_EXIT
+    )
+    wrote = state()
+    assert wrote["points"]["openai_agents--claim_top"]["last"]["run"] == [
+        "2026-11-26T19:50:00Z",
+        "2",
+    ]
+    done.clear()
+    assert run("2026-11-26", "1", "1", _result(_FLOOR), _result(_TOP)) == 0
+    assert "### This run is behind" in capsys.readouterr().out
+    after = state()
+    assert after["points"] == wrote["points"] and after["failing"] == wrote["failing"]
+    assert done == [], "and the issue the later run opened is not closed"
+    # The other order is two ordinary runs: the one planned later is the newest word.
+    assert (
+        run(
+            "2026-11-26",
+            "3",
+            "1",
+            _result(_FLOOR),
+            _result(_TOP),
+            **{"cutoff": "2026-11-26T20:00:00Z"},
+        )
+        == 0
+    )
+    assert state()["points"]["openai_agents--claim_top"]["last"]["outcome"] == "pass"
+
+
+def test_every_job_of_an_old_run_run_again_does_not_speak_for_the_tip(
+    tmp_path, monkeypatch, capsys
+):
+    """Run again whole, an old run makes a plan today and so is the newest by its plan. It
+    still builds its own old commit: a failure the tip's run found is not its to settle."""
+    run, state, done, _ = _behind_world(tmp_path, monkeypatch, now="2026-11-28")
+    old, tip = "a" * 40, "b" * 40
+    monkeypatch.setenv("GITHUB_SHA", old)
+    monkeypatch.setenv("COMPAT_TIP", old)
+    assert run("2026-11-26", "1", "1", _result(_FLOOR), _result(_TOP)) == 0
+    monkeypatch.setenv("GITHUB_SHA", tip)
+    monkeypatch.setenv("COMPAT_TIP", tip)
+    assert run("2026-11-27", "2", "1", _result(_FLOOR), _result(_TOP, "fail")) == report.RED_EXIT
+    wrote = state()
+    done.clear()
+    capsys.readouterr()
+    monkeypatch.setenv("GITHUB_SHA", old)
+    assert run("2026-11-28", "1", "2", _result(_FLOOR), _result(_TOP)) == 0
+    assert "no longer the tip of its branch" in capsys.readouterr().out
+    after = state()
+    assert after["points"] == wrote["points"] and after["failing"] == wrote["failing"]
+    assert after["versions"] == wrote["versions"] and done == []
+
+
+def test_a_run_that_is_behind_remembers_no_release_a_later_run_still_runs(tmp_path, monkeypatch):
+    """The later run found the point failing, on the release the point still runs. To the
+    run that is behind the point has no result of its own, and that is not a point that
+    is no longer planned: the release is on its point's record, and is no replaced one."""
+    run, state, _, _ = _behind_world(tmp_path, monkeypatch, now="2026-11-27")
+    top = {**_TOP, "python": "3.14"}
+    assert run("2026-11-26", "1", "1", _result(_FLOOR), _result(top)) == 0
+    assert run("2026-11-27", "2", "1", _result(_FLOOR), _result(top, "fail")) == report.RED_EXIT
+    wrote = state()
+    assert wrote.get("displaced") in (None, {})
+    assert run("2026-11-26", "1", "2", _result(_FLOOR), _result(top)) == 0
+    assert state().get("displaced") in (None, {})
+    assert state()["points"] == wrote["points"]
+
+
+def test_what_a_run_that_is_behind_does_with_the_releases_that_are_remembered(tmp_path):
+    """One it ran and saw pass is settled, as by any run. One its plan made no point of
+    stays, once."""
+    ran = {**_point("displaced", "0.22.9", line="0.22.9-py3.14"), "python": "3.14"}
+    kept = {**_point("displaced", "0.22.8", line="0.22.8-py3.14"), "python": "3.14"}
+
+    def item(point: dict) -> dict:
+        return {
+            "key": point["key"],
+            "targets": point["targets"],
+            "python": "3.14",
+            "failed_on": "2026-11-20",
+        }
+
+    plan = {**_plan(_FLOOR, _TOP, ran), "partial": False}
+    state = {"displaced": {"openai_agents": [item(ran), item(kept)]}}
+    results = _results(_result(_FLOOR), _result(_TOP), _result(ran))
+    late = report.next_displaced(state, plan, results, late=True)
+    assert late == {"openai_agents": [item(kept)]}
+    assert report.next_displaced(state, plan, results) == {}
+    failing = _results(_result(_FLOOR), _result(_TOP), _result(ran, "fail"))
+    assert report.next_displaced(state, plan, failing, late=True) == {
+        "openai_agents": [item(ran), item(kept)]
+    }
+
+
+def test_a_point_a_run_that_is_behind_has_no_result_for_is_not_one_no_longer_planned(tmp_path):
+    """Yesterday the newest tested release failed. A plan that makes no point of it at all
+    says the rules moved, and the release is remembered. The plan of a run that is behind
+    says no such thing: the point may be planned today, on that very release."""
+    plan = _plan_with_table(_FLOOR)
+    results = _results(_result(_FLOOR))
+    state = _top_failed_yesterday()
+    state["points"][_TOP["key"]]["point"] = {**_TOP, "kind": "framework", "watching": False}
+    assert report.next_displaced(state, plan, results) == {
+        "openai_agents": [
+            {
+                "key": "openai_agents--displaced--0.23.1-py3.14",
+                "targets": {"openai-agents": "0.23.1"},
+                "python": "3.14",
+                "failed_on": "2026-11-25",
+            }
+        ]
+    }
+    assert report.next_displaced(state, plan, results, late=True) == {}

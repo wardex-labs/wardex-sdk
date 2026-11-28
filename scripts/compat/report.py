@@ -304,7 +304,9 @@ def _recipe(point: dict | None) -> dict | None:
 _NOT_OWED = ("floor", "displaced")
 
 
-def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
+def next_displaced(
+    state: dict, plan: dict, results: dict[str, dict], *, late: bool = False
+) -> dict:
     """Releases inside the tested range that failed and that no rule picks any more.
 
     The newest release of a line is a point only while it is the newest. One
@@ -313,6 +315,10 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
     here and the next plan makes it a point of its own. It leaves the list when
     that point passes, or when the plan stops making the point: the table lists
     the release as bad, the range no longer holds it, or the index withdrew it.
+
+    The plan of a run that is behind (`late`) is no evidence of what is planned now: a
+    release it made no point of stays remembered, and a point it has no result for is not
+    a point that is no longer planned.
     """
     kept: dict[str, list[dict]] = {}
     for adapter, items in (state.get("displaced") or {}).items():
@@ -323,6 +329,9 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
             continue
         for item in items:
             result = results.get(item["key"]) or _picked_again(item, results)
+            if result is None and late:
+                kept.setdefault(adapter, []).append(item)
+                continue
             # No point at all means the plan no longer claims the release. A point that ran
             # it settles it either way: a pass ends it, and a failure at a rule's own point
             # is on that point's record from here on.
@@ -343,6 +352,8 @@ def next_displaced(state: dict, plan: dict, results: dict[str, dict]) -> dict:
                 continue
             adapter = result["adapter"]
             python = before.get("python") or result.get("planned_python") or ""
+        elif late:
+            continue
         else:
             # Its point is no longer planned at all: the rules moved (the floor now sits on
             # its line, the line it was the newest patch of became the top one). The
@@ -610,13 +621,42 @@ def behind(state: dict, run: dict, tip: str | None) -> str:
         same = (entry.get("cadence") or kinds.ISSUE_WRITER) == run["cadence"]
         if same and mine is not None and gate.run_of({"run": entry}) > mine:
             return "a run planned after this one has already reported"
-    if str(run.get("attempt") or "1") != "1" and tip != run["sdk_commit"]:
+    if off_tip(run, tip):
         return (
             "this is a run started again at a commit that is no longer the tip of its branch"
             if tip
             else "this is a run started again, and what its branch points at now is not known"
         )
     return ""
+
+
+def off_tip(run: dict, tip: str | None) -> bool:
+    """Whether this is a run started again at a commit its branch no longer points at.
+
+    A first attempt starts at the tip, whatever is pushed while it runs. A later attempt
+    runs the code of the run's own commit, and builds that commit's wheel."""
+    return str(run.get("attempt") or "1") != "1" and tip != run["sdk_commit"]
+
+
+def spoken_for(last: dict, run: dict, *, old_commit: bool) -> bool:
+    """Whether what a point last said is another run's word that a run that is behind
+    must leave standing.
+
+    Not by the day: two runs planned on one day are told apart by which was planned
+    later, and a run started again at an old commit with a plan made today is the newest
+    by its plan and still speaks for an older build. So: the point was last written by a
+    run planned after this one; or this run is of an old commit and the point was last
+    written at another commit. A point written before the run was kept on it is told by
+    its day, and on the same day is left standing."""
+    if not last:
+        return False
+    by = last.get("run")
+    if isinstance(by, list) and len(by) == 2 and all(isinstance(part, str) for part in by):
+        if (by[0], by[1]) > (run["started_at"], run["id"]):
+            return True
+    elif str(last.get("date") or "") >= run["date"]:
+        return True
+    return old_commit and last.get("commit") != run["sdk_commit"]
 
 
 def list_was_kept(state_dir: Path, days: list[str]) -> bool:
@@ -653,6 +693,7 @@ def next_state(
     plan: dict | None = None,
     *,
     late: bool = False,
+    old_commit: bool = False,
 ) -> dict:
     """The small file the next run reads: each point's last record, last check and last pass,
     and the failed releases a newer one has replaced.
@@ -660,16 +701,16 @@ def next_state(
     `late` is a run that is behind (`behind`). It adds what only it knows: a point no
     later run has spoken for takes its result, and a release it saw failing that no point
     runs any more is remembered. It takes nothing away: nothing is forgotten, and a point
-    a later run has spoken for keeps what that run said."""
+    a later run has spoken for keeps what that run said (`spoken_for`; `old_commit` says
+    the run was started again at a commit its branch no longer points at)."""
     points = dict(state.get("points", {}))
     locks: dict[str, Path] = {}
     found = results
     if late:
-        # Dated by its plan: a point that holds a later day was spoken for after it.
         results = {
             key: result
             for key, result in found.items()
-            if str(((points.get(key) or {}).get("last") or {}).get("date") or "") <= run["date"]
+            if not spoken_for((points.get(key) or {}).get("last") or {}, run, old_commit=old_commit)
         }
     failing = next_failing(state, results, run)
     for key, result in results.items():
@@ -688,6 +729,9 @@ def next_state(
             "cause": result["cause"],
             "targets": result["targets"],
             "url": run["url"],
+            # Which run wrote this, as the list of runs orders them: a run that is behind
+            # leaves standing what a run planned after it said.
+            "run": [run["started_at"], run["id"]],
             # Which commit of this repository ran it: a run of one adapter, and the weekly
             # run, leave rows of another commit than the one the page is headed with.
             "commit": run["sdk_commit"],
@@ -818,17 +862,10 @@ def next_state(
     if (plan or {}).get("published") and not late:
         out["release"] = plan["published"]["version"]
     out["displaced"] = (
-        next_displaced(state, plan, results) if plan else state.get("displaced") or {}
+        next_displaced(state, plan, results, late=late) if plan else state.get("displaced") or {}
     )
     if late:
-        # A release its plan made no point of is not one nobody asks about any more.
-        for adapter, items in (state.get("displaced") or {}).items():
-            kept = out["displaced"].setdefault(adapter, [])
-            for item in items:
-                spoke = results.get(item["key"]) or _picked_again(item, results)
-                if spoke is None and all(other["key"] != item["key"] for other in kept):
-                    kept.append(item)
-        # And a release it saw failing, under a point a later run has moved to another
+        # A release it saw failing, under a point a later run has moved to another
         # release: no point runs it any more, and this run is the only one that knows.
         for key in sorted(set(found) - set(results)):
             result, now = found[key], (points[key].get("last") or {}).get("targets")
@@ -1742,8 +1779,11 @@ def main(argv: list[str] | None = None) -> int:
     run["red"] = bool(reasons)
     # And how many lines the run writes, so a reader can tell that one is missing.
     run["points"] = len(results)
-    late = behind(state, run, os.environ.get("COMPAT_TIP"))
-    new_state = next_state(state, results, run, results_dir, plan, late=bool(late))
+    tip = os.environ.get("COMPAT_TIP")
+    late = behind(state, run, tip)
+    new_state = next_state(
+        state, results, run, results_dir, plan, late=bool(late), old_commit=off_tip(run, tip)
+    )
     locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
     # What the run found that a later run has already spoken for.
     older = set(new_state.pop("_older"))
@@ -1757,6 +1797,9 @@ def main(argv: list[str] | None = None) -> int:
             health[cadence] = {"date": run["date"], "marks": own}
     new_state["health"] = health
 
+    # The pages are of the day they are written, which for a run that is behind is not the
+    # day of its plan.
+    as_of = max(run["date"], today) if late else run["date"]
     gh = GitHub(os.environ.get("GITHUB_REPOSITORY", ""), write=args.write)
     quiet = {results[key].get("subject", results[key]["adapter"]) for key in older}
     wanted = wanted_issues(plan, results, new_state, run, late=bool(late), quiet=quiet)
@@ -1782,14 +1825,10 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(files), encoding="utf-8"
             )
         state_file.write_text(json.dumps(new_state, indent=1, sort_keys=True), encoding="utf-8")
-        # The pages are of the day they are written, which for a run that is behind is not
-        # the day of its plan.
-        render.write_site(state_dir, new_state, max(run["date"], today) if late else run["date"])
+        render.write_site(state_dir, new_state, as_of)
     if args.preview:
         # What the pages would say after this run, for a run that writes nothing.
-        render.write_site(
-            Path(args.preview), new_state, max(run["date"], today) if late else run["date"]
-        )
+        render.write_site(Path(args.preview), new_state, as_of)
 
     text = summary(
         plan, results, reasons, gh.log if args.write else [f"(dry run) {a}" for a in gh.log]
