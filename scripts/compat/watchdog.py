@@ -47,16 +47,27 @@ def _get(repo: str, path: str):
 def last_scheduled(repo: str) -> tuple[str, bool]:
     """The instant the schedule last fired, and whether it ever has.
 
-    When it never has, the instant is when GitHub first registered the
-    workflow: the moment from which a scheduled run could be expected. Not the
-    date of the commit that added the file, which can be days older than the
-    push that brought it to the default branch. Raises when GitHub does not
-    answer, so the caller changes nothing.
+    When it never has, the instant is the moment from which a scheduled run
+    could be expected: when the workflow file reached the default branch.
+    GitHub registers a workflow the first time it sees the file on any branch,
+    which can be days before that, so the registration alone would count days
+    in which no schedule could have fired. The later of the registration and of
+    the oldest commit on the default branch that holds the file is used.
+    Raises when GitHub does not answer, so the caller changes nothing.
     """
     runs = _get(repo, f"actions/workflows/{WORKFLOW}/runs?event=schedule&per_page=1")
     if runs.get("workflow_runs"):
         return runs["workflow_runs"][0]["created_at"], True
-    return _get(repo, f"actions/workflows/{WORKFLOW}")["created_at"], False
+    registered = _get(repo, f"actions/workflows/{WORKFLOW}")["created_at"]
+    commits = _get(repo, f"commits?path=.github/workflows/{WORKFLOW}&per_page=100")
+    landed = [commit["commit"]["committer"]["date"] for commit in commits or []]
+    since = max(_instant(stamp) for stamp in [registered, *landed[-1:]])
+    # In UTC, like every other instant here: the day it names is the day the alarm counts from.
+    return since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), False
+
+
+def _instant(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
 
 
 def wanted(last: str, now: datetime, *, ever: bool = True) -> dict:
