@@ -614,9 +614,9 @@ pycparser==3.12 \
 pydantic==2.14.4 \
     --hash=sha256:653a2ad9f6d8858529c77c72717d0ea991d6c6837fe683246b2f4b2bbfc3fadc \
     --hash=sha256:7c19f1d46f8accf55a4617a6116e1ade64840870f397b846a2c53fb9019414ba
-pydantic-ai-slim==2.76.0 \
-    --hash=sha256:5844b50b1974ee276ed1ba973e0c88cd27e58430f6ea3e7aee6d4265216cc849 \
-    --hash=sha256:cc23e4538d25bbb9a2ad60ef36671e9291dc2abbebb2fab2c0e40163747bee74
+pydantic-ai-slim==2.77.0 \
+    --hash=sha256:28ae793fb801145d97f7c7ea8e060b26e313f59e6d0972caaa147fe27827a6c0 \
+    --hash=sha256:83642b33f343a4ee170cb986336226d18ab0b0da37581d76f8169b2c10e32a9d
 pydantic-core==2.50.5 \
     --hash=sha256:004c784d4642bd1112a9fa9a022543aa17793fd32004f7e903ee97df2086bad4 \
     --hash=sha256:00598ae680c6e4a17cda01910e49c0da8ce15610505e6c57cec3f15d83daef88 \
@@ -758,9 +758,9 @@ pydantic-core==2.50.5 \
     --hash=sha256:f8fd7e9c44bb4c9214d41c3bef79cba5a513b29c3bcbfdaaf0440ca6f5fb65ea \
     --hash=sha256:fa66340c6d3e08a276803812e7665312dfc75dd24eedfa8e09f18a0f8e3e0e8f \
     --hash=sha256:feb8c87dbc4684777ddafbf37c922d9e2748272ba61e362ebf85db73ebda6234
-pydantic-graph==2.76.0 \
-    --hash=sha256:0d500e3afeb5eb169ee728b294def99524f59bb6f1c81a4ce708a02698a96fca \
-    --hash=sha256:838b8a452620f58a4c51b8e00fe3d0cd1f17408ec74e7ce1940de10e3d615f1c
+pydantic-graph==2.77.0 \
+    --hash=sha256:429439970c0f39105e9745e0b587860f5197cafe29bc54a5209a0016c63e299e \
+    --hash=sha256:af69635b0d2efdbe947a146b46a2b258a8ec9f9a877d27609ffdf7311c16cc11
 pydantic-settings==2.16.3 \
     --hash=sha256:10e36f616623ebb586c05ca3d3cd22927146869db413d4f14c20c514442a1337 \
     --hash=sha256:d1db16a2d34006323a1b42c0640898da58adfbad7ec30baaa9e2b18aafc08999
@@ -1137,4 +1137,4 @@ uvicorn==0.54.0 \
     --hash=sha256:505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf \
     --hash=sha256:a2e33cbfaa0306f8e6b0c13e0cb89d7d7a2da3e62b90c66e18c33d9807b28620
 /home/runner/work/wardex-sdk/wardex-sdk/dist/wardex_sdk-0.7.0b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
-    --hash=sha256:f2f0d672ffb82417691e3eb4bd74064a76d16f2157ffffd34df68576adda418e
+    --hash=sha256:87af137b4d49d141603d3fbc69dba1062291600d18b3a2b791feb65ffc62d0e6
