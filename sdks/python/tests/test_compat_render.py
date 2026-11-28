@@ -398,3 +398,69 @@ def test_a_failure_waiting_for_its_own_point_is_on_the_default_branchs_page():
     assert "- `x None` did not pass when it was last run, on an unknown day." in page
     state["displaced"]["openai_agents"] = "not a list"
     assert "No rule picks it" not in render.page(state, render.MAIN, _TODAY)
+
+
+# --- a version the default branch carries and PyPI does not serve yet ------------
+
+
+def _bumped(version: object = "0.7.0b2") -> dict:
+    """The default branch already says `version`; the only release with a page is older."""
+    state = _published(claim_top=("0.23.1", "fail", _TODAY))
+    built = _identity("openai_agents", "claim_top", "0.23.1")
+    state["points"]["openai_agents--claim_top"] = _entry(built)
+    about = state["versions"][_RELEASE]["adapters"]["openai_agents"]
+    state["versions"]["main"] = {
+        "version": version,
+        "commit": "fedcba9876543210",
+        "adapters": {"openai_agents": about, "langgraph": {"label": "langgraph"}},
+    }
+    return state
+
+
+def test_a_version_not_published_yet_gets_cells_drawn_from_the_default_branch():
+    """The README of a tree that bumped its version points at that version's cells. They
+    exist from the next run on, say whose result they are, and are never the published
+    release's result under another name."""
+    files = render.site(_bumped(), _TODAY)
+    assert "0.7.0b2/README.md" in files and "0.7.0b2/langgraph.svg" in files
+    cell = ET.fromstring(files["0.7.0b2/openai_agents.svg"])  # noqa: S314 - made just above
+    said = cell.find("{http://www.w3.org/2000/svg}title").text
+    assert said == "unpublished · 0.23.1 passes · 28 Nov", "the build's row, not the release's"
+    assert cell.find("{http://www.w3.org/2000/svg}circle").get("fill") == "#2da44e"
+    assert "0.23.1 fails" in files[f"{_RELEASE}/openai_agents.svg"], "the release keeps its own"
+    page = files["0.7.0b2/README.md"]
+    assert page.startswith("# Compatibility of wardex 0.7.0b2, not published yet\n")
+    assert "PyPI did not serve `wardex-sdk==0.7.0b2`" in page and "`fedcba9876`" in page
+    assert "No row here is a result of the published wheel." in page
+    assert "\n## openai-agents\n" in page, "the heading the README's link lands on"
+    assert (
+        "| framework release | newest tested release | `openai-agents 0.23.1` | `3.14` | pass "
+        in page
+    )
+    index = files["README.md"].splitlines()
+    assert "- [wardex 0.7.0b2, not published yet](0.7.0b2/README.md)" in index
+    assert "0.8.0.dev0/README.md" in render.site(_bumped("0.8.0.dev0"), _TODAY), "any number"
+    assert index.index("- [wardex 0.7.0b2, not published yet](0.7.0b2/README.md)") < index.index(
+        f"- [wardex {_RELEASE}]({_RELEASE}/README.md)"
+    )
+
+
+def test_a_version_with_its_own_page_is_never_drawn_from_the_default_branch():
+    state = _bumped(_RELEASE)
+    files = render.site(state, _TODAY)
+    assert render.unpublished(state) == ""
+    assert "0.23.1 fails" in files[f"{_RELEASE}/openai_agents.svg"]
+    assert "not published yet" not in files[f"{_RELEASE}/README.md"] + files["README.md"]
+    assert sorted(name.split("/")[0] for name in files) == sorted(
+        [_RELEASE, _RELEASE, "README.md", "main"]
+    )
+
+
+@pytest.mark.parametrize("version", ["../../outside", "main", "", None, 7, ["0.7.0b2"], "x" * 99])
+def test_a_version_string_that_is_not_a_release_number_names_no_folder(version, tmp_path):
+    state = _bumped(version)
+    assert render.unpublished(state) == ""
+    before = sorted(render.site(_bumped(_RELEASE), _TODAY))
+    assert sorted(render.site(state, _TODAY)) == before
+    render.write_site(tmp_path / "records", state, _TODAY)
+    assert not (tmp_path / "outside").exists()
