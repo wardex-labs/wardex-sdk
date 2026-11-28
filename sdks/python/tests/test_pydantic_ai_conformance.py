@@ -208,7 +208,8 @@ def test_the_readme_row_names_exactly_the_span_kinds_the_declared_tree_has():
     """Docs truth: each item the README's table says becomes a span is a kind of span the
     conformance subject's tree declares, and the tree has no kind the row leaves out."""
     readme = (Path(__file__).resolve().parents[3] / "README.md").read_text(encoding="utf-8")
-    (row,) = [line for line in readme.splitlines() if line.startswith("| Pydantic AI ")]
+    # The row of the table that says what becomes a span, not the one that says what was run.
+    (row,) = [line for line in readme.splitlines() if line.startswith("| Pydantic AI (")]
     found = re.search(r"\| each (.+?), read from", row)
     assert found is not None, row
     nouns = {n.strip() for n in re.split(r",| and ", found.group(1)) if n.strip()}

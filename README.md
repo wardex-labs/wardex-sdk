@@ -216,6 +216,27 @@ tree.
 | Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |
 | Any other framework, or your own loop | model calls with model, messages and token usage; decorators add the structure |
 
+### What was run, and when
+
+A daily run installs each framework release into a clean environment and runs
+the adapter's tests on it: the oldest and the newest release of each range,
+and the releases published since. The last column below is drawn by that run
+for the wardex release this README describes. It is an image on the records
+branch, so it changes without a commit here, and it links to the full list of
+what was run, with versions, dates and failing tests by name.
+
+<!-- compat-table: written by `python3 scripts/compat/claim.py sync`; do not edit by hand -->
+| Framework | Tested on | What a pass proves | Today, on wardex 0.7.0b1 |
+|---|---|---|---|
+| OpenAI Agents SDK | `openai-agents` 0.22.x, 0.23.x | the framework itself runs | [![OpenAI Agents SDK on wardex 0.7.0b1, as the daily run last found it](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/compat-results/site/0.7.0b1/openai_agents.svg)](https://github.com/wardex-labs/wardex-sdk/blob/compat-results/site/0.7.0b1/README.md#openai-agents) |
+| LangGraph | `langgraph` 1.2.x; `langgraph-prebuilt` 1.1.x | the framework itself runs | [![LangGraph on wardex 0.7.0b1, as the daily run last found it](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/compat-results/site/0.7.0b1/langgraph.svg)](https://github.com/wardex-labs/wardex-sdk/blob/compat-results/site/0.7.0b1/README.md#langgraph) |
+| Claude Agent SDK | `claude-agent-sdk` 0.2.x | its Python package runs, on recorded output of the CLI it drives | [![Claude Agent SDK on wardex 0.7.0b1, as the daily run last found it](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/compat-results/site/0.7.0b1/anthropic_agent_sdk.svg)](https://github.com/wardex-labs/wardex-sdk/blob/compat-results/site/0.7.0b1/README.md#claude-agent-sdk) |
+| Pydantic AI | `pydantic-ai-slim` 2.x from 2.54 | the framework itself runs | [![Pydantic AI on wardex 0.7.0b1, as the daily run last found it](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/compat-results/site/0.7.0b1/pydantic_ai.svg)](https://github.com/wardex-labs/wardex-sdk/blob/compat-results/site/0.7.0b1/README.md#pydantic-ai) |
+<!-- /compat-table -->
+
+[Everything the run found for the default branch](https://github.com/wardex-labs/wardex-sdk/blob/compat-results/site/main/README.md),
+and [how to reproduce any row](https://github.com/wardex-labs/wardex-sdk/blob/main/AGENTS.md#the-daily-compatibility-run).
+
 An adapter installs when your application imports its framework, before or
 after `init()`, and shows as `waiting_for_import` until then. `init()`
 imports no framework itself. The Codex adapter installs at `init()` when

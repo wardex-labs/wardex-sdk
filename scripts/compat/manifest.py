@@ -47,7 +47,8 @@ SUITE_TIMEOUT_S = 1500
 POINT_BUDGET_S = 2700
 
 
-#: `targets` are the distributions the table of tested versions names, primary
+#: `label` names the adapter on issues and pages; `title` is what the README calls the
+#: framework. `targets` are the distributions the table of tested versions names, primary
 #: first. `extras` are requested on a target so the framework's own bounds on
 #: them apply. `requires` is what every test file of the adapter imports
 #: beyond the target. An `optional` set is what only some files need: when it
@@ -59,6 +60,7 @@ POINT_BUDGET_S = 2700
 ADAPTERS: dict[str, dict] = {
     "openai_agents": {
         "label": "openai-agents",
+        "title": "OpenAI Agents SDK",
         "targets": ("openai-agents",),
         "extras": {},
         "imports": ("agents",),
@@ -70,6 +72,7 @@ ADAPTERS: dict[str, dict] = {
     },
     "langgraph": {
         "label": "langgraph",
+        "title": "LangGraph",
         "targets": ("langgraph", "langgraph-prebuilt"),
         "extras": {},
         "imports": ("langgraph.graph",),
@@ -81,6 +84,7 @@ ADAPTERS: dict[str, dict] = {
     },
     "anthropic_agent_sdk": {
         "label": "claude-agent-sdk",
+        "title": "Claude Agent SDK",
         "targets": ("claude-agent-sdk",),
         "extras": {},
         "imports": ("claude_agent_sdk",),
@@ -96,6 +100,7 @@ ADAPTERS: dict[str, dict] = {
     },
     "pydantic_ai": {
         "label": "pydantic-ai",
+        "title": "Pydantic AI",
         "targets": ("pydantic-ai-slim",),
         "extras": {"pydantic-ai-slim": "[openai]"},
         "imports": ("pydantic_ai",),

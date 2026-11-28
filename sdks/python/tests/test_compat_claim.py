@@ -357,6 +357,13 @@ def test_a_file_keeps_the_line_endings_it_came_with(tree):
     for name in (claim.MEASURED, claim.PYPROJECT, claim.README):
         data = (tree / name).read_bytes()
         assert data.count(b"\r\n") == data.count(b"\n") > 0, name
+    bumped = (tree / claim.PYPROJECT).read_bytes().replace(b'"0.7.0b1"', b'"9.9.9"', 1)
+    (tree / claim.PYPROJECT).write_bytes(bumped)
+    assert claim.main(["sync"], root=tree) == 0
+    data = (tree / claim.README).read_bytes()
+    assert b"/site/9.9.9/" in data and data.count(b"\r\n") == data.count(b"\n")
+
+    assert "9.1" not in path.read_text(encoding="utf-8")
 
 
 def test_a_range_wrapped_inside_a_quoted_paragraph_is_read_as_one_range(tree):
@@ -370,3 +377,65 @@ def test_a_range_wrapped_inside_a_quoted_paragraph_is_read_as_one_range(tree):
     path.write_text(path.read_text("utf-8").replace(quoted, wrong), "utf-8")
     (found,) = claim.drift(tree)
     assert f"says `{dist}` 9.1.x, " in found and "> " not in found
+
+
+# --- the README's table of what was run ------------------------------------------
+
+
+def _block(root: Path) -> str:
+    text = (root / claim.README).read_text(encoding="utf-8")
+    return text[text.index(claim.BLOCK_OPEN) : text.index(claim.BLOCK_CLOSE)]
+
+
+def test_the_readmes_table_of_what_was_run_has_a_row_for_every_adapter_the_run_tests():
+    """Written from the table of tested versions, the manifest and this tree's version;
+    the first test in this file fails when it is edited by hand."""
+    rows = [line for line in _block(_REPO).splitlines() if line.startswith("| ")][1:]
+    assert [row.split(" | ")[0].removeprefix("| ") for row in rows] == [
+        spec["title"] for spec in manifest.ADAPTERS.values()
+    ]
+    version = re.search(r'^version\s*=\s*"([^"]+)"', (_REPO / claim.PYPROJECT).read_text(), re.M)[1]
+    for (name, spec), row in zip(manifest.ADAPTERS.items(), rows, strict=True):
+        for entry in plan.read_measured()[name]:
+            assert f"`{entry['distribution']}` {plan.spelled(entry)}" in row
+        assert f"/compat-results/site/{version}/{name}.svg" in row
+        assert f"/blob/compat-results/site/{version}/README.md#{spec['label']})" in row
+        assert row.count("|") == 5, "one image, one link, nothing that splits the row"
+
+
+def test_a_version_bump_moves_the_tables_images_to_the_new_release(tree, capsys):
+    """A README shows its own release. The release script runs `sync` after the bump, and
+    a bump without it fails the check."""
+    path = tree / claim.PYPROJECT
+    text = path.read_text(encoding="utf-8")
+    bumped = re.sub(r'(?m)^version\s*=\s*".*"', 'version         = "9.9.9"', text)
+    assert bumped != text
+    path.write_text(bumped, encoding="utf-8")
+    assert claim.main(["check"], root=tree) == 1
+    assert "compat-table markers" in capsys.readouterr().out
+    assert claim.main(["sync"], root=tree) == 0 and claim.drift(tree) == []
+    block = _block(tree)
+    assert "Today, on wardex 9.9.9" in block and block.count("/site/9.9.9/") == 2 * len(
+        manifest.ADAPTERS
+    )
+    release = (_REPO / "scripts/release.py").read_text(encoding="utf-8")
+    assert '"scripts/compat/claim.py", "sync"' in release and "str(README)" in release
+
+
+def test_widening_a_range_rewrites_the_tables_row_too(tree):
+    row = _a_row_with_two_lines(tree)
+    line = _line_after(row)
+    assert claim.main(["widen", row["distribution"], line], root=tree) == 0
+    assert f"`{row['distribution']}` {plan.spelled(_row(tree, row['distribution']))}" in _block(
+        tree
+    )
+    assert claim.drift(tree) == []
+
+
+def test_a_readme_without_the_markers_is_left_without_a_table(tree):
+    path = tree / claim.README
+    text = path.read_text(encoding="utf-8")
+    start, end = text.index(claim.BLOCK_OPEN), text.index(claim.BLOCK_CLOSE)
+    path.write_text(text[:start] + text[end + len(claim.BLOCK_CLOSE) :], encoding="utf-8")
+    assert claim.main(["sync"], root=tree) == 0
+    assert claim.BLOCK_OPEN not in path.read_text(encoding="utf-8") and claim.drift(tree) == []

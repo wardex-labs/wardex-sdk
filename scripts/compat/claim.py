@@ -26,13 +26,27 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from compat import plan  # noqa: E402
+from compat import manifest, plan  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 MEASURED = "sdks/python/src/wardex_sdk/_adapters/_measured.py"
 ENUMS = "sdks/python/src/wardex_sdk/_enums.py"
 PYPROJECT = "sdks/python/pyproject.toml"
 README = "README.md"
+
+#: The README's table of what was run. Everything between the two markers is written by
+#: `sync`; the last column of each row is an image the daily run redraws on the records
+#: branch, at a path that holds this tree's version, so a README shows its own release.
+BLOCK_OPEN = (
+    "<!-- compat-table: written by `python3 scripts/compat/claim.py sync`; do not edit by hand -->"
+)
+BLOCK_CLOSE = "<!-- /compat-table -->"
+_RECORDS = "wardex-labs/wardex-sdk/compat-results/site"
+_PROVES = {
+    "live": "the framework itself runs",
+    "wrapper-live": "its Python package runs, on recorded output of the CLI it drives",
+}
+_VERSION_LINE = re.compile(r'^version\s*=\s*"([^"]+)"', re.M)
 
 # The README wraps its sentences, so the white space inside a phrase may hold one line
 # break, with the quote marks of a quoted paragraph after it. Not a blank line: that ends
@@ -137,6 +151,41 @@ def write_readme(text: str, entry: dict) -> str:
     return write_pins(text, entry)
 
 
+def block(root: Path) -> str:
+    """The README's table of what was run, markers included, as this tree's table of
+    tested versions, manifest and version write it."""
+    match = _VERSION_LINE.search((root / PYPROJECT).read_text(encoding="utf-8"))
+    version = match[1] if match else ""
+    measured = plan.read_measured(root / MEASURED, root / ENUMS)
+    lines = [
+        BLOCK_OPEN,
+        f"| Framework | Tested on | What a pass proves | Today, on wardex {version} |",
+        "|---|---|---|---|",
+    ]
+    for name, spec in manifest.ADAPTERS.items():
+        said = "; ".join(f"`{e['distribution']}` {plan.spelled(e)}" for e in measured[name])
+        image = f"https://raw.githubusercontent.com/{_RECORDS}/{version}/{name}.svg"
+        page = (
+            f"https://github.com/{_RECORDS.replace('/compat-results/', '/blob/compat-results/')}"
+            f"/{version}/README.md#{spec['label']}"
+        )
+        alt = f"{spec['title']} on wardex {version}, as the daily run last found it"
+        cell = f"[![{alt}]({image})]({page})"
+        lines.append(f"| {spec['title']} | {said} | {_PROVES[spec['evidence']]} | {cell} |")
+    return "\n".join([*lines, BLOCK_CLOSE])
+
+
+def write_block(text: str, root: Path) -> str:
+    """`text` with the table between the markers rewritten; untouched when it has none."""
+    start, end = text.find(BLOCK_OPEN), text.find(BLOCK_CLOSE)
+    if start < 0 or end < start:
+        return text
+    # In the line endings the file already has.
+    ending = "\r\n" if "\r\n" in text else "\n"
+    written = block(root).replace("\n", ending)
+    return text[:start] + written + text[end + len(BLOCK_CLOSE) :]
+
+
 # --- check ----------------------------------------------------------------------
 
 
@@ -174,6 +223,11 @@ def drift(root: Path) -> list[str]:
                     f"{README}:{line}: installs {dist}>={match['lower']},<{match['upper']}; the "
                     f"table says {said}, which is >={want[0]},<{want[1]}"
                 )
+    if BLOCK_OPEN in readme and write_block(readme, root) != readme:
+        found.append(
+            f"{README}: the table between the compat-table markers is not what the table of "
+            "tested versions and this version write"
+        )
     for _, entries in sorted(plan.read_measured(root / MEASURED, root / ENUMS).items()):
         for entry in entries[:1]:
             phrase = f"(tested on `{entry['distribution']}` {plan.spelled(entry)})"
@@ -258,6 +312,18 @@ def apply(root: Path, entry: dict) -> list[str]:
     return touched
 
 
+def sync_block(root: Path) -> list[str]:
+    """Rewrite the README's table of what was run. After a version bump this is the only
+    thing that changes: the images of the new version."""
+    path = root / README
+    before = path.read_bytes().decode("utf-8")
+    after = write_block(before, root)
+    if after == before:
+        return []
+    path.write_bytes(after.encode("utf-8"))
+    return [README]
+
+
 def main(argv: list[str] | None = None, root: Path = REPO) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -288,15 +354,16 @@ def main(argv: list[str] | None = None, root: Path = REPO) -> int:
 
     rows = table(root)
     if args.command == "sync":
-        touched = sorted({name for entry in rows.values() for name in apply(root, entry)})
+        touched = {name for entry in rows.values() for name in apply(root, entry)}
     else:
         if args.distribution not in rows:
             raise SystemExit(
                 f"{args.distribution} is not in the table; it has {', '.join(sorted(rows))}"
             )
         entry = changed(rows[args.distribution], args)
-        touched = apply(root, entry)
+        touched = set(apply(root, entry))
         print(f"{entry['distribution']}: tested on {plan.spelled(entry)}")
+    touched = sorted(touched | set(sync_block(root)))
     for name in touched:
         print(f"wrote {name}")
     left = drift(root)

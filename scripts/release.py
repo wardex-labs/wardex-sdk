@@ -18,6 +18,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "sdks" / "python" / "pyproject.toml"
 CHANGELOG = ROOT / "CHANGELOG.md"
+README = ROOT / "README.md"
 
 
 def bump_pyproject(version: str) -> None:
@@ -50,7 +51,11 @@ def main() -> None:
     tag = f"python-v{version}"
     bump_pyproject(version)
     roll_changelog(version)
-    subprocess.run(["git", "add", str(PYPROJECT), str(CHANGELOG)], check=True, cwd=ROOT)
+    # The README's table of what was run names this version in its image paths.
+    subprocess.run([sys.executable, "scripts/compat/claim.py", "sync"], check=True, cwd=ROOT)
+    subprocess.run(
+        ["git", "add", str(PYPROJECT), str(CHANGELOG), str(README)], check=True, cwd=ROOT
+    )
     subprocess.run(["git", "commit", "-m", f"chore(release): {tag}"], check=True, cwd=ROOT)
     subprocess.run(["git", "tag", tag], check=True, cwd=ROOT)
     print(f"created commit and tag {tag}. Review, then: git push origin main --tags")
