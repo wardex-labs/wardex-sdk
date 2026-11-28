@@ -3892,3 +3892,59 @@ def test_an_old_run_run_again_whole_does_not_outrank_a_newer_build_by_its_new_pl
     )
     assert state()["points"]["openai_agents--claim_top"]["last"]["outcome"] == "fail"
     assert done == []
+
+
+def test_a_point_that_holds_a_newer_word_makes_the_run_behind_whatever_the_list_remembers(
+    tmp_path, monkeypatch, capsys
+):
+    """The list of runs forgets a run after a week, and a run can be started again for
+    longer. Its failed jobs, run again at a tip that has not moved, come with a plan weeks
+    old: nothing in the list is later, and nothing says it is off the tip. The point it
+    ran says it: a run planned after this one wrote it."""
+    run, state, done, records = _behind_world(tmp_path, monkeypatch, now="2026-11-27")
+    assert run("2026-11-26", "1", "1", _result(_FLOOR), _result(_TOP)) == 0
+    assert run("2026-11-27", "2", "1", _result(_FLOOR), _result(_TOP, "fail")) == report.RED_EXIT
+    # The later run has left the list, as it does after a week.
+    kept = state()
+    kept["runs"] = [entry for entry in kept["runs"] if entry["id"] != "2"]
+    (records / "state.json").write_text(json.dumps(kept), encoding="utf-8")
+    assert report.behind(kept, {**_MINE, "id": "1", "attempt": "2"}, _MINE["sdk_commit"]) == ""
+    done.clear()
+    capsys.readouterr()
+    assert run("2026-11-26", "1", "2", _result(_FLOOR), _result(_TOP)) == 0
+    said = capsys.readouterr().out
+    assert "already holds the word of a newer build or a later run" in said
+    assert state()["points"]["openai_agents--claim_top"]["last"]["outcome"] == "fail"
+    assert done == [], "and the issue the later run opened is not closed"
+
+
+@pytest.mark.parametrize(
+    ("last", "reason"),
+    [
+        ({"run": ["2026-11-27T19:40:00Z", "9"], "commit": "c" * 40}, True),
+        ({"run": ["2026-11-27T19:40:00Z", "9"], "commit": "a" * 40}, True),
+        ({"run": ["2026-11-25T19:40:00Z", "0"], "commit": "c" * 40}, False),
+        ({"run": [_RUN["started_at"], _RUN["id"]], "commit": "c" * 40}, False),
+        ({"date": "2026-12-31"}, False),
+        ({"date": _RUN["date"]}, False),
+        ({"date": "2026-12-31", "run": ["2026-11-27T19:40:00Z", 9]}, False),
+        ({}, False),
+    ],
+    ids=[
+        "a-later-plan-of-this-build",
+        "a-later-run-of-another-build",
+        "an-earlier-run",
+        "its-own-word",
+        "unnamed-and-a-later-day",
+        "unnamed-and-the-same-day",
+        "a-name-that-is-not-one",
+        "never-run",
+    ],
+)
+def test_which_points_say_a_run_is_behind(last, reason):
+    """Only a point that names the run that wrote it. One written before that is told by
+    its day, and the first run of the day after the change shares its day with it."""
+    state = {"points": {"k": {"last": last}, "other": {"last": {"run": ["9999", "9"]}}}}
+    said = report.behind(state, _MINE, _MINE["sdk_commit"], ["k", "not-in-the-state"])
+    assert bool(said) is reason, said
+    assert report.behind(state, _MINE, _MINE["sdk_commit"]) == "", "nothing ran, nothing says so"

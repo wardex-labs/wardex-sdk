@@ -210,7 +210,9 @@ that release's history and stays.
 A run can be behind: planned before a run that has already reported (its
 failed jobs were run again later), or started again at a commit that is no
 longer the tip of its branch (GitHub re-runs a run with the code of its own
-commit, which does not know what was declared since). Such a run adds what
+commit, which does not know what was declared since), or holding a result for
+a point that already holds a newer word (the list of runs forgets a run after
+a week, and a run can be started again for longer). Such a run adds what
 only it knows and takes nothing away. It forgets nothing, writes nothing over
 a point a later run has spoken for, has no say about the run's own health, and
 rewrites the issue of a subject only when it is the newest word on all of it.

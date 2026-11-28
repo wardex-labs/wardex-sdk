@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -601,7 +602,7 @@ def run_list(before: object, run: dict, *, now: str | None = None) -> list[dict]
 LIST_GONE = "gone"
 
 
-def behind(state: dict, run: dict, tip: str | None) -> str:
+def behind(state: dict, run: dict, tip: str | None, ran: Iterable[str] = ()) -> str:
     """Why this run is not the one to say how things stand now, or "".
 
     The state is what the newest run of the newest code knows. Two runs are not that. A
@@ -613,7 +614,10 @@ def behind(state: dict, run: dict, tip: str | None) -> str:
     a run adds what only it knows and takes nothing away: it forgets nothing, writes
     nothing over what a later run found, and has no say about how the run itself stands.
 
-    `tip` is the commit the run's branch points at now, or empty when that is not known."""
+    `tip` is the commit the run's branch points at now, or empty when that is not known.
+    `ran` are the points this run has a result for. The list of runs forgets a run after a
+    week and a run can be started again for longer than that, so a point that itself holds
+    a newer word than this run's says the same thing the list would have said."""
     mine = gate.run_of({"run": run})
     for entry in state.get("runs") or [] if isinstance(state.get("runs"), list) else []:
         if not gate.entry_ok(entry) or entry["ref"] != run["ref"]:
@@ -627,6 +631,13 @@ def behind(state: dict, run: dict, tip: str | None) -> str:
             if tip
             else "this is a run started again, and what its branch points at now is not known"
         )
+    points = state.get("points") or {}
+    for key in ran:
+        last = (points.get(key) or {}).get("last") or {}
+        # Only a point that names the run that wrote it: one written before runs were kept
+        # on points is told by its day, which a run planned later the same day shares.
+        if _named(last) and spoken_for(last, run):
+            return "a point this run ran already holds the word of a newer build or a later run"
     return ""
 
 
@@ -636,6 +647,12 @@ def off_tip(run: dict, tip: str | None) -> bool:
     A first attempt starts at the tip, whatever is pushed while it runs. A later attempt
     runs the code of the run's own commit, and builds that commit's wheel."""
     return str(run.get("attempt") or "1") != "1" and tip != run["sdk_commit"]
+
+
+def _named(last: dict) -> bool:
+    """Whether what a point last said names the run that said it."""
+    by = last.get("run")
+    return isinstance(by, list) and len(by) == 2 and all(isinstance(part, str) for part in by)
 
 
 def spoken_for(last: dict, run: dict) -> bool:
@@ -657,7 +674,7 @@ def spoken_for(last: dict, run: dict) -> bool:
     A point written before the run was kept on it is told by its day, and on the same day
     is left standing."""
     by = last.get("run")
-    if isinstance(by, list) and len(by) == 2 and all(isinstance(part, str) for part in by):
+    if _named(last):
         if by[1] != run["id"] and last.get("commit") != run["sdk_commit"]:
             # Ids are numbers written as text: the longer is the greater.
             return (len(by[1]), by[1]) > (len(run["id"]), run["id"])
@@ -1802,7 +1819,7 @@ def main(argv: list[str] | None = None) -> int:
     # And how many lines the run writes, so a reader can tell that one is missing.
     run["points"] = len(results)
     tip = os.environ.get("COMPAT_TIP")
-    late = behind(state, run, tip)
+    late = behind(state, run, tip, results)
     new_state = next_state(state, results, run, results_dir, plan, late=bool(late))
     locks, forgotten = new_state.pop("_locks"), new_state.pop("_forget")
     # What the run found that a later run has already spoken for.
