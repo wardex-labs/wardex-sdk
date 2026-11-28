@@ -531,4 +531,4 @@ uvicorn==0.48.0 \
     --hash=sha256:48097851328b87ec36117d3d575234519eb58c2b22d79666e9bbc6c49a761dad \
     --hash=sha256:a5504207195d08c2511bf9125ede5ac4a4b71725d519e758d01dcf0bc2d31c37
 /home/runner/work/wardex-sdk/wardex-sdk/dist/wardex_sdk-0.7.0b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
-    --hash=sha256:20275b60416596ef7035cbf11bbd3121635e5ea569bc83f7a0f0910595481d95
+    --hash=sha256:7d5b63cf1d9a6cc0e8fce838b953115da5016505662cb1a3661667399030fcec
