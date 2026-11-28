@@ -510,10 +510,15 @@ def _versions(state: dict, plan: dict | None, run: dict) -> dict:
         return kept
 
     main = versions.get("main") or {}
+    # Which build the rows are of. Only a whole run that asked about the tested ranges
+    # ran them all at its own commit: a run of one adapter, or one of a cadence that plans
+    # no framework point, must not put its commit on rows another run found.
+    whole = not plan.get("partial") and bool(plan["adapters"])
+    stamp = run if whole or not main else {f"sdk_{k}": main.get(k) for k in ("version", "commit")}
     versions["main"] = {
-        "version": run["sdk_version"],
-        "commit": run["sdk_commit"],
-        "date": run["date"],
+        "version": stamp["sdk_version"],
+        "commit": stamp["sdk_commit"],
+        "date": run["date"] if whole or not main else main.get("date"),
         "adapters": merged(main, plan["adapters"]),
         "claims": [
             {name: _prose(claim.get(name) or "") for name in ("says", "proof", "why")}
@@ -535,7 +540,7 @@ def _versions(state: dict, plan: dict | None, run: dict) -> dict:
 
 #: How long the list of runs remembers a run. The release gate reads the last two days.
 RUN_LIST_DAYS = 7
-_RUN_KEPT = ("id", "attempt", "started_at", "date", "scope", "ref", "sdk_commit", "url")
+_RUN_KEPT = "id attempt started_at date scope cadence ref sdk_commit url".split()
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -703,14 +708,23 @@ def next_state(
         subject = identity.get("subject") or key.split("--")[0]
         # A kind nobody declares any more has no run that could cover it, so the first
         # whole run forgets its points; otherwise they would stay on an issue for good.
-        retired = kind not in kinds.KINDS and not scope.get("partial", True)
+        # Only the run that writes issues does this, so that the issue a retired check kept
+        # open hears of it from the same run that forgets it.
+        whole = not scope.get("partial", True)
+        writer = scope.get("cadence", kinds.ISSUE_WRITER) == kinds.ISSUE_WRITER
+        retired = kind not in kinds.KINDS and whole and writer
+        # A subject its kind's rule no longer knows (a set of frameworks taken out of the
+        # declarations) is planned by no run again. The run that writes issues forgets it,
+        # whichever run used to plan it, and leaves a trace so that its issue is closed.
+        known = scope.get("declared", {}).get(kind)
+        undeclared = whole and writer and known is not None and subject not in known
         # A point about another wardex release than the one this run planned is that
         # release's history, kept for its page.
         build = (identity.get("sdk") or {}).get("version")
         builds = scope.get("builds", {}).get(kind)
         if not retired and build is not None and builds is not None and build not in builds:
             continue
-        if retired or subject in scope.get("covers", {}).get(kind, ()):
+        if retired or undeclared or subject in scope.get("covers", {}).get(kind, ()):
             last = points[key].get("last") or {}
             if (
                 retired
@@ -723,6 +737,11 @@ def next_state(
                 retired_failing.append(
                     {"subject": subject, "key": key, "kind": kind, "date": last.get("date")}
                 )
+            elif undeclared and not retired:
+                gone = {"subject": subject, "key": key, "kind": kind, "date": last.get("date")}
+                gone["undeclared"] = True
+                gone["failing"] = last.get("outcome") not in GREEN
+                retired_failing.append(gone)
             del points[key]
             forgotten.append(key)
     seen = dict(state.get("kinds") or {})
@@ -998,7 +1017,8 @@ def adapter_issue(
             what = _outcome_words(result)
             said = _refusal(result, 300)
             if outcome == "not_installable" and said:
-                what += f" (the installer said: {said})"
+                # In a code span: what an installer prints can hold anything.
+                what += f" (the installer said: {code(said, 300)})"
         as_of = old[result["key"]]["as_of"] if result["key"] in old else ""
         when = f" (last run {code(as_of)})" if as_of else ""
         if is_watching(result):
@@ -1190,18 +1210,38 @@ def adapter_issue(
     )
     if unchecked:
         closing += " Not checked today: " + "; ".join(unchecked) + "."
-    for item in (state or {}).get("retired") or []:
-        if isinstance(item, dict) and item.get("subject") == name:
+    traces = [
+        item
+        for item in (state or {}).get("retired") or []
+        if isinstance(item, dict) and item.get("subject") == name
+    ]
+    if not mine and any(item.get("undeclared") for item in traces):
+        # Nothing was checked, so nothing passed: the question itself went away.
+        closing = (
+            f"Nothing here is asked any more: nothing declares {code(name)}, and no run "
+            "plans it again."
+        )
+    for item in traces:
+        if item.get("undeclared"):
+            if item.get("failing"):
+                closing += (
+                    f" The check {code(item.get('key', ''))} was not passing when it was last "
+                    f"run ({code(item.get('date', ''))}) and is no longer run. That is not a pass."
+                )
+        else:
             # Not fixed: no longer asked. Said, so a closed issue is not read as a pass.
             closing += (
                 f" The check {code(item.get('key', ''))} was failing when it was last run "
                 f"({code(item.get('date', ''))}) and is no longer run: its kind "
                 f"({code(item.get('kind', ''))}) was retired. That is not a pass."
             )
-    closing += (
-        " If a change to wardex is what fixed it, a wardex release published before that "
-        "commit does not contain the fix. Closing."
-    )
+    if closing.startswith("Nothing here is asked"):
+        closing += " Closing."
+    else:
+        closing += (
+            " If a change to wardex is what fixed it, a wardex release published before that "
+            "commit does not contain the fix. Closing."
+        )
     return {
         "key": name,
         "title": f"Compatibility: {info['label']}",
@@ -1353,6 +1393,11 @@ def wanted_issues(plan: dict, results: dict[str, dict], state: dict, run: dict) 
             identity = entry.get("point") or {}
             if identity.get("kind", "framework") in kinds.KINDS and identity.get("subject"):
                 subjects.add(identity["subject"])
+        # And a subject this run has just forgotten because nothing declares it any more:
+        # no later run will know of it, so this one closes what it left open.
+        for item in state.get("retired") or []:
+            if isinstance(item, dict) and item.get("undeclared") and item.get("subject"):
+                subjects.add(str(item["subject"]))
     wanted = [adapter_issue(name, plan, results, run, state) for name in sorted(subjects)]
     if not plan.get("partial"):
         wanted += [health_issue(plan, results, state, run), died_issue()]
@@ -1508,14 +1553,16 @@ def gate_rehearsal(plan: dict, results: dict[str, dict], run: dict) -> str:
     Printed by every run, so the gate's verdict is seen daily and not for the first time
     on the day of a release. It decides nothing here."""
     said = ["", "### If this commit were released now", ""]
-    if run.get("scope") != "all" or run.get("ref") != gate.MAIN_REF:
-        # A run of one adapter, or a run on a branch, proves nothing to the gate whatever
-        # it found, and saying "no run" from inside a run would be a strange thing to read.
+    proving = gate.PROOF in kinds.due(run.get("cadence") or kinds.ISSUE_WRITER)
+    if run.get("scope") != "all" or run.get("ref") != gate.MAIN_REF or not proving:
+        # A run of one adapter, a run on a branch, or a run of a cadence that does not ask
+        # about the tested ranges proves nothing to the gate whatever it found, and saying
+        # "no run" from inside a run would be a strange thing to read.
         return "\n".join(
             [
                 *said,
                 "This run cannot say: the release gate reads only whole runs on the default "
-                "branch, and this is not one.",
+                "branch that ask about the tested ranges, and this is not one.",
                 "",
             ]
         )

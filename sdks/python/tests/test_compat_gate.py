@@ -74,7 +74,7 @@ def _stamped(lines: tuple) -> list:
     return out
 
 
-_LISTED = ("id", "attempt", "started_at", "date", "scope", "ref", "sdk_commit", "url")
+_LISTED = ("id", "attempt", "started_at", "date", "scope", "cadence", "ref", "sdk_commit", "url")
 
 
 def _listed(lines: list) -> list[dict]:
@@ -871,3 +871,58 @@ def test_a_tree_whose_version_cannot_be_read_has_no_release_to_excuse(
         assert "the version of this tree could not be read" in said
     pyproject.write_text("[project]\nversion = '0.7.0b2'\n", encoding="utf-8")
     assert gate.tree_version(tree) == "0.7.0b2", "either kind of quote is a version line"
+
+
+def _weekly(outcome: str = "fail", **more) -> list:
+    run = {**_run(run_id="2"), "cadence": "weekly", "started_at": f"{_TODAY}T21:00:00Z", **more}
+    branch = _line("x", outcome, run=run, kind="devbranch", watching=True)
+    return _stamped(({**branch, "key": "devbranch--openai_agents"},))
+
+
+def test_a_run_that_did_not_ask_about_the_tested_ranges_never_decides():
+    """The weekly run is whole, on the default branch, and can be the newest run at a
+    commit. It holds watching points only. Read as the deciding run it would stop every
+    release cut after it, and it proves nothing either."""
+    morning = _run(run_id="1")
+    green = _stamped((_line("floor", run=morning), _line("claim_top", run=morning)))
+    week = _weekly()
+    decision = _judge([*green, *week])
+    assert decision["pass"] is True and decision["run"].endswith("/1")
+    # Alone at the commit it is no run the gate can use, whatever it found.
+    alone = _judge(_weekly("pass"))
+    assert alone["pass"] is False
+    assert alone["reasons"][0].startswith("no whole compatibility run on the default branch")
+    # An entry from before the schedule was recorded was the daily run.
+    old = [{k: v for k, v in entry.items() if k != "cadence"} for entry in _listed(green)]
+    assert _judge(green, old)["pass"] is True
+
+
+@pytest.mark.parametrize("cadence", ["hourly", "", 5, ["daily"], False], ids=repr)
+def test_a_schedule_that_is_no_schedule_is_damage_and_stops(cadence):
+    """Otherwise changing one word of the newest run's entry would take a red run out of
+    the gate's sight, and the run before it would decide."""
+    yesterday = _run("2026-12-02", run_id="1")
+    green = _stamped((_line("floor", run=yesterday), _line("claim_top", run=yesterday)))
+    red = _stamped((_line("floor", "fail", run=_run(run_id="2", red=True)),))
+    assert _judge([*green, *red])["pass"] is False
+    listed = _listed([*green, *red])
+    listed[-1] = {**listed[-1], "cadence": cadence}
+    decision = _judge([*green, *red], listed)
+    assert decision["pass"] is False
+    assert decision["reasons"] == ["the list of runs in `state.json` of the records cannot be read"]
+
+
+def test_a_line_and_the_list_that_disagree_about_the_schedule_stop():
+    yesterday = _run("2026-12-02", run_id="1")
+    green = _stamped((_line("floor", run=yesterday), _line("claim_top", run=yesterday)))
+    red = _stamped((_line("floor", "fail", run=_run(run_id="2", red=True)),))
+    listed = _listed([*green, *red])
+    listed[-1] = {**listed[-1], "cadence": "weekly"}
+    decision = _judge([*green, *red], listed)
+    assert (
+        decision["pass"] is False and "do not agree with the list of runs" in decision["reasons"][0]
+    )
+    # And the other way: a line of the deciding run that calls its run a weekly one.
+    lines = [{**green[0], "run": {**green[0]["run"], "cadence": "weekly"}}, green[1]]
+    decision = _judge(lines, _listed(green))
+    assert decision["pass"] is False and "does not agree with the list" in decision["reasons"][0]

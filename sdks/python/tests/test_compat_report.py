@@ -3212,3 +3212,19 @@ def test_a_removed_list_is_not_started_again_from_nothing(tmp_path, monkeypatch,
         runs=listed,
     )
     assert decision["reasons"] == ["the list of runs in `state.json` of the records cannot be read"]
+
+
+def test_the_list_of_runs_says_which_schedule_each_run_was_of():
+    run = {**_RUN, "scope": "all", "red": False, "points": 6}
+    listed = report.run_list(None, {**run, "cadence": "weekly"}, now=_RUN["date"])
+    assert listed[-1]["cadence"] == "weekly" and gate.entry_ok(listed[-1])
+    odd = {**listed[-1], "cadence": "hourly", "id": "9"}
+    kept = report.run_list([odd], {**run, "cadence": "daily"}, now=_RUN["date"])
+    assert kept[0] == {"unreadable_since": _RUN["date"]}, "a schedule there is not is damage"
+    assert kept[-1]["cadence"] == "daily" and gate.entry_ok(kept[-1])
+
+
+def test_a_weekly_run_is_told_it_cannot_rehearse_the_gate():
+    run = {**_RUN, "scope": "all", "ref": gate.MAIN_REF, "cadence": "weekly"}
+    said = report.gate_rehearsal({"points": []}, {}, run)
+    assert "This run cannot say" in said and "ask about the tested ranges" in said

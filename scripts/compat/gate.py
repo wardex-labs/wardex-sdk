@@ -56,6 +56,8 @@ STOP_EXIT = 20
 #: frameworks release daily. Two days leaves room for a release cut the morning after.
 MAX_AGE_DAYS = 2
 MAIN_REF = "refs/heads/main"
+#: The kind whose points prove a tested range.
+PROOF = "framework"
 OVERRIDE = model.OVERRIDE
 REPO = Path(__file__).resolve().parents[2]
 _VERSION_LINE = re.compile(r"""^version\s*=\s*(?:"([^"]+)"|'([^']+)')""", re.M)
@@ -116,7 +118,7 @@ def claimed(root: Path) -> dict[str, int]:
     table = plan.read_measured(
         root / plan.MEASURED_PY.relative_to(plan.REPO), root / plan.ENUMS_PY.relative_to(plan.REPO)
     )
-    need = kinds.KINDS["framework"].min_points
+    need = kinds.KINDS[PROOF].min_points
     return {name: need for name, rows in table.items() if rows and name in manifest.ADAPTERS}
 
 
@@ -186,7 +188,18 @@ def entry_ok(entry: object) -> bool:
         and isinstance(entry.get("red"), bool)
         and _count(entry.get("points"), least=0)
         and _attempt({"run": entry}) is not None
+        and _cadence(entry) is not None
     )
+
+
+def _cadence(run: dict) -> str | None:
+    """Which schedule a run was of, or None when what it says is no schedule there is.
+
+    A run from before this was recorded says nothing, and was the daily one."""
+    said = run.get("cadence")
+    if said is None:
+        return kinds.ISSUE_WRITER
+    return said if isinstance(said, str) and said in kinds.CRONS.values() else None
 
 
 def _not_whole(entry: dict, spoken: list[dict]) -> str:
@@ -259,7 +272,12 @@ def decide(
 
     def asked(run: dict) -> bool:
         whole = run["scope"] == "all" and run["ref"] == MAIN_REF
-        return whole and run["sdk_commit"] == commit and run["date"] >= oldest
+        # And a run that was due to ask about the tested ranges at all. A run of a cadence
+        # that holds watching kinds alone is whole, on the default branch, at this commit,
+        # and says nothing a release waits for: it must not stand in front of the run that
+        # does. A run from before cadences were recorded was the daily one.
+        proving = PROOF in kinds.due(_cadence(run) or "")
+        return whole and proving and run["sdk_commit"] == commit and run["date"] >= oldest
 
     listed = [entry for entry in runs if asked(entry)]
     known = {run_of({"run": entry}) for entry in runs}
@@ -302,13 +320,14 @@ def decide(
         for line in mine
         if damage(line)
     ]
-    # One run is one ref, one commit, one scope, one day. A line that carries this run's
-    # start and id and says otherwise is not a line of another run.
+    # One run is one ref, one commit, one scope, one day, one schedule. A line that carries
+    # this run's start and id and says otherwise is not a line of another run.
     damaged += [
         f"{code(line.get('key', ''), 120)}: a line of this run does not agree with the list "
         "of runs about which run it is"
         for line in mine
         if any(line["run"][field] != entry[field] for field in _RUN_FIELDS)
+        or _cadence(line["run"]) != _cadence(entry)
     ]
     if damaged:
         return _stop(*sorted(damaged), run=url)
@@ -337,8 +356,7 @@ def decide(
         reasons += sorted(set(stopped))
         subjects = {line["subject"] for line in said}
         proves = all(
-            line["in_claim"] and line["kind"] == "framework" and line["outcome"] in GREEN
-            for line in said
+            line["in_claim"] and line["kind"] == PROOF and line["outcome"] in GREEN for line in said
         )
         if proves and len(subjects) == 1:
             proving[said[0]["subject"]] = proving.get(said[0]["subject"], 0) + 1

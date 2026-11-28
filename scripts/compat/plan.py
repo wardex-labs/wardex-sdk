@@ -595,7 +595,7 @@ def fetch_published(cutoff: str, only: str | None = None) -> dict:
 
 _BASE = "key adapter role targets floats python in_claim cutoff assume_measured uploaded".split()
 _SHA = re.compile(r"[0-9a-f]{40}")
-_TAG = re.compile(r"v\d+(?:\.\d+){1,3}")
+_TAG = re.compile(r"v\d+\.\d+\.\d+")
 _NO_SPEC = {
     "extras": {},
     "requires": (),
@@ -875,6 +875,23 @@ def plan_devbranch(measured: dict, tops: dict[str, dict], facts: dict) -> dict:
     return {"points": points, "covered": covered, "problems": problems}
 
 
+def declared() -> dict[str, list[str]]:
+    """Every subject the rule of each kind knows, whether a run could plan it or not.
+
+    A fact of the declarations, the same for every run. A point the records remember of a
+    subject that is no longer here (a set of frameworks taken out of the manifest) is
+    planned by no run again, and this is how the report can tell that from a subject a
+    run could not plan today."""
+    return {
+        "combination": sorted(manifest.COMBINATIONS),
+        "neighbour": sorted({spec["adapter"] for spec in manifest.NEIGHBOURS.values()}),
+        "prerelease": sorted(manifest.ADAPTERS),
+        "cli": sorted(manifest.CLI),
+        "hermes": [manifest.HERMES["subject"]],
+        "devbranch": sorted(manifest.DEV_BRANCHES),
+    }
+
+
 def subjects() -> dict[str, dict]:
     """Every subject an issue can be about, and what to call it. An adapter is one; so is
     a set of frameworks run together, and so is a program that has no tested range."""
@@ -931,6 +948,7 @@ def build_plan(
         "covers": {"framework": covered} if due else {},
         "partial": partial,
         "builds": {},
+        "declared": declared(),
     }
     # What a watching kind could not plan. Said on the health issue and never a reason for
     # red: `problems` above is read by the verdict, this is not.
