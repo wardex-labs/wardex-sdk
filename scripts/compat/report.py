@@ -643,20 +643,23 @@ def spoken_for(last: dict, run: dict, *, old_commit: bool) -> bool:
     must leave standing.
 
     Not by the day: two runs planned on one day are told apart by which was planned
-    later, and a run started again at an old commit with a plan made today is the newest
-    by its plan and still speaks for an older build. So: the point was last written by a
-    run planned after this one; or this run is of an old commit and the point was last
-    written at another commit. A point written before the run was kept on it is told by
-    its day, and on the same day is left standing."""
-    if not last:
-        return False
+    later. And not by the plan alone: every job of an old run, run again, makes a plan
+    today, is the newest by its plan and still builds its old commit. So: the point was
+    last written by a run planned after this one; or this run is of an old commit and the
+    point was last written, at another commit, by a run created after this one. A branch
+    moves forward, and a run starts at its tip: that other commit is a newer one. A point
+    an older run wrote is not spoken for, whatever its commit, and neither is one a later
+    run wrote at this run's own commit: what this run found there is the newest there is
+    about that build. A point written before the run was kept on it is told by its day,
+    and on the same day is left standing."""
     by = last.get("run")
     if isinstance(by, list) and len(by) == 2 and all(isinstance(part, str) for part in by):
         if (by[0], by[1]) > (run["started_at"], run["id"]):
             return True
-    elif str(last.get("date") or "") >= run["date"]:
-        return True
-    return old_commit and last.get("commit") != run["sdk_commit"]
+        # A run keeps its id through every attempt, and ids rise with each new run.
+        created_later = (len(by[1]), by[1]) > (len(run["id"]), run["id"])
+        return old_commit and created_later and last.get("commit") != run["sdk_commit"]
+    return str(last.get("date") or "") >= run["date"]
 
 
 def list_was_kept(state_dir: Path, days: list[str]) -> bool:

@@ -3635,14 +3635,28 @@ _LAST = {"date": "2026-11-26", "run": ["2026-11-26T19:40:00Z", "5"], "commit": "
         (_LAST, "2026-11-27T08:00:00Z", "1", "a" * 40, False, False),
         (_LAST, "2026-11-27T08:00:00Z", "1", "a" * 40, True, True),
         (_LAST, "2026-11-27T08:00:00Z", "1", "c" * 40, True, False),
+        ({**_LAST, "commit": None}, "2026-11-27T08:00:00Z", "1", "c" * 40, True, True),
+        (_LAST, "2026-11-27T08:00:00Z", "6", "a" * 40, True, False),
+        (_LAST, "2026-11-27T08:00:00Z", "10", "a" * 40, True, False),
+        ({**_LAST, "run": [_LAST["run"][0], "10"]}, "2026-11-27T08:00:00Z", "9", "a", True, True),
+        (_LAST, "2026-11-26T19:40:00Z", "5", "a" * 40, True, False),
         ({"date": "2026-11-26"}, "2026-11-25T19:40:00Z", "1", "c", False, True),
         ({"date": "2026-11-26"}, "2026-11-26T19:40:00Z", "1", "c", False, True),
         ({"date": "2026-11-26"}, "2026-11-27T19:40:00Z", "1", "c", False, False),
-        ({"date": "2026-11-26"}, "2026-11-27T19:40:00Z", "1", "c", True, True),
+        ({"date": "2026-11-26"}, "2026-11-27T19:40:00Z", "1", "c", True, False),
         ({**_LAST, "run": ["x"]}, "2026-11-27T19:40:00Z", "1", "c" * 40, False, False),
         ({**_LAST, "run": "2026-11-28"}, "2026-11-26T19:40:00Z", "1", "c" * 40, False, True),
         ({**_LAST, "run": [5, 6]}, "2026-11-27T19:40:00Z", "1", "c" * 40, False, False),
         ({**_LAST, "run": ["2026-11-28", 6]}, "2026-11-26T19:40:00Z", "1", "c" * 40, False, True),
+        ({**_LAST, "run": [_LAST["run"][0], 6]}, "2026-11-26T19:40:00Z", "1", "c" * 40, True, True),
+        (
+            {**_LAST, "run": [_LAST["run"][0], 6]},
+            "2026-11-27T19:40:00Z",
+            "1",
+            "c" * 40,
+            True,
+            False,
+        ),
     ],
     ids=[
         "never-run",
@@ -3651,16 +3665,23 @@ _LAST = {"date": "2026-11-26", "run": ["2026-11-26T19:40:00Z", "5"], "commit": "
         "a-run-planned-at-the-same-instant-with-a-later-id",
         "a-run-planned-earlier-the-same-day",
         "an-earlier-run-at-another-commit",
-        "another-commit-and-this-run-is-of-an-old-one",
-        "the-same-commit-and-this-run-is-of-an-old-one",
+        "a-run-created-later-and-this-run-is-of-an-old-commit",
+        "a-run-created-later-at-this-runs-own-commit",
+        "a-run-created-later-that-kept-no-commit",
+        "a-run-created-earlier-and-this-run-is-of-an-old-commit",
+        "a-run-created-earlier-with-a-shorter-id",
+        "a-run-created-later-with-a-longer-id",
+        "its-own-earlier-attempt-and-this-run-is-of-an-old-commit",
         "unnamed-and-a-later-day",
         "unnamed-and-the-same-day",
         "unnamed-and-an-earlier-day",
-        "unnamed-no-commit-and-this-run-is-of-an-old-one",
+        "unnamed-an-earlier-day-and-this-run-is-of-an-old-commit",
         "a-name-that-is-not-one-and-an-earlier-day",
         "a-name-that-is-not-one-and-the-same-day",
         "a-name-of-numbers-and-an-earlier-day",
         "a-name-half-of-numbers-and-the-same-day",
+        "a-name-with-the-same-instant-and-a-number-the-same-day",
+        "a-name-with-a-number-and-an-earlier-day",
     ],
 )
 def test_what_a_later_run_has_spoken_for(last, started, run_id, commit, old, spoken):
@@ -3790,3 +3811,30 @@ def test_a_point_a_run_that_is_behind_has_no_result_for_is_not_one_no_longer_pla
         ]
     }
     assert report.next_displaced(state, plan, results, late=True) == {}
+
+
+def test_a_run_started_again_off_the_tip_is_the_newest_word_where_only_older_runs_spoke(
+    tmp_path, monkeypatch, capsys
+):
+    """An earlier run, at an older commit, passed. The next run found a regression, and its
+    report never wrote (the API failed). The branch moved on, and the run's jobs are run
+    again. The point's last word is another commit's, and older: what this run found is the
+    newest there is, whether the jobs come with the old plan or a new one."""
+    for index, replanned in enumerate((False, True)):
+        (tmp_path / str(index)).mkdir()
+        run, state, done, _ = _behind_world(tmp_path / str(index), monkeypatch, now="2026-11-28")
+        monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+        monkeypatch.setenv("COMPAT_TIP", "a" * 40)
+        assert run("2026-11-26", "1", "1", _result(_FLOOR), _result(_TOP)) == 0
+        done.clear()
+        capsys.readouterr()
+        monkeypatch.setenv("GITHUB_SHA", "b" * 40)
+        monkeypatch.setenv("COMPAT_TIP", "c" * 40)
+        day = "2026-11-28" if replanned else "2026-11-27"
+        assert run(day, "2", "2", _result(_FLOOR), _result(_TOP, "fail")) == report.RED_EXIT
+        said = capsys.readouterr().out
+        assert "no longer the tip of its branch" in said and "(0 of its 2 results" in said
+        last = state()["points"]["openai_agents--claim_top"]["last"]
+        assert (last["outcome"], last["commit"]) == ("fail", "b" * 40), replanned
+        assert [what.split()[0] for what in done] == ["open"], replanned
+        assert list(state()["failing"].values()) == [day]

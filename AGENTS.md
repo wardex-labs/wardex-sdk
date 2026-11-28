@@ -217,7 +217,8 @@ rewrites the issue of a subject only when it is the newest word on all of it.
 Which run spoke last for a point is told by the run that wrote it (each point
 keeps the run and the commit of its last result), not by the day: two runs
 planned on one day are told apart, and every job of an old run run again does
-not speak for the tip.
+not speak over what a run created after it found at a newer commit. Where only
+older runs have spoken, what it found is the newest word and is written.
 A release inside the tested range that only it saw failing is remembered and
 run again by the next plan. Its summary says it is behind; to say how things
 stand now, start a new run: `gh workflow run compat.yml`.
